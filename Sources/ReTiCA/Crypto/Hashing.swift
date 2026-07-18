@@ -2,7 +2,6 @@ import Foundation
 import CryptoKit
 
 /// Namespace for Reticulum's cryptographic primitives. Extended across the Crypto/ files.
-@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 public enum Crypto {
     /// Reticulum's addressable hash length: TRUNCATED_HASHLENGTH = 128 bits.
     public static let truncatedHashLength = 16
