@@ -27,7 +27,8 @@ let package = Package(
         ),
         .testTarget(
             name: "ReTiCATests",
-            dependencies: ["ReTiCA"]
+            dependencies: ["ReTiCA"],
+            resources: [.process("Vectors/fixtures.json")]
         ),
     ],
     swiftLanguageModes: [.v6]
