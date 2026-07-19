@@ -12,8 +12,8 @@ public struct Destination {
     public let direction: Direction
     public let appName: String
     public let aspects: [String]
-    public var identity: Identity?
-    public var groupKey: Data?
+    public let identity: Identity?
+    public let groupKey: Data?
 
     // MARK: Addressing (pure statics)
 
