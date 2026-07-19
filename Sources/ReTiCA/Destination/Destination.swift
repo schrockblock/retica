@@ -2,7 +2,7 @@ import Foundation
 
 /// A Reticulum destination: an addressable endpoint. Owns addressing (name/hash) and
 /// crypto dispatch. Framing is handled separately by `Packet`.
-public struct Destination {
+public struct Destination: Equatable {
     public enum Direction: UInt8, Equatable { case `in` = 0x11, out = 0x12 }
 
     public static let nameHashLength = 10 // NAME_HASH_LENGTH / 8
