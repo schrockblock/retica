@@ -101,6 +101,27 @@ public struct Packet: Equatable {
 }
 
 extension Packet {
+    /// Compose an encrypted DATA packet to a destination (HEADER_1, BROADCAST).
+    public static func data(to destination: Destination, plaintext: Data,
+                            ratchet: Data? = nil, context: PacketContext = .none) -> Packet {
+        Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+               destinationType: destination.kind, context: context, contextFlag: false, hops: 0,
+               destinationHash: destination.hash, transportId: nil,
+               payload: destination.encrypt(plaintext, ratchet: ratchet))
+    }
+
+    /// Compose an ANNOUNCE packet from a destination (HEADER_1, BROADCAST). The announce
+    /// payload is built separately via `Announce.buildPayload`.
+    public static func announce(from destination: Destination, payload: Data,
+                                pathResponse: Bool = false, ratchetPresent: Bool = false) -> Packet {
+        Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
+               destinationType: destination.kind,
+               context: pathResponse ? .pathResponse : .none, contextFlag: ratchetPresent, hops: 0,
+               destinationHash: destination.hash, transportId: nil, payload: payload)
+    }
+}
+
+extension Packet {
     /// The bytes hashed to produce the packet hash. Excludes hops, transport id,
     /// header type, context flag, and transport type — matching RNS `get_hashable_part`.
     public var hashablePart: Data {

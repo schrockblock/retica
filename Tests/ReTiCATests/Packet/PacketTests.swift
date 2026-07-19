@@ -61,3 +61,36 @@ import Foundation
 @Test func unpackRejectsTruncated() {
     #expect(Packet(raw: Data([0x00, 0x00])) == nil) // no room for dest hash + context
 }
+
+@Test func dataComposerEncryptsAndFrames() throws {
+    let id = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: id, groupKey: nil)!
+    let plaintext = Data("composed".utf8)
+    let packet = Packet.data(to: dest, plaintext: plaintext)
+    #expect(packet.packetType == .data)
+    #expect(packet.destinationType == .single)
+    #expect(packet.destinationHash == dest.hash)
+    #expect(packet.headerType == .header1)
+    // payload is ciphertext, not plaintext
+    #expect(packet.payload != plaintext)
+    #expect(dest.decrypt(packet.payload) == plaintext)
+    _ = try packet.packed() // frames within MTU
+}
+
+@Test func announceComposerSetsTypeAndRatchetFlag() {
+    let id = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: [],
+                           identity: id, groupKey: nil)!
+    let payload = Data("announce-bytes".utf8)
+    let plain = Packet.announce(from: dest, payload: payload)
+    #expect(plain.packetType == .announce)
+    #expect(plain.context == .none)
+    #expect(plain.contextFlag == false)
+    #expect(plain.payload == payload)
+
+    let withRatchet = Packet.announce(from: dest, payload: payload,
+                                      pathResponse: true, ratchetPresent: true)
+    #expect(withRatchet.context == .pathResponse)
+    #expect(withRatchet.contextFlag == true)
+}
