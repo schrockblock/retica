@@ -6,7 +6,7 @@ A native iOS library for the [Reticulum Network Stack (RNS)](https://reticulum.n
 
 The library follows a two-layer design:
 
-1. **Crypto + Identity core** (this sub-project) — pure Swift, zero third-party dependencies. Implements the cryptographic primitives and Identity type required by RNS, wire-compatible with reference Reticulum 1.3.8.
+1. **Pure Swift core** (sub-projects #1 and #2, complete) — zero third-party dependencies. Implements the cryptographic primitives, Identity, Packet framing, Destination addressing, and Announce validation required by RNS, wire-compatible with reference Reticulum 1.3.8.
 
 2. **TCA orchestration layer** (planned) — will use [The Composable Architecture](https://github.com/pointfreeco/swift-composable-architecture) to model Transport, Links, Announcements, and Resource delivery as reducers/effects on top of the crypto core.
 
@@ -60,4 +60,4 @@ Transport, Link establishment, and Resource delivery are **not** part of this su
 swift test
 ```
 
-All tests should pass (currently 39, including the Python-RNS cross-validation vectors).
+All tests should pass (currently 71, including the Python-RNS cross-validation vectors).
