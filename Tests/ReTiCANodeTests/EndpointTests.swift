@@ -20,7 +20,9 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     return (try! packet.packed(), destHash)
 }
 
-// Mock TCPConnection returning a caller-driven event stream; ends cleanly via continuation.finish().
+// Mock TCPConnection returning a caller-driven event stream. @MainActor because it builds a
+// TestStore (which is main-actor-isolated); tests end deterministically via .disconnect.
+@MainActor
 private func makeStore(host: String = "node", port: UInt16 = 4242)
     -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
     let events = AsyncStream<TCPEvent>.makeStream()
