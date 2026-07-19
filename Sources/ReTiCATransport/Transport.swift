@@ -67,6 +67,10 @@ public struct Transport {
                                                       contextFlagSet: packet.contextFlag)
                     else { return .none }
                     let emitted = Transport.announceEmitted(parsed.randomHash)
+                    // `nextHop` is the raw transport id (nil for a directly-heard HEADER_1
+                    // announce). The reference's `received_from = transport_id ?? destination_hash`
+                    // fallback is deferred to the relaying slice (4b), which is the only consumer
+                    // of `nextHop`; the leaf endpoint routes by `interfaceID`.
                     let candidate = LearnedDestination(
                         identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
                         interfaceID: interfaceID, hops: packet.hops, nextHop: packet.transportId,
