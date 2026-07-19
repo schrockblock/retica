@@ -6,7 +6,7 @@ A native iOS library for the [Reticulum Network Stack (RNS)](https://reticulum.n
 
 The library follows a two-layer design:
 
-1. **Crypto + Identity core** (this sub-project) — pure Swift, zero third-party dependencies. Implements the cryptographic primitives and Identity type required by RNS, wire-compatible with reference Reticulum 1.3.8.
+1. **Pure Swift core** (sub-projects #1 and #2, complete) — zero third-party dependencies. Implements the cryptographic primitives, Identity, Packet framing, Destination addressing, and Announce validation required by RNS, wire-compatible with reference Reticulum 1.3.8.
 
 2. **TCA orchestration layer** (planned) — will use [The Composable Architecture](https://github.com/pointfreeco/swift-composable-architecture) to model Transport, Links, Announcements, and Resource delivery as reducers/effects on top of the crypto core.
 
@@ -34,9 +34,20 @@ This is the first deliverable of the decomposition. It covers:
 
 Compatibility with reference Reticulum is verified through cross-validation tests (`Tests/ReTiCATests/Vectors/`) that decrypt ciphertexts and validate signatures produced by Python-RNS 1.3.8 fixtures, covering: identity hash, Token decryption, Identity-layer Token decryption, and Ed25519 signature verification.
 
+## Sub-project #2: Packet + Destination
+
+| Module | What it implements |
+|--------|--------------------|
+| `Packet` | Byte-exact Reticulum packet framing (flags, HEADER_1/HEADER_2, pack/unpack) and the transport-stable packet hash |
+| `PacketContext` / `PacketType` / `HeaderType` / `TransportType` / `DestinationType` | Wire constants |
+| `Destination` | Addressing (`expandName`/`nameHash`/`hash`) and encrypt/decrypt dispatch for SINGLE/GROUP/PLAIN |
+| `Announce` | Signed announce payload build + signature/hash validation |
+
+Framing is separated from crypto: `Packet` is pure framing over opaque payload bytes; `Destination` owns encryption; `Packet.data`/`Packet.announce` compose them. Wire compatibility is verified against Python-RNS 1.3.8 fixtures (packet bytes, packet hash, destination hash, announce validation).
+
 ## Not Yet Implemented
 
-Transport, Link establishment, Announcements, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition.
+Transport, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition.
 
 ## Requirements
 
@@ -49,4 +60,4 @@ Transport, Link establishment, Announcements, and Resource delivery are **not** 
 swift test
 ```
 
-All tests should pass (currently 39, including the Python-RNS cross-validation vectors).
+All tests should pass (currently 71, including the Python-RNS cross-validation vectors).
