@@ -55,18 +55,28 @@ Framing is separated from crypto: `Packet` is pure framing over opaque payload b
 
 The Composable Architecture enters here, confined to the new **`ReTiCAInterfaces`** product; the `ReTiCA` core stays dependency-free. Socket I/O is behind a `@Dependency`, so the reducer is tested deterministically with `TestStore` and a mock connection — no real socket. HDLC framing is cross-validated against Python-RNS 1.3.8.
 
-### Products
-
-- **`ReTiCA`** — pure Swift core (crypto, Identity, Packet, Destination, Announce, HDLC). Zero third-party dependencies.
-- **`ReTiCAInterfaces`** — TCA-based interfaces (TCP client). Depends on `ReTiCA` + The Composable Architecture.
-
 ### Live integration (manual)
 
 The live `TCPConnection` + `TCPClientInterface` can be pointed at a real Reticulum TCP node (e.g. a local `rnsd` TCP server) to receive real HDLC-framed packets. Received frames are delivered as raw `Data` via `delegate(.packetReceived(_:))` and can be parsed by the core `Packet`/`Announce` types. This is a manual check and is not part of `swift test`.
 
+## Sub-project #4: Transport (endpoint core)
+
+| Module | Target | What it implements |
+|--------|--------|--------------------|
+| `Transport` | `ReTiCATransport` | TCA reducer: announce ingest → path/known-destination table (recency + dedup), inbound DATA decrypt+deliver to local destinations, outbound routing to learned paths, self-announce |
+| `InterfaceID` / `LearnedDestination` | `ReTiCATransport` | Interface handle and the learned path+identity entry |
+
+`ReTiCATransport` is interface-agnostic (no Network.framework): interfaces are referenced by `InterfaceID`, inbound bytes arrive via `.received(InterfaceID, Data)`, and outbound bytes leave via `.delegate(.transmit(InterfaceID, Data))`, so an app layer wires Transport ↔ `ReTiCAInterfaces`. This is the endpoint (leaf) subset of RNS Transport; relaying, path requests, expiry/cull jobs, persistence, and links are future slices. Announce learning is cross-validated against a Python-RNS 1.3.8 announce packet.
+
+### Products
+
+- **`ReTiCA`** — pure Swift core (crypto, Identity, Packet, Destination, Announce, HDLC). Zero third-party dependencies.
+- **`ReTiCAInterfaces`** — TCA-based interfaces (TCP client). Depends on `ReTiCA` + The Composable Architecture.
+- **`ReTiCATransport`** — TCA endpoint-core Transport (no Network.framework). Depends on `ReTiCA` + The Composable Architecture.
+
 ## Not Yet Implemented
 
-Transport, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work.
+Transport-node relaying, path requests, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work.
 
 ## Requirements
 

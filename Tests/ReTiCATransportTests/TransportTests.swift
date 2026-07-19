@@ -205,3 +205,88 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     #expect(parsed?.identity.hash == dest.identity!.hash)
     #expect(parsed?.appData == Data("name".utf8))
 }
+
+@Test @MainActor func duplicateDataPacketIsDeduped() async {
+    // A DATA packet that arrives twice must only be delivered once.
+    // Without the seenPacketHashes guard, the second copy would re-decrypt and re-deliver.
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["dedup"],
+                           identity: Identity())!
+    let plaintext = Data("dedup-me".utf8)
+    let ciphertext = dest.encrypt(plaintext)
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: dest.hash, transportId: nil, payload: ciphertext)
+    let raw = try! packet.packed()
+
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
+
+    // First delivery.
+    await store.send(.received(InterfaceID("i1"), raw))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext)))
+
+    // Second copy of the same raw frame — must be dropped by dedup.
+    // Switch exhaustivity ON so any spurious delegate action would be caught.
+    store.exhaustivity = .on
+    await store.send(.received(InterfaceID("i1"), raw)) // no receive step → asserts no action emitted
+}
+
+@Test @MainActor func recencyEqualEmissionPrefersFewerHops() async {
+    let id = Identity()
+    let (farther, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 6, emitted: 300)
+    let (closer, _)         = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 2, emitted: 300)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.received(InterfaceID("i1"), farther))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 6)))
+    await store.send(.received(InterfaceID("i2"), closer))   // same emission, fewer hops → replaces
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.learned[destHash]?.hops == 2)
+}
+
+@Test @MainActor func dropsDataWhenLocalDestinationKindMismatches() async {
+    // Use a PLAIN destination (passthrough decrypt) but send a SINGLE-typed packet.
+    // Without the kind guard, `.plain.decrypt` would return the payload and deliver it.
+    // With the guard in place it's dropped — so the guard is the discriminating line.
+    // Exhaustivity ON so any spurious delivery would be caught as an unexpected action.
+    let dest = Destination(kind: .plain, direction: .in, appName: "app", aspects: ["plain"])!
+    let rawPacket = try! Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                                destinationHash: dest.hash, transportId: nil,
+                                payload: Data(repeating: 0xAB, count: 80)).packed()
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
+    // Use exhaustivity on, but supply the expected state delta (seenPacketHashes insertion)
+    // so that any spurious delegate action is caught as unexpected.
+    store.exhaustivity = .on
+    let expectedHash = Packet(raw: rawPacket)!.packetHash
+    await store.send(.received(InterfaceID("i1"), rawPacket)) {
+        $0.seenPacketHashes.insert(expectedHash)
+    }
+    // No receive step here: kind mismatch drops the packet — no delegate action must be emitted.
+}
+
+@Test @MainActor func announceFansOutToAllInterfaces() async {
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
+                           identity: Identity())!
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i1"))) { $0.interfaces = [InterfaceID("i1")] }
+    await store.send(.interfaceConnected(InterfaceID("i2"))) { $0.interfaces = [InterfaceID("i1"), InterfaceID("i2")] }
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
+
+    let seen = LockIsolated<Set<InterfaceID>>([])
+    await store.send(.announce(destinationHash: dest.hash, appData: nil))
+    // Two interfaces → two transmits.
+    for _ in 0..<2 {
+        await store.receive { action in
+            if case let .delegate(.transmit(id, _)) = action { seen.withValue { $0.insert(id); return () }; return true }
+            return false
+        }
+    }
+    #expect(seen.value == [InterfaceID("i1"), InterfaceID("i2")])
+}
