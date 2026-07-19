@@ -81,4 +81,4 @@ The platform floor was raised from the CryptoKit minimums (iOS 13 / macOS 10.15)
 swift test
 ```
 
-All tests should pass (currently 86, including Python-RNS cross-validation vectors and `TestStore`-based TCP client interface tests).
+All tests should pass, including the Python-RNS cross-validation vectors and the `TestStore`-based TCP client interface tests.
