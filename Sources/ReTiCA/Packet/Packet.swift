@@ -99,3 +99,21 @@ public struct Packet: Equatable {
                   payload: payload)
     }
 }
+
+extension Packet {
+    /// The bytes hashed to produce the packet hash. Excludes hops, transport id,
+    /// header type, context flag, and transport type — matching RNS `get_hashable_part`.
+    public var hashablePart: Data {
+        var part = Data([(destinationType.rawValue << 2) | packetType.rawValue])
+        part.append(destinationHash)
+        part.append(context.rawValue)
+        part.append(payload)
+        return part
+    }
+
+    /// SHA-256 packet hash (32 bytes), stable across transport-mutated fields.
+    public var packetHash: Data { Crypto.fullHash(hashablePart) }
+
+    /// First 16 bytes of the packet hash.
+    public var truncatedHash: Data { Crypto.truncatedHash(hashablePart) }
+}
