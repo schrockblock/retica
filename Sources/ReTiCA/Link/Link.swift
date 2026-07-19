@@ -14,7 +14,7 @@ public enum Link {
     /// bytes are part of the reference wire format (`Link.signalling_bytes(500, MODE_AES256_CBC)`),
     /// so they must appear in the signed/serialized payloads for byte-exact RNS 1.3.8 compatibility.
     public static let signallingLength = 3
-    static let signallingBytes = Data([0x20, 0x01, 0xf4])
+    public static let signallingBytes = Data([0x20, 0x01, 0xf4])
 
     /// Deterministic link id from a link-request packet: truncated hash of its hashable part.
     /// Mirrors RNS `link_id_from_lr_packet`: when the request carries trailing signalling bytes
