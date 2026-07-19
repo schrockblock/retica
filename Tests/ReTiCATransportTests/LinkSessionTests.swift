@@ -125,3 +125,107 @@ private func captureTransmit(_ store: TestStore<LinkSession.State, LinkSession.A
     #expect(initiator.state.sessionKey.count == 64)
     #expect(initiator.state.sessionKey == responder.state.sessionKey)
 }
+
+private let sampleKey = Data(repeating: 0x01, count: 64)   // valid AES-256 Token key
+private let sampleLinkID = Data(repeating: 0xAB, count: 16)
+
+private func activeState(role: LinkSession.Role) -> LinkSession.State {
+    var s: LinkSession.State
+    switch role {
+    case .initiator:
+        s = LinkSession.State(initiatorTo: Identity(), destinationHash: Data(repeating: 0x01, count: 16),
+                              interfaceID: InterfaceID("i"))
+    case .responder:
+        s = LinkSession.State(responderFor: Identity(), destinationHash: Data(repeating: 0x01, count: 16),
+                              interfaceID: InterfaceID("i"))
+    }
+    s.status = .active
+    s.sessionKey = sampleKey
+    s.linkID = sampleLinkID
+    return s
+}
+
+private func linkPacket(context: PacketContext, payload: Data) -> Data {
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: context, contextFlag: false, hops: 0,
+                   destinationHash: sampleLinkID, transportId: nil, payload: payload)
+    return try! p.packed()
+}
+
+@Test @MainActor func activeLinkSendEmitsEncryptedDataPacket() async {
+    let store = TestStore(initialState: activeState(role: .initiator)) { LinkSession() }
+        withDependencies: { $0.date = .constant(epoch) }
+    store.exhaustivity = .off
+    let plaintext = Data("hello link".utf8)
+    await store.send(.send(plaintext))
+    let raw = await captureTransmit(store)
+    let packet = Packet(raw: raw)!
+    #expect(packet.packetType == .data)
+    #expect(packet.context == .none)
+    #expect(packet.destinationHash == sampleLinkID)
+    #expect(Link.decrypt(packet.payload, sessionKey: sampleKey) == plaintext)
+}
+
+@Test @MainActor func activeLinkReceivesDataAndBubblesDataReceived() async {
+    let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
+        withDependencies: { $0.date = .constant(epoch) }
+    store.exhaustivity = .off
+    let plaintext = Data("inbound".utf8)
+    let cipher = Link.encrypt(plaintext, sessionKey: sampleKey)
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(linkPacket(context: .none, payload: cipher)))
+    await store.receive { action in
+        if case let .delegate(.dataReceived(p)) = action { captured.setValue(p); return true }
+        return false
+    }
+    #expect(captured.value == plaintext)
+    #expect(store.state.status == .active)
+}
+
+@Test @MainActor func corruptInboundDataIsIgnoredAndLinkStaysActive() async {
+    let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
+        withDependencies: { $0.date = .constant(epoch) }
+    store.exhaustivity = .off
+    await store.send(.received(linkPacket(context: .none, payload: Data(repeating: 0xFF, count: 80))))
+    #expect(store.state.status == .active)   // no teardown, no dataReceived
+}
+
+@Test @MainActor func initiatorCloseEmitsLinkCloseAndGoesClosed() async {
+    let store = TestStore(initialState: activeState(role: .initiator)) { LinkSession() }
+        withDependencies: { $0.date = .constant(epoch) }
+    store.exhaustivity = .off
+    await store.send(.close)
+    #expect(store.state.status == .closed)
+    let raw = await captureTransmit(store)
+    let packet = Packet(raw: raw)!
+    #expect(packet.context == .linkClose)
+    #expect(packet.destinationHash == sampleLinkID)
+    #expect(Link.decrypt(packet.payload, sessionKey: sampleKey) == sampleLinkID)  // payload = encrypt(link_id)
+    await store.receive(.delegate(.closed(.initiatorClosed)))
+}
+
+@Test @MainActor func responderReceivesLinkCloseAndGoesClosed() async {
+    let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
+        withDependencies: { $0.date = .constant(epoch) }
+    store.exhaustivity = .off
+    let closeCipher = Link.encrypt(sampleLinkID, sessionKey: sampleKey)
+    await store.send(.received(linkPacket(context: .linkClose, payload: closeCipher)))
+    #expect(store.state.status == .closed)
+    await store.receive(.delegate(.closed(.initiatorClosed)))  // responder observing peer close → initiatorClosed
+}
+
+@Test @MainActor func acceptRequestRejectsWrongLengthRequest() async {
+    // The tightened check accepts only 64 or 67 byte payloads (RNS-exact). 65 must be rejected.
+    let owner = Identity()
+    let store = TestStore(
+        initialState: LinkSession.State(responderFor: owner, destinationHash: Data(repeating: 0x02, count: 16),
+                                        interfaceID: InterfaceID("i"))
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch) }
+    store.exhaustivity = .off
+    let badRequest = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                            destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                            destinationHash: Data(repeating: 0x02, count: 16), transportId: nil,
+                            payload: Data(repeating: 0x33, count: 65))
+    await store.send(.acceptRequest(try! badRequest.packed()))
+    #expect(store.state.status == .pending)   // rejected, no handshake
+}

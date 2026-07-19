@@ -6,11 +6,13 @@ import ReTiCA
 /// Drives the initiator and responder roles through PENDING→HANDSHAKE→ACTIVE via the
 /// three-packet handshake (LINKREQUEST → LRPROOF → LRRTT). Interface-agnostic: raw packet
 /// bytes arrive via `received`/`acceptRequest`; outbound bytes leave via `delegate(.transmit)`.
-/// Establishment only — no data flow, close, or timers.
+/// After establishment the link can carry encrypted application data (DATA/NONE) and be
+/// explicitly closed (LINKCLOSE). Timers/keepalive are a separate slice.
 @Reducer
 public struct LinkSession {
     public enum Role: Equatable, Sendable { case initiator, responder }
-    public enum Status: Equatable, Sendable { case pending, handshake, active }
+    public enum Status: Equatable, Sendable { case pending, handshake, active, closed }
+    public enum CloseReason: Equatable, Sendable { case initiatorClosed, destinationClosed }
 
     @ObservableState
     public struct State: Equatable {
@@ -66,12 +68,16 @@ public struct LinkSession {
         case establish
         case acceptRequest(Data)
         case received(Data)
+        case send(Data)
+        case close
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
             case transmit(InterfaceID, Data)
             case established(linkID: Data, sessionKey: Data)
             case establishmentFailed
+            case dataReceived(Data)
+            case closed(CloseReason)
         }
     }
 
@@ -100,7 +106,8 @@ public struct LinkSession {
             case let .acceptRequest(data):
                 guard state.role == .responder, state.status == .pending,
                       let packet = Packet(raw: data), packet.packetType == .linkRequest,
-                      packet.payload.count >= 64, let owner = state.owningIdentity
+                      (packet.payload.count == 64 || packet.payload.count == 67),
+                      let owner = state.owningIdentity
                 else { return .none }
                 let linkID = Link.linkID(requestPacket: packet)
                 let peerPub = Data(packet.payload.prefix(32))
@@ -163,9 +170,45 @@ public struct LinkSession {
                     return .send(.delegate(.established(linkID: state.linkID,
                                                         sessionKey: state.sessionKey)))
 
+                case (_, .active, .data, .none):
+                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey)
+                    else { return .none }   // corrupt/foreign data is ignored, link stays active
+                    return .send(.delegate(.dataReceived(plain)))
+
+                case (_, .active, .data, .linkClose):
+                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                          plain == state.linkID
+                    else { return .none }
+                    state.status = .closed
+                    let reason: CloseReason = state.role == .initiator ? .destinationClosed : .initiatorClosed
+                    return .send(.delegate(.closed(reason)))
+
                 default:
                     return .none
                 }
+
+            case let .send(plaintext):
+                guard state.status == .active else { return .none }
+                let cipher = Link.encrypt(plaintext, sessionKey: state.sessionKey)
+                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                    destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: state.linkID, transportId: nil, payload: cipher)
+                guard let raw = try? packet.packed() else { return .none }
+                let id = state.interfaceID
+                return .send(.delegate(.transmit(id, raw)))
+
+            case .close:
+                guard state.status == .active else { return .none }
+                let cipher = Link.encrypt(state.linkID, sessionKey: state.sessionKey)
+                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                    destinationType: .link, context: .linkClose, contextFlag: false, hops: 0,
+                                    destinationHash: state.linkID, transportId: nil, payload: cipher)
+                state.status = .closed
+                let reason: CloseReason = state.role == .initiator ? .initiatorClosed : .destinationClosed
+                let closedAction = Action.delegate(.closed(reason))
+                guard let raw = try? packet.packed() else { return .send(closedAction) }
+                let id = state.interfaceID
+                return .merge(.send(.delegate(.transmit(id, raw))), .send(closedAction))
 
             case .delegate:
                 return .none
