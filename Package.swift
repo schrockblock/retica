@@ -5,6 +5,13 @@ import PackageDescription
 
 let package = Package(
     name: "ReTiCA",
+    platforms: [
+        .iOS(.v13),
+        .macOS(.v10_15),
+        .tvOS(.v13),
+        .watchOS(.v6),
+        .macCatalyst(.v13),
+    ],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
@@ -20,7 +27,8 @@ let package = Package(
         ),
         .testTarget(
             name: "ReTiCATests",
-            dependencies: ["ReTiCA"]
+            dependencies: ["ReTiCA"],
+            resources: [.process("Vectors/fixtures.json")]
         ),
     ],
     swiftLanguageModes: [.v6]
