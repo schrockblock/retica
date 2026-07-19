@@ -57,3 +57,66 @@ import ComposableArchitecture
         $0.interfaces = []
     }
 }
+
+// Builds a raw ANNOUNCE packet (HEADER_1) for a synthetic identity.
+private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [String],
+                                hops: UInt8, emitted: UInt64, appData: Data? = nil) -> (Data, Data) {
+    let nameHash = Destination.nameHash(appName: appName, aspects: aspects)
+    let destHash = Destination.hash(identityHash: identity.hash, appName: appName, aspects: aspects)
+    let randomHash = Announce.randomHash(now: emitted, randomPrefix: Data(repeating: 0xA5, count: 5))
+    let payload = Announce.buildPayload(identity: identity, destinationHash: destHash,
+                                        nameHash: nameHash, randomHash: randomHash, appData: appData)
+    let packet = Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: hops,
+                        destinationHash: destHash, transportId: nil, payload: payload)
+    return (try! packet.packed(), destHash)
+}
+
+@Test @MainActor func learnsPathFromAnnounceAndDedups() async {
+    let id = Identity()
+    let ifID = InterfaceID("i1")
+    let (raw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                             hops: 3, emitted: 1000, appData: Data("meta".utf8))
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+
+    await store.send(.received(ifID, raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 3)))
+
+    let entry = store.state.learned[destHash]
+    #expect(entry?.identity.hash == id.hash)
+    #expect(entry?.hops == 3)
+    #expect(entry?.interfaceID == ifID)
+    #expect(entry?.appData == Data("meta".utf8))
+    #expect(entry?.announceEmitted == 1000)
+
+    // Duplicate packet is suppressed (no second pathLearned).
+    await store.send(.received(ifID, raw))
+}
+
+@Test @MainActor func recencyPrefersNewerThenShorter() async {
+    let id = Identity()
+    let (older, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 2, emitted: 100)
+    let (newer, _)        = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 5, emitted: 200)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+
+    await store.send(.received(InterfaceID("i1"), newer))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 5)))
+    // Older emission must NOT replace the newer entry.
+    await store.send(.received(InterfaceID("i2"), older))
+    #expect(store.state.learned[destHash]?.hops == 5)
+    #expect(store.state.learned[destHash]?.announceEmitted == 200)
+}
+
+@Test @MainActor func ignoresAnnounceForLocalDestination() async {
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
+                           identity: Identity())!
+    let (raw, destHash) = makeAnnouncePacket(identity: dest.identity!, appName: "app",
+                                             aspects: ["me"], hops: 1, emitted: 50)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
+    await store.send(.received(InterfaceID("i1"), raw)) // announce for ourselves → ignored
+    #expect(store.state.learned[destHash] == nil)
+}

@@ -54,9 +54,50 @@ public struct Transport {
                 state.localDestinations[destination.hash] = destination
                 return .none
 
-            case .received, .announce, .send, .delegate:
+            case let .received(interfaceID, data):
+                guard let packet = Packet(raw: data) else { return .none }
+                guard state.seenPacketHashes.insert(packet.packetHash) else { return .none }
+
+                switch packet.packetType {
+                case .announce:
+                    // Don't learn a path to one of our own destinations.
+                    guard state.localDestinations[packet.destinationHash] == nil else { return .none }
+                    guard let parsed = Announce.parse(payload: packet.payload,
+                                                      destinationHash: packet.destinationHash,
+                                                      contextFlagSet: packet.contextFlag)
+                    else { return .none }
+                    let emitted = Transport.announceEmitted(parsed.randomHash)
+                    let candidate = LearnedDestination(
+                        identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
+                        interfaceID: interfaceID, hops: packet.hops, nextHop: packet.transportId,
+                        announceEmitted: emitted)
+                    guard Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate)
+                    else { return .none }
+                    state.learned[packet.destinationHash] = candidate
+                    return .send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
+                                                        hops: packet.hops)))
+                default:
+                    return .none
+                }
+
+            case .announce, .send, .delegate:
                 return .none
             }
         }
+    }
+
+    /// Emission time from an announce's random hash: big-endian of `randomHash[5..<10]`.
+    static func announceEmitted(_ randomHash: Data) -> UInt64 {
+        let bytes = randomHash.suffix(5)
+        return bytes.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+    }
+
+    /// Recency rule: accept a candidate if there is no existing entry, or it is newer, or it
+    /// is equally recent but reached us in fewer hops.
+    static func shouldReplace(_ existing: LearnedDestination?, with candidate: LearnedDestination) -> Bool {
+        guard let existing else { return true }
+        if candidate.announceEmitted > existing.announceEmitted { return true }
+        if candidate.announceEmitted == existing.announceEmitted && candidate.hops < existing.hops { return true }
+        return false
     }
 }
