@@ -37,6 +37,9 @@ struct VectorFixtures: Decodable {
     let linkProof: String
     let linkPlaintext: String
     let linkCiphertext: String
+    let linkRtt: Double
+    let linkRttMsgpack: String
+    let linkRttPacketCiphertext: String
 
     enum CodingKeys: String, CodingKey {
         case identityPrivateKey = "identity_private_key"
@@ -75,6 +78,9 @@ struct VectorFixtures: Decodable {
         case linkProof = "link_proof"
         case linkPlaintext = "link_plaintext"
         case linkCiphertext = "link_ciphertext"
+        case linkRtt = "link_rtt"
+        case linkRttMsgpack = "link_rtt_msgpack"
+        case linkRttPacketCiphertext = "link_rtt_packet_ciphertext"
     }
 
     static func load() throws -> VectorFixtures {

@@ -108,6 +108,12 @@ link_proof = link_dest.sign(link_proof_signed) + resp_x25519_pub_bytes + link_si
 link_plaintext = b"secure link message"
 link_ciphertext = LinkToken(link_derived_key).encrypt(link_plaintext)
 
+# --- Link RTT packet (LRRTT) vector: msgpack(rtt) encrypted under the session key ---
+import RNS.vendor.umsgpack as umsgpack
+link_rtt = 0.125                                    # deterministic fixed RTT
+link_rtt_msgpack = umsgpack.packb(link_rtt)         # genuine reference float64 encoding
+link_rtt_packet_ciphertext = LinkToken(link_derived_key).encrypt(link_rtt_msgpack)
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -145,4 +151,7 @@ print(json.dumps({
     "link_proof": link_proof.hex(),
     "link_plaintext": link_plaintext.hex(),
     "link_ciphertext": link_ciphertext.hex(),
+    "link_rtt": link_rtt,
+    "link_rtt_msgpack": link_rtt_msgpack.hex(),
+    "link_rtt_packet_ciphertext": link_rtt_packet_ciphertext.hex(),
 }, indent=2))

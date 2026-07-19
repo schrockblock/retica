@@ -31,3 +31,16 @@ import Foundation
     #expect(Link.decrypt(Data(hexString: f.linkCiphertext)!, sessionKey: key)
             == Data(hexString: f.linkPlaintext))
 }
+
+@Test func swiftMsgPackEncodesRTTLikeReference() throws {
+    let f = try VectorFixtures.load()
+    #expect(MsgPack.encode(f.linkRtt) == Data(hexString: f.linkRttMsgpack))
+}
+
+@Test func swiftDecryptsAndDecodesReferenceRTTPacket() throws {
+    let f = try VectorFixtures.load()
+    let key = Data(hexString: f.linkDerivedKey)!
+    let plain = Link.decrypt(Data(hexString: f.linkRttPacketCiphertext)!, sessionKey: key)
+    #expect(plain == Data(hexString: f.linkRttMsgpack))     // decrypts to the reference msgpack bytes
+    #expect(MsgPack.decodeDouble(plain ?? Data()) == f.linkRtt)  // and decodes back to the RTT
+}
