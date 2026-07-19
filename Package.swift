@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "ReTiCA", targets: ["ReTiCA"]),
         .library(name: "ReTiCAInterfaces", targets: ["ReTiCAInterfaces"]),
         .library(name: "ReTiCATransport", targets: ["ReTiCATransport"]),
+        .library(name: "ReTiCANode", targets: ["ReTiCANode"]),
     ],
     dependencies: [
         .package(url: "https://github.com/pointfreeco/swift-composable-architecture", from: "1.15.0"),
@@ -53,6 +54,21 @@ let package = Package(
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
             ],
             resources: [.process("Vectors/transport_fixtures.json")]
+        ),
+        .target(
+            name: "ReTiCANode",
+            dependencies: [
+                "ReTiCAInterfaces",
+                "ReTiCATransport",
+                .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
+            ]
+        ),
+        .testTarget(
+            name: "ReTiCANodeTests",
+            dependencies: [
+                "ReTiCANode",
+                .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]
