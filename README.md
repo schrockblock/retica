@@ -54,7 +54,11 @@ The `Link` namespace (pure core) implements the cryptographic handshake of a Ret
 - `Link.buildProof` / `Link.validateProof` — the LRPROOF signed by the destination identity, proving ownership while the X25519 half stays ephemeral (forward secrecy)
 - `Link.encrypt` / `Link.decrypt` — link data over the session key (wraps `Token`)
 
-Only `MODE_AES256_CBC` is implemented, and MTU is not negotiated. Reticulum nonetheless bakes 3 fixed **signalling bytes** (MTU 500 / AES-256-CBC) into the link-request and proof wire layouts unconditionally, so these primitives include them (`buildProof` emits a 99-byte proof; `validateProof` also accepts the 96-byte signalling-free form, mirroring RNS `validate_proof`) to stay byte-exact with real 1.3.8 peers. The stateful Link session (state machine, RTT, keepalives, requests) is a future slice. All four handshake constructions are cross-validated against Python-RNS 1.3.8 (the fixture generator drives the reference `RNS.Link` signalling/handshake code paths, not a reimplementation).
+Only `MODE_AES256_CBC` is implemented, and MTU is not negotiated. Reticulum nonetheless bakes 3 fixed **signalling bytes** (MTU 500 / AES-256-CBC) into the link-request and proof wire layouts unconditionally, so these primitives include them (`buildProof` emits a 99-byte proof; `validateProof` also accepts the 96-byte signalling-free form, mirroring RNS `validate_proof`) to stay byte-exact with real 1.3.8 peers. The stateful Link session that drives these primitives (establishment state machine, RTT,
+data flow, close) is the `LinkSession` reducer described below; keepalives and requests remain
+future slices. All four handshake constructions are cross-validated against Python-RNS 1.3.8
+(the fixture generator drives the reference `RNS.Link` signalling/handshake code paths, not a
+reimplementation).
 
 ### Link establishment, data flow, and close (`LinkSession`)
 
