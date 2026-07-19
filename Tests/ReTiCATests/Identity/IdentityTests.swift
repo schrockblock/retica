@@ -79,3 +79,20 @@ import CryptoKit
     let id = Identity()
     #expect(id.decrypt(Data(repeating: 0, count: 10)) == nil)
 }
+
+@Test func publicOnlyIdentityDecryptReturnsNil() {
+    let full = Identity()
+    let ct = full.encrypt(Data("x".utf8))
+    let pub = Identity(publicKey: full.publicKey)!
+    #expect(pub.decrypt(ct) == nil)
+}
+
+@Test func enforceRatchetsRejectsWhenNoRatchetMatches() {
+    let id = Identity()
+    let ct = id.encrypt(Data("y".utf8)) // encrypted to the STATIC key, no ratchet
+    let wrongRatchet = Curve25519.KeyAgreement.PrivateKey().rawRepresentation
+    // Without enforcement, static-key fallback recovers it:
+    #expect(id.decrypt(ct, ratchets: [wrongRatchet]) == Data("y".utf8))
+    // With enforcement, a non-matching ratchet set must return nil (no static fallback):
+    #expect(id.decrypt(ct, ratchets: [wrongRatchet], enforceRatchets: true) == nil)
+}
