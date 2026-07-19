@@ -147,3 +147,61 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
                         payload: Data(repeating: 0xAB, count: 80))
     await store.send(.received(InterfaceID("i1"), try! packet.packed())) // no delegate expected
 }
+
+@Test @MainActor func sendRoutesEncryptedPacketToLearnedInterface() async {
+    let remote = Identity()
+    let ifID = InterfaceID("i1")
+    let (raw, destHash) = makeAnnouncePacket(identity: remote, appName: "app", aspects: ["svc"],
+                                             hops: 2, emitted: 500)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.received(ifID, raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+
+    let plaintext = Data("outbound msg".utf8)
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.send(destinationHash: destHash, plaintext: plaintext))
+    await store.receive { action in
+        if case let .delegate(.transmit(id, out)) = action { captured.setValue((id, out)); return true }
+        return false
+    }
+
+    let (outID, outRaw) = captured.value!
+    #expect(outID == ifID)
+    let outPacket = Packet(raw: outRaw)!
+    #expect(outPacket.destinationHash == destHash)
+    #expect(remote.decrypt(outPacket.payload) == plaintext) // round-trips
+}
+
+@Test @MainActor func sendToUnknownDestinationFails() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    let destHash = Data(repeating: 0x22, count: 16)
+    await store.send(.send(destinationHash: destHash, plaintext: Data("x".utf8)))
+    await store.receive(.delegate(.sendFailed(destinationHash: destHash, reason: .notLearned)))
+}
+
+@Test @MainActor func announceEmitsValidPayloadPerInterface() async {
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
+                           identity: Identity())!
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i1"))) { $0.interfaces = [InterfaceID("i1")] }
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.announce(destinationHash: dest.hash, appData: Data("name".utf8)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+
+    let packet = Packet(raw: captured.value!)!
+    #expect(packet.packetType == .announce)
+    let parsed = Announce.parse(payload: packet.payload, destinationHash: dest.hash,
+                                contextFlagSet: packet.contextFlag)
+    #expect(parsed?.identity.hash == dest.identity!.hash)
+    #expect(parsed?.appData == Data("name".utf8))
+}

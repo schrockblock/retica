@@ -87,7 +87,37 @@ public struct Transport {
                     return .none
                 }
 
-            case .announce, .send, .delegate:
+            case let .send(destinationHash, plaintext):
+                guard let entry = state.learned[destinationHash] else {
+                    return .send(.delegate(.sendFailed(destinationHash: destinationHash,
+                                                       reason: .notLearned)))
+                }
+                let ciphertext = entry.identity.encrypt(plaintext, ratchet: entry.ratchet)
+                let packet = Packet(headerType: .header1, packetType: .data,
+                                    transportType: .broadcast, destinationType: .single,
+                                    context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: destinationHash, transportId: nil,
+                                    payload: ciphertext)
+                guard let raw = try? packet.packed() else {
+                    return .send(.delegate(.sendFailed(destinationHash: destinationHash,
+                                                       reason: .tooLarge)))
+                }
+                return .send(.delegate(.transmit(entry.interfaceID, raw)))
+
+            case let .announce(destinationHash, appData):
+                guard let dest = state.localDestinations[destinationHash],
+                      let identity = dest.identity, identity.privateKey != nil
+                else { return .none }
+                let now = UInt64(date.now.timeIntervalSince1970)
+                let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
+                let payload = Announce.buildPayload(identity: identity, destinationHash: destinationHash,
+                                                    nameHash: dest.nameHash, randomHash: randomHash,
+                                                    ratchet: nil, appData: appData)
+                let packet = Packet.announce(from: dest, payload: payload)
+                guard let raw = try? packet.packed() else { return .none }
+                return .merge(state.interfaces.map { .send(.delegate(.transmit($0, raw))) })
+
+            case .delegate:
                 return .none
             }
         }
