@@ -65,22 +65,30 @@ hdlc_framed = bytes([HDLC.FLAG]) + HDLC.escape(plain_packet_raw) + bytes([HDLC.F
 escape_input = bytes([0x00, HDLC.FLAG, 0x11, HDLC.ESC, 0x22]) + bytes([0xAB] * 20)
 escape_framed = bytes([HDLC.FLAG]) + HDLC.escape(escape_input) + bytes([HDLC.FLAG])
 
-# --- Link handshake vectors (base AES-256-CBC handshake, no MTU signalling) ---
+# --- Link handshake vectors (base AES-256-CBC handshake, fixed-default MTU signalling) ---
 from RNS.Cryptography import X25519PrivateKey, X25519PublicKey
 from RNS.Cryptography import Token as LinkToken
+
+# Genuine reference signalling bytes: fixed default MTU (500) + AES-256-CBC mode.
+# RNS unconditionally appends these to link requests and proofs (see RNS/Link.py prove/handshake).
+link_signalling = RNS.Link.signalling_bytes(RNS.Reticulum.MTU, RNS.Link.MODE_AES256_CBC)  # 3 bytes
 
 link_dest = RNS.Identity()                 # the destination the link is made to (responder owns it)
 link_init_eph = RNS.Identity()             # initiator ephemeral (X25519 ‖ Ed25519)
 link_resp_eph = RNS.Identity()             # responder ephemeral
 
-# Link request packet: HEADER_1 LINKREQUEST to the destination; data = initiator ephemeral public key.
+# Link request packet: HEADER_1 LINKREQUEST to the destination; data = initiator ephemeral
+# public key (64) ‖ signalling (3) = 67 bytes, exactly as a real RNS initiator transmits.
 link_dest_hash = RNS.Destination.hash(link_dest, "reticula", "link")
 lr_flags = (0 << 6) | (0 << 5) | (0 << 4) | (RNS.Destination.SINGLE << 2) | RNS.Packet.LINKREQUEST  # 0x02
-lr_data = link_init_eph.get_public_key()   # 64 bytes
+lr_data = link_init_eph.get_public_key() + link_signalling   # 67 bytes
 link_request_raw = bytes([lr_flags, 0]) + link_dest_hash + bytes([0x00]) + lr_data
 
-# link_id = truncated_hash(bytes([flags&0x0F]) ‖ dest_hash ‖ context ‖ data)
+# link_id (RNS link_id_from_lr_packet): trailing bytes beyond ECPUBSIZE(64) are stripped
+# from the hashable part before hashing.
 lr_hashable = bytes([lr_flags & 0x0F]) + link_dest_hash + bytes([0x00]) + lr_data
+if len(lr_data) > 64:
+    lr_hashable = lr_hashable[:-(len(lr_data) - 64)]
 link_id = RNS.Identity.truncated_hash(lr_hashable)
 
 # session key: HKDF(64, ECDH(init x25519 priv, resp x25519 pub), salt=link_id)
@@ -89,11 +97,12 @@ resp_x25519_pub = X25519PublicKey.from_public_bytes(link_resp_eph.get_public_key
 link_shared = init_x25519_priv.exchange(resp_x25519_pub)
 link_derived_key = RNS.Cryptography.hkdf(length=64, derive_from=link_shared, salt=link_id, context=None)
 
-# proof: signed = link_id ‖ resp x25519 pub(32) ‖ dest identity ed25519 pub(32); signed by the destination identity.
+# proof (RNS Link.prove): signed = link_id ‖ resp x25519 pub(32) ‖ dest identity ed25519 pub(32)
+# ‖ signalling(3), signed by the destination identity; wire = signature(64) ‖ pub(32) ‖ signalling(3).
 resp_x25519_pub_bytes = link_resp_eph.get_public_key()[:32]
 dest_ed25519_pub = link_dest.get_public_key()[32:64]
-link_proof_signed = link_id + resp_x25519_pub_bytes + dest_ed25519_pub
-link_proof = link_dest.sign(link_proof_signed) + resp_x25519_pub_bytes
+link_proof_signed = link_id + resp_x25519_pub_bytes + dest_ed25519_pub + link_signalling
+link_proof = link_dest.sign(link_proof_signed) + resp_x25519_pub_bytes + link_signalling
 
 # link data over the session key
 link_plaintext = b"secure link message"

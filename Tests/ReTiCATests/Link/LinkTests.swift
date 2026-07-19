@@ -31,10 +31,45 @@ private func x25519Pub(_ id: Identity) -> Data { Data(id.publicKey.prefix(32)) }
     let respEph = Identity()
     let linkID = Data(repeating: 0x22, count: 16)
     let proof = Link.buildProof(linkID: linkID, responderEphemeral: respEph, destinationIdentity: dest)
-    #expect(proof.count == 64 + 32)
+    #expect(proof.count == 64 + 32 + 3) // signature ‖ x25519 pub ‖ signalling bytes
+    #expect(proof.suffix(3) == Data([0x20, 0x01, 0xf4])) // fixed-default MTU/mode signalling
     let peerPub = Link.validateProof(proofData: proof, linkID: linkID,
                                      destinationIdentity: Identity(publicKey: dest.publicKey)!)
     #expect(peerPub == x25519Pub(respEph))
+}
+
+@Test func validateProofAcceptsSignallingFreeProof() {
+    // RNS validate_proof also accepts the 96-byte (no-signalling) form. Build one by signing
+    // the signalling-free payload directly and confirm it still validates.
+    let dest = Identity()
+    let respEph = Identity()
+    let linkID = Data(repeating: 0x22, count: 16)
+    let respX25519Pub = Data(respEph.publicKey.prefix(32))
+    let destEd25519Pub = Data(dest.publicKey.suffix(32))
+    let legacyProof = dest.sign(linkID + respX25519Pub + destEd25519Pub) + respX25519Pub
+    #expect(legacyProof.count == 64 + 32)
+    let peerPub = Link.validateProof(proofData: legacyProof, linkID: linkID,
+                                     destinationIdentity: Identity(publicKey: dest.publicKey)!)
+    #expect(peerPub == respX25519Pub)
+}
+
+@Test func linkIDStripsTrailingSignallingBytes() {
+    // A real link request carries the ephemeral public key (64) ‖ signalling (3) = 67 bytes.
+    // link_id must hash only the first 64 payload bytes (RNS link_id_from_lr_packet).
+    let eph = Identity()
+    let signalling = Data([0x20, 0x01, 0xf4])
+    let withSignalling = Packet(headerType: .header1, packetType: .linkRequest,
+                                transportType: .broadcast, destinationType: .single, context: .none,
+                                contextFlag: false, hops: 0,
+                                destinationHash: Data(repeating: 0x33, count: 16), transportId: nil,
+                                payload: eph.publicKey + signalling)
+    let withoutSignalling = Packet(headerType: .header1, packetType: .linkRequest,
+                                   transportType: .broadcast, destinationType: .single, context: .none,
+                                   contextFlag: false, hops: 0,
+                                   destinationHash: Data(repeating: 0x33, count: 16), transportId: nil,
+                                   payload: eph.publicKey)
+    // Stripping the 3 signalling bytes yields the same link_id as the signalling-free request.
+    #expect(Link.linkID(requestPacket: withSignalling) == Link.linkID(requestPacket: withoutSignalling))
 }
 
 @Test func proofRejectsTamperAndWrongInputs() {
