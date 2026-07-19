@@ -55,6 +55,16 @@ ann_signed = ann_dest_hash + identity.get_public_key() + ann_name_hash + ann_ran
 ann_signature = identity.sign(ann_signed)
 ann_payload = identity.get_public_key() + ann_name_hash + ann_random_hash + ann_ratchet + ann_signature
 
+# --- HDLC framing vectors (Interfaces sub-project) ---
+from RNS.Interfaces.TCPInterface import HDLC
+
+# HDLC framing of the deterministic PLAIN packet raw.
+hdlc_framed = bytes([HDLC.FLAG]) + HDLC.escape(plain_packet_raw) + bytes([HDLC.FLAG])
+
+# A payload containing FLAG (0x7E) and ESC (0x7D) bytes to exercise escaping across the boundary.
+escape_input = bytes([0x00, HDLC.FLAG, 0x11, HDLC.ESC, 0x22]) + bytes([0xAB] * 20)
+escape_framed = bytes([HDLC.FLAG]) + HDLC.escape(escape_input) + bytes([HDLC.FLAG])
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -80,4 +90,7 @@ print(json.dumps({
     "announce_dest_hash": ann_dest_hash.hex(),
     "announce_payload": ann_payload.hex(),
     "announce_context_flag": False,
+    "hdlc_framed": hdlc_framed.hex(),
+    "escape_input": escape_input.hex(),
+    "escape_framed": escape_framed.hex(),
 }, indent=2))

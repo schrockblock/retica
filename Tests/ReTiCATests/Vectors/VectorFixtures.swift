@@ -25,6 +25,9 @@ struct VectorFixtures: Decodable {
     let announceDestHash: String
     let announcePayload: String
     let announceContextFlag: Bool
+    let hdlcFramed: String
+    let escapeInput: String
+    let escapeFramed: String
 
     enum CodingKeys: String, CodingKey {
         case identityPrivateKey = "identity_private_key"
@@ -51,6 +54,9 @@ struct VectorFixtures: Decodable {
         case announceDestHash = "announce_dest_hash"
         case announcePayload = "announce_payload"
         case announceContextFlag = "announce_context_flag"
+        case hdlcFramed = "hdlc_framed"
+        case escapeInput = "escape_input"
+        case escapeFramed = "escape_framed"
     }
 
     static func load() throws -> VectorFixtures {
