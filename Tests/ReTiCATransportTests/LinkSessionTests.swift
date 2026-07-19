@@ -183,9 +183,10 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 }
 
 @Test @MainActor func corruptInboundDataIsIgnoredAndLinkStaysActive() async {
+    // Exhaustive: an unexpected .dataReceived (or any effect) would fail the test at deinit,
+    // so this asserts the corrupt packet is dropped silently — no teardown, no dataReceived.
     let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
         withDependencies: { $0.date = .constant(epoch) }
-    store.exhaustivity = .off
     await store.send(.received(linkPacket(context: .none, payload: Data(repeating: 0xFF, count: 80))))
     #expect(store.state.status == .active)   // no teardown, no dataReceived
 }
@@ -212,6 +213,16 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     await store.send(.received(linkPacket(context: .linkClose, payload: closeCipher)))
     #expect(store.state.status == .closed)
     await store.receive(.delegate(.closed(.initiatorClosed)))  // responder observing peer close → initiatorClosed
+}
+
+@Test @MainActor func initiatorReceivesLinkCloseAndGetsDestinationClosed() async {
+    let store = TestStore(initialState: activeState(role: .initiator)) { LinkSession() }
+        withDependencies: { $0.date = .constant(epoch) }
+    store.exhaustivity = .off
+    let closeCipher = Link.encrypt(sampleLinkID, sessionKey: sampleKey)
+    await store.send(.received(linkPacket(context: .linkClose, payload: closeCipher)))
+    #expect(store.state.status == .closed)
+    await store.receive(.delegate(.closed(.destinationClosed)))  // initiator observing peer close → destinationClosed
 }
 
 @Test @MainActor func acceptRequestRejectsWrongLengthRequest() async {
