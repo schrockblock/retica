@@ -74,9 +74,34 @@ The live `TCPConnection` + `TCPClientInterface` can be pointed at a real Reticul
 - **`ReTiCAInterfaces`** — TCA-based interfaces (TCP client). Depends on `ReTiCA` + The Composable Architecture.
 - **`ReTiCATransport`** — TCA endpoint-core Transport (no Network.framework). Depends on `ReTiCA` + The Composable Architecture.
 
+## App composition: `ReTiCANode`
+
+`ReTiCANode` assembles the stack into a working endpoint. The `Endpoint` reducer composes `TCPClientInterface` (interfaces) and `Transport` (routing), wiring them bidirectionally:
+
+- **inbound:** interface deframes → `Transport.received` → learn / deliver → `Endpoint.delegate(.messageReceived / .pathLearned)`
+- **outbound:** `Endpoint.send`/`.announce` → `Transport` → `.transmit` → `interface.send` → socket
+- **lifecycle:** `.connect` → `interfaceConnected`
+
+This is the first target that runs the whole stack. A `Store<Endpoint>` connected to a real Reticulum TCP node populates its path table from real network announces.
+
+### Live endpoint test (opt-in)
+
+`LiveEndpointTests` is skipped unless `RETICA_LIVE_HOST` is set. To run it against a real node (e.g. a local `rnsd` with a `TCPServerInterface`, or a testnet node):
+
+```
+RETICA_LIVE_HOST=127.0.0.1 RETICA_LIVE_PORT=4242 swift test --filter LiveEndpoint
+```
+
+### Products
+
+- **`ReTiCA`** — pure Swift core (crypto, Identity, Packet, Destination, Announce, HDLC). Zero third-party dependencies.
+- **`ReTiCAInterfaces`** — TCA TCP-client interface (Network.framework).
+- **`ReTiCATransport`** — TCA endpoint-core Transport (interface-agnostic).
+- **`ReTiCANode`** — composition of interface + transport into a working endpoint.
+
 ## Not Yet Implemented
 
-Transport-node relaying, path requests, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work.
+Transport-node relaying, path requests, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
 
 ## Requirements
 
