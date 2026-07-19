@@ -40,3 +40,20 @@ import ComposableArchitecture
     let b = a
     #expect(a == b)
 }
+
+@Test @MainActor func registersInterfacesAndLocalDestinations() async {
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: Identity())!
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+
+    await store.send(.interfaceConnected(InterfaceID("i1"))) {
+        $0.interfaces = [InterfaceID("i1")]
+    }
+    await store.send(.registerLocalDestination(dest)) {
+        $0.localDestinations = [dest.hash: dest]
+    }
+    await store.send(.interfaceDisconnected(InterfaceID("i1"))) {
+        $0.interfaces = []
+    }
+}
