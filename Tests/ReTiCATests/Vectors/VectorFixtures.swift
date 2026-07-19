@@ -28,6 +28,15 @@ struct VectorFixtures: Decodable {
     let hdlcFramed: String
     let escapeInput: String
     let escapeFramed: String
+    let linkDestIdentityPublic: String
+    let linkInitEphPrivateKey: String
+    let linkRespEphPublicKey: String
+    let linkRequestRaw: String
+    let linkID: String
+    let linkDerivedKey: String
+    let linkProof: String
+    let linkPlaintext: String
+    let linkCiphertext: String
 
     enum CodingKeys: String, CodingKey {
         case identityPrivateKey = "identity_private_key"
@@ -57,6 +66,15 @@ struct VectorFixtures: Decodable {
         case hdlcFramed = "hdlc_framed"
         case escapeInput = "escape_input"
         case escapeFramed = "escape_framed"
+        case linkDestIdentityPublic = "link_dest_identity_public"
+        case linkInitEphPrivateKey = "link_init_eph_private_key"
+        case linkRespEphPublicKey = "link_resp_eph_public_key"
+        case linkRequestRaw = "link_request_raw"
+        case linkID = "link_id"
+        case linkDerivedKey = "link_derived_key"
+        case linkProof = "link_proof"
+        case linkPlaintext = "link_plaintext"
+        case linkCiphertext = "link_ciphertext"
     }
 
     static func load() throws -> VectorFixtures {
