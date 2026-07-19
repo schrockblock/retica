@@ -51,7 +51,8 @@ let package = Package(
             dependencies: [
                 "ReTiCATransport",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
-            ]
+            ],
+            resources: [.process("Vectors/transport_fixtures.json")]
         ),
     ],
     swiftLanguageModes: [.v6]
