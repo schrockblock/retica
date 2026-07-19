@@ -21,7 +21,7 @@ This is the first deliverable of the decomposition. It covers:
 | `Crypto.hkdf` | HKDF-SHA-256 (RFC 5869), reference-exact counter encoding |
 | `PKCS7` | PKCS#7 padding at 16-byte block size, matching `RNS/Cryptography/PKCS7.py` |
 | `AESCBC` | AES-128-CBC and AES-256-CBC via CommonCrypto |
-| `Token` | Simplified Fernet (IV ‖ AES-CBC ciphertext ‖ HMAC-SHA-256), mode selected by key length (32 → AES-128, 64 → AES-256); constant-time HMAC verification |
+| `Token` | Simplified Fernet (IV ‖ AES-CBC ciphertext ‖ HMAC-SHA-256), mode selected by key length: a 32-byte key → AES-128 (16-byte HMAC key + 16-byte AES key), a 64-byte key → AES-256 (32-byte HMAC key + 32-byte AES key); constant-time HMAC verification |
 | `Identity` | X25519 + Ed25519 keypair; 64-byte serialization; HKDF-derived Token encryption with optional ratchet key; Ed25519 sign/validate; public-only variant |
 
 ### Cryptographic Backend
@@ -41,7 +41,7 @@ Transport, Link establishment, Announcements, and Resource delivery are **not** 
 ## Requirements
 
 - Swift 6 (swift-tools-version 6.3)
-- iOS 17+ / macOS 14+ (via CryptoKit + CommonCrypto)
+- iOS 13+ / macOS 10.15+ / tvOS 13+ / watchOS 6+ / Mac Catalyst 13+ (CryptoKit minimums, declared in `Package.swift`)
 
 ## Running Tests
 
@@ -49,4 +49,4 @@ Transport, Link establishment, Announcements, and Resource delivery are **not** 
 swift test
 ```
 
-Expected: 39 tests, all green.
+All tests should pass (currently 39, including the Python-RNS cross-validation vectors).
