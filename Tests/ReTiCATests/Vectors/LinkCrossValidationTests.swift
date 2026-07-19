@@ -44,3 +44,11 @@ import Foundation
     #expect(plain == Data(hexString: f.linkRttMsgpack))     // decrypts to the reference msgpack bytes
     #expect(MsgPack.decodeDouble(plain ?? Data()) == f.linkRtt)  // and decodes back to the RTT
 }
+
+@Test func swiftDecryptsReferenceLinkClosePacket() throws {
+    let f = try VectorFixtures.load()
+    let key = Data(hexString: f.linkDerivedKey)!
+    // RNS LINKCLOSE payload is encrypt(link_id); decrypting must recover the link_id exactly.
+    #expect(Link.decrypt(Data(hexString: f.linkCloseCiphertext)!, sessionKey: key)
+            == Data(hexString: f.linkID))
+}

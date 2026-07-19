@@ -114,6 +114,9 @@ link_rtt = 0.125                                    # deterministic fixed RTT
 link_rtt_msgpack = umsgpack.packb(link_rtt)         # genuine reference float64 encoding
 link_rtt_packet_ciphertext = LinkToken(link_derived_key).encrypt(link_rtt_msgpack)
 
+# --- Link close packet (LINKCLOSE) vector: encrypt(link_id) under the session key ---
+link_close_ciphertext = LinkToken(link_derived_key).encrypt(link_id)
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -154,4 +157,5 @@ print(json.dumps({
     "link_rtt": link_rtt,
     "link_rtt_msgpack": link_rtt_msgpack.hex(),
     "link_rtt_packet_ciphertext": link_rtt_packet_ciphertext.hex(),
+    "link_close_ciphertext": link_close_ciphertext.hex(),
 }, indent=2))
