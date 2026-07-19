@@ -3,7 +3,7 @@ import CryptoKit
 
 /// A Reticulum identity: an X25519 encryption keypair concatenated with an Ed25519
 /// signing keypair. Public/private serializations are 64 bytes: `X25519(32) ‖ Ed25519(32)`.
-public struct Identity: Equatable {
+public struct Identity: Equatable, Sendable {
     public static let keySize = 64
     private static let halfKey = 32
     private static let derivedKeyLength = 64 // AES-256 Token
