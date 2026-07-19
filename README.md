@@ -45,14 +45,35 @@ Compatibility with reference Reticulum is verified through cross-validation test
 
 Framing is separated from crypto: `Packet` is pure framing over opaque payload bytes; `Destination` owns encryption; `Packet.data`/`Packet.announce` compose them. Wire compatibility is verified against Python-RNS 1.3.8 fixtures (packet bytes, packet hash, destination hash, announce validation).
 
+## Sub-project #3: Interfaces (TCP client)
+
+| Module | Target | What it implements |
+|--------|--------|--------------------|
+| `HDLC` / `HDLCDeframer` | `ReTiCA` (pure core) | Byte-exact HDLC framing/deframing for byte-stream interfaces |
+| `TCPConnection` | `ReTiCAInterfaces` | Network.framework (`NWConnection`) socket behind a TCA `@Dependency` |
+| `TCPClientInterface` | `ReTiCAInterfaces` | TCA reducer: connect, deframe inbound → `delegate(.packetReceived)`, frame+send outbound, reconnect on drop |
+
+The Composable Architecture enters here, confined to the new **`ReTiCAInterfaces`** product; the `ReTiCA` core stays dependency-free. Socket I/O is behind a `@Dependency`, so the reducer is tested deterministically with `TestStore` and a mock connection — no real socket. HDLC framing is cross-validated against Python-RNS 1.3.8.
+
+### Products
+
+- **`ReTiCA`** — pure Swift core (crypto, Identity, Packet, Destination, Announce, HDLC). Zero third-party dependencies.
+- **`ReTiCAInterfaces`** — TCA-based interfaces (TCP client). Depends on `ReTiCA` + The Composable Architecture.
+
+### Live integration (manual)
+
+The live `TCPConnection` + `TCPClientInterface` can be pointed at a real Reticulum TCP node (e.g. a local `rnsd` TCP server) to receive real HDLC-framed packets. Received frames are delivered as raw `Data` via `delegate(.packetReceived(_:))` and can be parsed by the core `Packet`/`Announce` types. This is a manual check and is not part of `swift test`.
+
 ## Not Yet Implemented
 
-Transport, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition.
+Transport, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work.
 
 ## Requirements
 
 - Swift 6 (swift-tools-version 6.3)
-- iOS 13+ / macOS 10.15+ / tvOS 13+ / watchOS 6+ / Mac Catalyst 13+ (CryptoKit minimums, declared in `Package.swift`)
+- iOS 16+ / macOS 13+ / tvOS 16+ / watchOS 9+ / Mac Catalyst 16+
+
+The platform floor was raised from the CryptoKit minimums (iOS 13 / macOS 10.15) to iOS 16 / macOS 13 because The Composable Architecture requires it. The pure `ReTiCA` core has no third-party dependencies but shares the package's platform floor.
 
 ## Running Tests
 
@@ -60,4 +81,4 @@ Transport, Link establishment, and Resource delivery are **not** part of this su
 swift test
 ```
 
-All tests should pass (currently 71, including the Python-RNS cross-validation vectors).
+All tests should pass (currently 86, including Python-RNS cross-validation vectors and `TestStore`-based TCP client interface tests).

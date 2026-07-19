@@ -40,6 +40,13 @@ import Foundation
     #expect(deframer.ingest(framed.suffix(framed.count - mid)) == [payload])
 }
 
+@Test func unescapeReversesEscapesAndPassesUnknownEscThrough() {
+    #expect(HDLC.unescape(Data([0x7D, 0x5E])) == Data([0x7E]))          // 7D 5E -> FLAG
+    #expect(HDLC.unescape(Data([0x7D, 0x5D])) == Data([0x7D]))          // 7D 5D -> ESC
+    #expect(HDLC.unescape(Data([0x7D])) == Data([0x7D]))                // lone trailing ESC passes through
+    #expect(HDLC.unescape(Data([0x7D, 0x99])) == Data([0x7D, 0x99]))    // unknown ESC pair passes through (matches reference)
+}
+
 @Test func deframerDiscardsLeadingGarbageAndTooShortFrames() {
     let payload = Data(repeating: 0xD4, count: 25)
     var buf = Data([0xFF, 0xFE])                 // leading garbage before first FLAG
