@@ -45,6 +45,17 @@ Compatibility with reference Reticulum is verified through cross-validation test
 
 Framing is separated from crypto: `Packet` is pure framing over opaque payload bytes; `Destination` owns encryption; `Packet.data`/`Packet.announce` compose them. Wire compatibility is verified against Python-RNS 1.3.8 fixtures (packet bytes, packet hash, destination hash, announce validation).
 
+### Link handshake primitives (`Link`)
+
+The `Link` namespace (pure core) implements the cryptographic handshake of a Reticulum Link — an encrypted end-to-end session with forward secrecy:
+
+- `Link.linkID(requestPacket:)` — the deterministic link id from a link-request packet (truncated hash of its hashable part)
+- `Link.sessionKey(ephemeralPrivateX25519:peerPublicX25519:linkID:)` — the shared session key both sides derive (X25519 ECDH → HKDF salted by the link id); returns an empty `Data()` sentinel on bad-key input rather than trapping
+- `Link.buildProof` / `Link.validateProof` — the LRPROOF signed by the destination identity, proving ownership while the X25519 half stays ephemeral (forward secrecy)
+- `Link.encrypt` / `Link.decrypt` — link data over the session key (wraps `Token`)
+
+Only `MODE_AES256_CBC` and the base handshake (no MTU signalling) are implemented. The stateful Link session (state machine, RTT, keepalives, requests) is a future slice. All four handshake constructions are cross-validated against Python-RNS 1.3.8.
+
 ## Sub-project #3: Interfaces (TCP client)
 
 | Module | Target | What it implements |
@@ -95,7 +106,9 @@ RETICA_LIVE_HOST=127.0.0.1 RETICA_LIVE_PORT=4242 swift test --filter LiveEndpoin
 
 ## Not Yet Implemented
 
-Transport-node relaying, path requests, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
+Transport-node relaying, path requests, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
+
+The **Link state machine / lifecycle** — session establishment orchestration (PENDING → HANDSHAKE → ACTIVE → CLOSED), RTT measurement, keepalives, requests/responses, and link close — is a future slice. The cryptographic handshake primitives (`Link` namespace) are complete and cross-validated; the stateful session layer built on top of them is not yet implemented.
 
 ## Requirements
 

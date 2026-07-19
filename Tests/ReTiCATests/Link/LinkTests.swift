@@ -76,6 +76,14 @@ private func x25519Pub(_ id: Identity) -> Data { Data(id.publicKey.prefix(32)) }
     #expect(Link.decrypt(Data(repeating: 0xAB, count: 80), sessionKey: key) == nil) // garbage
 }
 
+@Test func sessionKeyReturnsEmptyOnBadInput() {
+    // An undersized (non-32-byte) private key can't form an X25519 key → empty-Data sentinel, no trap.
+    let key = Link.sessionKey(ephemeralPrivateX25519: Data([0x01, 0x02, 0x03]),
+                              peerPublicX25519: Data(repeating: 0xAB, count: 32),
+                              linkID: Data(repeating: 0x11, count: 16))
+    #expect(key.isEmpty)
+}
+
 @Test func fullHandshakeSimulationEstablishesSharedKeyAndDataFlows() {
     let dest = Identity()          // destination (responder owns it)
     let initEph = Identity()
