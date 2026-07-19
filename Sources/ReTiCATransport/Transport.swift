@@ -76,6 +76,13 @@ public struct Transport {
                     state.learned[packet.destinationHash] = candidate
                     return .send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
                                                         hops: packet.hops)))
+                case .data:
+                    guard let destination = state.localDestinations[packet.destinationHash],
+                          destination.kind == packet.destinationType,
+                          let plaintext = destination.decrypt(packet.payload)
+                    else { return .none }
+                    return .send(.delegate(.received(destinationHash: packet.destinationHash,
+                                                     plaintext: plaintext)))
                 default:
                     return .none
                 }

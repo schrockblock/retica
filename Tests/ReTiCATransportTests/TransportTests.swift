@@ -120,3 +120,30 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     await store.send(.received(InterfaceID("i1"), raw)) // announce for ourselves → ignored
     #expect(store.state.learned[destHash] == nil)
 }
+
+@Test @MainActor func deliversInboundDataToLocalDestination() async {
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["inbox"],
+                           identity: Identity())!
+    let plaintext = Data("hello endpoint".utf8)
+    let ciphertext = dest.encrypt(plaintext)            // encrypt to our own destination
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: dest.hash, transportId: nil, payload: ciphertext)
+    let raw = try! packet.packed()
+
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
+    await store.send(.received(InterfaceID("i1"), raw))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext)))
+}
+
+@Test @MainActor func dropsDataForUnknownDestination() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: Data(repeating: 0x11, count: 16), transportId: nil,
+                        payload: Data(repeating: 0xAB, count: 80))
+    await store.send(.received(InterfaceID("i1"), try! packet.packed())) // no delegate expected
+}
