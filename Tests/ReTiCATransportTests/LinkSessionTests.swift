@@ -240,3 +240,66 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     await store.send(.acceptRequest(try! badRequest.packed()))
     #expect(store.state.status == .pending)   // rejected, no handshake
 }
+
+@Test @MainActor func establishedLinkExchangesDataThenCloses() async {
+    let owner = Identity()
+    let destHash = Data(repeating: 0x77, count: 16)
+
+    let initiator = TestStore(
+        initialState: LinkSession.State(initiatorTo: Identity(publicKey: owner.publicKey)!,
+                                        destinationHash: destHash, interfaceID: InterfaceID("a"))
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch) }
+    initiator.exhaustivity = .off
+
+    let responder = TestStore(
+        initialState: LinkSession.State(responderFor: owner, destinationHash: destHash,
+                                        interfaceID: InterfaceID("b"))
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch) }
+    responder.exhaustivity = .off
+
+    // Establish (LINKREQUEST → LRPROOF → LRRTT).
+    await initiator.send(.establish)
+    let linkRequest = await captureTransmit(initiator)
+    await responder.send(.acceptRequest(linkRequest))
+    let proof = await captureTransmit(responder)
+    await initiator.send(.received(proof))
+    let rttPacket = await captureTransmit(initiator)
+    await initiator.receive { if case .delegate(.established) = $0 { return true }; return false }
+    await responder.send(.received(rttPacket))
+    await responder.receive { if case .delegate(.established) = $0 { return true }; return false }
+    #expect(initiator.state.status == .active)
+    #expect(responder.state.status == .active)
+
+    // Initiator → responder application data.
+    let up = Data("ping".utf8)
+    await initiator.send(.send(up))
+    let dataToResp = await captureTransmit(initiator)
+    let gotUp = LockIsolated<Data?>(nil)
+    await responder.send(.received(dataToResp))
+    await responder.receive { action in
+        if case let .delegate(.dataReceived(p)) = action { gotUp.setValue(p); return true }
+        return false
+    }
+    #expect(gotUp.value == up)
+
+    // Responder → initiator application data.
+    let down = Data("pong".utf8)
+    await responder.send(.send(down))
+    let dataToInit = await captureTransmit(responder)
+    let gotDown = LockIsolated<Data?>(nil)
+    await initiator.send(.received(dataToInit))
+    await initiator.receive { action in
+        if case let .delegate(.dataReceived(p)) = action { gotDown.setValue(p); return true }
+        return false
+    }
+    #expect(gotDown.value == down)
+
+    // Initiator closes; responder observes the close.
+    await initiator.send(.close)
+    let closePacket = await captureTransmit(initiator)
+    await initiator.receive(.delegate(.closed(.initiatorClosed)))
+    #expect(initiator.state.status == .closed)
+    await responder.send(.received(closePacket))
+    await responder.receive(.delegate(.closed(.initiatorClosed)))
+    #expect(responder.state.status == .closed)
+}

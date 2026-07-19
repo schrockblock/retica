@@ -56,7 +56,7 @@ The `Link` namespace (pure core) implements the cryptographic handshake of a Ret
 
 Only `MODE_AES256_CBC` is implemented, and MTU is not negotiated. Reticulum nonetheless bakes 3 fixed **signalling bytes** (MTU 500 / AES-256-CBC) into the link-request and proof wire layouts unconditionally, so these primitives include them (`buildProof` emits a 99-byte proof; `validateProof` also accepts the 96-byte signalling-free form, mirroring RNS `validate_proof`) to stay byte-exact with real 1.3.8 peers. The stateful Link session (state machine, RTT, keepalives, requests) is a future slice. All four handshake constructions are cross-validated against Python-RNS 1.3.8 (the fixture generator drives the reference `RNS.Link` signalling/handshake code paths, not a reimplementation).
 
-### Link establishment (`LinkSession`)
+### Link establishment, data flow, and close (`LinkSession`)
 
 `LinkSession` (in `ReTiCATransport`) drives the Link establishment handshake as a TCA
 reducer — one instance per link, for either role:
@@ -71,10 +71,16 @@ session key (`delegate(.established(linkID:sessionKey:))`). The reducer is inter
 (raw packet bytes in, `delegate(.transmit)` out). The LRRTT payload is `msgpack(rtt)`
 encrypted under the session key; a minimal double-only `MsgPack` codec lives in the pure core.
 
-This slice is **establishment only**: application data flow, link close/teardown,
-keepalive/watchdog/timeouts, identify, requests, and resources are future slices, as is
-wiring `LinkSession` into `Transport`/`Endpoint`. The msgpack encoding and the encrypted
-LRRTT packet are cross-validated against Python-RNS 1.3.8.
+An established link can then carry encrypted application data in both directions (`send(_:)` →
+a DATA/NONE packet; inbound data surfaces via `delegate(.dataReceived(_:))`) and be explicitly
+closed (`close` → a LINKCLOSE packet carrying `encrypt(link_id)`; either side reaching
+`.closed` emits `delegate(.closed(_:))` with the RNS-faithful reason). Data payloads and the
+close packet are encrypted under the session key; the close packet and its `encrypt(link_id)`
+format are cross-validated against Python-RNS 1.3.8.
+
+Still deferred to later slices: the time-driven layer (keepalive, watchdog, STALE detection,
+establishment/inactivity timeouts), plus identify, requests, resources, and wiring
+`LinkSession` into `Transport`/`Endpoint`.
 
 ## Sub-project #3: Interfaces (TCP client)
 
@@ -128,7 +134,7 @@ RETICA_LIVE_HOST=127.0.0.1 RETICA_LIVE_PORT=4242 swift test --filter LiveEndpoin
 
 Transport-node relaying, path requests, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
 
-The **Link session lifecycle beyond establishment** — application data flow, link close/teardown, keepalive/watchdog/timeouts, identify, requests, and resources — is a future slice. The cryptographic handshake primitives (`Link` namespace) are complete and cross-validated; `LinkSession` implements the establishment handshake (PENDING → HANDSHAKE → ACTIVE) but the stateful data/close/keepalive layers built on top are not yet implemented, nor is `LinkSession` wired into `Transport`/`Endpoint`.
+The **Link session lifecycle beyond establishment and data/close** — keepalive/watchdog/timeouts (STALE detection), identify, requests, and resources — is a future slice. The cryptographic handshake primitives (`Link` namespace) are complete and cross-validated; `LinkSession` implements establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data in both directions, and explicit link close, but the time-driven layer (keepalive, watchdog, STALE) and higher-level operations (identify, requests, resources) are not yet implemented, nor is `LinkSession` wired into `Transport`/`Endpoint`.
 
 ## Requirements
 
