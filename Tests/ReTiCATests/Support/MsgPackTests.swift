@@ -18,4 +18,5 @@ import Foundation
     #expect(MsgPack.decodeDouble(Data([0xCA]) + Data(repeating: 0, count: 8)) == nil)          // float32 tag, right length
     #expect(MsgPack.decodeDouble(Data()) == nil)                                                // empty
     #expect(MsgPack.decodeDouble(Data([0xCB]) + Data(repeating: 0, count: 7)) == nil)          // too short
+    #expect(MsgPack.decodeDouble(Data([0xCB]) + Data(repeating: 0, count: 9)) == nil)          // too long (10 bytes)
 }

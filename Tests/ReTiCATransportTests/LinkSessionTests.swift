@@ -84,3 +84,44 @@ private func captureTransmit(_ store: TestStore<LinkSession.State, LinkSession.A
     await store.receive(.delegate(.establishmentFailed))
     #expect(store.state.status == .pending)                      // no transition on failure
 }
+
+@Test @MainActor func initiatorAndResponderReachActiveWithEqualSessionKey() async {
+    let owner = Identity()                                  // responder owns this destination identity
+    let destHash = Data(repeating: 0x77, count: 16)
+
+    let initiator = TestStore(
+        initialState: LinkSession.State(initiatorTo: Identity(publicKey: owner.publicKey)!,
+                                        destinationHash: destHash, interfaceID: InterfaceID("a"))
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch) }
+    initiator.exhaustivity = .off
+
+    let responder = TestStore(
+        initialState: LinkSession.State(responderFor: owner, destinationHash: destHash,
+                                        interfaceID: InterfaceID("b"))
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch) }
+    responder.exhaustivity = .off
+
+    // 1. Initiator → LINKREQUEST
+    await initiator.send(.establish)
+    let linkRequest = await captureTransmit(initiator)
+
+    // 2. Responder accepts request → LRPROOF
+    await responder.send(.acceptRequest(linkRequest))
+    let proof = await captureTransmit(responder)
+    #expect(responder.state.status == .handshake)
+
+    // 3. Initiator validates proof → ACTIVE, emits LRRTT + established
+    await initiator.send(.received(proof))
+    let rttPacket = await captureTransmit(initiator)
+    await initiator.receive { if case .delegate(.established) = $0 { return true }; return false }
+    #expect(initiator.state.status == .active)
+
+    // 4. Responder receives LRRTT → ACTIVE, established
+    await responder.send(.received(rttPacket))
+    await responder.receive { if case .delegate(.established) = $0 { return true }; return false }
+    #expect(responder.state.status == .active)
+
+    // Both sides derived the same non-empty session key.
+    #expect(initiator.state.sessionKey.count == 64)
+    #expect(initiator.state.sessionKey == responder.state.sessionKey)
+}
