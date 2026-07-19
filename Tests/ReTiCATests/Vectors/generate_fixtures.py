@@ -65,6 +65,40 @@ hdlc_framed = bytes([HDLC.FLAG]) + HDLC.escape(plain_packet_raw) + bytes([HDLC.F
 escape_input = bytes([0x00, HDLC.FLAG, 0x11, HDLC.ESC, 0x22]) + bytes([0xAB] * 20)
 escape_framed = bytes([HDLC.FLAG]) + HDLC.escape(escape_input) + bytes([HDLC.FLAG])
 
+# --- Link handshake vectors (base AES-256-CBC handshake, no MTU signalling) ---
+from RNS.Cryptography import X25519PrivateKey, X25519PublicKey
+from RNS.Cryptography import Token as LinkToken
+
+link_dest = RNS.Identity()                 # the destination the link is made to (responder owns it)
+link_init_eph = RNS.Identity()             # initiator ephemeral (X25519 ‖ Ed25519)
+link_resp_eph = RNS.Identity()             # responder ephemeral
+
+# Link request packet: HEADER_1 LINKREQUEST to the destination; data = initiator ephemeral public key.
+link_dest_hash = RNS.Destination.hash(link_dest, "reticula", "link")
+lr_flags = (0 << 6) | (0 << 5) | (0 << 4) | (RNS.Destination.SINGLE << 2) | RNS.Packet.LINKREQUEST  # 0x02
+lr_data = link_init_eph.get_public_key()   # 64 bytes
+link_request_raw = bytes([lr_flags, 0]) + link_dest_hash + bytes([0x00]) + lr_data
+
+# link_id = truncated_hash(bytes([flags&0x0F]) ‖ dest_hash ‖ context ‖ data)
+lr_hashable = bytes([lr_flags & 0x0F]) + link_dest_hash + bytes([0x00]) + lr_data
+link_id = RNS.Identity.truncated_hash(lr_hashable)
+
+# session key: HKDF(64, ECDH(init x25519 priv, resp x25519 pub), salt=link_id)
+init_x25519_priv = X25519PrivateKey.from_private_bytes(link_init_eph.get_private_key()[:32])
+resp_x25519_pub = X25519PublicKey.from_public_bytes(link_resp_eph.get_public_key()[:32])
+link_shared = init_x25519_priv.exchange(resp_x25519_pub)
+link_derived_key = RNS.Cryptography.hkdf(length=64, derive_from=link_shared, salt=link_id, context=None)
+
+# proof: signed = link_id ‖ resp x25519 pub(32) ‖ dest identity ed25519 pub(32); signed by the destination identity.
+resp_x25519_pub_bytes = link_resp_eph.get_public_key()[:32]
+dest_ed25519_pub = link_dest.get_public_key()[32:64]
+link_proof_signed = link_id + resp_x25519_pub_bytes + dest_ed25519_pub
+link_proof = link_dest.sign(link_proof_signed) + resp_x25519_pub_bytes
+
+# link data over the session key
+link_plaintext = b"secure link message"
+link_ciphertext = LinkToken(link_derived_key).encrypt(link_plaintext)
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -93,4 +127,13 @@ print(json.dumps({
     "hdlc_framed": hdlc_framed.hex(),
     "escape_input": escape_input.hex(),
     "escape_framed": escape_framed.hex(),
+    "link_dest_identity_public": link_dest.get_public_key().hex(),
+    "link_init_eph_private_key": link_init_eph.get_private_key().hex(),
+    "link_resp_eph_public_key": link_resp_eph.get_public_key().hex(),
+    "link_request_raw": link_request_raw.hex(),
+    "link_id": link_id.hex(),
+    "link_derived_key": link_derived_key.hex(),
+    "link_proof": link_proof.hex(),
+    "link_plaintext": link_plaintext.hex(),
+    "link_ciphertext": link_ciphertext.hex(),
 }, indent=2))
