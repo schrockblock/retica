@@ -65,3 +65,16 @@ private func announceDestHash(_ id: Identity, nameHash: Data) -> Data {
     #expect(rh.prefix(5) == Data([1, 2, 3, 4, 5]))              // prefix truncated to 5
     #expect(rh.suffix(5) == Data([0x01, 0x02, 0x03, 0x04, 0x05])) // 5-byte big-endian time
 }
+
+@Test func parseRejectsForgedDestinationHashWithValidSignature() {
+    let id = Identity()
+    let nameHash = Destination.nameHash(appName: "app", aspects: [])
+    // A destination hash NOT derived from (nameHash ‖ identity.hash):
+    let forgedHash = Data(repeating: 0x01, count: 16)
+    let randomHash = Announce.randomHash(now: 9, randomPrefix: Data(repeating: 0x00, count: 5))
+    // buildPayload signs over forgedHash, so the signature will verify against forgedHash...
+    let payload = Announce.buildPayload(identity: id, destinationHash: forgedHash,
+                                        nameHash: nameHash, randomHash: randomHash)
+    // ...but parse must still reject it because forgedHash != SHA256(nameHash ‖ id.hash)[:16].
+    #expect(Announce.parse(payload: payload, destinationHash: forgedHash, contextFlagSet: false) == nil)
+}

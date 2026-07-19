@@ -34,9 +34,20 @@ This is the first deliverable of the decomposition. It covers:
 
 Compatibility with reference Reticulum is verified through cross-validation tests (`Tests/ReTiCATests/Vectors/`) that decrypt ciphertexts and validate signatures produced by Python-RNS 1.3.8 fixtures, covering: identity hash, Token decryption, Identity-layer Token decryption, and Ed25519 signature verification.
 
+## Sub-project #2: Packet + Destination
+
+| Module | What it implements |
+|--------|--------------------|
+| `Packet` | Byte-exact Reticulum packet framing (flags, HEADER_1/HEADER_2, pack/unpack) and the transport-stable packet hash |
+| `PacketContext` / `PacketType` / `HeaderType` / `TransportType` / `DestinationType` | Wire constants |
+| `Destination` | Addressing (`expandName`/`nameHash`/`hash`) and encrypt/decrypt dispatch for SINGLE/GROUP/PLAIN |
+| `Announce` | Signed announce payload build + signature/hash validation |
+
+Framing is separated from crypto: `Packet` is pure framing over opaque payload bytes; `Destination` owns encryption; `Packet.data`/`Packet.announce` compose them. Wire compatibility is verified against Python-RNS 1.3.8 fixtures (packet bytes, packet hash, destination hash, announce validation).
+
 ## Not Yet Implemented
 
-Transport, Link establishment, Announcements, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition.
+Transport, Link establishment, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition.
 
 ## Requirements
 
