@@ -68,9 +68,14 @@ private actor NWConnectionActor {
     private var continuation: AsyncStream<TCPEvent>.Continuation?
 
     func start(host: String, port: UInt16, continuation: AsyncStream<TCPEvent>.Continuation) {
+        // Tear down any prior connection/stream so a reused actor never leaks a continuation.
+        self.continuation?.finish()
+        self.connection?.cancel()
         self.continuation = continuation
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
-            continuation.yield(.disconnected(reason: "invalid port")); continuation.finish(); return
+            continuation.yield(.disconnected(reason: "invalid port")); continuation.finish()
+            self.continuation = nil
+            return
         }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
         self.connection = conn
