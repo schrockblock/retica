@@ -82,9 +82,17 @@ closed (`close` → a LINKCLOSE packet carrying `encrypt(link_id)`; either side 
 close packet are encrypted under the session key; the close packet and its `encrypt(link_id)`
 format are cross-validated against Python-RNS 1.3.8.
 
-Still deferred to later slices: the time-driven layer (keepalive, watchdog, STALE detection,
-establishment/inactivity timeouts), plus identify, requests, resources, and wiring
-`LinkSession` into `Transport`/`Endpoint`.
+A `LinkSession` is self-maintaining once it has a clock (`@Dependency(\.continuousClock)`): a
+hung handshake times out (`.pending`/`.handshake` past `establishmentTimeout` → `.closed` with
+`CloseReason.timedOut`); the initiator sends an unencrypted `0xFF` keepalive every
+`keepaliveInterval` and the responder replies `0xFE`, which keeps both sides' inactivity timers
+fresh; and a link that hears nothing for `staleTime` (`2 × keepaliveInterval`) tears itself down
+(LINKCLOSE + `.closed(.timedOut)`). Durations are local policy (simplified from RNS's per-hop
+computation, which needs Transport); only the keepalive packet (`context .keepalive`,
+unencrypted `0xFF`/`0xFE`) is wire-visible and matches RNS 1.3.8.
+
+Still deferred to later slices: RTT-adaptive keepalive intervals, identify, requests, resources,
+and wiring `LinkSession` into `Transport`/`Endpoint`.
 
 ## Sub-project #3: Interfaces (TCP client)
 
@@ -138,7 +146,7 @@ RETICA_LIVE_HOST=127.0.0.1 RETICA_LIVE_PORT=4242 swift test --filter LiveEndpoin
 
 Transport-node relaying, path requests, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
 
-The **Link session lifecycle beyond establishment and data/close** — keepalive/watchdog/timeouts (STALE detection), identify, requests, and resources — is a future slice. The cryptographic handshake primitives (`Link` namespace) are complete and cross-validated; `LinkSession` implements establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data in both directions, and explicit link close, but the time-driven layer (keepalive, watchdog, STALE) and higher-level operations (identify, requests, resources) are not yet implemented, nor is `LinkSession` wired into `Transport`/`Endpoint`.
+The **Link session lifecycle beyond data/close** — identify, requests, and resources — is a future slice. The cryptographic handshake primitives (`Link` namespace) are complete and cross-validated; `LinkSession` implements establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data in both directions, explicit link close, and the full time-driven watchdog (establishment timeout, keepalive 0xFF/0xFE, and inactivity teardown). Higher-level operations (identify, requests, resources) are not yet implemented, nor is `LinkSession` wired into `Transport`/`Endpoint`.
 
 ## Requirements
 
