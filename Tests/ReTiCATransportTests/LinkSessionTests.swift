@@ -433,3 +433,43 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     #expect(store.state.status == .closed)
     #expect(Packet(raw: close)!.context == .linkClose)
 }
+
+@Test @MainActor func activeInitiatorEmitsKeepaliveEveryInterval() async {
+    let clock = TestClock()
+    let store = await activeInitiatorStore(owner: Identity(), clock: clock)   // now starts a keepalive timer
+    await clock.advance(by: .seconds(store.state.keepaliveInterval))
+    await store.receive(.keepaliveDeadline)
+    let ka = await captureTransmit(store)
+    let packet = Packet(raw: ka)!
+    #expect(packet.context == .keepalive)
+    #expect(packet.payload == Data([0xFF]))                    // unencrypted sentinel
+    #expect(packet.destinationHash == store.state.linkID)
+    // Clean up (cancels the keepalive + inactivity timers).
+    await store.send(.close); _ = await captureTransmit(store)
+    await store.receive(.delegate(.closed(.initiatorClosed)))
+}
+
+@Test @MainActor func responderRepliesToKeepaliveWith0xFE() async {
+    var s = LinkSession.State(responderFor: Identity(), destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .active
+    s.sessionKey = Data(repeating: 0x01, count: 64)
+    s.linkID = Data(repeating: 0xAB, count: 16)
+    let clock = TestClock()
+    let store = TestStore(initialState: s) { LinkSession() }
+        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    store.exhaustivity = .off
+
+    // Inbound 0xFF keepalive → 0xFE reply.
+    let ka = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                    destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                    destinationHash: s.linkID, transportId: nil, payload: Data([0xFF]))
+    await store.send(.received(try! ka.packed()))
+    let reply = await captureTransmit(store)
+    let packet = Packet(raw: reply)!
+    #expect(packet.context == .keepalive)
+    #expect(packet.payload == Data([0xFE]))
+
+    await store.send(.close); _ = await captureTransmit(store)
+    await store.receive(.delegate(.closed(.destinationClosed)))
+}

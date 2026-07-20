@@ -119,6 +119,10 @@ public struct LinkSession {
                 .run { send in try await clock.sleep(for: .seconds(t)); await send(.inactivityDeadline) }
                     .cancellable(id: CancelID.inactivity, cancelInFlight: true)
             }
+            func keepaliveTimer(_ t: TimeInterval) -> Effect<Action> {
+                .run { send in while true { try await clock.sleep(for: .seconds(t)); await send(.keepaliveDeadline) } }
+                    .cancellable(id: CancelID.keepalive, cancelInFlight: true)
+            }
             let cancelAll = Effect<Action>.merge(.cancel(id: CancelID.establishment),
                                                  .cancel(id: CancelID.keepalive),
                                                  .cancel(id: CancelID.inactivity))
@@ -196,7 +200,8 @@ public struct LinkSession {
                     let cipher = Link.encrypt(MsgPack.encode(rtt), sessionKey: key)
                     let established = Action.delegate(.established(linkID: state.linkID, sessionKey: key))
                     let extra = Effect<Action>.merge(.cancel(id: CancelID.establishment),
-                                                     inactivityTimer(state.staleTime))
+                                                     inactivityTimer(state.staleTime),
+                                                     keepaliveTimer(state.keepaliveInterval))
                     guard let raw = linkPacket(state.linkID, .linkRequestRTT, cipher) else {
                         return .merge(.send(established), extra)
                     }
@@ -225,6 +230,20 @@ public struct LinkSession {
                     state.status = .closed
                     let reason: CloseReason = state.role == .initiator ? .destinationClosed : .initiatorClosed
                     return .merge(.send(.delegate(.closed(reason))), cancelAll)
+
+                case (.responder, .active, .data, .keepalive):
+                    state.lastInbound = now
+                    var effects: [Effect<Action>] = [inactivityTimer(state.staleTime)]
+                    if packet.payload == Data([LinkSession.keepaliveByte]),
+                       let raw = linkPacket(state.linkID, .keepalive, Data([LinkSession.keepaliveReplyByte])) {
+                        effects.append(.send(.delegate(.transmit(state.interfaceID, raw))))
+                    }
+                    return .merge(effects)
+
+                case (.initiator, .active, .data, .keepalive):
+                    guard packet.payload != Data([LinkSession.keepaliveByte]) else { return .none } // ignore own 0xFF loopback
+                    state.lastInbound = now
+                    return inactivityTimer(state.staleTime)                                          // 0xFE reply resets inactivity
 
                 default:
                     return .none
@@ -257,7 +276,10 @@ public struct LinkSession {
                 return .merge(.send(.delegate(.closed(.timedOut))), cancelAll)
 
             case .keepaliveDeadline:
-                return .none   // implemented in Task 2
+                guard state.status == .active, state.role == .initiator else { return .none }
+                guard let raw = linkPacket(state.linkID, .keepalive, Data([LinkSession.keepaliveByte]))
+                else { return .none }
+                return .send(.delegate(.transmit(state.interfaceID, raw)))
 
             case .inactivityDeadline:
                 guard state.status == .active else { return .none }
