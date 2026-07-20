@@ -378,3 +378,73 @@ private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
     // Cleanup: cancel to a terminal state.
     await store.send(.cancel); _ = await captureTransmits(store, count: 1)
 }
+
+// MARK: - Watchdog arming coverage (clock-advance tests)
+
+/// Proves the receiver watchdog is truly ARMED inside requestNextWindow (called from .accept).
+/// After .accept, advancing the TestClock past the timeout must cause .receiverDeadline to fire
+/// automatically — no manual store.send(.receiverDeadline) — and the handler must run (window 4→3).
+/// If the watchdog arm is removed from requestNextWindow, the clock advance produces nothing and
+/// the test hangs/times-out waiting for the auto-fired action, causing a mutation failure.
+@Test @MainActor func receiverWatchdogAutoFiresAfterWindowRequest() async {
+    // 160 bytes → 7 parts at sdu 24 (stream includes 4-byte prefix = 164 bytes / 24 ≈ 7 parts).
+    let data = Data(repeating: 0x33, count: 160)
+    let sender = senderState(data)
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+
+    // .accept → calls requestNextWindow → arms receiver watchdog.
+    await store.send(.accept(advertisementPacket(sender)))
+
+    // Receiver watchdog timeout = rtt * partTimeoutFactor + retryGrace + perRetryDelay * (maxRetries - retriesLeft)
+    // With defaults: 1s * 4 + 0.25s + 0.5s * 0 = 4.25s. Advance well past it.
+    await clock.advance(by: .seconds(10))
+
+    // The watchdog must fire on its own — this is NOT a manual send.
+    // We drain both the transmit and the auto-fired deadline; order is transmit-first then deadline.
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.receive { if case .receiverDeadline = $0 { return true }; return false }
+
+    // Handler ran: window should have shrunk from 4 → 3.
+    #expect(store.state.window.window == 3)
+
+    // Drive to terminal state to cancel all watchdogs (avoids leaked effects).
+    // retriesLeft is now maxRetries-1; the subsequent requestNextWindow re-arms the watchdog.
+    // Exhaust remaining retries manually, draining each re-request transmit.
+    for _ in 0..<ResourceTransfer.Const.maxRetries {
+        await store.send(.receiverDeadline)
+    }
+    #expect(store.state.status == .failed)
+}
+
+/// Proves the sender watchdog is truly ARMED inside the .advertise handler.
+/// After .advertise, advancing the TestClock past the advertised-state timeout must cause
+/// .senderDeadline to fire automatically. The handler re-advertises (advRetriesLeft decrements).
+/// If the watchdog arm is removed from .advertise, no deadline fires and the test hangs/times-out,
+/// causing a mutation failure.
+@Test @MainActor func senderWatchdogAutoFiresAfterAdvertise() async {
+    let data = Data("sender watchdog auto-arming probe".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+
+    // .advertise → transitions to .advertised + arms sender watchdog.
+    await store.send(.advertise) { $0.status = .advertised }
+
+    // Sender watchdog timeout in .advertised = rtt * partTimeoutFactor + processingGrace
+    // With defaults: 1s * 4 + 1s = 5s. Advance well past it.
+    await clock.advance(by: .seconds(15))
+
+    // The watchdog must fire on its own — NOT a manual send.
+    // We drain the initial ADV transmit, then the auto-fired senderDeadline.
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.receive { if case .senderDeadline = $0 { return true }; return false }
+
+    // Handler ran: advRetriesLeft should have decremented (maxAdvRetries → maxAdvRetries-1).
+    #expect(store.state.advRetriesLeft == ResourceTransfer.Const.maxAdvRetries - 1)
+
+    // Drive to terminal state: exhaust remaining adv retries then one final deadline.
+    for _ in 0...ResourceTransfer.Const.maxAdvRetries {
+        await store.send(.senderDeadline)
+    }
+    #expect(store.state.status == .failed)
+}
