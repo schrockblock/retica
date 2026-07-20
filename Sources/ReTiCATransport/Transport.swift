@@ -27,11 +27,14 @@ public struct Transport {
         case send(destinationHash: Data, plaintext: Data)
         case delegate(Delegate)
 
+        @CasePathable
         public enum Delegate: Equatable {
             case transmit(InterfaceID, Data)
             case received(destinationHash: Data, plaintext: Data)
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: SendFailure)
+            case linkPacket(linkID: Data, data: Data)
+            case linkRequest(destinationHash: Data, data: Data)
         }
     }
 
@@ -56,6 +59,15 @@ public struct Transport {
 
             case let .received(interfaceID, data):
                 guard let packet = Packet(raw: data) else { return .none }
+                // Link traffic is recognized and routed up BEFORE the announce/data dedup:
+                // byte-identical keepalives share a packet hash and must not be deduped, and a
+                // retried link request should still reach us.
+                if packet.destinationType == .link {
+                    return .send(.delegate(.linkPacket(linkID: packet.destinationHash, data: data)))
+                }
+                if packet.packetType == .linkRequest, state.localDestinations[packet.destinationHash] != nil {
+                    return .send(.delegate(.linkRequest(destinationHash: packet.destinationHash, data: data)))
+                }
                 guard state.seenPacketHashes.insert(packet.packetHash) else { return .none }
 
                 switch packet.packetType {

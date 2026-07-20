@@ -268,6 +268,81 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     // No receive step here: kind mismatch drops the packet — no delegate action must be emitted.
 }
 
+@Test @MainActor func routesLinkAddressedPacketAsLinkPacket() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    let linkID = Data(repeating: 0xAB, count: 16)
+    // A .link-addressed DATA packet (e.g. a keepalive) with a raw 0xFF payload.
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                        destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+    let raw = try! packet.packed()
+    let captured = LockIsolated<(Data, Data)?>(nil)
+    await store.send(.received(InterfaceID("i"), raw))
+    await store.receive { action in
+        if case let .delegate(.linkPacket(l, d)) = action { captured.setValue((l, d)); return true }
+        return false
+    }
+    #expect(captured.value?.0 == linkID)
+    #expect(captured.value?.1 == raw)
+}
+
+@Test @MainActor func identicalLinkPacketsBypassDedup() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    let linkID = Data(repeating: 0xCD, count: 16)
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                        destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+    let raw = try! packet.packed()
+    // First send → must produce a linkPacket delegate.
+    await store.send(.received(InterfaceID("i"), raw))
+    await store.receive { if case .delegate(.linkPacket) = $0 { return true }; return false }
+    // Second send with byte-identical packet → must NOT be deduped; must produce another linkPacket.
+    await store.send(.received(InterfaceID("i"), raw))
+    await store.receive { if case .delegate(.linkPacket) = $0 { return true }; return false }
+    // Both receives completed without timing out → dedup was bypassed twice.
+}
+
+@Test @MainActor func routesLinkRequestToLocalDestinationAsLinkRequest() async {
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: Identity())!
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
+    // A LINKREQUEST (packetType .linkRequest, destType .single) to our local destination.
+    let packet = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: dest.hash, transportId: nil,
+                        payload: Identity().publicKey + Link.signallingBytes)
+    let raw = try! packet.packed()
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("i"), raw))
+    await store.receive { action in
+        if case let .delegate(.linkRequest(h, _)) = action { captured.setValue(h); return true }
+        return false
+    }
+    #expect(captured.value == dest.hash)
+}
+
+@Test @MainActor func linkRequestToUnknownDestinationIsNotSurfaced() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    let unknown = Data(repeating: 0x11, count: 16)
+    let packet = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: unknown, transportId: nil,
+                        payload: Identity().publicKey + Link.signallingBytes)
+    await store.send(.received(InterfaceID("i"), try! packet.packed()))
+    // No local destination registered → the reducer returns .none; no linkRequest delegate.
+    // Switch to exhaustive mode so any unhandled pending action (e.g. a spurious .linkRequest
+    // emitted without the guard) causes the test to fail on cleanup.
+    store.exhaustivity = .on
+    // Assert state is unchanged (no crash, no learned/local mutation).
+    #expect(store.state.localDestinations.isEmpty)
+    #expect(store.state.learned.isEmpty)
+}
+
 @Test @MainActor func announceFansOutToAllInterfaces() async {
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
                            identity: Identity())!
