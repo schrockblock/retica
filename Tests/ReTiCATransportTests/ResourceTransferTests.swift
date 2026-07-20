@@ -126,8 +126,8 @@ private func receiverStore(_ clock: TestClock<Duration>) -> TestStore<ResourceTr
     let expectedBodyCount = 1 + 32 + 4 * 4
     #expect(body.count == expectedBodyCount)
     #expect(store.state.outstanding == [0, 1, 2, 3])
-    // Drive to failure to cancel the armed watchdog (16 timeouts).
-    for _ in 0..<ResourceTransfer.Const.maxRetries { await store.send(.receiverDeadline) }
+    // Drive to failure to cancel the armed watchdog (17 timeouts: 16 retries + 1 final fail).
+    for _ in 0..<(ResourceTransfer.Const.maxRetries + 1) { await store.send(.receiverDeadline) }
     #expect(store.state.status == .failed)
 }
 
@@ -176,7 +176,7 @@ private func receiverStore(_ clock: TestClock<Duration>) -> TestStore<ResourceTr
     _ = await captureTransmits(store, count: 1)           // re-request
 
     // Exhaust the remaining retries; the final timeout fails the transfer and emits an RCL.
-    for _ in 0..<(ResourceTransfer.Const.maxRetries - 1) { await store.send(.receiverDeadline) }
+    for _ in 0..<ResourceTransfer.Const.maxRetries { await store.send(.receiverDeadline) }
     #expect(store.state.status == .failed)
     // Skip any intermediate request transmits and find the RCL (non-exhaustive receive skips non-matching).
     let rclData = LockIsolated<Data?>(nil)

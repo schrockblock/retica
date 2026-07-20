@@ -296,7 +296,6 @@ public struct ResourceTransfer {
             case .receiverDeadline:
                 guard state.role == .receiver,
                       state.status == .requesting || state.status == .transferring else { return .none }
-                state.retriesLeft -= 1
                 guard state.retriesLeft > 0 else {
                     state.status = .failed
                     let rcl = linkPacket(.data, .resourceReceiverCancel,
@@ -306,6 +305,7 @@ public struct ResourceTransfer {
                                   .send(.delegate(.failed)))
                 }
                 state.window = state.window.shrunk()
+                state.retriesLeft -= 1
                 return requestNextWindow(&state)
 
             case .delegate:
