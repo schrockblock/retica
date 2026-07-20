@@ -34,6 +34,9 @@ public struct Endpoint {
         case registerLocalDestination(Destination)
         case announce(destinationHash: Data, appData: Data?)
         case send(destinationHash: Data, plaintext: Data)
+        case openLink(destinationHash: Data)
+        case sendOverLink(linkID: Data, data: Data)
+        case closeLink(linkID: Data)
 
         case delegate(Delegate)
         @CasePathable
@@ -41,6 +44,10 @@ public struct Endpoint {
             case messageReceived(destinationHash: Data, plaintext: Data)
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: Transport.SendFailure)
+            case linkEstablished(linkID: Data)
+            case linkDataReceived(linkID: Data, data: Data)
+            case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
+            case linkFailed(destinationHash: Data)
         }
     }
 
@@ -94,6 +101,38 @@ public struct Endpoint {
             case let .link(.element(_, .delegate(.transmit(txID, raw)))):
                 guard txID == id else { return .none }
                 return .send(.interface(.send(raw)))
+
+            case let .openLink(destinationHash):
+                guard let learned = state.transport.learned[destinationHash] else {
+                    return .send(.delegate(.linkFailed(destinationHash: destinationHash)))
+                }
+                let newID = uuid()
+                state.links.append(LinkSession.State(id: newID, initiatorTo: learned.identity,
+                                                     destinationHash: destinationHash, interfaceID: id))
+                return .send(.link(.element(id: newID, action: .establish)))
+
+            case let .sendOverLink(linkID, data):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .send(data))))
+
+            case let .closeLink(linkID):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .close)))
+
+            case let .link(.element(elementID, .delegate(.established(linkID, _)))):
+                return .send(.delegate(.linkEstablished(linkID: linkID)))
+
+            case let .link(.element(elementID, .delegate(.dataReceived(data)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data)))
+
+            case let .link(.element(elementID, .delegate(.closed(reason)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
+
+            case let .link(.element(elementID, .delegate(.establishmentFailed))):
+                guard let destHash = state.links[id: elementID]?.destinationHash else { return .none }
+                return .send(.delegate(.linkFailed(destinationHash: destHash)))
 
             case .interface, .transport, .delegate, .link:
                 return .none

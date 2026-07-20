@@ -167,6 +167,45 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.receive(\.interface.disconnect)
 }
 
+@Test @MainActor func openLinkToLearnedDestinationEmitsLinkRequest() async {
+    let (store, events) = makeStore()
+    let id = Identity()
+    let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                                     hops: 1, emitted: 1000)
+    await store.send(.connect)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+    events.yield(.data(HDLC.frame(announceRaw)))
+    await store.receive(\.transport.received)
+    await store.receive(\.delegate.pathLearned)         // destination learned
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.openLink(destinationHash: destHash))
+    await store.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
+    await store.receive { action in
+        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    #expect(store.state.links.count == 1)
+    #expect(Packet(raw: captured.value!)!.packetType == .linkRequest)
+
+    await store.send(.disconnect)
+    await store.receive(\.interface.disconnect)
+}
+
+@Test @MainActor func openLinkToUnlearnedDestinationFails() async {
+    let (store, events) = makeStore()
+    await store.send(.connect)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+    await store.send(.openLink(destinationHash: Data(repeating: 0x44, count: 16)))
+    await store.receive(.delegate(.linkFailed(destinationHash: Data(repeating: 0x44, count: 16))))
+    #expect(store.state.links.isEmpty)
+    await store.send(.disconnect)
+    await store.receive(\.interface.disconnect)
+}
+
 @Test @MainActor func inboundLinkPacketRoutesToHeldLink() async {
     // Build a responder link (as above) so the collection holds one link, then feed a link packet
     // addressed to its link_id and assert it is routed to that element.
