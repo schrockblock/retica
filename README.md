@@ -128,6 +128,18 @@ The live `TCPConnection` + `TCPClientInterface` can be pointed at a real Reticul
 
 This is the first target that runs the whole stack. A `Store<Endpoint>` connected to a real Reticulum TCP node populates its path table from real network announces.
 
+### Links in the endpoint
+
+`Endpoint` composes a collection of `LinkSession`s (`IdentifiedArrayOf` via `.forEach`). `Transport`
+recognizes link-addressed traffic and surfaces it (`delegate(.linkPacket/.linkRequest)`, bypassing
+the announce/data dedup so keepalives aren't dropped); the endpoint routes each inbound link packet
+to the matching link by `link_id`, creates a responder link on an inbound LINKREQUEST to a local
+destination, and can `openLink(destinationHash:)` to a learned destination. Link lifecycle surfaces
+as `Endpoint.delegate(.linkEstablished/.linkDataReceived/.linkClosed/.linkFailed)`, and
+`sendOverLink`/`closeLink` drive an active link. Two endpoints can establish a link, exchange data,
+and close — verified end-to-end. (Closed links remain inert in the collection; GC, multiple
+interfaces, identify/requests/resources are future work.)
+
 ### Live endpoint test (opt-in)
 
 `LiveEndpointTests` is skipped unless `RETICA_LIVE_HOST` is set. To run it against a real node (e.g. a local `rnsd` with a `TCPServerInterface`, or a testnet node):
@@ -147,7 +159,7 @@ RETICA_LIVE_HOST=127.0.0.1 RETICA_LIVE_PORT=4242 swift test --filter LiveEndpoin
 
 Transport-node relaying, path requests, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
 
-The **Link session lifecycle beyond data/close** — identify, requests, and resources — is a future slice. The cryptographic handshake primitives (`Link` namespace) are complete and cross-validated; `LinkSession` implements establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data in both directions, explicit link close, and the full time-driven watchdog (establishment timeout, keepalive 0xFF/0xFE, and inactivity teardown). Higher-level operations (identify, requests, resources) are not yet implemented, nor is `LinkSession` wired into `Transport`/`Endpoint`.
+The **Link session lifecycle beyond data/close** — identify, requests, and resources — is a future slice. The cryptographic handshake primitives (`Link` namespace) are complete and cross-validated; `LinkSession` implements establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data in both directions, explicit link close, and the full time-driven watchdog (establishment timeout, keepalive 0xFF/0xFE, and inactivity teardown). Higher-level operations (identify, requests, resources) are not yet implemented.
 
 ## Requirements
 

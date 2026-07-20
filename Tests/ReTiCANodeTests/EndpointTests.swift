@@ -248,3 +248,99 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.send(.disconnect)
     await store.receive(\.interface.disconnect)
 }
+
+@Test @MainActor func twoEndpointsEstablishLinkExchangeDataAndClose() async {
+    // Endpoint B owns a destination and announces it; Endpoint A learns it and opens a link.
+    let clock = TestClock()
+    let bIdentity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
+
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            Endpoint()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } },
+                                             close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
+    let (a, eventsA) = make("a", sentA)
+    let (b, eventsB) = make("b", sentB)
+
+    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await b.send(.registerLocalDestination(dest))
+    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+
+    // Deliver the next unconsumed frame from `from` into `to` (unframing HDLC). Returns the raw packet.
+    @discardableResult
+    func pump(from sent: LockIsolated<[Data]>, into to: AsyncStream<TCPEvent>.Continuation,
+              _ store: TestStore<Endpoint.State, Endpoint.Action>, _ idx: Int) async -> Data {
+        let framed = sent.value[idx]
+        to.yield(.data(framed))
+        await store.receive(\.transport.received)
+        return framed
+    }
+
+    // 1. B announces; A learns it.
+    await b.send(.announce(destinationHash: dest.hash, appData: nil))
+    let announceFrame = sentB.value.last!
+    eventsA.yield(.data(announceFrame))
+    await a.receive(\.transport.received)
+    await a.receive(\.delegate.pathLearned)
+
+    // 2. A opens the link → LINKREQUEST out to B.
+    await a.send(.openLink(destinationHash: dest.hash))
+    await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsB.yield(.data(sentA.value.last!))                 // LINKREQUEST → B
+    await b.receive(\.transport.received)
+    await b.receive(\.transport.delegate.linkRequest)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }  // LRPROOF out
+
+    // 3. B's LRPROOF → A → A active, emits LRRTT.
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }  // LRRTT out
+    await a.receive(\.delegate.linkEstablished)
+    #expect(a.state.links[0].status == .active)
+
+    // 4. A's LRRTT → B → B active.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    await b.receive(\.delegate.linkEstablished)
+    #expect(b.state.links[0].status == .active)
+    #expect(a.state.links[0].linkID == b.state.links[0].linkID)
+
+    // 5. A sends data over the link → B receives it.
+    let payload = Data("hello over link".utf8)
+    await a.send(.sendOverLink(linkID: a.state.links[0].linkID, data: payload))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    let gotData = LockIsolated<Data?>(nil)
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    await b.receive { action in
+        if case let .delegate(.linkDataReceived(_, d)) = action { gotData.setValue(d); return true }
+        return false
+    }
+    #expect(gotData.value == payload)
+
+    // 6. A closes the link → B observes the close.
+    await a.send(.closeLink(linkID: a.state.links[0].linkID))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive(\.delegate.linkClosed)
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    await b.receive(\.delegate.linkClosed)
+    #expect(a.state.links[0].status == .closed)
+    #expect(b.state.links[0].status == .closed)
+
+    await a.send(.disconnect); await b.send(.disconnect)
+}
