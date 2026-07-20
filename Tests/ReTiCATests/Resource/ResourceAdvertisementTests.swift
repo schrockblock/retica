@@ -37,3 +37,10 @@ private func sampleAdvertisement() -> ResourceAdvertisement {
     adv.requestID = Data(repeating: 0x9A, count: 16)
     #expect(ResourceAdvertisement.unpack(adv.pack())?.requestID == adv.requestID)
 }
+
+@Test func advertisementUnpackRejectsMalformed() {
+    #expect(ResourceAdvertisement.unpack(Data([0x01, 0x02])) == nil)          // not a msgpack map
+    #expect(ResourceAdvertisement.unpack(MsgPack.encode(.uint(5))) == nil)    // valid msgpack, not a map
+    // A map missing a required key (only "t") must be rejected.
+    #expect(ResourceAdvertisement.unpack(MsgPack.encode(.map([.init("t", .uint(1))]))) == nil)
+}

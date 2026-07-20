@@ -29,7 +29,6 @@ import Foundation
 
 @Test func swiftAdvertisementPackMatchesReference() throws {
     let f = try VectorFixtures.load()
-    let key = Data(hexString: f.resourceTokenKey)!
     let stream = Data(hexString: f.resourceStream)!
     let parts = Resource.parts(stream: stream, sdu: f.resourceSdu)
     let r = Data(hexString: f.resourceRandomHash)!
@@ -40,7 +39,6 @@ import Foundation
         segmentIndex: 0, totalSegments: 1, requestID: nil, flags: 0x01,
         hashmap: Resource.hashmap(parts: parts, randomHash: r))
     #expect(adv.pack() == Data(hexString: f.resourceAdvMsgpack))
-    _ = key
 }
 
 @Test func endToEndResourcePrimitiveRoundTrip() {
