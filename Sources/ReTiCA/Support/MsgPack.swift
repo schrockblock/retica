@@ -32,14 +32,14 @@ public enum MsgPack {
         }
     }
 
-    static func encodeUInt(_ u: UInt64) -> Data {
+    private static func encodeUInt(_ u: UInt64) -> Data {
         if u <= 0x7F { return Data([UInt8(u)]) }
         if u <= 0xFF { return Data([0xCC, UInt8(u)]) }
         if u <= 0xFFFF { return Data([0xCD]) + beBytes(UInt16(u)) }
         if u <= 0xFFFF_FFFF { return Data([0xCE]) + beBytes(UInt32(u)) }
         return Data([0xCF]) + beBytes(u)
     }
-    static func encodeBin(_ b: Data) -> Data {
+    private static func encodeBin(_ b: Data) -> Data {
         let n = b.count
         var d: Data
         if n <= 0xFF { d = Data([0xC4, UInt8(n)]) }
@@ -47,18 +47,22 @@ public enum MsgPack {
         else { d = Data([0xC6]) + beBytes(UInt32(n)) }
         d.append(b); return d
     }
-    static func encodeStr(_ s: String) -> Data {
+    private static func encodeStr(_ s: String) -> Data {
         let u = Data(s.utf8); let n = u.count
-        var d = n <= 31 ? Data([0xA0 | UInt8(n)]) : Data([0xD9, UInt8(n)])
+        var d: Data
+        if n <= 31 { d = Data([0xA0 | UInt8(n)]) }
+        else if n <= 0xFF { d = Data([0xD9, UInt8(n)]) }              // str8
+        else if n <= 0xFFFF { d = Data([0xDA]) + beBytes(UInt16(n)) } // str16
+        else { d = Data([0xDB]) + beBytes(UInt32(n)) }                // str32
         d.append(u); return d
     }
-    static func encodeMap(_ pairs: [MsgPackValue.Pair]) -> Data {
+    private static func encodeMap(_ pairs: [MsgPackValue.Pair]) -> Data {
         let n = pairs.count
         var d = n <= 15 ? Data([0x80 | UInt8(n)]) : Data([0xDE]) + beBytes(UInt16(n))
         for p in pairs { d.append(encodeStr(p.key)); d.append(encode(p.value)) }
         return d
     }
-    static func beBytes<T: FixedWidthInteger>(_ v: T) -> Data {
+    private static func beBytes<T: FixedWidthInteger>(_ v: T) -> Data {
         var be = v.bigEndian; return withUnsafeBytes(of: &be) { Data($0) }
     }
 
@@ -83,6 +87,8 @@ public enum MsgPack {
         case 0xC6: guard i + 4 < b.count else { return nil }; return bin(b, i + 5, Int(be(b, i + 1, 4)))
         case 0xA0...0xBF: return str(b, i + 1, Int(tag & 0x1F))
         case 0xD9: guard i + 1 < b.count else { return nil }; return str(b, i + 2, Int(b[i + 1]))
+        case 0xDA: guard i + 2 < b.count else { return nil }; return str(b, i + 3, Int(be(b, i + 1, 2)))
+        case 0xDB: guard i + 4 < b.count else { return nil }; return str(b, i + 5, Int(be(b, i + 1, 4)))
         case 0x80...0x8F: return parseMap(b, i + 1, Int(tag & 0x0F))
         case 0xDE: guard i + 2 < b.count else { return nil }; return parseMap(b, i + 3, Int(be(b, i + 1, 2)))
         default: return nil

@@ -57,3 +57,18 @@ import Foundation
     #expect(MsgPack.decodeValue(Data()) == nil)
     #expect(MsgPack.decodeValue(Data([0x05, 0x05])) == nil)        // trailing bytes after a value
 }
+
+@Test func msgPackEncodesLengthPrefixedForms() {
+    // bin16: 0xC5 + 2-byte BE length + data
+    let bin256 = Data(repeating: 0xEE, count: 256)
+    #expect(MsgPack.encode(.bin(bin256)) == Data([0xC5, 0x01, 0x00]) + bin256)
+    // str8: 0xD9 + 1-byte length + utf8
+    let str32 = String(repeating: "a", count: 32)
+    #expect(MsgPack.encode(.string(str32)) == Data([0xD9, 0x20]) + Data(str32.utf8))
+    // str16: 0xDA + 2-byte BE length + utf8
+    let str256 = String(repeating: "a", count: 256)
+    #expect(MsgPack.encode(.string(str256)) == Data([0xDA, 0x01, 0x00]) + Data(str256.utf8))
+    // and they round-trip
+    #expect(MsgPack.decodeValue(MsgPack.encode(.string(str256))) == .string(str256))
+    #expect(MsgPack.decodeValue(MsgPack.encode(.bin(bin256))) == .bin(bin256))
+}
