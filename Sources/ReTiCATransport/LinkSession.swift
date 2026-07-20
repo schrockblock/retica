@@ -7,7 +7,9 @@ import ReTiCA
 /// three-packet handshake (LINKREQUEST → LRPROOF → LRRTT). Interface-agnostic: raw packet
 /// bytes arrive via `received`/`acceptRequest`; outbound bytes leave via `delegate(.transmit)`.
 /// After establishment the link can carry encrypted application data (DATA/NONE) and be
-/// explicitly closed (LINKCLOSE). Timers/keepalive are a separate slice.
+/// explicitly closed (LINKCLOSE). A clock-driven watchdog times out hung handshakes, sends
+/// keepalives (initiator 0xFF / responder 0xFE) to keep active links alive, and tears down
+/// links that go silent (all via cancellable timer effects, cancelled on close).
 @Reducer
 public struct LinkSession {
     public enum Role: Equatable, Sendable { case initiator, responder }
