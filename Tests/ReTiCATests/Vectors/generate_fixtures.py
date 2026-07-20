@@ -139,6 +139,9 @@ _adv.h = res_hash; _adv.r = res_r; _adv.o = res_hash
 _adv.i = 0; _adv.l = 1; _adv.q = None; _adv.f = 0x01; _adv.m = res_hashmap
 res_adv_msgpack = _adv.pack(segment=0)
 
+# --- Resource request plaintext (single-window, hashmap not exhausted): 0x00 ‖ hash ‖ hashmap ---
+res_request_plaintext = bytes([0x00]) + res_hash + res_hashmap
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -190,4 +193,5 @@ print(json.dumps({
     "resource_map_hash0": res_map_hash0.hex(),
     "resource_proof": res_proof.hex(),
     "resource_adv_msgpack": res_adv_msgpack.hex(),
+    "resource_request_plaintext": res_request_plaintext.hex(),
 }, indent=2))

@@ -141,3 +141,45 @@ private func partPacket(_ chunk: Data) -> Data {
     #expect(got.value == data)
     #expect(store.state.status == .complete)
 }
+
+@Test @MainActor func endToEndTwoReducerResourceTransfer() async {
+    let data = Data("End-to-end resource: sender advertises, receiver requests, parts flow, proof concludes.".utf8)
+    let sender = TestStore(initialState: senderState(data)) { ResourceTransfer() }
+    sender.exhaustivity = .off
+    let receiver = TestStore(initialState: receiverState()) { ResourceTransfer() }
+    receiver.exhaustivity = .off
+
+    // 1. Sender advertises → receiver accepts → requests all parts.
+    await sender.send(.advertise)
+    let adv = (await captureTransmits(sender, count: 1))[0]
+    await receiver.send(.accept(adv))
+    let req = (await captureTransmits(receiver, count: 1))[0]
+
+    // 2. Sender processes the REQ and queues part transmits (drained; parts sourced from state).
+    await sender.send(.received(req))
+    _ = await captureTransmits(sender, count: sender.state.parts.count)
+
+    // 3. Receiver ingests parts from sender state; last part yields proof + data.
+    let partCount = sender.state.parts.count
+    let got = LockIsolated<Data?>(nil)
+    for (n, chunk) in sender.state.parts.enumerated() {
+        await receiver.send(.received(partPacket(chunk)))
+        if n == partCount - 1 {
+            let proofOut = LockIsolated<Data?>(nil)
+            await receiver.receive { action in
+                if case let .delegate(.transmit(_, raw)) = action { proofOut.setValue(raw); return true }
+                return false
+            }
+            await receiver.receive { action in
+                if case let .delegate(.received(d)) = action { got.setValue(d); return true }
+                return false
+            }
+            // 4. Proof → sender concludes.
+            await sender.send(.received(proofOut.value!))
+            await sender.receive(.delegate(.concluded))
+        }
+    }
+    #expect(got.value == data)                       // receiver reconstructed the ORIGINAL data
+    #expect(receiver.state.status == .complete)
+    #expect(sender.state.status == .complete)
+}
