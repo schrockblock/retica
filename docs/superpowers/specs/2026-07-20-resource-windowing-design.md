@@ -26,7 +26,9 @@ adaptive **window** rather than all-at-once, **retransmit** on timeout, and sign
    overall patience while transferring, and time out / retry while awaiting proof
    (`PROOF_TIMEOUT_FACTOR` = 3).
 5. **Cancellation.** `RESOURCE_ICL` (0x06, sender abort) and `RESOURCE_RCL` (0x07, receiver abort),
-   each carrying the resource hash; receiving the peer's cancel drives `.failed`.
+   each carrying the resource hash **encrypted with the link session key** (per `Packet.py`, ICL/RCL
+   fall in the "all other cases → encrypt" bucket, like ADV/REQ; only RESOURCE parts and RESOURCE_PRF
+   are plaintext); receiving the peer's cancel drives `.failed`.
 
 **Explicitly deferred (out of scope)**
 
@@ -140,12 +142,13 @@ stays `Equatable` + `Identifiable`; `ResourceWindow` and `Duration` are `Equatab
 
 ### Cancellation
 
-- **inbound `RESOURCE_ICL` (0x06)** at a receiver whose payload equals `resourceHash` → `.failed` +
-  `delegate(.failed)`, cancel watchdog.
-- **inbound `RESOURCE_RCL` (0x07)** at a sender whose payload equals `resourceHash` → `.failed` +
-  `delegate(.failed)`, cancel watchdog.
-- **`.cancel`** (external action) → emit the role's cancel packet (raw; payload = `resourceHash`;
-  `RESOURCE_RCL` for a receiver, `RESOURCE_ICL` for a sender), status `.failed`, cancel watchdog.
+- **inbound `RESOURCE_ICL` (0x06)** at a receiver → `Link.decrypt` the payload; if it equals
+  `resourceHash` → `.failed` + `delegate(.failed)`, cancel watchdog.
+- **inbound `RESOURCE_RCL` (0x07)** at a sender → `Link.decrypt` the payload; if it equals
+  `resourceHash` → `.failed` + `delegate(.failed)`, cancel watchdog.
+- **`.cancel`** (external action) → emit the role's cancel packet (payload =
+  `Link.encrypt(resourceHash)`; `RESOURCE_RCL` for a receiver, `RESOURCE_ICL` for a sender), status
+  `.failed`, cancel watchdog.
 - Local abort on retries-exhausted emits the same role cancel packet.
 
 ## Effects / timers
