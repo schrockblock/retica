@@ -109,8 +109,23 @@ public struct ResourceTransfer {
                 state.status = .advertised
                 return .send(.delegate(.transmit(state.interfaceID, raw)))
 
-            case .accept:
-                return .none   // receiver: implemented in Task 2
+            case let .accept(data):
+                guard state.role == .receiver, state.status == .idle,
+                      let packet = Packet(raw: data), packet.packetType == .data,
+                      packet.context == .resourceAdvertisement,
+                      let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                      let adv = ResourceAdvertisement.unpack(plain)
+                else { return .none }
+                state.resourceHash = adv.hash
+                state.randomHash = adv.randomHash
+                state.expectedParts = adv.numberOfParts
+                state.advertisement = adv
+                state.status = .requesting
+                let request = Data([0x00]) + adv.hash + adv.hashmap
+                guard let raw = linkPacket(.data, .resourceRequest,
+                                           Link.encrypt(request, sessionKey: state.sessionKey))
+                else { return .none }
+                return .send(.delegate(.transmit(state.interfaceID, raw)))
 
             case let .received(data):
                 guard let packet = Packet(raw: data), packet.destinationHash == state.linkID
@@ -143,6 +158,35 @@ public struct ResourceTransfer {
                     }
                     state.status = .failed
                     return .send(.delegate(.failed))
+
+                case (.receiver, .data, .resource):
+                    guard state.status == .requesting || state.status == .transferring,
+                          let adv = state.advertisement else { return .none }
+                    let chunk = packet.payload
+                    let mh = Resource.mapHash(chunk: chunk, randomHash: state.randomHash)
+                    let m = Data(adv.hashmap)
+                    var index: Int? = nil
+                    var gi = 0
+                    var j = m.startIndex
+                    while j + 4 <= m.endIndex {
+                        if Data(m[j..<(j + 4)]) == mh { index = gi; break }
+                        gi += 1; j += 4
+                    }
+                    guard let idx = index, state.receivedParts[idx] == nil else { return .none }
+                    state.receivedParts[idx] = chunk
+                    state.status = .transferring
+                    guard state.receivedParts.count == Int(state.expectedParts) else { return .none }
+                    let ordered = (0..<Int(state.expectedParts)).compactMap { state.receivedParts[$0] }
+                    guard ordered.count == Int(state.expectedParts),
+                          let out = Resource.assemble(parts: ordered, sessionKey: state.sessionKey),
+                          Resource.verify(data: out, randomHash: state.randomHash, hash: state.resourceHash)
+                    else { state.status = .failed; return .send(.delegate(.failed)) }
+                    state.status = .complete
+                    let proof = Resource.proofData(data: out, hash: state.resourceHash)
+                    guard let praw = linkPacket(.proof, .resourceProof, proof)
+                    else { return .send(.delegate(.received(out))) }
+                    return .merge(.send(.delegate(.transmit(state.interfaceID, praw))),
+                                  .send(.delegate(.received(out))))
 
                 default:
                     return .none

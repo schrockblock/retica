@@ -86,3 +86,58 @@ private func resourceRequestPacket(_ s: ResourceTransfer.State) -> Data {
     await store2.send(.received(proofPacket(s.resourceHash + Data(repeating: 0x00, count: 32))))
     await store2.receive(.delegate(.failed)) { $0.status = .failed }
 }
+
+private func receiverState() -> ResourceTransfer.State {
+    ResourceTransfer.State(receivingOn: linkID, sessionKey: key, interfaceID: InterfaceID("r"))
+}
+private func advertisementPacket(_ s: ResourceTransfer.State) -> Data {
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: .resourceAdvertisement, contextFlag: false, hops: 0,
+                   destinationHash: linkID, transportId: nil,
+                   payload: Link.encrypt(s.advertisement!.pack(), sessionKey: key))
+    return try! p.packed()
+}
+private func partPacket(_ chunk: Data) -> Data {
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: .resource, contextFlag: false, hops: 0,
+                   destinationHash: linkID, transportId: nil, payload: chunk)
+    return try! p.packed()
+}
+
+@Test @MainActor func receiverAcceptEmitsRequestForAllParts() async {
+    let data = Data(repeating: 0x33, count: 120)
+    let sender = senderState(data)
+    let store = TestStore(initialState: receiverState()) { ResourceTransfer() }
+    store.exhaustivity = .off
+    await store.send(.accept(advertisementPacket(sender))) { $0.status = .requesting }
+    let raw = (await captureTransmits(store, count: 1))[0]
+    let packet = Packet(raw: raw)!
+    #expect(packet.context == .resourceRequest)
+    let plain = Link.decrypt(packet.payload, sessionKey: key)!
+    #expect(plain == Data([0x00]) + sender.resourceHash + sender.advertisement!.hashmap)
+    #expect(store.state.expectedParts == UInt64(sender.parts.count))
+}
+
+@Test @MainActor func receiverAssemblesPartsAndProves() async {
+    let data = Data("the receiver reconstructs this exact payload from parts".utf8)
+    let sender = senderState(data)
+    let store = TestStore(initialState: receiverState()) { ResourceTransfer() }
+    store.exhaustivity = .off
+    await store.send(.accept(advertisementPacket(sender)))
+    _ = await captureTransmits(store, count: 1)   // the request
+
+    // Feed every part (in reverse to prove order-independence); the last completes the transfer.
+    let got = LockIsolated<Data?>(nil)
+    for (n, chunk) in sender.parts.enumerated().reversed() {
+        await store.send(.received(partPacket(chunk)))
+        if n == 0 {   // after the final missing part arrives
+            await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }   // the RESOURCE_PRF
+            await store.receive { action in
+                if case let .delegate(.received(d)) = action { got.setValue(d); return true }
+                return false
+            }
+        }
+    }
+    #expect(got.value == data)
+    #expect(store.state.status == .complete)
+}
