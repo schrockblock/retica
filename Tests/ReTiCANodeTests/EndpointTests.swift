@@ -153,7 +153,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.receive(\.transport.received)
     await store.receive(\.transport.delegate.linkRequest)
     await store.receive { action in
-        if case let .link(.element(_, .delegate(.transmit(_, raw)))) = action { return true }
+        if case .link(.element(_, .delegate(.transmit))) = action { return true }
         return false
     }
     await store.receive { action in
@@ -278,16 +278,6 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(dest))
     await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
-
-    // Deliver the next unconsumed frame from `from` into `to` (unframing HDLC). Returns the raw packet.
-    @discardableResult
-    func pump(from sent: LockIsolated<[Data]>, into to: AsyncStream<TCPEvent>.Continuation,
-              _ store: TestStore<Endpoint.State, Endpoint.Action>, _ idx: Int) async -> Data {
-        let framed = sent.value[idx]
-        to.yield(.data(framed))
-        await store.receive(\.transport.received)
-        return framed
-    }
 
     // 1. B announces; A learns it.
     await b.send(.announce(destinationHash: dest.hash, appData: nil))

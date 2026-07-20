@@ -119,7 +119,7 @@ public struct Endpoint {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .close)))
 
-            case let .link(.element(elementID, .delegate(.established(linkID, _)))):
+            case let .link(.element(_, .delegate(.established(linkID, _)))):
                 return .send(.delegate(.linkEstablished(linkID: linkID)))
 
             case let .link(.element(elementID, .delegate(.dataReceived(data)))):
