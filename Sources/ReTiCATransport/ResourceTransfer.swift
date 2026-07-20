@@ -116,6 +116,7 @@ public struct ResourceTransfer {
         case received(Data)
         case receiverDeadline
         case senderDeadline
+        case cancel
         case delegate(Delegate)
         public enum Delegate: Equatable {
             case transmit(InterfaceID, Data)
@@ -322,6 +323,18 @@ public struct ResourceTransfer {
                                   .send(.delegate(.transmit(state.interfaceID, praw))),
                                   .send(.delegate(.received(out))))
 
+                case (.receiver, .data, .resourceInitiatorCancel):
+                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                          Data(plain) == state.resourceHash else { return .none }
+                    state.status = .failed
+                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+
+                case (.sender, .data, .resourceReceiverCancel):
+                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                          Data(plain) == state.resourceHash else { return .none }
+                    state.status = .failed
+                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+
                 default:
                     return .none
                 }
@@ -367,6 +380,16 @@ public struct ResourceTransfer {
                 default:
                     return .none
                 }
+
+            case .cancel:
+                guard state.status != .complete, state.status != .failed else { return .none }
+                let context: PacketContext = state.role == .sender ? .resourceInitiatorCancel : .resourceReceiverCancel
+                state.status = .failed
+                let cancel = linkPacket(.data, context,
+                                        Link.encrypt(state.resourceHash, sessionKey: state.sessionKey))
+                return .merge(.cancel(id: CancelID.watchdog),
+                              cancel.map { Effect.send(.delegate(.transmit(state.interfaceID, $0))) } ?? .none,
+                              .send(.delegate(.failed)))
 
             case .delegate:
                 return .none

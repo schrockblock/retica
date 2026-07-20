@@ -285,3 +285,63 @@ private func receiverStore(_ clock: TestClock<Duration>) -> TestStore<ResourceTr
     #expect(receiver.state.status == .complete)
     #expect(sender.state.status == .complete)
 }
+
+// Encrypted cancel packet carrying the resource hash.
+private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: context, contextFlag: false, hops: 0,
+                   destinationHash: linkID, transportId: nil,
+                   payload: Link.encrypt(hash, sessionKey: key))
+    return try! p.packed()
+}
+
+@Test @MainActor func receiverFailsOnInboundInitiatorCancel() async {
+    let data = Data(repeating: 0x22, count: 100)
+    let sender = senderState(data)
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+    await store.send(.accept(advertisementPacket(sender)))
+    _ = await captureTransmits(store, count: 1)
+    await store.send(.received(cancelPacket(.resourceInitiatorCancel, sender.resourceHash)))
+    await store.receive(.delegate(.failed))
+    #expect(store.state.status == .failed)
+}
+
+@Test @MainActor func senderFailsOnInboundReceiverCancel() async {
+    let data = Data("sender aborts when the receiver rejects".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)
+    await store.send(.received(cancelPacket(.resourceReceiverCancel, store.state.resourceHash)))
+    await store.receive(.delegate(.failed))
+    #expect(store.state.status == .failed)
+}
+
+@Test @MainActor func externalCancelEmitsReceiverCancelPacket() async {
+    let data = Data(repeating: 0x77, count: 100)
+    let sender = senderState(data)
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+    await store.send(.accept(advertisementPacket(sender)))
+    _ = await captureTransmits(store, count: 1)
+    await store.send(.cancel)
+    let raw = (await captureTransmits(store, count: 1))[0]
+    let p = Packet(raw: raw)!
+    #expect(p.context == .resourceReceiverCancel)
+    #expect(Link.decrypt(p.payload, sessionKey: key) == sender.resourceHash)
+    #expect(store.state.status == .failed)
+}
+
+@Test @MainActor func inboundCancelWithWrongHashIsIgnored() async {
+    let data = Data(repeating: 0x22, count: 100)
+    let sender = senderState(data)
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+    await store.send(.accept(advertisementPacket(sender)))
+    _ = await captureTransmits(store, count: 1)
+    await store.send(.received(cancelPacket(.resourceInitiatorCancel, Data(repeating: 0xEE, count: 32))))
+    #expect(store.state.status != .failed)
+    // Cleanup: cancel to a terminal state.
+    await store.send(.cancel); _ = await captureTransmits(store, count: 1)
+}
