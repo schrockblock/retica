@@ -21,6 +21,7 @@ public struct LinkSession {
 
     @ObservableState
     public struct State: Equatable {
+        public let id: UUID
         public var role: Role
         public var status: Status
         public var interfaceID: InterfaceID
@@ -40,9 +41,10 @@ public struct LinkSession {
         var staleTime: TimeInterval { keepaliveInterval * 2 }
 
         /// Initiator: link to a known destination identity.
-        public init(initiatorTo destinationIdentity: Identity, destinationHash: Data,
+        public init(id: UUID = UUID(), initiatorTo destinationIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
                     establishmentTimeout: TimeInterval = 15, keepaliveInterval: TimeInterval = 30) {
+            self.id = id
             self.role = .initiator
             self.status = .pending
             self.interfaceID = interfaceID
@@ -62,9 +64,10 @@ public struct LinkSession {
         }
 
         /// Responder: accept links for a destination owned by `owningIdentity`.
-        public init(responderFor owningIdentity: Identity, destinationHash: Data,
+        public init(id: UUID = UUID(), responderFor owningIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
                     establishmentTimeout: TimeInterval = 15, keepaliveInterval: TimeInterval = 30) {
+            self.id = id
             self.role = .responder
             self.status = .pending
             self.interfaceID = interfaceID
@@ -299,3 +302,5 @@ public struct LinkSession {
         }
     }
 }
+
+extension LinkSession.State: Identifiable {}

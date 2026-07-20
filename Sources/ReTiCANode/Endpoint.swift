@@ -12,6 +12,7 @@ public struct Endpoint {
     public struct State: Equatable {
         public var interface: TCPClientInterface.State
         public var transport: Transport.State
+        public var links: IdentifiedArrayOf<LinkSession.State> = []
         public let interfaceID: InterfaceID
 
         public init(host: String, port: UInt16, reconnectOnDrop: Bool = true,
@@ -26,6 +27,7 @@ public struct Endpoint {
     public enum Action: Equatable {
         case interface(TCPClientInterface.Action)
         case transport(Transport.Action)
+        case link(IdentifiedActionOf<LinkSession>)
 
         case connect
         case disconnect
@@ -44,9 +46,12 @@ public struct Endpoint {
 
     public init() {}
 
+    @Dependency(\.uuid) var uuid
+
     public var body: some ReducerOf<Self> {
         Scope(state: \.interface, action: \.interface) { TCPClientInterface() }
         Scope(state: \.transport, action: \.transport) { Transport() }
+        .forEach(\.links, action: \.link) { LinkSession() }
         Reduce { state, action in
             let id = state.interfaceID
             switch action {
@@ -73,7 +78,24 @@ public struct Endpoint {
             case let .transport(.delegate(.sendFailed(h, r))):
                 return .send(.delegate(.sendFailed(destinationHash: h, reason: r)))
 
-            case .interface, .transport, .delegate:
+            case let .transport(.delegate(.linkPacket(linkID, data))):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .received(data))))
+
+            case let .transport(.delegate(.linkRequest(destHash, data))):
+                guard let owner = state.transport.localDestinations[destHash]?.identity,
+                      owner.privateKey != nil
+                else { return .none }
+                let newID = uuid()
+                state.links.append(LinkSession.State(id: newID, responderFor: owner,
+                                                     destinationHash: destHash, interfaceID: id))
+                return .send(.link(.element(id: newID, action: .acceptRequest(data))))
+
+            case let .link(.element(_, .delegate(.transmit(txID, raw)))):
+                guard txID == id else { return .none }
+                return .send(.interface(.send(raw)))
+
+            case .interface, .transport, .delegate, .link:
                 return .none
             }
         }

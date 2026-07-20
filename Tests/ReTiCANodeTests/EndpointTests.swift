@@ -34,6 +34,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         $0.tcpConnection = TCPConnection(open: { _, _ in events.stream }, send: { _ in }, close: { })
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
     }
     store.exhaustivity = .off
     return (store, events.continuation)
@@ -128,6 +129,83 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
     await store.send(.send(destinationHash: destHash, plaintext: Data("x".utf8)))
     await store.receive(.delegate(.sendFailed(destinationHash: destHash, reason: .notLearned)))
+    await store.send(.disconnect)
+    await store.receive(\.interface.disconnect)
+}
+
+@Test @MainActor func inboundLinkRequestCreatesResponderAndEmitsProof() async {
+    let (store, events) = makeStore()
+    let owner = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: owner)!
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.connect)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+
+    // Craft an inbound LINKREQUEST to our local destination.
+    let initEph = Identity()
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: dest.hash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    let captured = LockIsolated<Data?>(nil)   // the LRPROOF bytes sent to the interface
+    events.yield(.data(HDLC.frame(try! request.packed())))
+    await store.receive(\.transport.received)
+    await store.receive(\.transport.delegate.linkRequest)
+    await store.receive { action in
+        if case let .link(.element(_, .delegate(.transmit(_, raw)))) = action { return true }
+        return false
+    }
+    await store.receive { action in
+        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    #expect(store.state.links.count == 1)
+    #expect(Packet(raw: captured.value!)!.packetType == .proof)
+
+    await store.send(.disconnect)
+    await store.receive(\.interface.disconnect)
+}
+
+@Test @MainActor func inboundLinkPacketRoutesToHeldLink() async {
+    // Build a responder link (as above) so the collection holds one link, then feed a link packet
+    // addressed to its link_id and assert it is routed to that element.
+    let (store, events) = makeStore()
+    let owner = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: owner)!
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.connect)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+
+    let initEph = Identity()
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: dest.hash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    events.yield(.data(HDLC.frame(try! request.packed())))
+    await store.receive(\.transport.received)
+    await store.receive(\.transport.delegate.linkRequest)
+    await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
+    await store.receive { if case .interface(.send) = $0 { return true }; return false }
+    let linkID = store.state.links[0].linkID
+    #expect(store.state.links[0].status == .handshake)
+
+    // Feed a garbage link-data packet addressed to this link_id; it must route to the element
+    // (which will fail to decrypt and stay in .handshake — the point is the routing, not the payload).
+    let linkPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                            destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                            destinationHash: linkID, transportId: nil, payload: Data(repeating: 0xEE, count: 48))
+    let routed = LockIsolated(false)
+    events.yield(.data(HDLC.frame(try! linkPacket.packed())))
+    await store.receive(\.transport.received)
+    await store.receive(\.transport.delegate.linkPacket)
+    await store.receive { action in
+        if case let .link(.element(_, .received(d))) = action { routed.setValue(d == (try! linkPacket.packed())); return true }
+        return false
+    }
+    #expect(routed.value == true)
+
     await store.send(.disconnect)
     await store.receive(\.interface.disconnect)
 }
