@@ -160,6 +160,25 @@ genuine `ResourceAdvertisement.pack`). Multi-segment resources, compression, and
 machine (advertise → request → send → assemble → prove, with windowing/retransmission) are future
 slices, as is wiring resources over a live `LinkSession`.
 
+### Resource transfer (`ResourceTransfer`)
+
+`ResourceTransfer` (in `ReTiCATransport`) drives a single-segment Reticulum resource transfer over
+a link's session key, as a TCA reducer with a sender and a receiver role:
+
+- **Sender:** `advertise` emits a `RESOURCE_ADV` (the encrypted `ResourceAdvertisement`); on a
+  `RESOURCE_REQ` it sends the requested `RESOURCE` part-packets (raw ciphertext chunks); on the
+  `RESOURCE_PRF` proof it validates and reaches `.complete` (`delegate(.concluded)`).
+- **Receiver:** `accept` decrypts+unpacks the advertisement and requests all parts in one
+  `RESOURCE_REQ` (`0x00 ‖ hash ‖ hashmap`); as `RESOURCE` parts arrive it places each by map-hash,
+  and when all are in, reassembles + verifies the data, emits the `RESOURCE_PRF` proof, and surfaces
+  the reconstructed data via `delegate(.received(_:))`.
+
+Two `ResourceTransfer` reducers sharing a session key complete a transfer end-to-end. The
+control-packet formats and their encryption status (`RESOURCE_ADV`/`RESOURCE_REQ` encrypted;
+`RESOURCE` parts and `RESOURCE_PRF` raw) are wire-compatible with Python-RNS 1.3.8. Windowing,
+retransmission, hashmap-update, cancel/reject, multi-segment, compression, and wiring
+`ResourceTransfer` into `LinkSession`/`Endpoint` are future slices.
+
 ### Live endpoint test (opt-in)
 
 `LiveEndpointTests` is skipped unless `RETICA_LIVE_HOST` is set. To run it against a real node (e.g. a local `rnsd` with a `TCPServerInterface`, or a testnet node):
