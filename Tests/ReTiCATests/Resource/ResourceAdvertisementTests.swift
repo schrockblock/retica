@@ -1,0 +1,39 @@
+import Testing
+import Foundation
+@testable import ReTiCA
+
+private func sampleAdvertisement() -> ResourceAdvertisement {
+    ResourceAdvertisement(
+        transferSize: 40, dataSize: 20, numberOfParts: 1,
+        hash: Data(repeating: 0x11, count: 32), randomHash: Data(repeating: 0x22, count: 4),
+        originalHash: Data(repeating: 0x11, count: 32), segmentIndex: 0, totalSegments: 1,
+        requestID: nil, flags: 0x01, hashmap: Data(repeating: 0x33, count: 4))
+}
+
+@Test func advertisementPacksToReferenceBytes() {
+    // umsgpack.packb of {t:40,d:20,n:1,h:0x11*32,r:0x22*4,o:0x11*32,i:0,l:1,q:None,f:1,m:0x33*4}
+    let expected = Data(hexString:
+        "8ba17428a16414a16e01a168c420" + String(repeating: "11", count: 32) +
+        "a172c40422222222a16fc420" + String(repeating: "11", count: 32) +
+        "a16900a16c01a171c0a16601a16dc40433333333")!
+    #expect(sampleAdvertisement().pack() == expected)
+}
+
+@Test func advertisementRoundTrips() {
+    let adv = sampleAdvertisement()
+    #expect(ResourceAdvertisement.unpack(adv.pack()) == adv)
+}
+
+@Test func advertisementFlagAccessors() {
+    var adv = sampleAdvertisement()
+    #expect(adv.isEncrypted == true && adv.isCompressed == false && adv.isRequest == false)
+    adv.flags = 0b0011_1110   // meta+response+request+split+compressed, not encrypted
+    #expect(adv.hasMetadata && adv.isResponse && adv.isRequest && adv.isSplit && adv.isCompressed)
+    #expect(adv.isEncrypted == false)
+}
+
+@Test func advertisementUnpackWithRequestID() {
+    var adv = sampleAdvertisement()
+    adv.requestID = Data(repeating: 0x9A, count: 16)
+    #expect(ResourceAdvertisement.unpack(adv.pack())?.requestID == adv.requestID)
+}
