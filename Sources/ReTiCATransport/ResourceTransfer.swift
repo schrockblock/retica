@@ -115,6 +115,7 @@ public struct ResourceTransfer {
         case accept(Data)
         case received(Data)
         case receiverDeadline
+        case senderDeadline
         case delegate(Delegate)
         public enum Delegate: Equatable {
             case transmit(InterfaceID, Data)
@@ -163,6 +164,32 @@ public struct ResourceTransfer {
                 }.cancellable(id: CancelID.watchdog, cancelInFlight: true)
             }
 
+            func armSenderWatchdog(_ s: State) -> Effect<Action> {
+                let timeout: Duration
+                switch s.status {
+                case .advertised:
+                    timeout = s.rtt * Const.partTimeoutFactor + Const.processingGrace
+                case .transferring:
+                    timeout = s.rtt * Const.partTimeoutFactor * Const.maxRetries + Const.senderGrace
+                case .awaitingProof:
+                    timeout = s.rtt * Const.proofTimeoutFactor + Const.senderGrace
+                default:
+                    return .none
+                }
+                let c = clock
+                return .run { send in
+                    try await c.sleep(for: timeout)
+                    await send(.senderDeadline)
+                }.cancellable(id: CancelID.watchdog, cancelInFlight: true)
+            }
+
+            func senderCancel(_ s: State) -> Effect<Action> {
+                guard let icl = linkPacket(.data, .resourceInitiatorCancel,
+                                           Link.encrypt(s.resourceHash, sessionKey: s.sessionKey))
+                else { return .none }
+                return .send(.delegate(.transmit(s.interfaceID, icl)))
+            }
+
             func requestNextWindow(_ s: inout State) -> Effect<Action> {
                 let received = Set(s.receivedParts.keys)
                 let req = Resource.nextWindowRequest(
@@ -190,7 +217,7 @@ public struct ResourceTransfer {
                                            Link.encrypt(adv.pack(), sessionKey: state.sessionKey))
                 else { return .none }
                 state.status = .advertised
-                return .send(.delegate(.transmit(state.interfaceID, raw)))
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), armSenderWatchdog(state))
 
             case let .accept(data):
                 guard state.role == .receiver, state.status == .idle,
@@ -220,6 +247,7 @@ public struct ResourceTransfer {
                           Data(p[(p.startIndex + 1)..<(p.startIndex + 33)]) == state.resourceHash
                     else { return .none }
                     state.status = .transferring
+                    state.retriesLeft = Const.maxRetries
                     let reqHashes = Data(p.dropFirst(33))
                     var effects: [Effect<Action>] = []
                     var i = reqHashes.startIndex
@@ -227,19 +255,24 @@ public struct ResourceTransfer {
                         let mh = Data(reqHashes[i..<(i + 4)])
                         if let idx = state.partMapHashes.firstIndex(of: mh),
                            let raw = linkPacket(.data, .resource, state.parts[idx]) {
+                            state.sentIndices.insert(idx)
                             effects.append(.send(.delegate(.transmit(state.interfaceID, raw))))
                         }
                         i += 4
                     }
+                    if state.sentIndices.count == state.parts.count {
+                        state.status = .awaitingProof
+                    }
+                    effects.append(armSenderWatchdog(state))
                     return .merge(effects)
 
                 case (.sender, .proof, .resourceProof):
                     if Resource.validateProof(proofData: packet.payload, expectedProof: state.expectedProof) {
                         state.status = .complete
-                        return .send(.delegate(.concluded))
+                        return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.concluded)))
                     }
                     state.status = .failed
-                    return .send(.delegate(.failed))
+                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
 
                 case (.receiver, .data, .resource):
                     guard state.status == .requesting || state.status == .transferring,
@@ -307,6 +340,33 @@ public struct ResourceTransfer {
                 state.window = state.window.shrunk()
                 state.retriesLeft -= 1
                 return requestNextWindow(&state)
+
+            case .senderDeadline:
+                guard state.role == .sender else { return .none }
+                switch state.status {
+                case .advertised:
+                    guard state.advRetriesLeft > 0, let adv = state.advertisement,
+                          let raw = linkPacket(.data, .resourceAdvertisement,
+                                               Link.encrypt(adv.pack(), sessionKey: state.sessionKey))
+                    else {
+                        state.status = .failed
+                        return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed)))
+                    }
+                    state.advRetriesLeft -= 1
+                    return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), armSenderWatchdog(state))
+                case .transferring:
+                    state.status = .failed
+                    return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed)))
+                case .awaitingProof:
+                    guard state.proofRetriesLeft > 0 else {
+                        state.status = .failed
+                        return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed)))
+                    }
+                    state.proofRetriesLeft -= 1
+                    return armSenderWatchdog(state)
+                default:
+                    return .none
+                }
 
             case .delegate:
                 return .none

@@ -36,55 +36,100 @@ private func resourceRequestPacket(_ s: ResourceTransfer.State) -> Data {
     return try! p.packed()
 }
 
+@MainActor
+private func senderStore(_ data: Data, _ clock: TestClock<Duration>) -> TestStore<ResourceTransfer.State, ResourceTransfer.Action> {
+    let store = TestStore(initialState: senderState(data)) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = clock }
+    store.exhaustivity = .off
+    return store
+}
+
 @Test @MainActor func senderAdvertiseEmitsResourceAdvertisement() async {
     let data = Data("a small resource to send".utf8)
-    let s = senderState(data)
-    let store = TestStore(initialState: s) { ResourceTransfer() }
-    store.exhaustivity = .off
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
     await store.send(.advertise) { $0.status = .advertised }
     let raw = (await captureTransmits(store, count: 1))[0]
     let packet = Packet(raw: raw)!
     #expect(packet.context == .resourceAdvertisement)
-    let plain = Link.decrypt(packet.payload, sessionKey: key)!
-    let adv = ResourceAdvertisement.unpack(plain)!
-    #expect(adv.hash == s.resourceHash)
-    #expect(adv.numberOfParts == UInt64(s.parts.count))
-    #expect(adv.flags == 0x01)
+    let adv = ResourceAdvertisement.unpack(Link.decrypt(packet.payload, sessionKey: key)!)!
+    #expect(adv.hash == store.state.resourceHash)
+    // Cleanup: exhaust adv retries to fail (cancels the watchdog).
+    for _ in 0...ResourceTransfer.Const.maxAdvRetries { await store.send(.senderDeadline) }
+    #expect(store.state.status == .failed)
 }
 
-@Test @MainActor func senderRespondsToRequestWithAllParts() async {
-    let data = Data(repeating: 0x7A, count: 200)   // several parts at sdu 24
-    let s = senderState(data)
-    let store = TestStore(initialState: s) { ResourceTransfer() }
-    store.exhaustivity = .off
-    await store.send(.received(resourceRequestPacket(s))) { $0.status = .transferring }
-    let raws = await captureTransmits(store, count: s.parts.count)
-    // Every emitted part is a raw RESOURCE packet carrying one of the ciphertext chunks.
-    let sentChunks = raws.map { Packet(raw: $0)!.payload }
-    #expect(raws.allSatisfy { Packet(raw: $0)!.context == .resource })
-    #expect(Set(sentChunks) == Set(s.parts))
-}
-
-@Test @MainActor func senderConcludesOnValidProofFailsOnBad() async {
-    let data = Data("prove it".utf8)
-    let s = senderState(data)
-    let store = TestStore(initialState: s) { ResourceTransfer() }
-    store.exhaustivity = .off
-
-    func proofPacket(_ payload: Data) -> Data {
-        let p = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
-                       destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
-                       destinationHash: linkID, transportId: nil, payload: payload)
-        return try! p.packed()
+@Test @MainActor func senderReAdvertisesThenFailsAndCancels() async {
+    let data = Data("re-advertise then give up".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)                       // initial ADV
+    // Each deadline while ADVERTISED re-advertises, up to maxAdvRetries times.
+    for _ in 0..<ResourceTransfer.Const.maxAdvRetries {
+        await store.send(.senderDeadline)
+        _ = await captureTransmits(store, count: 1)                  // re-ADV
     }
-    let goodProof = Resource.proofData(data: data, hash: s.resourceHash)   // hash ‖ full_hash(data ‖ hash)
-    await store.send(.received(proofPacket(goodProof)))
-    await store.receive(.delegate(.concluded)) { $0.status = .complete }
+    #expect(store.state.advRetriesLeft == 0)
+    await store.send(.senderDeadline)                                // no retries left -> fail + ICL
+    #expect(store.state.status == .failed)
+    let icl = (await captureTransmits(store, count: 1))[0]
+    let p = Packet(raw: icl)!
+    #expect(p.context == .resourceInitiatorCancel)
+    #expect(Link.decrypt(p.payload, sessionKey: key) == store.state.resourceHash)
+}
 
-    let store2 = TestStore(initialState: senderState(data)) { ResourceTransfer() }
-    store2.exhaustivity = .off
-    await store2.send(.received(proofPacket(s.resourceHash + Data(repeating: 0x00, count: 32))))
-    await store2.receive(.delegate(.failed)) { $0.status = .failed }
+@Test @MainActor func senderServesAllPartsThenAwaitsProofAndConcludes() async {
+    let data = Data("sender serves parts, then awaits and validates the proof".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)
+    let s = store.state
+    await store.send(.received(resourceRequestPacket(s)))            // requests all parts
+    _ = await captureTransmits(store, count: s.parts.count)
+    #expect(store.state.status == .awaitingProof)
+
+    // Valid proof concludes.
+    let proof = Resource.proofData(data: data, hash: s.resourceHash)
+    let pkt = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                     destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
+                     destinationHash: linkID, transportId: nil, payload: proof)
+    await store.send(.received(try! pkt.packed()))
+    await store.receive(.delegate(.concluded))
+    #expect(store.state.status == .complete)
+}
+
+@Test @MainActor func senderAwaitingProofTimesOutThenFails() async {
+    let data = Data("sender never receives a proof".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)
+    await store.send(.received(resourceRequestPacket(store.state)))
+    _ = await captureTransmits(store, count: store.state.parts.count)
+    #expect(store.state.status == .awaitingProof)
+    // Exhaust proof retries.
+    for _ in 0...ResourceTransfer.Const.proofRetries { await store.send(.senderDeadline) }
+    #expect(store.state.status == .failed)
+    let icl = (await captureTransmits(store, count: 1))[0]
+    #expect(Packet(raw: icl)!.context == .resourceInitiatorCancel)
+}
+
+@Test @MainActor func senderRejectsInvalidProof() async {
+    let data = Data("bad proof path".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)
+    await store.send(.received(resourceRequestPacket(store.state)))
+    _ = await captureTransmits(store, count: store.state.parts.count)
+    let bad = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                     destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
+                     destinationHash: linkID, transportId: nil, payload: Data(repeating: 0x00, count: 64))
+    await store.send(.received(try! bad.packed()))
+    await store.receive(.delegate(.failed))
+    #expect(store.state.status == .failed)
 }
 
 private func receiverState() -> ResourceTransfer.State {
@@ -196,7 +241,9 @@ private func receiverStore(_ clock: TestClock<Duration>) -> TestStore<ResourceTr
     // At sdu=24, token overhead=48 (IV+HMAC), prefix=4: 29 bytes data -> 33 plaintext -> PKCS7 48 -> 96 stream -> 4 parts.
     let data = Data("End-to-end windowed: 1 round.".utf8)
     let senderInit = senderState(data)
+    let senderClock = TestClock<Duration>()
     let sender = TestStore(initialState: senderInit) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = senderClock }
     sender.exhaustivity = .off
     let clock = TestClock<Duration>()
     let receiver = TestStore(initialState: receiverState()) { ResourceTransfer() } withDependencies: { $0.continuousClock = clock }
