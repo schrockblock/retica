@@ -12,7 +12,10 @@ import ReTiCA
 public struct LinkSession {
     public enum Role: Equatable, Sendable { case initiator, responder }
     public enum Status: Equatable, Sendable { case pending, handshake, active, closed }
-    public enum CloseReason: Equatable, Sendable { case initiatorClosed, destinationClosed }
+    public enum CloseReason: Equatable, Sendable { case initiatorClosed, destinationClosed, timedOut }
+
+    static let keepaliveByte: UInt8 = 0xFF
+    static let keepaliveReplyByte: UInt8 = 0xFE
 
     @ObservableState
     public struct State: Equatable {
@@ -28,10 +31,16 @@ public struct LinkSession {
         public var sessionKey: Data
         public var requestedAt: Double?
         public var rtt: Double?
+        public var activatedAt: Double?
+        public var lastInbound: Double?
+        public var establishmentTimeout: TimeInterval
+        public var keepaliveInterval: TimeInterval
+        var staleTime: TimeInterval { keepaliveInterval * 2 }
 
         /// Initiator: link to a known destination identity.
         public init(initiatorTo destinationIdentity: Identity, destinationHash: Data,
-                    interfaceID: InterfaceID, ephemeral: Identity = Identity()) {
+                    interfaceID: InterfaceID, ephemeral: Identity = Identity(),
+                    establishmentTimeout: TimeInterval = 15, keepaliveInterval: TimeInterval = 30) {
             self.role = .initiator
             self.status = .pending
             self.interfaceID = interfaceID
@@ -44,11 +53,16 @@ public struct LinkSession {
             self.sessionKey = Data()
             self.requestedAt = nil
             self.rtt = nil
+            self.activatedAt = nil
+            self.lastInbound = nil
+            self.establishmentTimeout = establishmentTimeout
+            self.keepaliveInterval = keepaliveInterval
         }
 
         /// Responder: accept links for a destination owned by `owningIdentity`.
         public init(responderFor owningIdentity: Identity, destinationHash: Data,
-                    interfaceID: InterfaceID, ephemeral: Identity = Identity()) {
+                    interfaceID: InterfaceID, ephemeral: Identity = Identity(),
+                    establishmentTimeout: TimeInterval = 15, keepaliveInterval: TimeInterval = 30) {
             self.role = .responder
             self.status = .pending
             self.interfaceID = interfaceID
@@ -61,6 +75,10 @@ public struct LinkSession {
             self.sessionKey = Data()
             self.requestedAt = nil
             self.rtt = nil
+            self.activatedAt = nil
+            self.lastInbound = nil
+            self.establishmentTimeout = establishmentTimeout
+            self.keepaliveInterval = keepaliveInterval
         }
     }
 
@@ -70,6 +88,9 @@ public struct LinkSession {
         case received(Data)
         case send(Data)
         case close
+        case establishmentDeadline
+        case keepaliveDeadline
+        case inactivityDeadline
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -82,11 +103,32 @@ public struct LinkSession {
     }
 
     @Dependency(\.date) var date
+    @Dependency(\.continuousClock) var clock
+
+    private enum CancelID: Hashable { case establishment, keepalive, inactivity }
 
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { state, action in
+        Reduce { [date, clock] state, action in
+            func establishmentTimer(_ t: TimeInterval) -> Effect<Action> {
+                .run { send in try await clock.sleep(for: .seconds(t)); await send(.establishmentDeadline) }
+                    .cancellable(id: CancelID.establishment, cancelInFlight: true)
+            }
+            func inactivityTimer(_ t: TimeInterval) -> Effect<Action> {
+                .run { send in try await clock.sleep(for: .seconds(t)); await send(.inactivityDeadline) }
+                    .cancellable(id: CancelID.inactivity, cancelInFlight: true)
+            }
+            let cancelAll = Effect<Action>.merge(.cancel(id: CancelID.establishment),
+                                                 .cancel(id: CancelID.keepalive),
+                                                 .cancel(id: CancelID.inactivity))
+            func linkPacket(_ linkID: Data, _ context: PacketContext, _ payload: Data) -> Data? {
+                let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                               destinationType: .link, context: context, contextFlag: false, hops: 0,
+                               destinationHash: linkID, transportId: nil, payload: payload)
+                return try? p.packed()
+            }
+
             switch action {
             case .establish:
                 guard state.role == .initiator, state.status == .pending, state.linkID.isEmpty
@@ -101,7 +143,7 @@ public struct LinkSession {
                 state.requestedAt = date.now.timeIntervalSince1970
                 guard let raw = try? packet.packed() else { return .none }
                 let id = state.interfaceID
-                return .send(.delegate(.transmit(id, raw)))
+                return .merge(.send(.delegate(.transmit(id, raw))), establishmentTimer(state.establishmentTimeout))
 
             case let .acceptRequest(data):
                 guard state.role == .responder, state.status == .pending,
@@ -127,11 +169,12 @@ public struct LinkSession {
                                        destinationHash: linkID, transportId: nil, payload: proof)
                 guard let raw = try? packetOut.packed() else { return .none }
                 let id = state.interfaceID
-                return .send(.delegate(.transmit(id, raw)))
+                return .merge(.send(.delegate(.transmit(id, raw))), establishmentTimer(state.establishmentTimeout))
 
             case let .received(data):
                 guard let packet = Packet(raw: data), packet.destinationHash == state.linkID
                 else { return .none }
+                let now = date.now.timeIntervalSince1970
                 switch (state.role, state.status, packet.packetType, packet.context) {
                 case (.initiator, .pending, .proof, .linkRequestProof):
                     guard let destID = state.destinationIdentity,
@@ -146,20 +189,18 @@ public struct LinkSession {
                     state.peerX25519Pub = peerPub
                     state.sessionKey = key
                     state.status = .active
-                    let now = date.now.timeIntervalSince1970
+                    state.activatedAt = now
+                    state.lastInbound = now
                     let rtt = now - (state.requestedAt ?? now)
                     state.rtt = rtt
                     let cipher = Link.encrypt(MsgPack.encode(rtt), sessionKey: key)
-                    let rttPacket = Packet(headerType: .header1, packetType: .data,
-                                           transportType: .broadcast, destinationType: .link,
-                                           context: .linkRequestRTT, contextFlag: false, hops: 0,
-                                           destinationHash: state.linkID, transportId: nil,
-                                           payload: cipher)
-                    let id = state.interfaceID
-                    let established = Action.delegate(.established(linkID: state.linkID,
-                                                                  sessionKey: key))
-                    guard let raw = try? rttPacket.packed() else { return .send(established) }
-                    return .merge(.send(.delegate(.transmit(id, raw))), .send(established))
+                    let established = Action.delegate(.established(linkID: state.linkID, sessionKey: key))
+                    let extra = Effect<Action>.merge(.cancel(id: CancelID.establishment),
+                                                     inactivityTimer(state.staleTime))
+                    guard let raw = linkPacket(state.linkID, .linkRequestRTT, cipher) else {
+                        return .merge(.send(established), extra)
+                    }
+                    return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(established), extra)
 
                 case (.responder, .handshake, .data, .linkRequestRTT):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
@@ -167,8 +208,10 @@ public struct LinkSession {
                     else { return .send(.delegate(.establishmentFailed)) }
                     state.rtt = rtt
                     state.status = .active
-                    return .send(.delegate(.established(linkID: state.linkID,
-                                                        sessionKey: state.sessionKey)))
+                    state.activatedAt = now
+                    state.lastInbound = now
+                    return .merge(.send(.delegate(.established(linkID: state.linkID, sessionKey: state.sessionKey))),
+                                  .cancel(id: CancelID.establishment), inactivityTimer(state.staleTime))
 
                 case (_, .active, .data, .none):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey)
@@ -181,7 +224,7 @@ public struct LinkSession {
                     else { return .none }
                     state.status = .closed
                     let reason: CloseReason = state.role == .initiator ? .destinationClosed : .initiatorClosed
-                    return .send(.delegate(.closed(reason)))
+                    return .merge(.send(.delegate(.closed(reason))), cancelAll)
 
                 default:
                     return .none
@@ -200,15 +243,31 @@ public struct LinkSession {
             case .close:
                 guard state.status == .active else { return .none }
                 let cipher = Link.encrypt(state.linkID, sessionKey: state.sessionKey)
-                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
-                                    destinationType: .link, context: .linkClose, contextFlag: false, hops: 0,
-                                    destinationHash: state.linkID, transportId: nil, payload: cipher)
                 state.status = .closed
                 let reason: CloseReason = state.role == .initiator ? .initiatorClosed : .destinationClosed
                 let closedAction = Action.delegate(.closed(reason))
-                guard let raw = try? packet.packed() else { return .send(closedAction) }
-                let id = state.interfaceID
-                return .merge(.send(.delegate(.transmit(id, raw))), .send(closedAction))
+                guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
+                    return .merge(.send(closedAction), cancelAll)
+                }
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll)
+
+            case .establishmentDeadline:
+                guard state.status == .pending || state.status == .handshake else { return .none }
+                state.status = .closed
+                return .merge(.send(.delegate(.closed(.timedOut))), cancelAll)
+
+            case .keepaliveDeadline:
+                return .none   // implemented in Task 2
+
+            case .inactivityDeadline:
+                guard state.status == .active else { return .none }
+                let cipher = Link.encrypt(state.linkID, sessionKey: state.sessionKey)
+                state.status = .closed
+                let closedAction = Action.delegate(.closed(.timedOut))
+                guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
+                    return .merge(.send(closedAction), cancelAll)
+                }
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll)
 
             case .delegate:
                 return .none
