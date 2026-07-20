@@ -17,14 +17,22 @@ private func senderState(_ data: Data, sdu: Int = 24) -> ResourceTransfer.State 
 @MainActor
 private func captureTransmits(_ store: TestStore<ResourceTransfer.State, ResourceTransfer.Action>,
                               count: Int) async -> [Data] {
-    let captured = LockIsolated<[Data]>([])
+    // The predicate must be pure (no side effects): TCA's TestStore calls it multiple times per
+    // matched action (for async polling, contains-check, while-loop guard, and final guard).
+    // Capture using a separate LockIsolated per iteration so each iteration appends exactly once.
+    var captured: [Data] = []
     for _ in 0..<count {
+        let slot = LockIsolated<Data?>(nil)
         await store.receive { action in
-            if case let .delegate(.transmit(_, raw)) = action { captured.withValue { $0.append(raw) }; return true }
+            if case let .delegate(.transmit(_, raw)) = action {
+                slot.withValue { if $0 == nil { $0 = raw } }  // set once; idempotent on re-calls
+                return true
+            }
             return false
         }
+        if let raw = slot.value { captured.append(raw) }
     }
-    return captured.value
+    return captured
 }
 
 // Build a RESOURCE_REQ packet asking for all parts of `s`.
@@ -236,53 +244,78 @@ private func receiverStore(_ clock: TestClock<Duration>) -> TestStore<ResourceTr
     #expect(Link.decrypt(p.payload, sessionKey: key) == sender.resourceHash)
 }
 
-@Test @MainActor func endToEndTwoReducerResourceTransfer() async {
-    // Use data that fits in a single window (≤4 parts at sdu:24) to keep the end-to-end routing simple.
-    // At sdu=24, token overhead=48 (IV+HMAC), prefix=4: 29 bytes data -> 33 plaintext -> PKCS7 48 -> 96 stream -> 4 parts.
-    let data = Data("End-to-end windowed: 1 round.".utf8)
-    let senderInit = senderState(data)
+@Test @MainActor func endToEndWindowedTransferWithADroppedPart() async {
+    // 142-byte payload → 9 parts at sdu=24 (stream = 208 bytes).
+    // Window starts at 4, so the transfer spans at least 3 rounds (4 + 3 + 3 = 10 > 9 part slots),
+    // and a dropped part forces a timeout+retransmit, proving all four required properties:
+    //   1. receiver reconstructs EXACT original data; 2. both sides reach .complete;
+    //   3. window advances across multiple rounds; 4. dropped part recovered via retransmission.
+    let data = Data("End-to-end windowed resource transfer with retransmission of a dropped part, spanning multiple request rounds so the window actually advances.".utf8)
     let senderClock = TestClock<Duration>()
-    let sender = TestStore(initialState: senderInit) { ResourceTransfer() }
+    let receiverClock = TestClock<Duration>()
+    let sender = TestStore(initialState: senderState(data)) { ResourceTransfer() }
         withDependencies: { $0.continuousClock = senderClock }
     sender.exhaustivity = .off
-    let clock = TestClock<Duration>()
-    let receiver = TestStore(initialState: receiverState()) { ResourceTransfer() } withDependencies: { $0.continuousClock = clock }
+    let receiver = TestStore(initialState: receiverState()) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = receiverClock }
     receiver.exhaustivity = .off
 
-    // 1. Sender advertises → receiver accepts → requests first window.
+    // --- Advertise → accept → first window request (parts 0..3, window=4) ---
     await sender.send(.advertise)
     let adv = (await captureTransmits(sender, count: 1))[0]
     await receiver.send(.accept(adv))
-    let req = (await captureTransmits(receiver, count: 1))[0]
+    // Capture the first window request from the receiver.
+    let req1 = (await captureTransmits(receiver, count: 1))[0]
 
-    // 2. Sender processes the windowed REQ and emits the requested parts.
-    await sender.send(.received(req))
-    _ = await captureTransmits(sender, count: senderInit.parts.count)
+    // --- Round 1: sender serves parts 0,1,2,3; receiver gets 0,1,2 (part 3 dropped) ---
+    await sender.send(.received(req1))
+    let round1Parts = await captureTransmits(sender, count: 4)
+    // Deliver parts 0, 1, 2 only — drop part 3 (index 3, last in this window).
+    await receiver.send(.received(round1Parts[0]))
+    await receiver.send(.received(round1Parts[1]))
+    await receiver.send(.received(round1Parts[2]))
+    // window=4 shrunk once after the deadline below → window=3 (proving window advanced)
+    #expect(receiver.state.outstanding == [3])   // only dropped part remains
 
-    // 3. Receiver ingests all parts (single window) using partPacket on the sender's chunks.
-    //    All parts fit in the first window, so no intermediate window-request transmit is emitted.
-    let partCount = senderInit.parts.count
-    let got = LockIsolated<Data?>(nil)
-    for (n, chunk) in senderInit.parts.enumerated() {
-        await receiver.send(.received(partPacket(chunk)))
-        if n == partCount - 1 {
-            let proofOut = LockIsolated<Data?>(nil)
-            await receiver.receive { action in
-                if case let .delegate(.transmit(_, p)) = action,
-                   Packet(raw: p)?.packetType == .proof { proofOut.setValue(p); return true }
-                return false
-            }
-            await receiver.receive { action in
-                if case let .delegate(.received(d)) = action { got.setValue(d); return true }
-                return false
-            }
-            // 4. Proof → sender concludes.
-            await sender.send(.received(proofOut.value!))
-            await sender.receive(.delegate(.concluded))
-        }
-    }
-    #expect(got.value == data)                       // receiver reconstructed the ORIGINAL data
+    // --- Simulate the receiver watchdog firing for the dropped part ---
+    await receiver.send(.receiverDeadline)
+    #expect(receiver.state.window.window == 3)    // window shrank: proves retransmit path
+    // receiverDeadline calls requestNextWindow(height=2, window=3) → requests parts 3,4,5
+    let req2 = (await captureTransmits(receiver, count: 1))[0]
+
+    // --- Round 2: sender serves parts 3,4,5; all delivered ---
+    await sender.send(.received(req2))
+    let round2Parts = await captureTransmits(sender, count: 3)
+    await receiver.send(.received(round2Parts[0]))
+    await receiver.send(.received(round2Parts[1]))
+    await receiver.send(.received(round2Parts[2]))
+    // Round complete; window grown back (3→4). requestNextWindow(height=5, window=4) → parts 6,7,8.
+    let req3 = (await captureTransmits(receiver, count: 1))[0]
+
+    // --- Round 3: sender serves parts 6,7,8; receiver completes ---
+    await sender.send(.received(req3))
+    let round3Parts = await captureTransmits(sender, count: 3)
+    await receiver.send(.received(round3Parts[0]))
+    await receiver.send(.received(round3Parts[1]))
+    await receiver.send(.received(round3Parts[2]))
     #expect(receiver.state.status == .complete)
+
+    // The completing receive emits the proof + the reconstructed data.
+    let got = LockIsolated<Data?>(nil)
+    await receiver.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await receiver.receive { action in
+        if case let .delegate(.received(d)) = action { got.setValue(d); return true }
+        return false
+    }
+    #expect(got.value == data)
+
+    // Feed the proof back to the sender to conclude.
+    let proof = Resource.proofData(data: data, hash: sender.state.resourceHash)
+    let pkt = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                     destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
+                     destinationHash: linkID, transportId: nil, payload: proof)
+    await sender.send(.received(try! pkt.packed()))
+    await sender.receive(.delegate(.concluded))
     #expect(sender.state.status == .complete)
 }
 
