@@ -41,6 +41,16 @@ struct VectorFixtures: Decodable {
     let linkRttMsgpack: String
     let linkRttPacketCiphertext: String
     let linkCloseCiphertext: String
+    let resourceData: String
+    let resourceRandomHash: String
+    let resourcePrefix: String
+    let resourceTokenKey: String
+    let resourceSdu: Int
+    let resourceStream: String
+    let resourceHash: String
+    let resourceMapHash0: String
+    let resourceProof: String
+    let resourceAdvMsgpack: String
 
     enum CodingKeys: String, CodingKey {
         case identityPrivateKey = "identity_private_key"
@@ -83,6 +93,16 @@ struct VectorFixtures: Decodable {
         case linkRttMsgpack = "link_rtt_msgpack"
         case linkRttPacketCiphertext = "link_rtt_packet_ciphertext"
         case linkCloseCiphertext = "link_close_ciphertext"
+        case resourceData = "resource_data"
+        case resourceRandomHash = "resource_random_hash"
+        case resourcePrefix = "resource_prefix"
+        case resourceTokenKey = "resource_token_key"
+        case resourceSdu = "resource_sdu"
+        case resourceStream = "resource_stream"
+        case resourceHash = "resource_hash"
+        case resourceMapHash0 = "resource_map_hash0"
+        case resourceProof = "resource_proof"
+        case resourceAdvMsgpack = "resource_adv_msgpack"
     }
 
     static func load() throws -> VectorFixtures {

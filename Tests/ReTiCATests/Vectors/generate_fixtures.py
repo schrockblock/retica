@@ -117,6 +117,28 @@ link_rtt_packet_ciphertext = LinkToken(link_derived_key).encrypt(link_rtt_msgpac
 # --- Link close packet (LINKCLOSE) vector: encrypt(link_id) under the session key ---
 link_close_ciphertext = LinkToken(link_derived_key).encrypt(link_id)
 
+# --- Resource primitive vectors (single-segment, uncompressed; genuine RNS building blocks) ---
+from RNS.Resource import ResourceAdvertisement as RNSResourceAdvertisement
+
+res_data     = b"reticulum resource payload for cross validation"
+res_r        = os.urandom(4)                       # resource random hash
+res_prefix   = os.urandom(4)                       # 4-byte stream prefix
+res_key      = os.urandom(64)                      # AES-256 Token key
+res_sdu      = 32
+res_stream   = LinkToken(res_key).encrypt(res_prefix + res_data)   # genuine Token (aliased LinkToken in this generator)
+res_hash     = RNS.Identity.full_hash(res_data + res_r)         # genuine full_hash
+res_parts    = [res_stream[i:i+res_sdu] for i in range(0, len(res_stream), res_sdu)]
+res_map_hash0 = RNS.Identity.full_hash(res_parts[0] + res_r)[:4]
+res_proof    = RNS.Identity.full_hash(res_data + res_hash)
+res_hashmap  = b"".join(RNS.Identity.full_hash(p + res_r)[:4] for p in res_parts)
+
+# Genuine RNS advertisement pack (construct empty, set fields, pack).
+_adv = RNSResourceAdvertisement()
+_adv.t = len(res_stream); _adv.d = len(res_data); _adv.n = len(res_parts)
+_adv.h = res_hash; _adv.r = res_r; _adv.o = res_hash
+_adv.i = 0; _adv.l = 1; _adv.q = None; _adv.f = 0x01; _adv.m = res_hashmap
+res_adv_msgpack = _adv.pack(segment=0)
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -158,4 +180,14 @@ print(json.dumps({
     "link_rtt_msgpack": link_rtt_msgpack.hex(),
     "link_rtt_packet_ciphertext": link_rtt_packet_ciphertext.hex(),
     "link_close_ciphertext": link_close_ciphertext.hex(),
+    "resource_data": res_data.hex(),
+    "resource_random_hash": res_r.hex(),
+    "resource_prefix": res_prefix.hex(),
+    "resource_token_key": res_key.hex(),
+    "resource_sdu": res_sdu,
+    "resource_stream": res_stream.hex(),
+    "resource_hash": res_hash.hex(),
+    "resource_map_hash0": res_map_hash0.hex(),
+    "resource_proof": res_proof.hex(),
+    "resource_adv_msgpack": res_adv_msgpack.hex(),
 }, indent=2))
