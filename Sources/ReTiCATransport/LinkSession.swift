@@ -18,6 +18,7 @@ public struct LinkSession {
 
     static let keepaliveByte: UInt8 = 0xFF
     static let keepaliveReplyByte: UInt8 = 0xFE
+    static let resourceSDU = 464
 
     @ObservableState
     public struct State: Equatable {
@@ -96,6 +97,7 @@ public struct LinkSession {
         case establishmentDeadline
         case keepaliveDeadline
         case inactivityDeadline
+        case sendResource(Data)
         case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
 
@@ -114,13 +116,14 @@ public struct LinkSession {
     @Dependency(\.date) var date
     @Dependency(\.continuousClock) var clock
     @Dependency(\.uuid) var uuid
+    @Dependency(\.randomBytes) var randomBytes
 
     private enum CancelID: Hashable { case establishment, keepalive, inactivity }
 
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { [date, clock, uuid] state, action in
+        Reduce { [date, clock, uuid, randomBytes] state, action in
             func establishmentTimer(_ t: TimeInterval) -> Effect<Action> {
                 .run { send in try await clock.sleep(for: .seconds(t)); await send(.establishmentDeadline) }
                     .cancellable(id: CancelID.establishment, cancelInFlight: true)
@@ -279,6 +282,18 @@ public struct LinkSession {
                 default:
                     return .none
                 }
+
+            case let .sendResource(data):
+                guard state.status == .active else { return .none }
+                let r = Data(randomBytes(8))
+                let prefix = Data(r[r.startIndex ..< r.startIndex + 4])
+                let randomHash = Data(r[r.startIndex + 4 ..< r.startIndex + 8])
+                let newID = uuid()
+                state.transfers.append(ResourceTransfer.State(
+                    sending: data, linkID: state.linkID, sessionKey: state.sessionKey,
+                    interfaceID: state.interfaceID, prefix: prefix, randomHash: randomHash,
+                    sdu: Self.resourceSDU, rtt: .seconds(state.rtt ?? 1), id: newID))
+                return .send(.transfer(.element(id: newID, action: .advertise)))
 
             case let .send(plaintext):
                 guard state.status == .active else { return .none }

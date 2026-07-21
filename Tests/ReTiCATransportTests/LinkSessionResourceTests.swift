@@ -100,3 +100,42 @@ private func partPacket(_ chunk: Data) -> Data {
     #expect(got.value == data)
     #expect(store.state.transfers[0].status == .complete)
 }
+
+@Test @MainActor func sendResourceSpawnsSenderAndEmitsEncryptedAdvertisement() async {
+    let clock = TestClock<Duration>()
+    let store = activeLinkStore(clock)
+    let data = Data("a resource sent out over the link".utf8)
+    await store.send(.sendResource(data))
+    #expect(store.state.transfers.count == 1)
+    #expect(store.state.transfers[0].role == .sender)
+    await store.receive { if case .transfer(.element(_, .advertise)) = $0 { return true }; return false }
+    let advOut = LockIsolated<Data?>(nil)
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action, Packet(raw: raw)?.context == .resourceAdvertisement {
+            advOut.setValue(raw); return true
+        }
+        return false
+    }
+    // The advertisement is encrypted with the link key and unpacks to the sender's advertisement.
+    let packet = Packet(raw: advOut.value!)!
+    let plain = Link.decrypt(packet.payload, sessionKey: resKey)!
+    let adv = ResourceAdvertisement.unpack(plain)!
+    #expect(adv.hash == store.state.transfers[0].resourceHash)
+    // Cleanup: cancel the sender transfer (cancels its advertise watchdog).
+    let tid = store.state.transfers[0].id
+    await store.send(.transfer(.element(id: tid, action: .cancel)))
+}
+
+@Test @MainActor func sendResourceOnInactiveLinkDoesNothing() async {
+    let clock = TestClock<Duration>()
+    var s = LinkSession.State(responderFor: Identity(),
+                              destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .pending                                     // not active
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.sendResource(Data("nope".utf8)))
+    #expect(store.state.transfers.isEmpty)
+}
