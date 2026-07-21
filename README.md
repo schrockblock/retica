@@ -186,6 +186,22 @@ proof in an `awaitingProof` state, and gives up after its patience elapses. Eith
 the link key — drive the peer to a failed state. Rate-adaptive window escalation (fast/very-slow),
 hashmap-update (multi-segment), and compression remain future slices.
 
+### Sending resources over a link (`Endpoint`)
+
+Once a link is established, a resource is sent end-to-end through the public API:
+
+- `Endpoint.sendResourceOverLink(linkID:data:)` hands the bytes to that link's `LinkSession`, which
+  spawns a sender `ResourceTransfer` (its random prefix/hash come from the `RandomBytes` dependency) and
+  advertises it.
+- The peer `LinkSession` recognises the inbound `RESOURCE_ADV`, spawns a receiver transfer (deduping
+  re-advertisements by resource hash), and drives the windowed request/serve/assemble/prove exchange —
+  all resource packets ride the link's existing transmit path.
+- Completion surfaces as `Endpoint` delegates: `resourceReceived(linkID:data:)` on the receiver, and
+  `resourceConcluded(linkID:resourceHash:)` / `resourceFailed(linkID:resourceHash:)` on either side.
+
+`ResourceTransfer` instances live inside their `LinkSession` (link-scoped). Terminal transfers are
+retained (no GC yet); MTU/SDU negotiation, multi-segment, and compression remain future slices.
+
 ### Live endpoint test (opt-in)
 
 `LiveEndpointTests` is skipped unless `RETICA_LIVE_HOST` is set. To run it against a real node (e.g. a local `rnsd` with a `TCPServerInterface`, or a testnet node):

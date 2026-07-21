@@ -274,7 +274,8 @@ public struct LinkSession {
                      (_, .active, .data, .resourceRequest),
                      (_, .active, .data, .resourceProof),
                      (_, .active, .data, .resourceInitiatorCancel),
-                     (_, .active, .data, .resourceReceiverCancel):
+                     (_, .active, .data, .resourceReceiverCancel),
+                     (_, .active, .proof, .resourceProof):
                     return .merge(state.transfers.ids.map {
                         .send(.transfer(.element(id: $0, action: .received(data))))
                     })
