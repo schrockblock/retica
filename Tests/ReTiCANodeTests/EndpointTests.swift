@@ -334,3 +334,154 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
     await a.send(.disconnect); await b.send(.disconnect)
 }
+
+@Test @MainActor func sendResourceOverLinkDispatchesToTheMatchingLink() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: {
+        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
+                                     destinationHash: Data(repeating: 0x02, count: 16),
+                                     interfaceID: InterfaceID("tcp"))
+        link.status = .active
+        link.sessionKey = Data(repeating: 0x01, count: 64)
+        link.linkID = Data(repeating: 0xAB, count: 16)
+        link.rtt = 1.0
+        s.links.append(link)
+        return s
+    }()) { Endpoint() } withDependencies: {
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+    await store.send(.sendResourceOverLink(linkID: Data(repeating: 0xAB, count: 16), data: Data("hi".utf8)))
+    await store.receive { if case .link(.element(_, .sendResource)) = $0 { return true }; return false }
+    #expect(store.state.links[0].transfers.count == 1)
+    // Cleanup: cancel the spawned transfer.
+    let tid = store.state.links[0].transfers[0].id
+    await store.send(.link(.element(id: UUID(0), action: .transfer(.element(id: tid, action: .cancel)))))
+}
+
+@Test @MainActor func resourceReceivedDelegateSurfacesWithLinkID() async {
+    let clock = TestClock()
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let store = TestStore(initialState: {
+        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
+                                     destinationHash: Data(repeating: 0x02, count: 16),
+                                     interfaceID: InterfaceID("tcp"))
+        link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
+        s.links.append(link)
+        return s
+    }()) { Endpoint() } withDependencies: {
+        $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    // Simulate the hosted link emitting a resourceReceived delegate.
+    let payload = Data("assembled".utf8)
+    let got = LockIsolated<(Data, Data)?>(nil)
+    await store.send(.link(.element(id: UUID(0), action: .delegate(.resourceReceived(payload)))))
+    await store.receive { action in
+        if case let .delegate(.resourceReceived(lid, d)) = action { got.setValue((lid, d)); return true }
+        return false
+    }
+    #expect(got.value?.0 == linkID)
+    #expect(got.value?.1 == payload)
+}
+
+@Test @MainActor func twoEndpointsTransferAResourceOverALink() async {
+    let clock = TestClock()
+    let bIdentity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
+
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            Endpoint()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } },
+                                             close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
+    let (a, eventsA) = make("a", sentA)
+    let (b, eventsB) = make("b", sentB)
+
+    // --- Establish the link (mirrors twoEndpointsEstablishLinkExchangeDataAndClose steps 1–4) ---
+    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await b.send(.registerLocalDestination(dest))
+    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.announce(destinationHash: dest.hash, appData: nil))
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
+    await a.send(.openLink(destinationHash: dest.hash))
+    await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive(\.delegate.linkEstablished)
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
+    let linkID = a.state.links[0].linkID
+    #expect(a.state.links[0].status == .active && b.state.links[0].status == .active)
+
+    // --- A sends a 2-part resource to B; B assembles it; A concludes. ---
+    let payload = Data((0..<600).map { UInt8($0 & 0xff) })     // > 1 part at SDU 464, ≤ 4 parts → one window
+    await a.send(.sendResourceOverLink(linkID: linkID, data: payload))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_ADV out
+    // ADV → B: spawns a receiver, emits RESOURCE_REQ.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_REQ out
+    // REQ → A: A serves its parts.
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    let partCount = a.state.links[0].transfers[0].parts.count
+    for _ in 0..<partCount {
+        await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    }
+    // Deliver every part frame A emitted (the last `partCount` frames in sentA) to B.
+    let parts = Array(sentA.value.suffix(partCount))
+    let got = LockIsolated<Data?>(nil)
+    for (i, frame) in parts.enumerated() {
+        eventsB.yield(.data(frame))
+        await b.receive(\.transport.received)
+        if i == partCount - 1 {
+            await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_PRF out
+            await b.receive { action in
+                if case let .delegate(.resourceReceived(lid, d)) = action, lid == linkID { got.setValue(d); return true }
+                return false
+            }
+        }
+    }
+    #expect(got.value == payload)
+    #expect(b.state.links[0].transfers[0].status == .complete)
+    // PRF → A: A validates and concludes.
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    await a.receive { action in
+        if case let .delegate(.resourceConcluded(lid, _)) = action, lid == linkID { return true }
+        return false
+    }
+    #expect(a.state.links[0].transfers[0].status == .complete)
+
+    // Close the link to cancel the link timers, then disconnect.
+    await a.send(.closeLink(linkID: linkID))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive(\.delegate.linkClosed)
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received); await b.receive(\.delegate.linkClosed)
+    await a.send(.disconnect); await b.send(.disconnect)
+}

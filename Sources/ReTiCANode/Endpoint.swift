@@ -36,6 +36,7 @@ public struct Endpoint {
         case send(destinationHash: Data, plaintext: Data)
         case openLink(destinationHash: Data)
         case sendOverLink(linkID: Data, data: Data)
+        case sendResourceOverLink(linkID: Data, data: Data)
         case closeLink(linkID: Data)
 
         case delegate(Delegate)
@@ -48,6 +49,9 @@ public struct Endpoint {
             case linkDataReceived(linkID: Data, data: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
             case linkFailed(destinationHash: Data)
+            case resourceReceived(linkID: Data, data: Data)
+            case resourceConcluded(linkID: Data, resourceHash: Data)
+            case resourceFailed(linkID: Data, resourceHash: Data)
         }
     }
 
@@ -115,6 +119,10 @@ public struct Endpoint {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .send(data))))
 
+            case let .sendResourceOverLink(linkID, data):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .sendResource(data))))
+
             case let .closeLink(linkID):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .close)))
@@ -133,6 +141,16 @@ public struct Endpoint {
             case let .link(.element(elementID, .delegate(.establishmentFailed))):
                 guard let destHash = state.links[id: elementID]?.destinationHash else { return .none }
                 return .send(.delegate(.linkFailed(destinationHash: destHash)))
+
+            case let .link(.element(elementID, .delegate(.resourceReceived(data)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.resourceReceived(linkID: linkID, data: data)))
+            case let .link(.element(elementID, .delegate(.resourceConcluded(hash)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.resourceConcluded(linkID: linkID, resourceHash: hash)))
+            case let .link(.element(elementID, .delegate(.resourceFailed(hash)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.resourceFailed(linkID: linkID, resourceHash: hash)))
 
             case .interface, .transport, .delegate, .link:
                 return .none

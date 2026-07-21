@@ -30,7 +30,7 @@ private func activeInitiatorStore(owner: Identity, clock: TestClock<Duration>)
         initialState: LinkSession.State(initiatorTo: Identity(publicKey: owner.publicKey)!,
                                         destinationHash: Data(repeating: 0x55, count: 16),
                                         interfaceID: InterfaceID("i"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     store.exhaustivity = .off
     await store.send(.establish)
     _ = await captureTransmit(store)                                   // LINKREQUEST
@@ -61,7 +61,7 @@ private func activeResponderStore(clock: TestClock<Duration>)
     let store = TestStore(
         initialState: LinkSession.State(responderFor: owner, destinationHash: destHash,
                                         interfaceID: InterfaceID("i"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     store.exhaustivity = .off
     await store.send(.acceptRequest(try! request.packed()))
     _ = await captureTransmit(store)                                   // LRPROOF
@@ -81,7 +81,7 @@ private func activeResponderStore(clock: TestClock<Duration>)
     let store = TestStore(
         initialState: LinkSession.State(initiatorTo: Identity(publicKey: dest.publicKey)!,
                                         destinationHash: destHash, interfaceID: InterfaceID("i"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     store.exhaustivity = .off
 
     await store.send(.establish)
@@ -111,7 +111,7 @@ private func activeResponderStore(clock: TestClock<Duration>)
     let store = TestStore(
         initialState: LinkSession.State(responderFor: owner, destinationHash: destHash,
                                         interfaceID: InterfaceID("i"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     store.exhaustivity = .off
 
     await store.send(.acceptRequest(requestRaw))
@@ -134,7 +134,7 @@ private func activeResponderStore(clock: TestClock<Duration>)
         initialState: LinkSession.State(initiatorTo: Identity(publicKey: dest.publicKey)!,
                                         destinationHash: Data(repeating: 0x55, count: 16),
                                         interfaceID: InterfaceID("i"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     store.exhaustivity = .off
 
     await store.send(.establish)
@@ -167,13 +167,13 @@ private func activeResponderStore(clock: TestClock<Duration>)
     let initiator = TestStore(
         initialState: LinkSession.State(initiatorTo: Identity(publicKey: owner.publicKey)!,
                                         destinationHash: destHash, interfaceID: InterfaceID("a"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     initiator.exhaustivity = .off
 
     let responder = TestStore(
         initialState: LinkSession.State(responderFor: owner, destinationHash: destHash,
                                         interfaceID: InterfaceID("b"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     responder.exhaustivity = .off
 
     // 1. Initiator → LINKREQUEST
@@ -236,7 +236,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 
 @Test @MainActor func activeLinkSendEmitsEncryptedDataPacket() async {
     let store = TestStore(initialState: activeState(role: .initiator)) { LinkSession() }
-        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock() }
+        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock(); $0.uuid = .incrementing }
     store.exhaustivity = .off
     let plaintext = Data("hello link".utf8)
     await store.send(.send(plaintext))
@@ -250,7 +250,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 
 @Test @MainActor func activeLinkReceivesDataAndBubblesDataReceived() async {
     let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
-        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock() }
+        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock(); $0.uuid = .incrementing }
     store.exhaustivity = .off
     let plaintext = Data("inbound".utf8)
     let cipher = Link.encrypt(plaintext, sessionKey: sampleKey)
@@ -268,14 +268,14 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     // Exhaustive: an unexpected .dataReceived (or any effect) would fail the test at deinit,
     // so this asserts the corrupt packet is dropped silently — no teardown, no dataReceived.
     let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
-        withDependencies: { $0.date = .constant(epoch) }
+        withDependencies: { $0.date = .constant(epoch); $0.uuid = .incrementing }
     await store.send(.received(linkPacket(context: .none, payload: Data(repeating: 0xFF, count: 80))))
     #expect(store.state.status == .active)   // no teardown, no dataReceived
 }
 
 @Test @MainActor func initiatorCloseEmitsLinkCloseAndGoesClosed() async {
     let store = TestStore(initialState: activeState(role: .initiator)) { LinkSession() }
-        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock() }
+        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock(); $0.uuid = .incrementing }
     store.exhaustivity = .off
     await store.send(.close)
     #expect(store.state.status == .closed)
@@ -289,7 +289,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 
 @Test @MainActor func responderReceivesLinkCloseAndGoesClosed() async {
     let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
-        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock() }
+        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock(); $0.uuid = .incrementing }
     store.exhaustivity = .off
     let closeCipher = Link.encrypt(sampleLinkID, sessionKey: sampleKey)
     await store.send(.received(linkPacket(context: .linkClose, payload: closeCipher)))
@@ -299,7 +299,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 
 @Test @MainActor func initiatorReceivesLinkCloseAndGetsDestinationClosed() async {
     let store = TestStore(initialState: activeState(role: .initiator)) { LinkSession() }
-        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock() }
+        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock(); $0.uuid = .incrementing }
     store.exhaustivity = .off
     let closeCipher = Link.encrypt(sampleLinkID, sessionKey: sampleKey)
     await store.send(.received(linkPacket(context: .linkClose, payload: closeCipher)))
@@ -313,7 +313,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     let store = TestStore(
         initialState: LinkSession.State(responderFor: owner, destinationHash: Data(repeating: 0x02, count: 16),
                                         interfaceID: InterfaceID("i"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock() }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = testClock(); $0.uuid = .incrementing }
     store.exhaustivity = .off
     let badRequest = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
                             destinationType: .single, context: .none, contextFlag: false, hops: 0,
@@ -331,13 +331,13 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     let initiator = TestStore(
         initialState: LinkSession.State(initiatorTo: Identity(publicKey: owner.publicKey)!,
                                         destinationHash: destHash, interfaceID: InterfaceID("a"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     initiator.exhaustivity = .off
 
     let responder = TestStore(
         initialState: LinkSession.State(responderFor: owner, destinationHash: destHash,
                                         interfaceID: InterfaceID("b"))
-    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     responder.exhaustivity = .off
 
     // Establish (LINKREQUEST → LRPROOF → LRRTT).
@@ -398,6 +398,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     ) { LinkSession() } withDependencies: {
         $0.date = .constant(epoch)
         $0.continuousClock = clock
+        $0.uuid = .incrementing
     }
     store.exhaustivity = .off
     await store.send(.establish)
@@ -457,7 +458,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     s.linkID = Data(repeating: 0xAB, count: 16)
     let clock = TestClock()
     let store = TestStore(initialState: s) { LinkSession() }
-        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock }
+        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     store.exhaustivity = .off
 
     // Inbound 0xFF keepalive → 0xFE reply.

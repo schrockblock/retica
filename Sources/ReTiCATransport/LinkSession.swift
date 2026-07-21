@@ -18,6 +18,7 @@ public struct LinkSession {
 
     static let keepaliveByte: UInt8 = 0xFF
     static let keepaliveReplyByte: UInt8 = 0xFE
+    static let resourceSDU = 464
 
     @ObservableState
     public struct State: Equatable {
@@ -36,10 +37,10 @@ public struct LinkSession {
         public var rtt: Double?
         public var activatedAt: Double?
         public var lastInbound: Double?
+        public var transfers: IdentifiedArrayOf<ResourceTransfer.State> = []
         public var establishmentTimeout: TimeInterval
         public var keepaliveInterval: TimeInterval
         var staleTime: TimeInterval { keepaliveInterval * 2 }
-
         /// Initiator: link to a known destination identity.
         public init(id: UUID = UUID(), initiatorTo destinationIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
@@ -96,6 +97,8 @@ public struct LinkSession {
         case establishmentDeadline
         case keepaliveDeadline
         case inactivityDeadline
+        case sendResource(Data)
+        case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -104,18 +107,23 @@ public struct LinkSession {
             case establishmentFailed
             case dataReceived(Data)
             case closed(CloseReason)
+            case resourceReceived(Data)
+            case resourceConcluded(Data)
+            case resourceFailed(Data)
         }
     }
 
     @Dependency(\.date) var date
     @Dependency(\.continuousClock) var clock
+    @Dependency(\.uuid) var uuid
+    @Dependency(\.randomBytes) var randomBytes
 
     private enum CancelID: Hashable { case establishment, keepalive, inactivity }
 
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { [date, clock] state, action in
+        Reduce { [date, clock, uuid, randomBytes] state, action in
             func establishmentTimer(_ t: TimeInterval) -> Effect<Action> {
                 .run { send in try await clock.sleep(for: .seconds(t)); await send(.establishmentDeadline) }
                     .cancellable(id: CancelID.establishment, cancelInFlight: true)
@@ -250,9 +258,43 @@ public struct LinkSession {
                     state.lastInbound = now
                     return inactivityTimer(state.staleTime)                                          // 0xFE reply resets inactivity
 
+                case (_, .active, .data, .resourceAdvertisement):
+                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                          let adv = ResourceAdvertisement.unpack(plain) else { return .none }
+                    if state.transfers.contains(where: { $0.resourceHash == adv.hash }) { return .none }
+                    let newID = uuid()
+                    let transferRTT: Duration = .seconds(state.rtt ?? 1)
+                    state.transfers.append(ResourceTransfer.State(
+                        receivingOn: state.linkID, sessionKey: state.sessionKey,
+                        interfaceID: state.interfaceID, rtt: transferRTT, id: newID))
+                    state.transfers[id: newID]?.resourceHash = adv.hash
+                    return .send(.transfer(.element(id: newID, action: .accept(data))))
+
+                case (_, .active, .data, .resource),
+                     (_, .active, .data, .resourceRequest),
+                     (_, .active, .data, .resourceProof),
+                     (_, .active, .data, .resourceInitiatorCancel),
+                     (_, .active, .data, .resourceReceiverCancel),
+                     (_, .active, .proof, .resourceProof):
+                    return .merge(state.transfers.ids.map {
+                        .send(.transfer(.element(id: $0, action: .received(data))))
+                    })
+
                 default:
                     return .none
                 }
+
+            case let .sendResource(data):
+                guard state.status == .active else { return .none }
+                let r = Data(randomBytes(8))
+                let prefix = Data(r[r.startIndex ..< r.startIndex + 4])
+                let randomHash = Data(r[r.startIndex + 4 ..< r.startIndex + 8])
+                let newID = uuid()
+                state.transfers.append(ResourceTransfer.State(
+                    sending: data, linkID: state.linkID, sessionKey: state.sessionKey,
+                    interfaceID: state.interfaceID, prefix: prefix, randomHash: randomHash,
+                    sdu: Self.resourceSDU, rtt: .seconds(state.rtt ?? 1), id: newID))
+                return .send(.transfer(.element(id: newID, action: .advertise)))
 
             case let .send(plaintext):
                 guard state.status == .active else { return .none }
@@ -296,10 +338,24 @@ public struct LinkSession {
                 }
                 return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll)
 
+            case let .transfer(.element(_, .delegate(.transmit(ifID, raw)))):
+                return .send(.delegate(.transmit(ifID, raw)))
+            case let .transfer(.element(_, .delegate(.received(payload)))):
+                return .send(.delegate(.resourceReceived(payload)))
+            case let .transfer(.element(elementID, .delegate(.concluded))):
+                guard let hash = state.transfers[id: elementID]?.resourceHash else { return .none }
+                return .send(.delegate(.resourceConcluded(hash)))
+            case let .transfer(.element(elementID, .delegate(.failed))):
+                guard let hash = state.transfers[id: elementID]?.resourceHash else { return .none }
+                return .send(.delegate(.resourceFailed(hash)))
+            case .transfer:
+                return .none
+
             case .delegate:
                 return .none
             }
         }
+        .forEach(\.transfers, action: \.transfer) { ResourceTransfer() }
     }
 }
 
