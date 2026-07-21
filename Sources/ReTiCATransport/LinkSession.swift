@@ -34,6 +34,7 @@ public struct LinkSession {
         public var sessionKey: Data
         public var requestedAt: Double?
         public var rtt: Double?
+        public var activatedAt: Double?
         public var lastInbound: Double?
         public var transfers: IdentifiedArrayOf<ResourceTransfer.State> = []
         public var establishmentTimeout: TimeInterval
@@ -56,6 +57,7 @@ public struct LinkSession {
             self.sessionKey = Data()
             self.requestedAt = nil
             self.rtt = nil
+            self.activatedAt = nil
             self.lastInbound = nil
             self.establishmentTimeout = establishmentTimeout
             self.keepaliveInterval = keepaliveInterval
@@ -78,6 +80,7 @@ public struct LinkSession {
             self.sessionKey = Data()
             self.requestedAt = nil
             self.rtt = nil
+            self.activatedAt = nil
             self.lastInbound = nil
             self.establishmentTimeout = establishmentTimeout
             self.keepaliveInterval = keepaliveInterval
@@ -200,6 +203,7 @@ public struct LinkSession {
                     state.peerX25519Pub = peerPub
                     state.sessionKey = key
                     state.status = .active
+                    state.activatedAt = now
                     state.lastInbound = now
                     let rtt = now - (state.requestedAt ?? now)
                     state.rtt = rtt
@@ -219,6 +223,7 @@ public struct LinkSession {
                     else { return .send(.delegate(.establishmentFailed)) }
                     state.rtt = rtt
                     state.status = .active
+                    state.activatedAt = now
                     state.lastInbound = now
                     return .merge(.send(.delegate(.established(linkID: state.linkID, sessionKey: state.sessionKey))),
                                   .cancel(id: CancelID.establishment), inactivityTimer(state.staleTime))
