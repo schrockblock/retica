@@ -175,9 +175,16 @@ a link's session key, as a TCA reducer with a sender and a receiver role:
 
 Two `ResourceTransfer` reducers sharing a session key complete a transfer end-to-end. The
 control-packet formats and their encryption status (`RESOURCE_ADV`/`RESOURCE_REQ` encrypted;
-`RESOURCE` parts and `RESOURCE_PRF` raw) are wire-compatible with Python-RNS 1.3.8. Windowing,
-retransmission, hashmap-update, cancel/reject, multi-segment, compression, and wiring
-`ResourceTransfer` into `LinkSession`/`Endpoint` are future slices.
+`RESOURCE` parts and `RESOURCE_PRF` raw) are wire-compatible with Python-RNS 1.3.8.
+
+Transfers are **windowed and self-healing**: the receiver requests parts a window at a time (start 4,
+growing +1 per completed round up to the slow cap of 10, shrinking on timeout), tracks a
+consecutive-completed height, and retransmits outstanding parts on an rtt-seeded watchdog, failing
+after 16 retries. The sender re-advertises when no request arrives (up to 4 times), waits for the
+proof in an `awaitingProof` state, and gives up after its patience elapses. Either side can abort:
+`RESOURCE_ICL` (sender) and `RESOURCE_RCL` (receiver) — each carrying the resource hash encrypted with
+the link key — drive the peer to a failed state. Rate-adaptive window escalation (fast/very-slow),
+hashmap-update (multi-segment), and compression remain future slices.
 
 ### Live endpoint test (opt-in)
 

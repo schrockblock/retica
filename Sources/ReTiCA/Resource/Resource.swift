@@ -74,4 +74,28 @@ public enum Resource {
         guard d.count == 64 else { return false }
         return Data(d.suffix(32)) == expectedProof
     }
+
+    /// Select the next window of still-missing parts to request. Scans the `window` slots after
+    /// `height` (bounded by `partCount`), returning the indices not present in `receivedIndices`
+    /// and their concatenated 4-byte map hashes sliced from `hashmap`. Index-safe.
+    public static func nextWindowRequest(
+        receivedIndices: Set<Int>, hashmap: Data, height: Int, window: Int, partCount: Int
+    ) -> (indices: [Int], mapHashes: Data) {
+        let m = Data(hashmap)
+        var indices: [Int] = []
+        var mapHashes = Data()
+        var pn = height + 1
+        let searchEnd = min(height + 1 + window, partCount)
+        while pn < searchEnd {
+            if !receivedIndices.contains(pn) {
+                let start = m.startIndex + pn * mapHashLength
+                let end = start + mapHashLength
+                guard end <= m.endIndex else { break }
+                indices.append(pn)
+                mapHashes.append(Data(m[start..<end]))
+            }
+            pn += 1
+        }
+        return (indices, mapHashes)
+    }
 }
