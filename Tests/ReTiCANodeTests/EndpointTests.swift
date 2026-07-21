@@ -334,3 +334,58 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
     await a.send(.disconnect); await b.send(.disconnect)
 }
+
+@Test @MainActor func sendResourceOverLinkDispatchesToTheMatchingLink() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: {
+        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
+                                     destinationHash: Data(repeating: 0x02, count: 16),
+                                     interfaceID: InterfaceID("tcp"))
+        link.status = .active
+        link.sessionKey = Data(repeating: 0x01, count: 64)
+        link.linkID = Data(repeating: 0xAB, count: 16)
+        link.rtt = 1.0
+        s.links.append(link)
+        return s
+    }()) { Endpoint() } withDependencies: {
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+    await store.send(.sendResourceOverLink(linkID: Data(repeating: 0xAB, count: 16), data: Data("hi".utf8)))
+    await store.receive { if case .link(.element(_, .sendResource)) = $0 { return true }; return false }
+    #expect(store.state.links[0].transfers.count == 1)
+    // Cleanup: cancel the spawned transfer.
+    let tid = store.state.links[0].transfers[0].id
+    await store.send(.link(.element(id: UUID(0), action: .transfer(.element(id: tid, action: .cancel)))))
+}
+
+@Test @MainActor func resourceReceivedDelegateSurfacesWithLinkID() async {
+    let clock = TestClock()
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let store = TestStore(initialState: {
+        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
+                                     destinationHash: Data(repeating: 0x02, count: 16),
+                                     interfaceID: InterfaceID("tcp"))
+        link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
+        s.links.append(link)
+        return s
+    }()) { Endpoint() } withDependencies: {
+        $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    // Simulate the hosted link emitting a resourceReceived delegate.
+    let payload = Data("assembled".utf8)
+    let got = LockIsolated<(Data, Data)?>(nil)
+    await store.send(.link(.element(id: UUID(0), action: .delegate(.resourceReceived(payload)))))
+    await store.receive { action in
+        if case let .delegate(.resourceReceived(lid, d)) = action { got.setValue((lid, d)); return true }
+        return false
+    }
+    #expect(got.value?.0 == linkID)
+    #expect(got.value?.1 == payload)
+}
