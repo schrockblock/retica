@@ -467,6 +467,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         }
     }
     #expect(got.value == payload)
+    #expect(b.state.links[0].transfers[0].status == .complete)
     // PRF → A: A validates and concludes.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
