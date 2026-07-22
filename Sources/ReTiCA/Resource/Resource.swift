@@ -6,6 +6,8 @@ import Foundation
 public enum Resource {
     public static let mapHashLength = 4
     public static let randomHashSize = 4
+    /// Map hashes that fit in one advertisement / HMU chunk: floor((Link.MDU 431 - 134) / 4) = 74.
+    public static let hashmapMaxLen = 74
 
     /// Resource hash: `full_hash(data ‖ r)` over the original (pre-encryption) data.
     public static func resourceHash(data: Data, randomHash: Data) -> Data {
@@ -76,26 +78,29 @@ public enum Resource {
     }
 
     /// Select the next window of still-missing parts to request. Scans the `window` slots after
-    /// `height` (bounded by `partCount`), returning the indices not present in `receivedIndices`
-    /// and their concatenated 4-byte map hashes sliced from `hashmap`. Index-safe.
+    /// `height` (bounded by `partCount`), returning the missing indices whose map-hash is KNOWN
+    /// (present in `hashmap`) and their concatenated 4-byte map hashes. `exhausted` is `true` when the
+    /// scan reaches a missing part whose map-hash is not yet in `hashmap` (the receiver must request an
+    /// HMU). Index-safe.
     public static func nextWindowRequest(
         receivedIndices: Set<Int>, hashmap: Data, height: Int, window: Int, partCount: Int
-    ) -> (indices: [Int], mapHashes: Data) {
+    ) -> (indices: [Int], mapHashes: Data, exhausted: Bool) {
         let m = Data(hashmap)
         var indices: [Int] = []
         var mapHashes = Data()
+        var exhausted = false
         var pn = height + 1
         let searchEnd = min(height + 1 + window, partCount)
         while pn < searchEnd {
             if !receivedIndices.contains(pn) {
                 let start = m.startIndex + pn * mapHashLength
                 let end = start + mapHashLength
-                guard end <= m.endIndex else { break }
+                if end > m.endIndex { exhausted = true; break }   // map-hash for this missing part not yet known
                 indices.append(pn)
                 mapHashes.append(Data(m[start..<end]))
             }
             pn += 1
         }
-        return (indices, mapHashes)
+        return (indices, mapHashes, exhausted)
     }
 }

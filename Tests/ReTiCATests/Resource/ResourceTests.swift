@@ -92,3 +92,37 @@ private let prefix = Data([0x01, 0x02, 0x03, 0x04])  // 4-byte stream prefix
     #expect(req.indices.isEmpty)
     #expect(req.mapHashes.isEmpty)
 }
+
+@Test func hashmapMaxLenMatchesRNS() {
+    // floor((Link.MDU 431 - OVERHEAD 134) / MAPHASH_LEN 4) = 74
+    #expect(Resource.hashmapMaxLen == 74)
+}
+
+@Test func nextWindowRequestNotExhaustedWhenHashmapComplete() {
+    var hashmap = Data()
+    for i in 0..<8 { hashmap += Data(repeating: UInt8(i), count: 4) }
+    let req = Resource.nextWindowRequest(receivedIndices: [], hashmap: hashmap,
+                                         height: -1, window: 4, partCount: 8)
+    #expect(req.indices == [0, 1, 2, 3])
+    #expect(req.exhausted == false)
+}
+
+@Test func nextWindowRequestExhaustedWhenSlotBeyondKnownHashmap() {
+    // Only 2 map hashes known, but 8 parts total. Requesting from height 1 reaches slot 2 (unknown).
+    var hashmap = Data()
+    for i in 0..<2 { hashmap += Data(repeating: UInt8(i), count: 4) }   // known slots 0,1 only
+    let req = Resource.nextWindowRequest(receivedIndices: [0, 1], hashmap: hashmap,
+                                         height: 1, window: 4, partCount: 8)
+    #expect(req.indices.isEmpty)          // slot 2 is unknown → nothing requested this round
+    #expect(req.exhausted == true)
+}
+
+@Test func nextWindowRequestExhaustedStopsAfterKnownMissingParts() {
+    // 3 map hashes known (slots 0,1,2); slot 0 received, slots 1,2 missing-known, slot 3 unknown.
+    var hashmap = Data()
+    for i in 0..<3 { hashmap += Data(repeating: UInt8(i), count: 4) }
+    let req = Resource.nextWindowRequest(receivedIndices: [0], hashmap: hashmap,
+                                         height: 0, window: 4, partCount: 8)
+    #expect(req.indices == [1, 2])        // requests the known-missing 1 and 2, then hits unknown 3
+    #expect(req.exhausted == true)
+}
