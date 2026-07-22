@@ -19,6 +19,7 @@ public struct LinkSession {
     static let keepaliveByte: UInt8 = 0xFF
     static let keepaliveReplyByte: UInt8 = 0xFE
     static let resourceSDU = 464
+    static let requestMDU = 431
 
     @ObservableState
     public struct State: Equatable {
@@ -38,6 +39,7 @@ public struct LinkSession {
         public var activatedAt: Double?
         public var lastInbound: Double?
         public var remoteIdentity: Identity?
+        public var pendingRequests: Set<Data>
         public var transfers: IdentifiedArrayOf<ResourceTransfer.State> = []
         public var establishmentTimeout: TimeInterval
         public var keepaliveInterval: TimeInterval
@@ -62,6 +64,7 @@ public struct LinkSession {
             self.activatedAt = nil
             self.lastInbound = nil
             self.remoteIdentity = nil
+            self.pendingRequests = []
             self.establishmentTimeout = establishmentTimeout
             self.keepaliveInterval = keepaliveInterval
         }
@@ -86,6 +89,7 @@ public struct LinkSession {
             self.activatedAt = nil
             self.lastInbound = nil
             self.remoteIdentity = nil
+            self.pendingRequests = []
             self.establishmentTimeout = establishmentTimeout
             self.keepaliveInterval = keepaliveInterval
         }
@@ -102,6 +106,8 @@ public struct LinkSession {
         case keepaliveDeadline
         case inactivityDeadline
         case sendResource(Data)
+        case sendRequest(path: String, data: Data)
+        case requestDeadline(Data)
         case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
 
@@ -115,6 +121,8 @@ public struct LinkSession {
             case resourceConcluded(Data)
             case resourceFailed(Data)
             case identified(Identity)
+            case responseReceived(requestID: Data, data: Data)
+            case requestFailed(requestID: Data)
         }
     }
 
@@ -123,7 +131,7 @@ public struct LinkSession {
     @Dependency(\.uuid) var uuid
     @Dependency(\.randomBytes) var randomBytes
 
-    private enum CancelID: Hashable { case establishment, keepalive, inactivity }
+    private enum CancelID: Hashable { case establishment, keepalive, inactivity, request(Data) }
 
     public init() {}
 
@@ -286,6 +294,16 @@ public struct LinkSession {
                         .send(.transfer(.element(id: $0, action: .received(data))))
                     })
 
+                case (_, .active, .data, .response):
+                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                          case let .array(items)? = MsgPack.decodeValue(Data(plain)), items.count == 2,
+                          case let .bin(requestID) = items[0], case let .bin(data) = items[1],
+                          state.pendingRequests.contains(requestID)
+                    else { return .none }
+                    state.pendingRequests.remove(requestID)
+                    return .merge(.cancel(id: CancelID.request(requestID)),
+                                  .send(.delegate(.responseReceived(requestID: requestID, data: data))))
+
                 case (_, .active, .data, .linkIdentify):
                     guard state.role == .responder,
                           let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey)
@@ -322,6 +340,28 @@ public struct LinkSession {
                                            Link.encrypt(payload, sessionKey: state.sessionKey))
                 else { return .none }
                 return .send(.delegate(.transmit(state.interfaceID, raw)))
+
+            case let .sendRequest(path, data):
+                guard state.status == .active else { return .none }
+                let pathHash = Crypto.truncatedHash(Data(path.utf8))
+                let packed = MsgPack.encode(.array([.double(date.now.timeIntervalSince1970),
+                                                    .bin(pathHash), .bin(data)]))
+                guard packed.count <= Self.requestMDU else { return .none }
+                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                    destinationType: .link, context: .request, contextFlag: false, hops: 0,
+                                    destinationHash: state.linkID, transportId: nil,
+                                    payload: Link.encrypt(packed, sessionKey: state.sessionKey))
+                let requestID = packet.truncatedHash
+                guard let raw = try? packet.packed() else { return .none }
+                state.pendingRequests.insert(requestID)
+                let timeout = (state.rtt ?? 0.5) * 6 + 11.25
+                let id = state.interfaceID
+                return .merge(
+                    .send(.delegate(.transmit(id, raw))),
+                    .run { send in
+                        try await clock.sleep(for: .seconds(timeout))
+                        await send(.requestDeadline(requestID))
+                    }.cancellable(id: CancelID.request(requestID), cancelInFlight: true))
 
             case let .send(plaintext):
                 guard state.status == .active else { return .none }
@@ -364,6 +404,11 @@ public struct LinkSession {
                     return .merge(.send(closedAction), cancelAll)
                 }
                 return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll)
+
+            case let .requestDeadline(requestID):
+                guard state.pendingRequests.contains(requestID) else { return .none }
+                state.pendingRequests.remove(requestID)
+                return .send(.delegate(.requestFailed(requestID: requestID)))
 
             case let .transfer(.element(_, .delegate(.transmit(ifID, raw)))):
                 return .send(.delegate(.transmit(ifID, raw)))

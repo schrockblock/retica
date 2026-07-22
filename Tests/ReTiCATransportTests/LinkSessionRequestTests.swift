@@ -97,3 +97,67 @@ private func captureTransmitReq(_ store: TestStore<LinkSession.State, LinkSessio
     }
     return captured.value!
 }
+
+// Build an inbound RESPONSE packet echoing `requestID`.
+private func responsePacket(_ requestID: Data, _ data: Data) -> Data {
+    let packed = MsgPack.encode(.array([.bin(requestID), .bin(data)]))
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: .response, contextFlag: false, hops: 0,
+                   destinationHash: reqLinkID, transportId: nil, payload: Link.encrypt(packed, sessionKey: reqKey))
+    return try! p.packed()
+}
+
+@Test @MainActor func sendRequestEmitsRequestPacketWithPathHash() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .initiator, clock)
+    await store.send(.sendRequest(path: "svc/echo", data: Data("hello".utf8)))
+    let raw = await captureTransmitReq(store)
+    let packet = Packet(raw: raw)!
+    #expect(packet.context == .request)
+    let plain = Data(Link.decrypt(packet.payload, sessionKey: reqKey)!)
+    guard case let .array(items)? = MsgPack.decodeValue(plain), items.count == 3,
+          case let .bin(pathHash) = items[1], case let .bin(data) = items[2] else { Issue.record("bad req"); return }
+    #expect(pathHash == Crypto.truncatedHash(Data("svc/echo".utf8)))
+    #expect(data == Data("hello".utf8))
+    #expect(store.state.pendingRequests.contains(packet.truncatedHash))
+    // cleanup: fire the deadline to drain the timer
+    await store.send(.requestDeadline(packet.truncatedHash))
+}
+
+@Test @MainActor func inboundResponseMatchesPendingRequestAndClearsIt() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .initiator, clock)
+    await store.send(.sendRequest(path: "svc/echo", data: Data("hi".utf8)))
+    let raw = await captureTransmitReq(store)
+    let requestID = Packet(raw: raw)!.truncatedHash
+    let got = LockIsolated<Data?>(nil)
+    await store.send(.received(responsePacket(requestID, Data("world".utf8))))
+    await store.receive { action in
+        if case let .delegate(.responseReceived(rid, d)) = action, rid == requestID { got.setValue(d); return true }
+        return false
+    }
+    #expect(got.value == Data("world".utf8))
+    #expect(!store.state.pendingRequests.contains(requestID))   // cleared (+ timeout cancelled)
+}
+
+@Test @MainActor func requestDeadlineFiresRequestFailed() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .initiator, clock)
+    await store.send(.sendRequest(path: "svc/slow", data: Data()))
+    let raw = await captureTransmitReq(store)
+    let requestID = Packet(raw: raw)!.truncatedHash
+    // Advance past the timeout (rtt 1.0 → 1*6 + 11.25 = 17.25 s).
+    await clock.advance(by: .seconds(18))
+    await store.receive { action in
+        if case let .delegate(.requestFailed(rid)) = action, rid == requestID { return true }
+        return false
+    }
+    #expect(!store.state.pendingRequests.contains(requestID))
+}
+
+@Test @MainActor func oversizeRequestIsNotSent() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .initiator, clock)
+    await store.send(.sendRequest(path: "svc/big", data: Data(repeating: 0x7A, count: 500)))  // > 431 packed
+    #expect(store.state.pendingRequests.isEmpty)
+}
