@@ -142,6 +142,11 @@ res_adv_msgpack = _adv.pack(segment=0)
 # --- Resource request plaintext (single-window, hashmap not exhausted): 0x00 ‖ hash ‖ hashmap ---
 res_request_plaintext = bytes([0x00]) + res_hash + res_hashmap
 
+# --- HMU msgpack payload: umsgpack.packb([chunk_index, hashmap_bytes]) ---
+hmu_chunk_index = 1
+hmu_hashmap = bytes([i % 256 for i in range(296)])   # 74 * 4 deterministic bytes
+hmu_msgpack = umsgpack.packb([hmu_chunk_index, hmu_hashmap])
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -194,4 +199,6 @@ print(json.dumps({
     "resource_proof": res_proof.hex(),
     "resource_adv_msgpack": res_adv_msgpack.hex(),
     "resource_request_plaintext": res_request_plaintext.hex(),
+    "hmu_msgpack": hmu_msgpack.hex(),
+    "hmu_hashmap": hmu_hashmap.hex(),
 }, indent=2))

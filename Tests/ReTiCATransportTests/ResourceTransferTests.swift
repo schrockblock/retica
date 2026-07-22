@@ -599,3 +599,64 @@ private func hmuPacket(_ hash: Data, chunk: Int, hashes: Data) -> Data {
     // cleanup
     await store.send(.cancel); _ = await captureTransmits(store, count: 1)
 }
+
+// How many transmits the sender will emit in response to `reqFrame`:
+// one RESOURCE part per requested map-hash, plus one RESOURCE_HMU if the request was exhausted (0xFF).
+private func expectedSenderTransmits(_ reqFrame: Data) -> Int {
+    let plain = Data(Link.decrypt(Packet(raw: reqFrame)!.payload, sessionKey: key)!)
+    let exhausted = plain.first == 0xFF
+    let pad = exhausted ? 5 : 1                    // flag(1) [+ last_map_hash(4) when exhausted]
+    let reqBytes = max(0, plain.count - pad - 32)  // minus flag/pad and the 32-byte resource hash
+    let parts = reqBytes / 4
+    return parts + (exhausted ? 1 : 0)
+}
+
+@Test @MainActor func endToEndTransferWithHmuAcrossHashmapBoundary() async {
+    let data = Data((0..<900).map { UInt8($0 & 0xff) })   // ~113 parts at sdu 8 → ≥1 HMU round
+    let senderClock = TestClock<Duration>()
+    let receiverClock = TestClock<Duration>()
+    let sender = TestStore(initialState: senderState(data, sdu: 8)) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = senderClock }
+    sender.exhaustivity = .off
+    let receiver = TestStore(initialState: receiverState()) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = receiverClock }
+    receiver.exhaustivity = .off
+
+    await sender.send(.advertise)
+    let adv = (await captureTransmits(sender, count: 1))[0]
+    await receiver.send(.accept(adv))
+    var req = (await captureTransmits(receiver, count: 1))[0]
+
+    let got = LockIsolated<Data?>(nil)
+    var guardCount = 0
+    while receiver.state.status != .complete && guardCount < 400 {
+        guardCount += 1
+        // The sender emits exactly `requested parts (+ 1 HMU if the REQ was exhausted)` transmits.
+        let n = expectedSenderTransmits(req)
+        await sender.send(.received(req))
+        let outs = await captureTransmits(sender, count: n)
+        for frame in outs { await receiver.send(.received(frame)) }   // parts + HMU both route in
+        if receiver.state.status == .complete {
+            await receiver.receive { if case .delegate(.transmit) = $0 { return true }; return false }  // PRF
+            await receiver.receive { action in
+                if case let .delegate(.received(d)) = action { got.setValue(d); return true }
+                return false
+            }
+            break
+        }
+        // Receiver emits its next request (normal or exhausted) in response to the parts/HMU it got.
+        req = (await captureTransmits(receiver, count: 1))[0]
+    }
+    #expect(got.value == data)
+    #expect(receiver.state.status == .complete)
+    #expect(sender.state.parts.count > 74)               // the transfer genuinely crossed the HMU boundary
+
+    // Feed the proof back so the sender concludes.
+    let proof = Resource.proofData(data: data, hash: sender.state.resourceHash)
+    let pkt = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                     destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
+                     destinationHash: linkID, transportId: nil, payload: proof)
+    await sender.send(.received(try! pkt.packed()))
+    await sender.receive(.delegate(.concluded))
+    #expect(sender.state.status == .complete)
+}

@@ -52,6 +52,8 @@ struct VectorFixtures: Decodable {
     let resourceProof: String
     let resourceAdvMsgpack: String
     let resourceRequestPlaintext: String
+    let hmuMsgpack: String
+    let hmuHashmap: String
 
     enum CodingKeys: String, CodingKey {
         case identityPrivateKey = "identity_private_key"
@@ -105,6 +107,8 @@ struct VectorFixtures: Decodable {
         case resourceProof = "resource_proof"
         case resourceAdvMsgpack = "resource_adv_msgpack"
         case resourceRequestPlaintext = "resource_request_plaintext"
+        case hmuMsgpack = "hmu_msgpack"
+        case hmuHashmap = "hmu_hashmap"
     }
 
     static func load() throws -> VectorFixtures {
