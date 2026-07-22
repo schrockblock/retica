@@ -329,8 +329,8 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     await b.receive(\.delegate.linkClosed)
-    #expect(a.state.links[0].status == .closed)
-    #expect(b.state.links[0].status == .closed)
+    #expect(a.state.links.isEmpty)      // closed link is removed from the collection
+    #expect(b.state.links.isEmpty)      // closed link is removed from the collection
 
     await a.send(.disconnect); await b.send(.disconnect)
 }
@@ -467,7 +467,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         }
     }
     #expect(got.value == payload)
-    #expect(b.state.links[0].transfers[0].status == .complete)
+    #expect(b.state.links[0].transfers[0].status == .complete)  // receiver transfer stays until link closes
     // PRF → A: A validates and concludes.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
@@ -475,7 +475,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         if case let .delegate(.resourceConcluded(lid, _)) = action, lid == linkID { return true }
         return false
     }
-    #expect(a.state.links[0].transfers[0].status == .complete)
+    #expect(a.state.links[0].transfers.isEmpty)   // sender transfer removed on conclude (GC)
 
     // Close the link to cancel the link timers, then disconnect.
     await a.send(.closeLink(linkID: linkID))
@@ -1059,4 +1059,33 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     await b.receive(\.transport.received)
 
     await a.send(.disconnect); await b.send(.disconnect)
+}
+
+// MARK: – GC: closed/failed links are removed from the collection
+
+@Test @MainActor func closedLinkIsRemovedFromEndpoint() async {
+    let clock = TestClock()
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let (store, elementID) = endpointWithActiveLink(linkID: linkID, remoteIdentity: nil,
+                                                    registrations: [:], responder: .testValue, clock)
+    await store.send(.link(.element(id: elementID, action: .delegate(.closed(.initiatorClosed)))))
+    await store.receive { action in
+        if case let .delegate(.linkClosed(lid, reason)) = action { return lid == linkID && reason == .initiatorClosed }
+        return false
+    }
+    #expect(store.state.links[id: elementID] == nil)           // removed
+}
+
+@Test @MainActor func establishmentFailedLinkIsRemovedFromEndpoint() async {
+    let clock = TestClock()
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let (store, elementID) = endpointWithActiveLink(linkID: linkID, remoteIdentity: nil,
+                                                    registrations: [:], responder: .testValue, clock)
+    let destHash = store.state.links[id: elementID]!.destinationHash
+    await store.send(.link(.element(id: elementID, action: .delegate(.establishmentFailed))))
+    await store.receive { action in
+        if case let .delegate(.linkFailed(dh)) = action { return dh == destHash }
+        return false
+    }
+    #expect(store.state.links[id: elementID] == nil)           // removed
 }

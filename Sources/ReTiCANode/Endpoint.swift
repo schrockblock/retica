@@ -164,10 +164,12 @@ public struct Endpoint {
 
             case let .link(.element(elementID, .delegate(.closed(reason)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                state.links.remove(id: elementID)
                 return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
 
             case let .link(.element(elementID, .delegate(.establishmentFailed))):
                 guard let destHash = state.links[id: elementID]?.destinationHash else { return .none }
+                state.links.remove(id: elementID)
                 return .send(.delegate(.linkFailed(destinationHash: destHash)))
 
             case let .link(.element(elementID, .delegate(.resourceReceived(data)))):
