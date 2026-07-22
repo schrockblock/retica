@@ -107,6 +107,7 @@ public struct LinkSession {
         case inactivityDeadline
         case sendResource(Data)
         case sendRequest(path: String, data: Data)
+        case sendResponse(requestID: Data, data: Data)
         case requestDeadline(Data)
         case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
@@ -123,6 +124,7 @@ public struct LinkSession {
             case identified(Identity)
             case responseReceived(requestID: Data, data: Data)
             case requestFailed(requestID: Data)
+            case requestReceived(requestID: Data, pathHash: Data, data: Data)
         }
     }
 
@@ -317,6 +319,14 @@ public struct LinkSession {
                     state.remoteIdentity = peer
                     return .send(.delegate(.identified(peer)))
 
+                case (_, .active, .data, .request):
+                    let requestID = packet.truncatedHash
+                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                          case let .array(items)? = MsgPack.decodeValue(Data(plain)), items.count == 3,
+                          case let .bin(pathHash) = items[1], case let .bin(data) = items[2]
+                    else { return .none }
+                    return .send(.delegate(.requestReceived(requestID: requestID, pathHash: pathHash, data: data)))
+
                 default:
                     return .none
                 }
@@ -362,6 +372,15 @@ public struct LinkSession {
                         try await clock.sleep(for: .seconds(timeout))
                         await send(.requestDeadline(requestID))
                     }.cancellable(id: CancelID.request(requestID), cancelInFlight: true))
+
+            case let .sendResponse(requestID, data):
+                guard state.status == .active else { return .none }
+                let packed = MsgPack.encode(.array([.bin(requestID), .bin(data)]))
+                guard packed.count <= Self.requestMDU,
+                      let raw = linkPacket(state.linkID, .response,
+                                           Link.encrypt(packed, sessionKey: state.sessionKey))
+                else { return .none }
+                return .send(.delegate(.transmit(state.interfaceID, raw)))
 
             case let .send(plaintext):
                 guard state.status == .active else { return .none }

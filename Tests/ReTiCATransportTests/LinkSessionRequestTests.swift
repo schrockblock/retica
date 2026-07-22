@@ -161,3 +161,43 @@ private func responsePacket(_ requestID: Data, _ data: Data) -> Data {
     await store.send(.sendRequest(path: "svc/big", data: Data(repeating: 0x7A, count: 500)))  // > 431 packed
     #expect(store.state.pendingRequests.isEmpty)
 }
+
+// Build an inbound REQUEST packet for a path+data.
+private func requestPacket(_ path: String, _ data: Data) -> Data {
+    let packed = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data(path.utf8))), .bin(data)]))
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: .request, contextFlag: false, hops: 0,
+                   destinationHash: reqLinkID, transportId: nil, payload: Link.encrypt(packed, sessionKey: reqKey))
+    return try! p.packed()
+}
+
+@Test @MainActor func inboundRequestSurfacesRequestReceivedWithPacketID() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .responder, clock)
+    let raw = requestPacket("svc/echo", Data("ping".utf8))
+    let expectedID = Packet(raw: raw)!.truncatedHash
+    let got = LockIsolated<(Data, Data, Data)?>(nil)
+    await store.send(.received(raw))
+    await store.receive { action in
+        if case let .delegate(.requestReceived(rid, ph, d)) = action { got.setValue((rid, ph, d)); return true }
+        return false
+    }
+    #expect(got.value?.0 == expectedID)
+    #expect(got.value?.1 == Crypto.truncatedHash(Data("svc/echo".utf8)))
+    #expect(got.value?.2 == Data("ping".utf8))
+}
+
+@Test @MainActor func sendResponseEmitsResponsePacketEchoingRequestID() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .responder, clock)
+    let requestID = Data(repeating: 0xCD, count: 16)
+    await store.send(.sendResponse(requestID: requestID, data: Data("pong".utf8)))
+    let raw = await captureTransmitReq(store)
+    let packet = Packet(raw: raw)!
+    #expect(packet.context == .response)
+    let plain = Data(Link.decrypt(packet.payload, sessionKey: reqKey)!)
+    guard case let .array(items)? = MsgPack.decodeValue(plain), items.count == 2,
+          case let .bin(rid) = items[0], case let .bin(d) = items[1] else { Issue.record("bad resp"); return }
+    #expect(rid == requestID)
+    #expect(d == Data("pong".utf8))
+}
