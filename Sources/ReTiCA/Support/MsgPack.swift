@@ -29,6 +29,7 @@ public enum MsgPack {
         case let .double(x):  return encode(x)          // existing float64 encoder
         case .null:           return Data([0xC0])
         case let .map(pairs): return encodeMap(pairs)
+        case let .array(items): return encodeArray(items)
         }
     }
 
@@ -62,6 +63,15 @@ public enum MsgPack {
         for p in pairs { d.append(encodeStr(p.key)); d.append(encode(p.value)) }
         return d
     }
+    private static func encodeArray(_ items: [MsgPackValue]) -> Data {
+        let n = items.count
+        var d: Data
+        if n <= 15 { d = Data([0x90 | UInt8(n)]) }
+        else if n <= 0xFFFF { d = Data([0xDC]) + beBytes(UInt16(n)) }
+        else { d = Data([0xDD]) + beBytes(UInt32(n)) }
+        for it in items { d.append(encode(it)) }
+        return d
+    }
     private static func beBytes<T: FixedWidthInteger>(_ v: T) -> Data {
         var be = v.bigEndian; return withUnsafeBytes(of: &be) { Data($0) }
     }
@@ -91,6 +101,9 @@ public enum MsgPack {
         case 0xDB: guard i + 4 < b.count else { return nil }; return str(b, i + 5, Int(be(b, i + 1, 4)))
         case 0x80...0x8F: return parseMap(b, i + 1, Int(tag & 0x0F))
         case 0xDE: guard i + 2 < b.count else { return nil }; return parseMap(b, i + 3, Int(be(b, i + 1, 2)))
+        case 0x90...0x9F: return parseArray(b, i + 1, Int(tag & 0x0F))
+        case 0xDC: guard i + 2 < b.count else { return nil }; return parseArray(b, i + 3, Int(be(b, i + 1, 2)))
+        case 0xDD: guard i + 4 < b.count else { return nil }; return parseArray(b, i + 5, Int(be(b, i + 1, 4)))
         default: return nil
         }
     }
@@ -111,6 +124,14 @@ public enum MsgPack {
         }
         return (.map(pairs), i)
     }
+    private static func parseArray(_ b: [UInt8], _ start: Int, _ count: Int) -> (MsgPackValue, Int)? {
+        var i = start; var items: [MsgPackValue] = []
+        for _ in 0..<count {
+            guard let (v, ni) = parse(b, i) else { return nil }
+            items.append(v); i = ni
+        }
+        return (.array(items), i)
+    }
     private static func be(_ b: [UInt8], _ i: Int, _ n: Int) -> UInt64 {
         (0..<n).reduce(UInt64(0)) { ($0 << 8) | UInt64(b[i + $1]) }
     }
@@ -125,6 +146,7 @@ public indirect enum MsgPackValue: Equatable {
     case double(Double)
     case null
     case map([Pair])
+    case array([MsgPackValue])
 
     public struct Pair: Equatable {
         public let key: String

@@ -72,3 +72,25 @@ import Foundation
     #expect(MsgPack.decodeValue(MsgPack.encode(.string(str256))) == .string(str256))
     #expect(MsgPack.decodeValue(MsgPack.encode(.bin(bin256))) == .bin(bin256))
 }
+
+@Test func msgpackEncodesFixarrayOfIntAndBin() {
+    // [5, 0x01020304] → 0x92 (fixarray-2) 0x05 (uint 5) 0xC4 0x04 (bin8 len4) 01 02 03 04
+    let v = MsgPackValue.array([.uint(5), .bin(Data([1, 2, 3, 4]))])
+    #expect(MsgPack.encode(v) == Data([0x92, 0x05, 0xC4, 0x04, 1, 2, 3, 4]))
+}
+
+@Test func msgpackArrayRoundTrips() {
+    let v = MsgPackValue.array([.uint(148), .bin(Data(repeating: 0xAB, count: 296))])
+    #expect(MsgPack.decodeValue(MsgPack.encode(v)) == v)
+}
+
+@Test func msgpackEmptyArrayRoundTrips() {
+    #expect(MsgPack.decodeValue(MsgPack.encode(.array([]))) == .array([]))
+}
+
+@Test func msgpackArray16RoundTripsForLargeArrays() {
+    let v = MsgPackValue.array((0..<20).map { MsgPackValue.uint(UInt64($0)) })   // 20 > 15 → array16
+    let encoded = MsgPack.encode(v)
+    #expect(encoded[encoded.startIndex] == 0xDC)      // array16 tag
+    #expect(MsgPack.decodeValue(encoded) == v)
+}
