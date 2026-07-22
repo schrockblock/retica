@@ -921,8 +921,14 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     await a.receive { if case .interface(.send) = $0 { return true }; return false }
 
     // Request frame → B: B auto-answers, never surfaces requestReceived.
+    // bSurfaced is checked in EVERY B-side predicate so a delegate.requestReceived emitted in any
+    // dispatch cycle is caught, not just the one that waits for interface(.send).
     eventsB.yield(.data(sentA.value.last!))
-    await b.receive(\.transport.received)
+    await b.receive { action in
+        if case .delegate(.requestReceived) = action { bSurfaced.setValue(true) }
+        if case .transport(.received) = action { return true }
+        return false
+    }
     // The auto-responder fires synchronously inside the reducer; B emits sendResponseOverLink which
     // routes through link → interface(.send). Scan for both but require no requestReceived.
     await b.receive { action in
