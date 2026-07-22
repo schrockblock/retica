@@ -147,6 +147,20 @@ hmu_chunk_index = 1
 hmu_hashmap = bytes([i % 256 for i in range(296)])   # 74 * 4 deterministic bytes
 hmu_msgpack = umsgpack.packb([hmu_chunk_index, hmu_hashmap])
 
+# --- Link IDENTIFY: RNS-produced payload for a fixed identity + link_id ---
+identify_prv = bytes([(i * 7 + 3) % 256 for i in range(64)])
+identify_identity = RNS.Identity.from_bytes(identify_prv)
+identify_link_id = bytes([0xAB] * 16)
+identify_pub = identify_identity.get_public_key()
+identify_signature = identify_identity.sign(identify_link_id + identify_pub)
+identify_payload = identify_pub + identify_signature
+
+# --- path hash + msgpack request/response layouts ---
+req_path = "svc/echo"
+req_path_hash = RNS.Identity.truncated_hash(req_path.encode("utf-8"))
+req_msgpack = umsgpack.packb([1.5, req_path_hash, b"ping"])
+resp_msgpack = umsgpack.packb([bytes([0xCD] * 16), b"pong"])
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -201,4 +215,11 @@ print(json.dumps({
     "resource_request_plaintext": res_request_plaintext.hex(),
     "hmu_msgpack": hmu_msgpack.hex(),
     "hmu_hashmap": hmu_hashmap.hex(),
+    "identify_prv": identify_prv.hex(),
+    "identify_link_id": identify_link_id.hex(),
+    "identify_pub": identify_pub.hex(),
+    "identify_payload": identify_payload.hex(),
+    "req_path_hash": req_path_hash.hex(),
+    "req_msgpack": req_msgpack.hex(),
+    "resp_msgpack": resp_msgpack.hex(),
 }, indent=2))

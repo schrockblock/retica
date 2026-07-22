@@ -54,6 +54,13 @@ struct VectorFixtures: Decodable {
     let resourceRequestPlaintext: String
     let hmuMsgpack: String
     let hmuHashmap: String
+    let identifyPrv: String
+    let identifyLinkId: String
+    let identifyPub: String
+    let identifyPayload: String
+    let reqPathHash: String
+    let reqMsgpack: String
+    let respMsgpack: String
 
     enum CodingKeys: String, CodingKey {
         case identityPrivateKey = "identity_private_key"
@@ -109,6 +116,13 @@ struct VectorFixtures: Decodable {
         case resourceRequestPlaintext = "resource_request_plaintext"
         case hmuMsgpack = "hmu_msgpack"
         case hmuHashmap = "hmu_hashmap"
+        case identifyPrv = "identify_prv"
+        case identifyLinkId = "identify_link_id"
+        case identifyPub = "identify_pub"
+        case identifyPayload = "identify_payload"
+        case reqPathHash = "req_path_hash"
+        case reqMsgpack = "req_msgpack"
+        case respMsgpack = "resp_msgpack"
     }
 
     static func load() throws -> VectorFixtures {

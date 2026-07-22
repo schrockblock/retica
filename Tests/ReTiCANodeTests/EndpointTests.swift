@@ -529,3 +529,78 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     #expect(got.value?.0 == linkID)
     #expect(got.value?.1 == rid)
 }
+
+@Test @MainActor func twoEndpointsIdentifyAndRoundTripARequest() async {
+    let clock = TestClock()
+    let aIdentity = Identity()
+    let bIdentity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
+
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            Endpoint()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } }, close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
+    let (a, eventsA) = make("a", sentA)
+    let (b, eventsB) = make("b", sentB)
+
+    // Establish (identical to twoEndpointsEstablishLinkExchangeDataAndClose steps 1–4).
+    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await b.send(.registerLocalDestination(dest))
+    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.announce(destinationHash: dest.hash, appData: nil))
+    eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
+    await a.send(.openLink(destinationHash: dest.hash))
+    await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive(\.delegate.linkEstablished)
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
+    let linkID = a.state.links[0].linkID
+
+    // A identifies → B surfaces linkIdentified with A's identity.
+    await a.send(.identifyOverLink(linkID: linkID, identity: aIdentity))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    let idHash = LockIsolated<Data?>(nil)
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received)
+    await b.receive { action in
+        if case let .delegate(.linkIdentified(_, id)) = action { idHash.setValue(id.hash); return true }
+        return false
+    }
+    #expect(idHash.value == aIdentity.hash)
+
+    // A requests → B surfaces requestReceived → B responds → A surfaces responseReceived.
+    await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: Data("ping".utf8)))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    let reqID = LockIsolated<Data?>(nil)
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received)
+    await b.receive { action in
+        if case let .delegate(.requestReceived(_, rid, _, d)) = action, d == Data("ping".utf8) { reqID.setValue(rid); return true }
+        return false
+    }
+    await b.send(.sendResponseOverLink(linkID: linkID, requestID: reqID.value!, data: Data("pong".utf8)))
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    let respData = LockIsolated<Data?>(nil)
+    eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
+    await a.receive { action in
+        if case let .delegate(.responseReceived(_, rid, d)) = action, rid == reqID.value! { respData.setValue(d); return true }
+        return false
+    }
+    #expect(respData.value == Data("pong".utf8))
+
+    await a.send(.disconnect); await b.send(.disconnect)
+}
