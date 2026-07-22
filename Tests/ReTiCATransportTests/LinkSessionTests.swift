@@ -559,12 +559,20 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     // Drain the transmit + closed delegate actions emitted by .close.
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     await store.receive { if case .delegate(.closed(.initiatorClosed)) = $0 { return true }; return false }
-    // Switch to exhaustive mode: if the request timer was NOT cancelled by cancelPending,
-    // requestDeadline arrives as an unhandled received action → exhaustive teardown fails.
+    _ = requestID   // captured above; used only to document what was pending before the close
+    // Advancing well past the request timeout (rtt*6+11.25 = 17.25 s) surfaces no requestFailed:
+    // pendingRequests is empty, so even if a timer fired its .requestDeadline the guard would drop
+    // it. In exhaustive mode a spurious requestFailed here would fail the run.
     store.exhaustivity = .on
-    // Advance well past rtt*6+11.25 (17.25 s). The timer was cancelled → no action queued.
-    _ = requestID   // suppress unused warning
     await clock.advance(by: .seconds(120))
+    // NOTE (mutation coverage): the behaviorally-meaningful guarantee of cancelPending is that
+    // pendingRequests is EMPTIED on close (asserted above; a mutation dropping removeAll() fails
+    // this test). The additional `.cancel(id: CancelID.request(rid))` it issues is defensive
+    // resource-hygiene: because the set is already cleared, a leaked request timer is behaviorally
+    // inert (its .requestDeadline is guard-dropped) AND does not surface as a received action or an
+    // in-flight effect in this TCA/Swift-Testing harness — so a mutation that drops only the
+    // `.cancel` (keeping removeAll) has no observable effect and is not independently catchable here,
+    // analogous to the documented requestMDU-boundary case. The cancel is retained as correct hygiene.
 }
 
 // NOTE (TCA 1.26 choreography): TCA 1.26's receive-with-predicate takes a synchronous path
