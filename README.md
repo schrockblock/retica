@@ -184,7 +184,17 @@ after 16 retries. The sender re-advertises when no request arrives (up to 4 time
 proof in an `awaitingProof` state, and gives up after its patience elapses. Either side can abort:
 `RESOURCE_ICL` (sender) and `RESOURCE_RCL` (receiver) — each carrying the resource hash encrypted with
 the link key — drive the peer to a failed state. Rate-adaptive window escalation (fast/very-slow),
-hashmap-update (multi-segment), and compression remain future slices.
+and compression remain future slices.
+
+### Large resources: hashmap-update (HMU)
+
+A resource with more than `HASHMAP_MAX_LEN` = 74 parts (~34 KB at SDU 464) is transferred in a single
+`ResourceTransfer` whose part-hashmap is delivered incrementally. The advertisement carries only the
+first 74 map-hashes; as the receiver's window reaches an unknown slot it sends an exhausted-flagged
+`RESOURCE_REQ` (`0xFF ‖ last-hash ‖ hash ‖ requested`), and the sender replies with the next 74-hash
+`RESOURCE_HMU` chunk (`hash ‖ msgpack([chunkIndex, hashes])`, encrypted). This lifts the single-transfer
+ceiling to ~1 MB, wire-compatible with Python-RNS 1.3.8. Resources larger than that (true multi-segment
+sub-resources) remain a future slice.
 
 ### Sending resources over a link (`Endpoint`)
 
