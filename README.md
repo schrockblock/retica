@@ -136,8 +136,12 @@ to the matching link by `link_id`, creates a responder link on an inbound LINKRE
 destination, and can `openLink(destinationHash:)` to a learned destination. Link lifecycle surfaces
 as `Endpoint.delegate(.linkEstablished/.linkDataReceived/.linkClosed/.linkFailed)`, and
 `sendOverLink`/`closeLink` drive an active link. Two endpoints can establish a link, exchange data,
-and close — verified end-to-end. (Closed links remain inert in the collection; link GC and multiple
-interfaces per endpoint are future work.)
+and close — verified end-to-end. Closed and establishment-failed links are removed from the
+endpoint's link collection as soon as their terminal delegate fires (`linkClosed` / `linkFailed`),
+and concluded or failed resource transfers are removed from their link. Removing a link also cancels
+any of its in-flight timers (keepalive/inactivity) and outstanding request timers, and clears its
+pending requests — so terminal state and timers do not accumulate. (Multiple interfaces per endpoint
+are future work.)
 
 ### Link identify & request/response (`Endpoint`)
 
@@ -239,8 +243,8 @@ Once a link is established, a resource is sent end-to-end through the public API
 - Completion surfaces as `Endpoint` delegates: `resourceReceived(linkID:data:)` on the receiver, and
   `resourceConcluded(linkID:resourceHash:)` / `resourceFailed(linkID:resourceHash:)` on either side.
 
-`ResourceTransfer` instances live inside their `LinkSession` (link-scoped). Terminal transfers are
-retained (no GC yet); MTU/SDU negotiation, multi-segment, and compression remain future slices.
+`ResourceTransfer` instances live inside their `LinkSession` (link-scoped). Terminal transfers (concluded or failed) are removed from their `LinkSession` automatically; MTU/SDU
+negotiation, multi-segment, and compression remain future slices.
 
 ### Live endpoint test (opt-in)
 
