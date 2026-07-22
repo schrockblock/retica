@@ -853,3 +853,201 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
         action: .delegate(.requestReceived(requestID: Data([1]), pathHash: pathHash("svc/p"), data: Data([9]))))))
     #expect(called.value == false)
 }
+
+// MARK: – E2E auto-answer tests (two live Endpoint stores)
+
+@Test @MainActor func handlerAutoAnswersInlineRequestWithoutSurfacing() async {
+    let clock = TestClock()
+    let bIdentity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
+
+    let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
+
+    // Build A (initiator): standard make.
+    let eventsA_stream = AsyncStream<TCPEvent>.makeStream()
+    let a = TestStore(initialState: Endpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
+        Endpoint()
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in eventsA_stream.stream },
+                                         send: { d in sentA.withValue { $0.append(d) } }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+    }
+    a.exhaustivity = .off
+    let eventsA = eventsA_stream.continuation
+
+    // Build B (responder): same, plus the echo requestResponder.
+    let eventsB_stream = AsyncStream<TCPEvent>.makeStream()
+    let b = TestStore(initialState: Endpoint.State(host: "b", port: 4242, reconnectOnDrop: false)) {
+        Endpoint()
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in eventsB_stream.stream },
+                                         send: { d in sentB.withValue { $0.append(d) } }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+        $0.requestResponder = RequestResponder { path, data, _ in path == "svc/echo" ? data : nil }
+    }
+    b.exhaustivity = .off
+    let eventsB = eventsB_stream.continuation
+
+    // Establish link (same as twoEndpointsIdentifyAndRoundTripARequest steps 1–4).
+    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await b.send(.registerLocalDestination(dest))
+    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.announce(destinationHash: dest.hash, appData: nil))
+    eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
+    await a.send(.openLink(destinationHash: dest.hash))
+    await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive(\.delegate.linkEstablished)
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
+    let linkID = a.state.links[0].linkID
+
+    // Register the handler on B.
+    await b.send(.registerRequestHandler(path: "svc/echo", policy: .all))
+
+    // Track whether B ever surfaces delegate.requestReceived.
+    let bSurfaced = LockIsolated(false)
+
+    // A sends a small inline request.
+    let reqPayload = Data("ping".utf8)
+    await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: reqPayload))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+
+    // Request frame → B: B auto-answers, never surfaces requestReceived.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    // The auto-responder fires synchronously inside the reducer; B emits sendResponseOverLink which
+    // routes through link → interface(.send). Scan for both but require no requestReceived.
+    await b.receive { action in
+        if case .delegate(.requestReceived) = action { bSurfaced.setValue(true) }
+        if case .interface(.send) = action { return true }
+        return false
+    }
+    #expect(bSurfaced.value == false, "B must NOT surface delegate.requestReceived for a registered+allowed path")
+
+    // Response frame → A: A surfaces responseReceived with the echoed payload.
+    let gotRespData = LockIsolated<Data?>(nil)
+    let gotRespID = LockIsolated<Data?>(nil)
+    eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
+    await a.receive { action in
+        if case let .delegate(.responseReceived(_, rid, d)) = action { gotRespID.setValue(rid); gotRespData.setValue(d); return true }
+        return false
+    }
+    #expect(gotRespData.value == reqPayload, "A must receive the exact echoed bytes")
+
+    await a.send(.disconnect); await b.send(.disconnect)
+}
+
+@Test @MainActor func handlerAutoAnswersWithLargeResourceResponse() async {
+    let clock = TestClock()
+    let bIdentity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
+
+    let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
+
+    // B's responder returns a >431-byte payload so the response rides a Resource.
+    let largeResponse = Data((0..<600).map { UInt8($0 & 0xff) })
+
+    // Build A (initiator).
+    let eventsA_stream = AsyncStream<TCPEvent>.makeStream()
+    let a = TestStore(initialState: Endpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
+        Endpoint()
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in eventsA_stream.stream },
+                                         send: { d in sentA.withValue { $0.append(d) } }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+    }
+    a.exhaustivity = .off
+    let eventsA = eventsA_stream.continuation
+
+    // Build B (responder) with large-response responder.
+    let eventsB_stream = AsyncStream<TCPEvent>.makeStream()
+    let b = TestStore(initialState: Endpoint.State(host: "b", port: 4242, reconnectOnDrop: false)) {
+        Endpoint()
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in eventsB_stream.stream },
+                                         send: { d in sentB.withValue { $0.append(d) } }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+        $0.requestResponder = RequestResponder { path, _, _ in path == "svc/echo" ? largeResponse : nil }
+    }
+    b.exhaustivity = .off
+    let eventsB = eventsB_stream.continuation
+
+    // Establish link (same steps as above).
+    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await b.send(.registerLocalDestination(dest))
+    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.announce(destinationHash: dest.hash, appData: nil))
+    eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
+    await a.send(.openLink(destinationHash: dest.hash))
+    await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive(\.delegate.linkEstablished)
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
+    let linkID = a.state.links[0].linkID
+
+    // Register the handler on B.
+    await b.send(.registerRequestHandler(path: "svc/echo", policy: .all))
+
+    // A sends a small inline request (only the RESPONSE is large).
+    await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: Data("ping".utf8)))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+
+    // Request frame → B: B auto-answers with the large response, which rides a Resource.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    // B emits RESOURCE_ADV for the large response (not an interface(.send) from inline).
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESP_RESOURCE_ADV out
+
+    // ADV → A: A's pendingRequests has the requestID, so it accepts the response resource and emits RESOURCE_REQ.
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_REQ out
+
+    // REQ → B: B serves its parts.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    let respPartCount = b.state.links[0].transfers.first(where: { $0.role == .sender && $0.advertisement?.isResponse == true })!.parts.count
+    for _ in 0..<respPartCount {
+        await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    }
+
+    // Deliver every part frame B emitted (last `respPartCount` frames in sentB) to A.
+    let respParts = Array(sentB.value.suffix(respPartCount))
+    let gotRespData = LockIsolated<Data?>(nil)
+    for (i, frame) in respParts.enumerated() {
+        eventsA.yield(.data(frame))
+        await a.receive(\.transport.received)
+        if i == respPartCount - 1 {
+            // Last part: A sends PRF then surfaces responseReceived.
+            await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_PRF out
+            await a.receive { action in
+                if case let .delegate(.responseReceived(_, _, d)) = action { gotRespData.setValue(d); return true }
+                return false
+            }
+        }
+    }
+    #expect(gotRespData.value == largeResponse, "A must receive the exact large bytes from the in-library handler")
+    #expect(largeResponse.count > 431, "Response payload must exceed 431 bytes to verify the Resource path")
+
+    // PRF → B: B validates.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+
+    await a.send(.disconnect); await b.send(.disconnect)
+}
