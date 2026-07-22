@@ -13,6 +13,7 @@ public struct Endpoint {
         public var interface: TCPClientInterface.State
         public var transport: Transport.State
         public var links: IdentifiedArrayOf<LinkSession.State> = []
+        public var registrations: [Data: RequestRegistration] = [:]
         public let interfaceID: InterfaceID
 
         public init(host: String, port: UInt16, reconnectOnDrop: Bool = true,
@@ -41,6 +42,8 @@ public struct Endpoint {
         case identifyOverLink(linkID: Data, identity: Identity)
         case sendRequestOverLink(linkID: Data, path: String, data: Data)
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
+        case registerRequestHandler(path: String, policy: RequestPolicy)
+        case deregisterRequestHandler(path: String)
 
         case delegate(Delegate)
         @CasePathable
@@ -65,6 +68,7 @@ public struct Endpoint {
     public init() {}
 
     @Dependency(\.uuid) var uuid
+    @Dependency(\.requestResponder) var requestResponder
 
     public var body: some ReducerOf<Self> {
         Scope(state: \.interface, action: \.interface) { TCPClientInterface() }
@@ -144,6 +148,13 @@ public struct Endpoint {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .close)))
 
+            case let .registerRequestHandler(path, policy):
+                state.registrations[Crypto.truncatedHash(Data(path.utf8))] = RequestRegistration(path: path, policy: policy)
+                return .none
+            case let .deregisterRequestHandler(path):
+                state.registrations[Crypto.truncatedHash(Data(path.utf8))] = nil
+                return .none
+
             case let .link(.element(_, .delegate(.established(linkID, _)))):
                 return .send(.delegate(.linkEstablished(linkID: linkID)))
 
@@ -174,7 +185,19 @@ public struct Endpoint {
                 return .send(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: identity)))
             case let .link(.element(elementID, .delegate(.requestReceived(rid, ph, data)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
-                return .send(.delegate(.requestReceived(linkID: linkID, requestID: rid, pathHash: ph, data: data)))
+                guard let reg = state.registrations[ph] else {
+                    // No registered handler for this path: surface to the app exactly as before.
+                    return .send(.delegate(.requestReceived(linkID: linkID, requestID: rid, pathHash: ph, data: data)))
+                }
+                let identity = state.links[id: elementID]?.remoteIdentity
+                guard isAllowed(reg.policy, identity) else { return .none }   // denied → silent drop
+                let path = reg.path
+                let responder = requestResponder
+                return .run { send in
+                    if let response = await responder(path, data, identity) {
+                        await send(.sendResponseOverLink(linkID: linkID, requestID: rid, data: response))
+                    }
+                }
             case let .link(.element(elementID, .delegate(.responseReceived(rid, data)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
                 return .send(.delegate(.responseReceived(linkID: linkID, requestID: rid, data: data)))

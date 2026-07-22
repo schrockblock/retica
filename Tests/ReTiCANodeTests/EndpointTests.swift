@@ -738,3 +738,118 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
     await a.send(.disconnect); await b.send(.disconnect)
 }
+
+// MARK: – Request handler registry + allow-gated auto-response tests
+
+// Build an Endpoint store holding one active link (so requestReceived can be routed), with the given
+// registrations and responder. `remoteIdentity` is optional (nil = un-identified peer).
+@MainActor
+private func endpointWithActiveLink(
+    linkID: Data,
+    remoteIdentity: Identity?,
+    registrations: [Data: RequestRegistration],
+    responder: RequestResponder,
+    _ clock: TestClock<Duration>
+) -> (TestStore<Endpoint.State, Endpoint.Action>, UUID) {
+    var s = Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+    let elementID = UUID(0)
+    var link = LinkSession.State(id: elementID, responderFor: Identity(),
+                                 destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
+    link.status = .active
+    link.sessionKey = Data(repeating: 0x09, count: 64)
+    link.linkID = linkID
+    link.remoteIdentity = remoteIdentity
+    s.links.append(link)
+    s.registrations = registrations
+    let store = TestStore(initialState: s) { Endpoint() } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+        $0.requestResponder = responder
+    }
+    store.exhaustivity = .off
+    return (store, elementID)
+}
+
+private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) }
+
+@Test @MainActor func registerThenDeregisterMutatesRegistrations() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: Endpoint.State(host: "h", port: 1)) { Endpoint() } withDependencies: {
+        $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.registerRequestHandler(path: "svc/echo", policy: .all))
+    #expect(store.state.registrations[pathHash("svc/echo")]?.policy == .all)
+    #expect(store.state.registrations[pathHash("svc/echo")]?.path == "svc/echo")
+    await store.send(.deregisterRequestHandler(path: "svc/echo"))
+    #expect(store.state.registrations[pathHash("svc/echo")] == nil)
+}
+
+@Test @MainActor func unregisteredRequestForwardsToApp() async {
+    let clock = TestClock()
+    let called = LockIsolated(false)
+    let responder = RequestResponder { _, _, _ in called.setValue(true); return Data() }
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let (store, _) = endpointWithActiveLink(linkID: linkID, remoteIdentity: nil,
+                                            registrations: [:], responder: responder, clock)
+    await store.send(.link(.element(id: UUID(0),
+        action: .delegate(.requestReceived(requestID: Data([1]), pathHash: pathHash("svc/x"), data: Data([9]))))))
+    await store.receive { action in
+        if case let .delegate(.requestReceived(lid, rid, ph, d)) = action {
+            return lid == linkID && rid == Data([1]) && ph == pathHash("svc/x") && d == Data([9])
+        }
+        return false
+    }
+    #expect(called.value == false)     // responder never consulted for an unregistered path
+}
+
+@Test @MainActor func allowedRequestAutoRespondsAndDoesNotSurface() async {
+    let clock = TestClock()
+    let called = LockIsolated(false)
+    let responder = RequestResponder { path, data, _ in
+        called.setValue(true); return path == "svc/echo" ? data : nil
+    }
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let (store, _) = endpointWithActiveLink(linkID: linkID, remoteIdentity: nil,
+        registrations: [pathHash("svc/echo"): RequestRegistration(path: "svc/echo", policy: .all)],
+        responder: responder, clock)
+    await store.send(.link(.element(id: UUID(0),
+        action: .delegate(.requestReceived(requestID: Data([7]), pathHash: pathHash("svc/echo"), data: Data([4, 2]))))))
+    await store.receive { action in
+        if case let .sendResponseOverLink(lid, rid, d) = action {
+            return lid == linkID && rid == Data([7]) && d == Data([4, 2])   // echoed payload
+        }
+        return false
+    }
+    #expect(called.value == true)
+}
+
+@Test @MainActor func deniedRequestDropsWithoutRespondingOrSurfacing() async {
+    let clock = TestClock()
+    let called = LockIsolated(false)
+    let responder = RequestResponder { _, _, _ in called.setValue(true); return Data([0]) }
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let (store, _) = endpointWithActiveLink(linkID: linkID, remoteIdentity: nil,
+        registrations: [pathHash("svc/secret"): RequestRegistration(path: "svc/secret", policy: .none)],
+        responder: responder, clock)
+    await store.send(.link(.element(id: UUID(0),
+        action: .delegate(.requestReceived(requestID: Data([1]), pathHash: pathHash("svc/secret"), data: Data([9]))))))
+    #expect(called.value == false)     // gate blocks before the responder; nothing sent, nothing surfaced
+}
+
+@Test @MainActor func listPolicyGatesOnRemoteIdentity() async {
+    let clock = TestClock()
+    let allowed = Identity()
+    let called = LockIsolated(false)
+    let responder = RequestResponder { _, data, _ in called.setValue(true); return data }
+    let linkID = Data(repeating: 0xAB, count: 16)
+    // Peer identity is NOT on the allowed list → denied.
+    let (store, _) = endpointWithActiveLink(linkID: linkID, remoteIdentity: Identity(),
+        registrations: [pathHash("svc/p"): RequestRegistration(path: "svc/p", policy: .list([allowed.hash]))],
+        responder: responder, clock)
+    await store.send(.link(.element(id: UUID(0),
+        action: .delegate(.requestReceived(requestID: Data([1]), pathHash: pathHash("svc/p"), data: Data([9]))))))
+    #expect(called.value == false)
+}
