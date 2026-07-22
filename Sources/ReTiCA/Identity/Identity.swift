@@ -136,4 +136,10 @@ public struct Identity: Equatable, Sendable {
         else { return false }
         return key.isValidSignature(signature, for: message)
     }
+
+    // Identity equality is public-key equality: two Identity values representing the
+    // same Reticulum identity compare equal regardless of whether they carry private keys.
+    public static func == (lhs: Identity, rhs: Identity) -> Bool {
+        lhs.x25519Public == rhs.x25519Public && lhs.ed25519Public == rhs.ed25519Public
+    }
 }

@@ -37,6 +37,7 @@ public struct LinkSession {
         public var rtt: Double?
         public var activatedAt: Double?
         public var lastInbound: Double?
+        public var remoteIdentity: Identity?
         public var transfers: IdentifiedArrayOf<ResourceTransfer.State> = []
         public var establishmentTimeout: TimeInterval
         public var keepaliveInterval: TimeInterval
@@ -60,6 +61,7 @@ public struct LinkSession {
             self.rtt = nil
             self.activatedAt = nil
             self.lastInbound = nil
+            self.remoteIdentity = nil
             self.establishmentTimeout = establishmentTimeout
             self.keepaliveInterval = keepaliveInterval
         }
@@ -83,6 +85,7 @@ public struct LinkSession {
             self.rtt = nil
             self.activatedAt = nil
             self.lastInbound = nil
+            self.remoteIdentity = nil
             self.establishmentTimeout = establishmentTimeout
             self.keepaliveInterval = keepaliveInterval
         }
@@ -93,6 +96,7 @@ public struct LinkSession {
         case acceptRequest(Data)
         case received(Data)
         case send(Data)
+        case identify(Identity)
         case close
         case establishmentDeadline
         case keepaliveDeadline
@@ -110,6 +114,7 @@ public struct LinkSession {
             case resourceReceived(Data)
             case resourceConcluded(Data)
             case resourceFailed(Data)
+            case identified(Identity)
         }
     }
 
@@ -281,6 +286,19 @@ public struct LinkSession {
                         .send(.transfer(.element(id: $0, action: .received(data))))
                     })
 
+                case (_, .active, .data, .linkIdentify):
+                    guard state.role == .responder,
+                          let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey)
+                    else { return .none }
+                    let p = Data(plain)
+                    guard p.count == 128,
+                          let peer = Identity(publicKey: Data(p[p.startIndex..<(p.startIndex + 64)])),
+                          peer.validate(signature: Data(p[(p.startIndex + 64)..<(p.startIndex + 128)]),
+                                        message: state.linkID + Data(p[p.startIndex..<(p.startIndex + 64)]))
+                    else { return .none }
+                    state.remoteIdentity = peer
+                    return .send(.delegate(.identified(peer)))
+
                 default:
                     return .none
                 }
@@ -296,6 +314,14 @@ public struct LinkSession {
                     interfaceID: state.interfaceID, prefix: prefix, randomHash: randomHash,
                     sdu: Self.resourceSDU, rtt: .seconds(state.rtt ?? 1), id: newID))
                 return .send(.transfer(.element(id: newID, action: .advertise)))
+
+            case let .identify(identity):
+                guard state.role == .initiator, state.status == .active else { return .none }
+                let payload = identity.publicKey + identity.sign(state.linkID + identity.publicKey)
+                guard let raw = linkPacket(state.linkID, .linkIdentify,
+                                           Link.encrypt(payload, sessionKey: state.sessionKey))
+                else { return .none }
+                return .send(.delegate(.transmit(state.interfaceID, raw)))
 
             case let .send(plaintext):
                 guard state.status == .active else { return .none }
