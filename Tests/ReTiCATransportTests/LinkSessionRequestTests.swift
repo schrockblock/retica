@@ -155,11 +155,49 @@ private func responsePacket(_ requestID: Data, _ data: Data) -> Data {
     #expect(!store.state.pendingRequests.contains(requestID))
 }
 
-@Test @MainActor func oversizeRequestIsNotSent() async {
+// A large request/response payload (> ~431 packed → Resource path). 500 raw bytes packs to ~530.
+private func bigData() -> Data { Data((0..<500).map { UInt8($0 & 0xff) }) }
+
+@Test @MainActor func largeSendRequestSpawnsRequestResource() async {
     let clock = TestClock<Duration>()
     let store = activeStore(role: .initiator, clock)
-    await store.send(.sendRequest(path: "svc/big", data: Data(repeating: 0x7A, count: 500)))  // > 431 packed
-    #expect(store.state.pendingRequests.isEmpty)
+    await store.send(.sendRequest(path: "svc/big", data: bigData()))
+    #expect(store.state.transfers.count == 1)
+    let adv = store.state.transfers[0].advertisement!
+    #expect(adv.isRequest == true)
+    // request_id = truncatedHash(packed) where packed uses the deterministic epoch timestamp (0.0).
+    let expectedPacked = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data("svc/big".utf8))), .bin(bigData())]))
+    #expect(adv.requestID == Crypto.truncatedHash(expectedPacked))
+    #expect(store.state.pendingRequests.contains(Crypto.truncatedHash(expectedPacked)))
+    // Cleanup: cancel the spawned transfer and fire the request timeout so no effects dangle.
+    let tid = store.state.transfers[0].id
+    await store.send(.transfer(.element(id: tid, action: .cancel)))
+    await clock.advance(by: .seconds(30))
+}
+
+@Test @MainActor func largeSendResponseSpawnsResponseResource() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .responder, clock)
+    let rid = Data(repeating: 0xCD, count: 16)
+    await store.send(.sendResponse(requestID: rid, data: bigData()))
+    #expect(store.state.transfers.count == 1)
+    let adv = store.state.transfers[0].advertisement!
+    #expect(adv.isResponse == true)
+    #expect(adv.requestID == rid)
+    let tid = store.state.transfers[0].id
+    await store.send(.transfer(.element(id: tid, action: .cancel)))
+    await clock.advance(by: .seconds(30))
+}
+
+@Test @MainActor func inlineSendRequestStillUsesAPacket() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .initiator, clock)
+    await store.send(.sendRequest(path: "svc/small", data: Data("hi".utf8)))
+    #expect(store.state.transfers.isEmpty)                 // inline → no Resource spawned
+    let raw = await captureTransmitReq(store)
+    #expect(Packet(raw: raw)?.context == .request)
+    // Cleanup: fire the inline request timeout.
+    await clock.advance(by: .seconds(30))
 }
 
 // Build an inbound REQUEST packet for a path+data.

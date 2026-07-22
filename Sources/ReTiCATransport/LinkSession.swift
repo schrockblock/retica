@@ -356,31 +356,61 @@ public struct LinkSession {
                 let pathHash = Crypto.truncatedHash(Data(path.utf8))
                 let packed = MsgPack.encode(.array([.double(date.now.timeIntervalSince1970),
                                                     .bin(pathHash), .bin(data)]))
-                guard packed.count <= Self.requestMDU else { return .none }
-                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
-                                    destinationType: .link, context: .request, contextFlag: false, hops: 0,
-                                    destinationHash: state.linkID, transportId: nil,
-                                    payload: Link.encrypt(packed, sessionKey: state.sessionKey))
-                let requestID = packet.truncatedHash
-                guard let raw = try? packet.packed() else { return .none }
-                state.pendingRequests.insert(requestID)
+                let ifID = state.interfaceID
                 let timeout = (state.rtt ?? 0.5) * 6 + 11.25
-                let id = state.interfaceID
-                return .merge(
-                    .send(.delegate(.transmit(id, raw))),
-                    .run { send in
-                        try await clock.sleep(for: .seconds(timeout))
-                        await send(.requestDeadline(requestID))
-                    }.cancellable(id: CancelID.request(requestID), cancelInFlight: true))
+                if packed.count <= Self.requestMDU {
+                    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                        destinationType: .link, context: .request, contextFlag: false, hops: 0,
+                                        destinationHash: state.linkID, transportId: nil,
+                                        payload: Link.encrypt(packed, sessionKey: state.sessionKey))
+                    let requestID = packet.truncatedHash
+                    guard let raw = try? packet.packed() else { return .none }
+                    state.pendingRequests.insert(requestID)
+                    return .merge(
+                        .send(.delegate(.transmit(ifID, raw))),
+                        .run { send in
+                            try await clock.sleep(for: .seconds(timeout)); await send(.requestDeadline(requestID))
+                        }.cancellable(id: CancelID.request(requestID), cancelInFlight: true))
+                } else {
+                    // Large request: send as a request-Resource; request_id = truncatedHash(packed blob).
+                    let requestID = Crypto.truncatedHash(packed)
+                    state.pendingRequests.insert(requestID)
+                    let rnd = Data(randomBytes(8))
+                    let prefix = Data(rnd[rnd.startIndex ..< rnd.startIndex + 4])
+                    let randomHash = Data(rnd[rnd.startIndex + 4 ..< rnd.startIndex + 8])
+                    let newID = uuid()
+                    state.transfers.append(ResourceTransfer.State(
+                        sending: packed, linkID: state.linkID, sessionKey: state.sessionKey,
+                        interfaceID: state.interfaceID, prefix: prefix, randomHash: randomHash,
+                        sdu: Self.resourceSDU, requestID: requestID, isResponse: false,
+                        rtt: .seconds(state.rtt ?? 1), id: newID))
+                    return .merge(
+                        .send(.transfer(.element(id: newID, action: .advertise))),
+                        .run { send in
+                            try await clock.sleep(for: .seconds(timeout)); await send(.requestDeadline(requestID))
+                        }.cancellable(id: CancelID.request(requestID), cancelInFlight: true))
+                }
 
             case let .sendResponse(requestID, data):
                 guard state.status == .active else { return .none }
                 let packed = MsgPack.encode(.array([.bin(requestID), .bin(data)]))
-                guard packed.count <= Self.requestMDU,
-                      let raw = linkPacket(state.linkID, .response,
-                                           Link.encrypt(packed, sessionKey: state.sessionKey))
-                else { return .none }
-                return .send(.delegate(.transmit(state.interfaceID, raw)))
+                if packed.count <= Self.requestMDU {
+                    guard let raw = linkPacket(state.linkID, .response,
+                                               Link.encrypt(packed, sessionKey: state.sessionKey))
+                    else { return .none }
+                    return .send(.delegate(.transmit(state.interfaceID, raw)))
+                } else {
+                    let rnd = Data(randomBytes(8))
+                    let prefix = Data(rnd[rnd.startIndex ..< rnd.startIndex + 4])
+                    let randomHash = Data(rnd[rnd.startIndex + 4 ..< rnd.startIndex + 8])
+                    let newID = uuid()
+                    state.transfers.append(ResourceTransfer.State(
+                        sending: packed, linkID: state.linkID, sessionKey: state.sessionKey,
+                        interfaceID: state.interfaceID, prefix: prefix, randomHash: randomHash,
+                        sdu: Self.resourceSDU, requestID: requestID, isResponse: true,
+                        rtt: .seconds(state.rtt ?? 1), id: newID))
+                    return .send(.transfer(.element(id: newID, action: .advertise)))
+                }
 
             case let .send(plaintext):
                 guard state.status == .active else { return .none }
