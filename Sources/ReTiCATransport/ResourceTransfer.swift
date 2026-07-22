@@ -67,7 +67,7 @@ public struct ResourceTransfer {
                 transferSize: UInt64(stream.count), dataSize: UInt64(data.count),
                 numberOfParts: UInt64(chunks.count), hash: h, randomHash: randomHash, originalHash: h,
                 segmentIndex: 0, totalSegments: 1, requestID: nil, flags: 0x01,
-                hashmap: mapHashes.reduce(Data()) { $0 + $1 })
+                hashmap: mapHashes.prefix(Resource.hashmapMaxLen).reduce(Data()) { $0 + $1 })
             self.window = ResourceWindow()
             self.consecutiveCompletedHeight = -1
             self.outstanding = []
@@ -244,12 +244,15 @@ public struct ResourceTransfer {
                 case (.sender, .data, .resourceRequest):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey) else { return .none }
                     let p = Data(plain)
-                    guard p.count >= 33, p.first == 0x00,
-                          Data(p[(p.startIndex + 1)..<(p.startIndex + 33)]) == state.resourceHash
+                    guard let flag = p.first else { return .none }
+                    let wantsHMU = flag == 0xFF
+                    let pad = wantsHMU ? 1 + Resource.mapHashLength : 1      // 5 or 1
+                    guard p.count >= pad + 32,
+                          Data(p[(p.startIndex + pad)..<(p.startIndex + pad + 32)]) == state.resourceHash
                     else { return .none }
                     state.status = .transferring
                     state.retriesLeft = Const.maxRetries
-                    let reqHashes = Data(p.dropFirst(33))
+                    let reqHashes = Data(p.dropFirst(pad + 32))
                     var effects: [Effect<Action>] = []
                     var i = reqHashes.startIndex
                     while i + 4 <= reqHashes.endIndex {
@@ -260,6 +263,30 @@ public struct ResourceTransfer {
                             effects.append(.send(.delegate(.transmit(state.interfaceID, raw))))
                         }
                         i += 4
+                    }
+                    if wantsHMU {
+                        let lastMapHash = Data(p[(p.startIndex + 1)..<(p.startIndex + 1 + Resource.mapHashLength)])
+                        if let li = state.partMapHashes.firstIndex(of: lastMapHash) {
+                            let partIndex = li + 1
+                            if partIndex % Resource.hashmapMaxLen != 0 {
+                                // sequencing error → cancel the transfer (matches RNS)
+                                state.status = .failed
+                                let icl = linkPacket(.data, .resourceInitiatorCancel,
+                                                     Link.encrypt(state.resourceHash, sessionKey: state.sessionKey))
+                                return .merge(.cancel(id: CancelID.watchdog),
+                                              icl.map { Effect.send(.delegate(.transmit(state.interfaceID, $0))) } ?? .none,
+                                              .send(.delegate(.failed)))
+                            }
+                            let chunk = partIndex / Resource.hashmapMaxLen
+                            let lo = chunk * Resource.hashmapMaxLen
+                            let hi = min((chunk + 1) * Resource.hashmapMaxLen, state.partMapHashes.count)
+                            let chunkBytes = state.partMapHashes[lo..<hi].reduce(Data()) { $0 + $1 }
+                            let hmu = state.resourceHash + MsgPack.encode(.array([.uint(UInt64(chunk)), .bin(chunkBytes)]))
+                            if let raw = linkPacket(.data, .resourceHashmapUpdate,
+                                                    Link.encrypt(hmu, sessionKey: state.sessionKey)) {
+                                effects.append(.send(.delegate(.transmit(state.interfaceID, raw))))
+                            }
+                        }
                     }
                     if state.sentIndices.count == state.parts.count {
                         state.status = .awaitingProof

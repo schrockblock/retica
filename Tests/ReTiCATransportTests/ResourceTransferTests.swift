@@ -448,3 +448,69 @@ private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
     }
     #expect(store.state.status == .failed)
 }
+
+// MARK: - HMU sender tests
+
+// Build an exhausted RESOURCE_REQ (0xFF ‖ lastHash ‖ hash ‖ requested) for a sender state.
+private func exhaustedRequestPacket(_ s: ResourceTransfer.State, lastMapHash: Data, requested: [Data]) -> Data {
+    var payload = Data([0xFF]) + lastMapHash + s.resourceHash
+    for h in requested { payload += h }
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: .resourceRequest, contextFlag: false, hops: 0,
+                   destinationHash: linkID, transportId: nil, payload: Link.encrypt(payload, sessionKey: key))
+    return try! p.packed()
+}
+
+@Test @MainActor func senderAdvertisementCapsHashmapAt74() async {
+    let data = Data(repeating: 0x5A, count: 800)          // > 74 parts at sdu 8
+    let s = senderState(data, sdu: 8)
+    #expect(s.parts.count > 74)
+    #expect(s.advertisement!.hashmap.count == 74 * 4)     // capped, not the full N*4
+    #expect(s.advertisement!.numberOfParts == UInt64(s.parts.count))
+}
+
+@Test @MainActor func senderRepliesWithHmuChunkOnExhaustedRequest() async {
+    let data = Data(repeating: 0x5A, count: 800)
+    let s = senderState(data, sdu: 8)
+    let clock = TestClock<Duration>()
+    let store = TestStore(initialState: s) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = clock }
+    store.exhaustivity = .off
+    // Exhausted request: last known map-hash is partMapHashes[73] (74-boundary).
+    let last = s.partMapHashes[73]
+    await store.send(.received(exhaustedRequestPacket(s, lastMapHash: last, requested: [])))
+    // The sender emits a RESOURCE_HMU for chunk 1 (parts 74..147).
+    let raw = (await captureTransmits(store, count: 1)).first { Packet(raw: $0)?.context == .resourceHashmapUpdate }!
+    let plain = Data(Link.decrypt(Packet(raw: raw)!.payload, sessionKey: key)!)
+    #expect(Data(plain.prefix(32)) == s.resourceHash)
+    guard case let .array(items)? = MsgPack.decodeValue(Data(plain.dropFirst(32))),
+          case let .uint(chunkIndex) = items[0], case let .bin(bytes) = items[1] else { Issue.record("bad HMU"); return }
+    #expect(chunkIndex == 1)
+    let expectedCount = min(74, s.partMapHashes.count - 74) * 4
+    #expect(bytes.count == expectedCount)
+    #expect(bytes == s.partMapHashes[74..<min(148, s.partMapHashes.count)].reduce(Data()) { $0 + $1 })
+    // cleanup: drive terminal
+    await store.send(.received(cancelPacket(.resourceReceiverCancel, s.resourceHash)))
+}
+
+@Test @MainActor func senderCancelsOnNonBoundaryHmuRequest() async {
+    let data = Data(repeating: 0x5A, count: 800)
+    let s = senderState(data, sdu: 8)
+    let clock = TestClock<Duration>()
+    let store = TestStore(initialState: s) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = clock }
+    store.exhaustivity = .off
+    // last known map-hash at a NON-boundary index (e.g. partMapHashes[72] → partIndex 73, 73 % 74 != 0).
+    let last = s.partMapHashes[72]
+    await store.send(.received(exhaustedRequestPacket(s, lastMapHash: last, requested: [])))
+    // ICL transmit fires before .failed in the merge order; capture it using the predicate form.
+    let iclData = LockIsolated<Data?>(nil)
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action,
+           Packet(raw: raw)?.context == .resourceInitiatorCancel { iclData.setValue(raw); return true }
+        return false
+    }
+    await store.receive(.delegate(.failed))
+    #expect(store.state.status == .failed)
+    #expect(iclData.value != nil)
+}
