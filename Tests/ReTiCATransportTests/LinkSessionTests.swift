@@ -535,6 +535,38 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     #expect(responder.state.status == .closed)
 }
 
+// MARK: - GC: close clears pending requests
+
+@Test @MainActor func closeClearsPendingRequestsAndCancelsTheirTimers() async {
+    let clock = TestClock<Duration>()
+    // Build a pre-active store (same pattern as activeState(role:) above but with a real clock).
+    var s = activeState(role: .initiator)
+    s.rtt = 1.0   // sets timeout = 1*6 + 11.25 = 17.25 s
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(epoch)
+        $0.continuousClock = clock
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    // Send a small inline request — arms pendingRequests + a CancelID.request timer.
+    await store.send(.sendRequest(path: "svc/x", data: Data([1, 2])))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.pendingRequests.isEmpty == false)
+    let requestID = store.state.pendingRequests.first!
+    // Close — emits LINKCLOSE transmit + .closed, and cancelPending cancels the request timer.
+    await store.send(.close)
+    #expect(store.state.pendingRequests.isEmpty == true)
+    // Drain the transmit + closed delegate actions emitted by .close.
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.receive { if case .delegate(.closed(.initiatorClosed)) = $0 { return true }; return false }
+    // Switch to exhaustive mode: if the request timer was NOT cancelled by cancelPending,
+    // requestDeadline arrives as an unhandled received action → exhaustive teardown fails.
+    store.exhaustivity = .on
+    // Advance well past rtt*6+11.25 (17.25 s). The timer was cancelled → no action queued.
+    _ = requestID   // suppress unused warning
+    await clock.advance(by: .seconds(120))
+}
+
 // NOTE (TCA 1.26 choreography): TCA 1.26's receive-with-predicate takes a synchronous path
 // (no waiting) when inFlightEffects is empty at the call site. Capturing two consecutive
 // keepalive transmits from a `while true` loop effect is unreliable in this version because

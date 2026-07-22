@@ -154,6 +154,11 @@ public struct LinkSession {
             let cancelAll = Effect<Action>.merge(.cancel(id: CancelID.establishment),
                                                  .cancel(id: CancelID.keepalive),
                                                  .cancel(id: CancelID.inactivity))
+            func cancelPending(_ state: inout State) -> Effect<Action> {
+                let cancels = state.pendingRequests.map { Effect<Action>.cancel(id: CancelID.request($0)) }
+                state.pendingRequests.removeAll()
+                return .merge(cancels)
+            }
             func linkPacket(_ linkID: Data, _ context: PacketContext, _ payload: Data) -> Data? {
                 let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                                destinationType: .link, context: context, contextFlag: false, hops: 0,
@@ -257,7 +262,7 @@ public struct LinkSession {
                     else { return .none }
                     state.status = .closed
                     let reason: CloseReason = state.role == .initiator ? .destinationClosed : .initiatorClosed
-                    return .merge(.send(.delegate(.closed(reason))), cancelAll)
+                    return .merge(.send(.delegate(.closed(reason))), cancelAll, cancelPending(&state))
 
                 case (.responder, .active, .data, .keepalive):
                     state.lastInbound = now
@@ -437,15 +442,16 @@ public struct LinkSession {
                 state.status = .closed
                 let reason: CloseReason = state.role == .initiator ? .initiatorClosed : .destinationClosed
                 let closedAction = Action.delegate(.closed(reason))
+                let pending = cancelPending(&state)
                 guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
-                    return .merge(.send(closedAction), cancelAll)
+                    return .merge(.send(closedAction), cancelAll, pending)
                 }
-                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll)
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll, pending)
 
             case .establishmentDeadline:
                 guard state.status == .pending || state.status == .handshake else { return .none }
                 state.status = .closed
-                return .merge(.send(.delegate(.closed(.timedOut))), cancelAll)
+                return .merge(.send(.delegate(.closed(.timedOut))), cancelAll, cancelPending(&state))
 
             case .keepaliveDeadline:
                 guard state.status == .active, state.role == .initiator else { return .none }
@@ -458,10 +464,11 @@ public struct LinkSession {
                 let cipher = Link.encrypt(state.linkID, sessionKey: state.sessionKey)
                 state.status = .closed
                 let closedAction = Action.delegate(.closed(.timedOut))
+                let pending = cancelPending(&state)
                 guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
-                    return .merge(.send(closedAction), cancelAll)
+                    return .merge(.send(closedAction), cancelAll, pending)
                 }
-                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll)
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll, pending)
 
             case let .requestDeadline(requestID):
                 guard state.pendingRequests.contains(requestID) else { return .none }
@@ -488,11 +495,14 @@ public struct LinkSession {
                 return .send(.delegate(.resourceReceived(payload)))
             case let .transfer(.element(elementID, .delegate(.concluded))):
                 let adv = state.transfers[id: elementID]?.advertisement
+                let hash = state.transfers[id: elementID]?.resourceHash
+                state.transfers.remove(id: elementID)
                 if adv?.isRequest == true || adv?.isResponse == true { return .none }   // internal req/resp delivery
-                guard let hash = state.transfers[id: elementID]?.resourceHash else { return .none }
+                guard let hash else { return .none }
                 return .send(.delegate(.resourceConcluded(hash)))
             case let .transfer(.element(elementID, .delegate(.failed))):
                 let t = state.transfers[id: elementID]
+                state.transfers.remove(id: elementID)
                 if let rid = t?.advertisement?.requestID, state.pendingRequests.contains(rid) {
                     state.pendingRequests.remove(rid)
                     return .merge(.cancel(id: CancelID.request(rid)),

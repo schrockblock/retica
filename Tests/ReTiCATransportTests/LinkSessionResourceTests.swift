@@ -126,6 +126,48 @@ private func partPacket(_ chunk: Data) -> Data {
     await store.send(.transfer(.element(id: tid, action: .cancel)))
 }
 
+// MARK: - GC: terminal transfer removal
+
+/// Returns (store, transferID, resourceHash) for a link store pre-loaded with one plain (non-request,
+/// non-response) sender transfer. The transfer is injected directly into initial state — no effects are
+/// running for it — so firing .delegate(.concluded/.failed) on the parent LinkSession is clean.
+@MainActor
+private func activeLinkHostingPlainTransfer()
+    -> (TestStore<LinkSession.State, LinkSession.Action>, UUID, Data)
+{
+    let clock = TestClock<Duration>()
+    let t = senderFor(Data("plain resource payload".utf8))   // no requestID → plain advertisement
+    var s = LinkSession.State(responderFor: Identity(),
+                              destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .active
+    s.sessionKey = resKey
+    s.linkID = resLinkID
+    s.rtt = 1.0
+    s.transfers.append(t)
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = clock
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    return (store, t.id, t.resourceHash)
+}
+
+@Test @MainActor func concludedTransferIsRemovedFromState() async {
+    let (store, tid, hash) = activeLinkHostingPlainTransfer()
+    await store.send(.transfer(.element(id: tid, action: .delegate(.concluded))))
+    await store.receive { if case .delegate(.resourceConcluded(hash)) = $0 { return true }; return false }
+    #expect(store.state.transfers[id: tid] == nil)              // removed
+}
+
+@Test @MainActor func failedTransferIsRemovedFromState() async {
+    let (store, tid, hash) = activeLinkHostingPlainTransfer()
+    await store.send(.transfer(.element(id: tid, action: .delegate(.failed))))
+    await store.receive { if case .delegate(.resourceFailed(hash)) = $0 { return true }; return false }
+    #expect(store.state.transfers[id: tid] == nil)              // removed
+}
+
 @Test @MainActor func sendResourceOnInactiveLinkDoesNothing() async {
     let clock = TestClock<Duration>()
     var s = LinkSession.State(responderFor: Identity(),
