@@ -94,3 +94,14 @@ import Foundation
     #expect(encoded[encoded.startIndex] == 0xDC)      // array16 tag
     #expect(MsgPack.decodeValue(encoded) == v)
 }
+
+@Test func msgpackDecodeRejectsTruncatedArrays() {
+    // fixarray claiming 2 elements but only 1 present
+    #expect(MsgPack.decodeValue(Data([0x92, 0x05])) == nil)
+    // array16 tag with a truncated length header
+    #expect(MsgPack.decodeValue(Data([0xDC, 0x00])) == nil)
+    // array16 header complete but body shorter than declared count
+    #expect(MsgPack.decodeValue(Data([0xDC, 0x00, 0x03, 0x05, 0x06])) == nil)
+    // array32 tag with a truncated length header
+    #expect(MsgPack.decodeValue(Data([0xDD, 0x00, 0x00, 0x00])) == nil)
+}
