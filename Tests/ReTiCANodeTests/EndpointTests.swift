@@ -929,8 +929,10 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
         if case .transport(.received) = action { return true }
         return false
     }
-    // The auto-responder fires synchronously inside the reducer; B emits sendResponseOverLink which
-    // routes through link → interface(.send). Scan for both but require no requestReceived.
+    // The auto-responder runs as an async .run effect; B emits sendResponseOverLink which routes
+    // through link → interface(.send). This scan (plus the transport.received scan above) drains all
+    // intervening B actions through the flag-checking predicate, so a requestReceived in any B cycle
+    // is caught. Require no requestReceived.
     await b.receive { action in
         if case .delegate(.requestReceived) = action { bSurfaced.setValue(true) }
         if case .interface(.send) = action { return true }
@@ -1029,6 +1031,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     let respPartCount = b.state.links[0].transfers.first(where: { $0.role == .sender && $0.advertisement?.isResponse == true })!.parts.count
+    #expect(respPartCount > 1, "Large auto-response must ride a genuinely multi-part Resource")
     for _ in 0..<respPartCount {
         await b.receive { if case .interface(.send) = $0 { return true }; return false }
     }
