@@ -154,10 +154,14 @@ authenticated request:
   back to `responseReceived(...)` by `request_id` (the request packet's truncated hash). A lost response
   surfaces `requestFailed(...)` after `rtt·6 + 11.25 s`.
 
-Requests/responses are inline for payloads ≤ 431 bytes and wire-compatible with Python-RNS 1.3.8. The
-application generates responses and enforces its own allow-policy using the identified `remoteIdentity`;
-RNS's in-library handler-registry/allow-policy and large (Resource-based) requests/responses remain
-future slices.
+Requests and responses with packed payloads ≤ 431 bytes are sent inline. Requests and responses larger
+than 431 bytes are transferred as Resources: the sender advertises a resource whose advertisement carries
+the `request_id` (`q`) and an is_request / is_response flag, and the peer routes the completed transfer
+to `requestReceived` / `responseReceived` (matched by `request_id`) rather than the plain
+`resourceReceived`. A large request's `request_id` is `truncatedHash` of the packed request. This makes
+request/response work for any payload size, wire-compatible with Python-RNS 1.3.8. The application
+generates responses and enforces its own allow-policy using the identified `remoteIdentity`;
+RNS's in-library handler-registry/allow-policy remains a future slice.
 
 ### Resource primitives (`Resource`, `ResourceAdvertisement`)
 
@@ -250,7 +254,7 @@ RETICA_LIVE_HOST=127.0.0.1 RETICA_LIVE_PORT=4242 swift test --filter LiveEndpoin
 
 Transport-node relaying, path requests, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
 
-The **Link session lifecycle** is now substantially complete: establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data, explicit link close, keepalive/inactivity watchdog, inline identify (IDENTIFY payload + Ed25519 verification), and inline request/response (msgpack-framed, matched by `request_id`). All are wire-compatible with Python-RNS 1.3.8 and verified by cross-validation vectors. Large (Resource-based) requests/responses remain a future slice.
+The **Link session lifecycle** is now substantially complete: establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data, explicit link close, keepalive/inactivity watchdog, inline identify (IDENTIFY payload + Ed25519 verification), and request/response (both inline ≤ 431 bytes and large Resource-based, matched by `request_id`). All are wire-compatible with Python-RNS 1.3.8 and verified by cross-validation vectors.
 
 ## Requirements
 
