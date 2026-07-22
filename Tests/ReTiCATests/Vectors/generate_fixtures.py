@@ -161,6 +161,25 @@ req_path_hash = RNS.Identity.truncated_hash(req_path.encode("utf-8"))
 req_msgpack = umsgpack.packb([1.5, req_path_hash, b"ping"])
 resp_msgpack = umsgpack.packb([bytes([0xCD] * 16), b"pong"])
 
+# --- Request/response resource advertisements (q + is_request/is_response flags) ---
+# Reuse the existing res_hash, res_random_hash, res_hashmap from above; use 4 parts for the adv.
+rr_request_id = bytes([0xCD] * 16)
+rr_req_adv = RNSResourceAdvertisement()
+rr_req_adv.t = 96; rr_req_adv.d = 40; rr_req_adv.n = 4
+rr_req_adv.h = res_hash; rr_req_adv.r = res_r; rr_req_adv.o = res_hash
+rr_req_adv.i = 1; rr_req_adv.l = 1; rr_req_adv.m = res_hashmap[:4*4]
+rr_req_adv.q = rr_request_id
+rr_req_adv.f = 0x01 | 0 << 5 | 0 << 4 | 1 << 3 | 0 << 2 | 0 << 1   # e=1, u=1 (is_request)
+rr_req_adv_packed = rr_req_adv.pack()
+
+rr_resp_adv = RNSResourceAdvertisement()
+rr_resp_adv.t = 96; rr_resp_adv.d = 40; rr_resp_adv.n = 4
+rr_resp_adv.h = res_hash; rr_resp_adv.r = res_r; rr_resp_adv.o = res_hash
+rr_resp_adv.i = 1; rr_resp_adv.l = 1; rr_resp_adv.m = res_hashmap[:4*4]
+rr_resp_adv.q = rr_request_id
+rr_resp_adv.f = 0x01 | 0 << 5 | 1 << 4 | 0 << 3 | 0 << 2 | 0 << 1   # e=1, p=1 (is_response)
+rr_resp_adv_packed = rr_resp_adv.pack()
+
 print(json.dumps({
     "identity_private_key": priv.hex(),
     "identity_public_key": pub.hex(),
@@ -222,4 +241,10 @@ print(json.dumps({
     "req_path_hash": req_path_hash.hex(),
     "req_msgpack": req_msgpack.hex(),
     "resp_msgpack": resp_msgpack.hex(),
+    "rr_request_id": rr_request_id.hex(),
+    "rr_req_adv": rr_req_adv_packed.hex(),
+    "rr_resp_adv": rr_resp_adv_packed.hex(),
+    "rr_res_hash": res_hash.hex(),
+    "rr_res_random_hash": res_r.hex(),
+    "rr_res_hashmap4": res_hashmap[:4*4].hex(),
 }, indent=2))

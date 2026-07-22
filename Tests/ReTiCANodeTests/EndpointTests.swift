@@ -530,6 +530,140 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     #expect(got.value?.1 == rid)
 }
 
+@Test @MainActor func twoEndpointsRoundTripALargeRequestAndResponse() async {
+    let clock = TestClock()
+    let bIdentity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
+
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            Endpoint()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } }, close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
+    let (a, eventsA) = make("a", sentA)
+    let (b, eventsB) = make("b", sentB)
+
+    // --- Establish the link (same steps as twoEndpointsTransferAResourceOverALink) ---
+    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await b.send(.registerLocalDestination(dest))
+    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.announce(destinationHash: dest.hash, appData: nil))
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
+    await a.send(.openLink(destinationHash: dest.hash))
+    await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive(\.delegate.linkEstablished)
+    eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
+    let linkID = a.state.links[0].linkID
+    #expect(a.state.links[0].status == .active && b.state.links[0].status == .active)
+
+    // --- A sends a large (>431 packed) request; it rides a Resource. ---
+    // reqData: 450 bytes. Packed as [timestamp(0.0), pathHash(16), data(450)] ≈ 478 bytes → > 431 MDU.
+    // respData: 450 bytes. Packed as [requestID(16), data(450)] ≈ 474 bytes → > 431 MDU.
+    let reqData = Data(repeating: 0xAB, count: 450)
+    let respData = Data(repeating: 0xCD, count: 450)
+
+    await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: reqData))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }   // REQ_RESOURCE_ADV out
+
+    // ADV → B: spawns a receiver, emits RESOURCE_REQ.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_REQ out
+
+    // REQ → A: A serves its parts.
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    let reqPartCount = a.state.links[0].transfers[0].parts.count
+    for _ in 0..<reqPartCount {
+        await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    }
+
+    // Deliver every part frame A emitted (the last `reqPartCount` frames in sentA) to B.
+    let reqParts = Array(sentA.value.suffix(reqPartCount))
+    let gotReqID = LockIsolated<Data?>(nil)
+    let gotReqData = LockIsolated<Data?>(nil)
+    for (i, frame) in reqParts.enumerated() {
+        eventsB.yield(.data(frame))
+        await b.receive(\.transport.received)
+        if i == reqPartCount - 1 {
+            // Last part: B sends PRF, then surfaces requestReceived.
+            await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_PRF out
+            await b.receive { action in
+                if case let .delegate(.requestReceived(_, rid, _, d)) = action {
+                    gotReqID.setValue(rid); gotReqData.setValue(d); return true
+                }
+                return false
+            }
+        }
+    }
+    #expect(gotReqData.value == reqData)
+
+    // PRF → A: A validates but does NOT emit resourceConcluded at Endpoint level (req/resp suppressed).
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+
+    // --- B replies with a large response; it rides a Resource. ---
+    await b.send(.sendResponseOverLink(linkID: linkID, requestID: gotReqID.value!, data: respData))
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESP_RESOURCE_ADV out
+
+    // ADV → A: A's pendingRequests has the requestID, so it accepts the response resource.
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_REQ out
+
+    // REQ → B: B serves its parts.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    let respPartCount = b.state.links[0].transfers.first(where: { $0.role == .sender && $0.advertisement?.isResponse == true })!.parts.count
+    for _ in 0..<respPartCount {
+        await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    }
+
+    // Deliver every part frame B emitted (the last `respPartCount` frames in sentB) to A.
+    let respParts = Array(sentB.value.suffix(respPartCount))
+    let gotRespData = LockIsolated<Data?>(nil)
+    for (i, frame) in respParts.enumerated() {
+        eventsA.yield(.data(frame))
+        await a.receive(\.transport.received)
+        if i == respPartCount - 1 {
+            // Last part: A sends PRF, then surfaces responseReceived.
+            await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_PRF out
+            await a.receive { action in
+                if case let .delegate(.responseReceived(_, rid, d)) = action, rid == gotReqID.value! {
+                    gotRespData.setValue(d); return true
+                }
+                return false
+            }
+        }
+    }
+    #expect(gotRespData.value == respData)
+
+    // PRF → B: B validates but does NOT emit resourceConcluded at Endpoint level (req/resp suppressed).
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+
+    await a.send(.disconnect); await b.send(.disconnect)
+}
+
 @Test @MainActor func twoEndpointsIdentifyAndRoundTripARequest() async {
     let clock = TestClock()
     let aIdentity = Identity()
