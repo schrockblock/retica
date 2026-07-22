@@ -55,8 +55,8 @@ The `Link` namespace (pure core) implements the cryptographic handshake of a Ret
 - `Link.encrypt` / `Link.decrypt` — link data over the session key (wraps `Token`)
 
 Only `MODE_AES256_CBC` is implemented, and MTU is not negotiated. Reticulum nonetheless bakes 3 fixed **signalling bytes** (MTU 500 / AES-256-CBC) into the link-request and proof wire layouts unconditionally, so these primitives include them (`buildProof` emits a 99-byte proof; `validateProof` also accepts the 96-byte signalling-free form, mirroring RNS `validate_proof`) to stay byte-exact with real 1.3.8 peers. The stateful Link session that drives these primitives (establishment state machine, RTT,
-data flow, close, and the keepalive/timeout watchdog) is the `LinkSession` reducer described
-below; requests and resources remain future slices. All four handshake constructions are
+data flow, close, keepalive/timeout watchdog, identify, requests, and resources) is the
+`LinkSession` reducer described below. All four handshake constructions are
 cross-validated against Python-RNS 1.3.8
 (the fixture generator drives the reference `RNS.Link` signalling/handshake code paths, not a
 reimplementation).
@@ -92,8 +92,7 @@ fresh; and a link that hears nothing for `staleTime` (`2 × keepaliveInterval`) 
 computation, which needs Transport); only the keepalive packet (`context .keepalive`,
 unencrypted `0xFF`/`0xFE`) is wire-visible and matches RNS 1.3.8.
 
-Still deferred to later slices: RTT-adaptive keepalive intervals, identify, requests, resources,
-and wiring `LinkSession` into `Transport`/`Endpoint`.
+Still deferred to later slices: RTT-adaptive keepalive intervals.
 
 ## Sub-project #3: Interfaces (TCP client)
 
@@ -159,9 +158,17 @@ than 431 bytes are transferred as Resources: the sender advertises a resource wh
 the `request_id` (`q`) and an is_request / is_response flag, and the peer routes the completed transfer
 to `requestReceived` / `responseReceived` (matched by `request_id`) rather than the plain
 `resourceReceived`. A large request's `request_id` is `truncatedHash` of the packed request. This makes
-request/response work for any payload size, wire-compatible with Python-RNS 1.3.8. The application
-generates responses and enforces its own allow-policy using the identified `remoteIdentity`;
-RNS's in-library handler-registry/allow-policy remains a future slice.
+request/response work for any payload size, wire-compatible with Python-RNS 1.3.8.
+
+A node can register in-library request handlers instead of answering every request in the app. Call
+`registerRequestHandler(path:policy:)` on the endpoint and supply a `requestResponder` dependency (one
+closure that switches on `path` and returns the response bytes, or `nil` to decline). When a request
+arrives for a registered path, the library checks the allow-policy against the link's identified
+`remoteIdentity` — `.none` rejects all, `.all` accepts all, `.list([identityHash])` accepts only listed
+peers (an un-identified peer is allowed only under `.all`) — and, if allowed, generates and sends the
+response automatically (routing over a Resource when it exceeds 431 bytes). Denied requests are dropped;
+requests for unregistered paths are still surfaced to the app's `requestReceived` delegate, so app-side
+handling remains available.
 
 ### Resource primitives (`Resource`, `ResourceAdvertisement`)
 
