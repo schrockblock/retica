@@ -485,3 +485,47 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await b.receive(\.transport.received); await b.receive(\.delegate.linkClosed)
     await a.send(.disconnect); await b.send(.disconnect)
 }
+
+@Test @MainActor func identifyOverLinkDispatchesToTheMatchingLink() async {
+    let clock = TestClock()
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let store = TestStore(initialState: {
+        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var link = LinkSession.State(id: UUID(0), initiatorTo: Identity(),
+                                     destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
+        link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
+        s.links.append(link)
+        return s
+    }()) { Endpoint() } withDependencies: {
+        $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+    await store.send(.identifyOverLink(linkID: linkID, identity: Identity()))
+    await store.receive { if case .link(.element(_, .identify)) = $0 { return true }; return false }
+}
+
+@Test @MainActor func requestReceivedDelegateSurfacesWithLinkID() async {
+    let clock = TestClock()
+    let linkID = Data(repeating: 0xAB, count: 16)
+    let store = TestStore(initialState: {
+        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
+                                     destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
+        link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
+        s.links.append(link)
+        return s
+    }()) { Endpoint() } withDependencies: {
+        $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    let rid = Data(repeating: 0x11, count: 16); let ph = Data(repeating: 0x22, count: 16)
+    let got = LockIsolated<(Data, Data)?>(nil)
+    await store.send(.link(.element(id: UUID(0), action: .delegate(.requestReceived(requestID: rid, pathHash: ph, data: Data("x".utf8))))))
+    await store.receive { action in
+        if case let .delegate(.requestReceived(lid, gotRid, _, _)) = action { got.setValue((lid, gotRid)); return true }
+        return false
+    }
+    #expect(got.value?.0 == linkID)
+    #expect(got.value?.1 == rid)
+}

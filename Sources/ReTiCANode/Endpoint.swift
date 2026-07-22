@@ -38,6 +38,9 @@ public struct Endpoint {
         case sendOverLink(linkID: Data, data: Data)
         case sendResourceOverLink(linkID: Data, data: Data)
         case closeLink(linkID: Data)
+        case identifyOverLink(linkID: Data, identity: Identity)
+        case sendRequestOverLink(linkID: Data, path: String, data: Data)
+        case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
 
         case delegate(Delegate)
         @CasePathable
@@ -52,6 +55,10 @@ public struct Endpoint {
             case resourceReceived(linkID: Data, data: Data)
             case resourceConcluded(linkID: Data, resourceHash: Data)
             case resourceFailed(linkID: Data, resourceHash: Data)
+            case linkIdentified(linkID: Data, remoteIdentity: Identity)
+            case requestReceived(linkID: Data, requestID: Data, pathHash: Data, data: Data)
+            case responseReceived(linkID: Data, requestID: Data, data: Data)
+            case requestFailed(linkID: Data, requestID: Data)
         }
     }
 
@@ -123,6 +130,16 @@ public struct Endpoint {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .sendResource(data))))
 
+            case let .identifyOverLink(linkID, identity):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .identify(identity))))
+            case let .sendRequestOverLink(linkID, path, data):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .sendRequest(path: path, data: data))))
+            case let .sendResponseOverLink(linkID, requestID, data):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .sendResponse(requestID: requestID, data: data))))
+
             case let .closeLink(linkID):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .close)))
@@ -151,6 +168,19 @@ public struct Endpoint {
             case let .link(.element(elementID, .delegate(.resourceFailed(hash)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
                 return .send(.delegate(.resourceFailed(linkID: linkID, resourceHash: hash)))
+
+            case let .link(.element(elementID, .delegate(.identified(identity)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: identity)))
+            case let .link(.element(elementID, .delegate(.requestReceived(rid, ph, data)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.requestReceived(linkID: linkID, requestID: rid, pathHash: ph, data: data)))
+            case let .link(.element(elementID, .delegate(.responseReceived(rid, data)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.responseReceived(linkID: linkID, requestID: rid, data: data)))
+            case let .link(.element(elementID, .delegate(.requestFailed(rid)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.requestFailed(linkID: linkID, requestID: rid)))
 
             case .interface, .transport, .delegate, .link:
                 return .none
