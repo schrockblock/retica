@@ -560,19 +560,23 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     await store.receive { if case .delegate(.closed(.initiatorClosed)) = $0 { return true }; return false }
     _ = requestID   // captured above; used only to document what was pending before the close
-    // Advancing well past the request timeout (rtt*6+11.25 = 17.25 s) surfaces no requestFailed:
-    // pendingRequests is empty, so even if a timer fired its .requestDeadline the guard would drop
-    // it. In exhaustive mode a spurious requestFailed here would fail the run.
+    // Advance past the request timeout (rtt*6+11.25 = 17.25 s) under exhaustive mode: if a request
+    // timer were still armed AND its .requestDeadline surfaced, this would fail on an unexpected
+    // action. pendingRequests is already empty, so even a fired .requestDeadline is guard-dropped.
     store.exhaustivity = .on
     await clock.advance(by: .seconds(120))
-    // NOTE (mutation coverage): the behaviorally-meaningful guarantee of cancelPending is that
-    // pendingRequests is EMPTIED on close (asserted above; a mutation dropping removeAll() fails
-    // this test). The additional `.cancel(id: CancelID.request(rid))` it issues is defensive
-    // resource-hygiene: because the set is already cleared, a leaked request timer is behaviorally
-    // inert (its .requestDeadline is guard-dropped) AND does not surface as a received action or an
-    // in-flight effect in this TCA/Swift-Testing harness — so a mutation that drops only the
-    // `.cancel` (keeping removeAll) has no observable effect and is not independently catchable here,
-    // analogous to the documented requestMDU-boundary case. The cancel is retained as correct hygiene.
+    // NOTE (mutation coverage of cancelPending):
+    //  • Dropping `removeAll()` is caught deterministically by the `pendingRequests.isEmpty` assertion
+    //    above, in every environment.
+    //  • Dropping ONLY the `.cancel(id:)` (keeping removeAll) is behaviorally inert through the
+    //    reducer — the cleared set makes the leaked timer's .requestDeadline guard-drop to .none — so
+    //    the only possible signal is the harness surfacing the leaked effect's action as *unexpected*
+    //    under the exhaustive advance above. Whether it does is TCA-scheduler-dependent: it was
+    //    observed to fail the run in final review, but did NOT reproduce in the controller's
+    //    environment (the leaked action never surfaced there). Because there is no
+    //    environment-independent behavioral discriminator (removeAll runs in both the correct and
+    //    mutant paths), the `.cancel` is retained as correct resource hygiene rather than for
+    //    test-observability; it prevents a genuinely leaked sleeping task in production.
 }
 
 // NOTE (TCA 1.26 choreography): TCA 1.26's receive-with-predicate takes a synchronous path
