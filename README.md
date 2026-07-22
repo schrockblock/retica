@@ -140,6 +140,25 @@ as `Endpoint.delegate(.linkEstablished/.linkDataReceived/.linkClosed/.linkFailed
 and close — verified end-to-end. (Closed links remain inert in the collection; GC, multiple
 interfaces, identify/requests/resources are future work.)
 
+### Link identify & request/response (`Endpoint`)
+
+Over an established link, the initiator can prove its identity and either peer can make an
+authenticated request:
+
+- `Endpoint.identifyOverLink(linkID:identity:)` sends `publicKey ‖ sign(linkID ‖ publicKey)` (encrypted,
+  context `LINKIDENTIFY`); the responder verifies the Ed25519 signature and surfaces
+  `linkIdentified(linkID:remoteIdentity:)`.
+- `Endpoint.sendRequestOverLink(linkID:path:data:)` sends `REQUEST` = `msgpack([time, path_hash, data])`
+  (encrypted); the peer surfaces `requestReceived(linkID:requestID:pathHash:data:)` and replies with
+  `sendResponseOverLink(linkID:requestID:data:)` → `RESPONSE` = `msgpack([request_id, data])`, matched
+  back to `responseReceived(...)` by `request_id` (the request packet's truncated hash). A lost response
+  surfaces `requestFailed(...)` after `rtt·6 + 11.25 s`.
+
+Requests/responses are inline for payloads ≤ 431 bytes and wire-compatible with Python-RNS 1.3.8. The
+application generates responses and enforces its own allow-policy using the identified `remoteIdentity`;
+RNS's in-library handler-registry/allow-policy and large (Resource-based) requests/responses remain
+future slices.
+
 ### Resource primitives (`Resource`, `ResourceAdvertisement`)
 
 The `Resource` namespace (pure core) implements the single-segment, uncompressed representation
@@ -231,7 +250,7 @@ RETICA_LIVE_HOST=127.0.0.1 RETICA_LIVE_PORT=4242 swift test --filter LiveEndpoin
 
 Transport-node relaying, path requests, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
 
-The **Link session lifecycle beyond data/close** — identify, requests, and resources — is a future slice. The cryptographic handshake primitives (`Link` namespace) are complete and cross-validated; `LinkSession` implements establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data in both directions, explicit link close, and the full time-driven watchdog (establishment timeout, keepalive 0xFF/0xFE, and inactivity teardown). Higher-level operations (identify, requests, resources) are not yet implemented.
+The **Link session lifecycle** is now substantially complete: establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data, explicit link close, keepalive/inactivity watchdog, inline identify (IDENTIFY payload + Ed25519 verification), and inline request/response (msgpack-framed, matched by `request_id`). All are wire-compatible with Python-RNS 1.3.8 and verified by cross-validation vectors. Large (Resource-based) requests/responses remain a future slice.
 
 ## Requirements
 
