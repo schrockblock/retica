@@ -277,13 +277,22 @@ public struct LinkSession {
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
                           let adv = ResourceAdvertisement.unpack(plain) else { return .none }
                     if state.transfers.contains(where: { $0.resourceHash == adv.hash }) { return .none }
+                    // A response-Resource is only ours if its request_id is currently pending.
+                    if adv.isResponse {
+                        guard let rid = adv.requestID, state.pendingRequests.contains(rid) else { return .none }
+                    }
                     let newID = uuid()
                     let transferRTT: Duration = .seconds(state.rtt ?? 1)
                     state.transfers.append(ResourceTransfer.State(
                         receivingOn: state.linkID, sessionKey: state.sessionKey,
                         interfaceID: state.interfaceID, rtt: transferRTT, id: newID))
                     state.transfers[id: newID]?.resourceHash = adv.hash
-                    return .send(.transfer(.element(id: newID, action: .accept(data))))
+                    let accept = Effect<Action>.send(.transfer(.element(id: newID, action: .accept(data))))
+                    if adv.isResponse, let rid = adv.requestID {
+                        // Response is arriving; stop the request timeout while it downloads.
+                        return .merge(accept, .cancel(id: CancelID.request(rid)))
+                    }
+                    return accept
 
                 case (_, .active, .data, .resource),
                      (_, .active, .data, .resourceRequest),
@@ -461,13 +470,36 @@ public struct LinkSession {
 
             case let .transfer(.element(_, .delegate(.transmit(ifID, raw)))):
                 return .send(.delegate(.transmit(ifID, raw)))
-            case let .transfer(.element(_, .delegate(.received(payload)))):
+            case let .transfer(.element(elementID, .delegate(.received(payload)))):
+                let adv = state.transfers[id: elementID]?.advertisement
+                if adv?.isRequest == true {
+                    guard case let .array(items)? = MsgPack.decodeValue(payload), items.count == 3,
+                          case let .bin(pathHash) = items[1], case let .bin(data) = items[2] else { return .none }
+                    return .send(.delegate(.requestReceived(requestID: Crypto.truncatedHash(payload),
+                                                            pathHash: pathHash, data: data)))
+                } else if adv?.isResponse == true {
+                    guard case let .array(items)? = MsgPack.decodeValue(payload), items.count == 2,
+                          case let .bin(rid) = items[0], case let .bin(data) = items[1],
+                          state.pendingRequests.contains(rid) else { return .none }
+                    state.pendingRequests.remove(rid)
+                    return .merge(.cancel(id: CancelID.request(rid)),
+                                  .send(.delegate(.responseReceived(requestID: rid, data: data))))
+                }
                 return .send(.delegate(.resourceReceived(payload)))
             case let .transfer(.element(elementID, .delegate(.concluded))):
+                let adv = state.transfers[id: elementID]?.advertisement
+                if adv?.isRequest == true || adv?.isResponse == true { return .none }   // internal req/resp delivery
                 guard let hash = state.transfers[id: elementID]?.resourceHash else { return .none }
                 return .send(.delegate(.resourceConcluded(hash)))
             case let .transfer(.element(elementID, .delegate(.failed))):
-                guard let hash = state.transfers[id: elementID]?.resourceHash else { return .none }
+                let t = state.transfers[id: elementID]
+                if let rid = t?.advertisement?.requestID, state.pendingRequests.contains(rid) {
+                    state.pendingRequests.remove(rid)
+                    return .merge(.cancel(id: CancelID.request(rid)),
+                                  .send(.delegate(.requestFailed(requestID: rid))))
+                }
+                if t?.advertisement?.isRequest == true || t?.advertisement?.isResponse == true { return .none }
+                guard let hash = t?.resourceHash else { return .none }
                 return .send(.delegate(.resourceFailed(hash)))
             case .transfer:
                 return .none

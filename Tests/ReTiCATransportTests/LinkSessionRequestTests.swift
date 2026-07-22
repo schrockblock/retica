@@ -200,6 +200,74 @@ private func bigData() -> Data { Data((0..<500).map { UInt8($0 & 0xff) }) }
     await clock.advance(by: .seconds(30))
 }
 
+// A hosted sender transfer whose advertisement is marked isRequest/isResponse (used to exercise
+// the completion-routing interception directly, without driving a full transfer).
+private func hostedTransfer(_ packed: Data, requestID: Data, isResponse: Bool) -> ResourceTransfer.State {
+    ResourceTransfer.State(sending: packed, linkID: reqLinkID, sessionKey: reqKey,
+                           interfaceID: InterfaceID("i"), prefix: Data([0, 1, 2, 3]),
+                           randomHash: Data([4, 5, 6, 7]), sdu: 24, requestID: requestID, isResponse: isResponse)
+}
+
+@MainActor
+private func responderStoreWith(_ transfer: ResourceTransfer.State, _ pending: Set<Data>,
+                                _ clock: TestClock<Duration>) -> TestStore<LinkSession.State, LinkSession.Action> {
+    var s = LinkSession.State(responderFor: Identity(), destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .active; s.sessionKey = reqKey; s.linkID = reqLinkID; s.rtt = 1.0
+    s.transfers.append(transfer)
+    s.pendingRequests = pending
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    return store
+}
+
+@Test @MainActor func completedRequestResourceRoutesToRequestReceived() async {
+    let clock = TestClock<Duration>()
+    let packed = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data("svc/x".utf8))), .bin(Data("body".utf8))]))
+    let t = hostedTransfer(packed, requestID: Crypto.truncatedHash(packed), isResponse: false)
+    let store = responderStoreWith(t, [], clock)
+    let got = LockIsolated<(Data, Data)?>(nil)
+    await store.send(.transfer(.element(id: t.id, action: .delegate(.received(packed)))))
+    await store.receive { action in
+        if case let .delegate(.requestReceived(rid, ph, d)) = action { got.setValue((ph, d)); return rid == Crypto.truncatedHash(packed) }
+        return false
+    }
+    #expect(got.value?.0 == Crypto.truncatedHash(Data("svc/x".utf8)))
+    #expect(got.value?.1 == Data("body".utf8))
+}
+
+@Test @MainActor func completedResponseResourceRoutesToResponseReceivedAndClearsPending() async {
+    let clock = TestClock<Duration>()
+    let rid = Data(repeating: 0xCD, count: 16)
+    let packed = MsgPack.encode(.array([.bin(rid), .bin(Data("answer".utf8))]))
+    let t = hostedTransfer(packed, requestID: rid, isResponse: true)
+    let store = responderStoreWith(t, [rid], clock)
+    let got = LockIsolated<Data?>(nil)
+    await store.send(.transfer(.element(id: t.id, action: .delegate(.received(packed)))))
+    await store.receive { action in
+        if case let .delegate(.responseReceived(r, d)) = action, r == rid { got.setValue(d); return true }
+        return false
+    }
+    #expect(got.value == Data("answer".utf8))
+    #expect(!store.state.pendingRequests.contains(rid))
+}
+
+@Test @MainActor func responseAdvertisementNotPendingIsIgnored() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .initiator, clock)
+    // Build a response-Resource advertisement packet whose request_id is NOT pending.
+    let rid = Data(repeating: 0xEE, count: 16)
+    let sender = hostedTransfer(MsgPack.encode(.array([.bin(rid), .bin(bigData())])), requestID: rid, isResponse: true)
+    let advPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                           destinationType: .link, context: .resourceAdvertisement, contextFlag: false, hops: 0,
+                           destinationHash: reqLinkID, transportId: nil,
+                           payload: Link.encrypt(sender.advertisement!.pack(), sessionKey: reqKey))
+    await store.send(.received(try! advPacket.packed()))
+    #expect(store.state.transfers.isEmpty)     // unmatched response ADV → not spawned
+}
+
 // Build an inbound REQUEST packet for a path+data.
 private func requestPacket(_ path: String, _ data: Data) -> Data {
     let packed = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data(path.utf8))), .bin(data)]))
