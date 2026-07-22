@@ -42,6 +42,10 @@ public struct ResourceTransfer {
         public var sentIndices: Set<Int>
         public var advRetriesLeft: Int
         public var proofRetriesLeft: Int
+        // hashmap-update (receiver)
+        public var knownHashmap: Data
+        public var hashmapHeight: Int
+        public var waitingForHMU: Bool
 
         /// Sender: build the resource from `data` over the link's session key.
         public init(sending data: Data, linkID: Data, sessionKey: Data, interfaceID: InterfaceID,
@@ -78,6 +82,9 @@ public struct ResourceTransfer {
             self.sentIndices = []
             self.advRetriesLeft = Const.maxAdvRetries
             self.proofRetriesLeft = Const.proofRetries
+            self.knownHashmap = Data()
+            self.hashmapHeight = 0
+            self.waitingForHMU = false
         }
 
         /// Receiver: accept an inbound resource on the given link.
@@ -107,6 +114,9 @@ public struct ResourceTransfer {
             self.sentIndices = []
             self.advRetriesLeft = Const.maxAdvRetries
             self.proofRetriesLeft = Const.proofRetries
+            self.knownHashmap = Data()
+            self.hashmapHeight = 0
+            self.waitingForHMU = false
         }
     }
 
@@ -192,13 +202,21 @@ public struct ResourceTransfer {
             }
 
             func requestNextWindow(_ s: inout State) -> Effect<Action> {
+                if s.waitingForHMU { return armReceiverWatchdog(s) }   // await the HMU; don't spam REQs
                 let received = Set(s.receivedParts.keys)
                 let req = Resource.nextWindowRequest(
-                    receivedIndices: received, hashmap: s.advertisement?.hashmap ?? Data(),
+                    receivedIndices: received, hashmap: s.knownHashmap,
                     height: s.consecutiveCompletedHeight, window: s.window.window,
                     partCount: Int(s.expectedParts))
                 s.outstanding = Set(req.indices)
-                let payload = Data([0x00]) + s.resourceHash + req.mapHashes
+                var payload: Data
+                if req.exhausted, s.hashmapHeight > 0 {
+                    let last = Data(s.knownHashmap.suffix(Resource.mapHashLength))   // knownHashmap[hashmapHeight-1]
+                    payload = Data([0xFF]) + last + s.resourceHash + req.mapHashes
+                    s.waitingForHMU = true
+                } else {
+                    payload = Data([0x00]) + s.resourceHash + req.mapHashes
+                }
                 let linkID = s.linkID
                 let interfaceID = s.interfaceID
                 let sessionKey = s.sessionKey
@@ -231,6 +249,9 @@ public struct ResourceTransfer {
                 state.randomHash = adv.randomHash
                 state.expectedParts = adv.numberOfParts
                 state.advertisement = adv
+                state.knownHashmap = Data(adv.hashmap)
+                state.hashmapHeight = adv.hashmap.count / Resource.mapHashLength
+                state.waitingForHMU = false
                 state.window = ResourceWindow()
                 state.consecutiveCompletedHeight = -1
                 state.retriesLeft = Const.maxRetries
@@ -307,7 +328,7 @@ public struct ResourceTransfer {
                           let adv = state.advertisement else { return .none }
                     let chunk = packet.payload
                     let mh = Resource.mapHash(chunk: chunk, randomHash: state.randomHash)
-                    let m = Data(adv.hashmap)
+                    let m = Data(state.knownHashmap)
                     var index: Int? = nil
                     var gi = 0
                     var j = m.startIndex
@@ -362,6 +383,22 @@ public struct ResourceTransfer {
                     state.status = .failed
                     return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
 
+                case (.receiver, .data, .resourceHashmapUpdate):
+                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey) else { return .none }
+                    let p = Data(plain)
+                    guard p.count >= 32,
+                          Data(p[p.startIndex..<(p.startIndex + 32)]) == state.resourceHash else { return .none }
+                    guard case let .array(items)? = MsgPack.decodeValue(Data(p.dropFirst(32))),
+                          items.count == 2,
+                          case let .uint(chunkIndex) = items[0],
+                          case let .bin(chunkBytes) = items[1] else { return .none }
+                    let offset = Int(chunkIndex) * Resource.hashmapMaxLen * Resource.mapHashLength
+                    guard offset == state.knownHashmap.count else { return .none }   // must extend contiguously
+                    state.knownHashmap.append(chunkBytes)
+                    state.hashmapHeight = state.knownHashmap.count / Resource.mapHashLength
+                    state.waitingForHMU = false
+                    return requestNextWindow(&state)
+
                 default:
                     return .none
                 }
@@ -379,6 +416,7 @@ public struct ResourceTransfer {
                 }
                 state.window = state.window.shrunk()
                 state.retriesLeft -= 1
+                state.waitingForHMU = false
                 return requestNextWindow(&state)
 
             case .senderDeadline:

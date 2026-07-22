@@ -514,3 +514,88 @@ private func exhaustedRequestPacket(_ s: ResourceTransfer.State, lastMapHash: Da
     #expect(store.state.status == .failed)
     #expect(iclData.value != nil)
 }
+
+// Build a RESOURCE_HMU packet for chunk `idx` carrying `hashes`.
+private func hmuPacket(_ hash: Data, chunk: Int, hashes: Data) -> Data {
+    let payload = hash + MsgPack.encode(.array([.uint(UInt64(chunk)), .bin(hashes)]))
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: .resourceHashmapUpdate, contextFlag: false, hops: 0,
+                   destinationHash: linkID, transportId: nil, payload: Link.encrypt(payload, sessionKey: key))
+    return try! p.packed()
+}
+
+@Test @MainActor func receiverEmitsExhaustedRequestWhenHashmapRunsOut() async {
+    let data = Data(repeating: 0x33, count: 800)          // > 74 parts at sdu 8
+    let sender = senderState(data, sdu: 8)
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+    await store.send(.accept(advertisementPacket(sender)))
+    #expect(store.state.hashmapHeight == 74)              // ADV seeded first 74
+    _ = await captureTransmits(store, count: 1)           // first REQ (parts 0..3, all known)
+
+    // In TCA 1.26.0 non-exhaustive TestStore, unobserved effect-actions are discarded on
+    // the next store.send call. So we must drain each round-boundary REQ immediately after
+    // the send that triggers it. We save the last drained REQ (the 0xFF one).
+    // (Deviation from brief: interleave drain inside loop; all correctness assertions kept.)
+    var lastREQ: Data? = nil
+    for n in 0..<74 {
+        let prevWaiting = store.state.waitingForHMU
+        let prevOutstanding = store.state.outstanding
+        await store.send(.received(partPacket(sender.parts[n])))
+        let newOutstanding = store.state.outstanding
+        // A REQ is emitted when a round completes: outstanding transitions to a fully new set.
+        // Also when waitingForHMU just became true (exhausted REQ).
+        let newRoundStarted = !newOutstanding.isEmpty && newOutstanding.isDisjoint(with: prevOutstanding)
+        let exhaustedFired = store.state.waitingForHMU && !prevWaiting
+        if newRoundStarted || exhaustedFired {
+            let captured = await captureTransmits(store, count: 1)
+            if let pkt = captured.first { lastREQ = pkt }
+        }
+    }
+    // lastREQ is the 0xFF exhausted request.
+    let raw = lastREQ
+    #expect(raw != nil)
+    guard let raw = raw else { return }
+    let plain = Data(Link.decrypt(Packet(raw: raw)!.payload, sessionKey: key)!)
+    #expect(plain.first == 0xFF)
+    #expect(Data(plain[(plain.startIndex + 1)..<(plain.startIndex + 5)]) == sender.partMapHashes[73])  // last known hash
+    #expect(store.state.waitingForHMU == true)
+    // cleanup
+    await store.send(.cancel); _ = await captureTransmits(store, count: 1)
+}
+
+@Test @MainActor func receiverIngestsHmuAndExtendsHashmap() async {
+    let data = Data(repeating: 0x33, count: 800)
+    let sender = senderState(data, sdu: 8)
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+    await store.send(.accept(advertisementPacket(sender)))
+    _ = await captureTransmits(store, count: 1)
+    // Feed 74 parts with same round-boundary drain technique as receiverEmitsExhaustedRequest.
+    for n in 0..<74 {
+        let prevWaiting = store.state.waitingForHMU
+        let prevOutstanding = store.state.outstanding
+        await store.send(.received(partPacket(sender.parts[n])))
+        let newOutstanding = store.state.outstanding
+        let newRoundStarted = !newOutstanding.isEmpty && newOutstanding.isDisjoint(with: prevOutstanding)
+        let exhaustedFired = store.state.waitingForHMU && !prevWaiting
+        if newRoundStarted || exhaustedFired {
+            _ = await captureTransmits(store, count: 1)  // drain each REQ as it appears
+        }
+    }
+    #expect(store.state.waitingForHMU == true)
+
+    // Deliver chunk 1 (parts 74..min(148,N)).
+    let hi = min(148, sender.partMapHashes.count)
+    let chunkBytes = sender.partMapHashes[74..<hi].reduce(Data()) { $0 + $1 }
+    await store.send(.received(hmuPacket(sender.resourceHash, chunk: 1, hashes: chunkBytes)))
+    #expect(store.state.hashmapHeight == hi)
+    #expect(store.state.waitingForHMU == false)
+    // The receiver resumes requesting (a normal REQ goes out).
+    let more = (await captureTransmits(store, count: 1)).first {
+        Link.decrypt(Packet(raw: $0)!.payload, sessionKey: key)?.first == 0x00
+    }
+    #expect(more != nil)
+    // cleanup
+    await store.send(.cancel); _ = await captureTransmits(store, count: 1)
+}

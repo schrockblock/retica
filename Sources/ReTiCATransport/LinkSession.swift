@@ -272,6 +272,7 @@ public struct LinkSession {
 
                 case (_, .active, .data, .resource),
                      (_, .active, .data, .resourceRequest),
+                     (_, .active, .data, .resourceHashmapUpdate),
                      (_, .active, .data, .resourceProof),
                      (_, .active, .data, .resourceInitiatorCancel),
                      (_, .active, .data, .resourceReceiverCancel),
