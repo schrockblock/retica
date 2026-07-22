@@ -49,7 +49,8 @@ public struct ResourceTransfer {
 
         /// Sender: build the resource from `data` over the link's session key.
         public init(sending data: Data, linkID: Data, sessionKey: Data, interfaceID: InterfaceID,
-                    prefix: Data, randomHash: Data, sdu: Int, rtt: Duration = .seconds(1), id: UUID = UUID()) {
+                    prefix: Data, randomHash: Data, sdu: Int, requestID: Data? = nil, isResponse: Bool = false,
+                    rtt: Duration = .seconds(1), id: UUID = UUID()) {
             self.id = id
             self.role = .sender
             self.status = .idle
@@ -67,10 +68,11 @@ public struct ResourceTransfer {
             self.expectedProof = Resource.expectedProof(data: data, hash: h)
             self.expectedParts = UInt64(chunks.count)
             self.receivedParts = [:]
+            let advFlags: UInt8 = 0x01 | (requestID != nil ? (isResponse ? 0x10 : 0x08) : 0)
             self.advertisement = ResourceAdvertisement(
                 transferSize: UInt64(stream.count), dataSize: UInt64(data.count),
                 numberOfParts: UInt64(chunks.count), hash: h, randomHash: randomHash, originalHash: h,
-                segmentIndex: 0, totalSegments: 1, requestID: nil, flags: 0x01,
+                segmentIndex: 0, totalSegments: 1, requestID: requestID, flags: advFlags,
                 hashmap: mapHashes.prefix(Resource.hashmapMaxLen).reduce(Data()) { $0 + $1 })
             self.window = ResourceWindow()
             self.consecutiveCompletedHeight = -1

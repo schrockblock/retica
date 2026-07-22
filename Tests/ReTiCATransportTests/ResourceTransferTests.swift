@@ -660,3 +660,32 @@ private func expectedSenderTransmits(_ reqFrame: Data) -> Int {
     await sender.receive(.delegate(.concluded))
     #expect(sender.state.status == .complete)
 }
+
+@Test func senderRequestResourceSetsIsRequestFlagAndRequestID() {
+    let rid = Data(repeating: 0xCD, count: 16)
+    let s = ResourceTransfer.State(sending: Data(repeating: 0x33, count: 40), linkID: linkID, sessionKey: key,
+                                   interfaceID: InterfaceID("s"), prefix: prefix, randomHash: r, sdu: 24,
+                                   requestID: rid, isResponse: false)
+    #expect(s.advertisement!.requestID == rid)
+    #expect(s.advertisement!.isRequest == true)
+    #expect(s.advertisement!.isResponse == false)
+    #expect(s.advertisement!.flags == 0x09)        // 0x01 | 0x08
+}
+
+@Test func senderResponseResourceSetsIsResponseFlag() {
+    let rid = Data(repeating: 0xCD, count: 16)
+    let s = ResourceTransfer.State(sending: Data(repeating: 0x33, count: 40), linkID: linkID, sessionKey: key,
+                                   interfaceID: InterfaceID("s"), prefix: prefix, randomHash: r, sdu: 24,
+                                   requestID: rid, isResponse: true)
+    #expect(s.advertisement!.requestID == rid)
+    #expect(s.advertisement!.isResponse == true)
+    #expect(s.advertisement!.isRequest == false)
+    #expect(s.advertisement!.flags == 0x11)        // 0x01 | 0x10
+}
+
+@Test func senderPlainResourceHasNoRequestID() {
+    let s = ResourceTransfer.State(sending: Data(repeating: 0x33, count: 40), linkID: linkID, sessionKey: key,
+                                   interfaceID: InterfaceID("s"), prefix: prefix, randomHash: r, sdu: 24)
+    #expect(s.advertisement!.requestID == nil)
+    #expect(s.advertisement!.flags == 0x01)
+}
