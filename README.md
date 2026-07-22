@@ -137,8 +137,8 @@ to the matching link by `link_id`, creates a responder link on an inbound LINKRE
 destination, and can `openLink(destinationHash:)` to a learned destination. Link lifecycle surfaces
 as `Endpoint.delegate(.linkEstablished/.linkDataReceived/.linkClosed/.linkFailed)`, and
 `sendOverLink`/`closeLink` drive an active link. Two endpoints can establish a link, exchange data,
-and close — verified end-to-end. (Closed links remain inert in the collection; GC, multiple
-interfaces, identify/requests/resources are future work.)
+and close — verified end-to-end. (Closed links remain inert in the collection; link GC and multiple
+interfaces per endpoint are future work.)
 
 ### Link identify & request/response (`Endpoint`)
 
