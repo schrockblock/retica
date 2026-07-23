@@ -6,6 +6,9 @@ struct TransportVectorFixtures: Decodable {
     let announceAppData: String
     let announceHops: Int
     let announcePacket: String
+    let bz2Original: String
+    let bz2Compressed: String
+    let bz2OriginalLen: Int
 
     enum CodingKeys: String, CodingKey {
         case announceDestHash = "announce_dest_hash"
@@ -13,6 +16,9 @@ struct TransportVectorFixtures: Decodable {
         case announceAppData = "announce_app_data"
         case announceHops = "announce_hops"
         case announcePacket = "announce_packet"
+        case bz2Original = "bz2_original"
+        case bz2Compressed = "bz2_compressed"
+        case bz2OriginalLen = "bz2_original_len"
     }
 
     static func load() throws -> TransportVectorFixtures {

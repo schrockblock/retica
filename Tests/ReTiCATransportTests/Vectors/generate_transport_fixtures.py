@@ -5,7 +5,7 @@
 # Emits a full HEADER_1 ANNOUNCE packet (raw bytes) wrapping a reference-authentic announce
 # payload, so the Swift Transport reducer can be cross-validated: feeding this packet must
 # make Transport learn the reference destination (identity hash, app_data, hops).
-import json, os, time
+import json, os, time, bz2
 import RNS
 
 identity = RNS.Identity()
@@ -26,10 +26,17 @@ hops = 3
 flags = 0x01
 announce_packet = bytes([flags, hops]) + dest_hash + bytes([0x00]) + payload
 
+# --- bz2 compression cross-validation (genuine Python bz2, level 9 = what RNS uses) ---
+bz2_original = b"reticulum resource payload for cross validation " * 6
+bz2_compressed = bz2.compress(bz2_original, 9)
+
 print(json.dumps({
     "announce_dest_hash": dest_hash.hex(),
     "announce_identity_hash": identity.hash.hex(),
     "announce_app_data": app_data.hex(),
     "announce_hops": hops,
     "announce_packet": announce_packet.hex(),
+    "bz2_original": bz2_original.hex(),
+    "bz2_compressed": bz2_compressed.hex(),
+    "bz2_original_len": len(bz2_original),
 }, indent=2))
