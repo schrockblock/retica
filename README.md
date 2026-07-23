@@ -190,7 +190,7 @@ primitives of a Reticulum Resource — the chunked large-object transfer that ri
   (`t,d,n,h,r,o,i,l,q,f,m`), built on a `MsgPack` value codec (uint/bin/string/nil/ordered-map).
 
 All of it is cross-validated against Python-RNS 1.3.8 (msgpack bytes, hashes, `Token` decrypt, and a
-genuine `ResourceAdvertisement.pack`). Multi-segment resources, compression, and the transfer state
+genuine `ResourceAdvertisement.pack`). Multi-segment resources and the transfer state
 machine (advertise → request → send → assemble → prove, with windowing/retransmission) are future
 slices, as is wiring resources over a live `LinkSession`.
 
@@ -217,8 +217,14 @@ consecutive-completed height, and retransmits outstanding parts on an rtt-seeded
 after 16 retries. The sender re-advertises when no request arrives (up to 4 times), waits for the
 proof in an `awaitingProof` state, and gives up after its patience elapses. Either side can abort:
 `RESOURCE_ICL` (sender) and `RESOURCE_RCL` (receiver) — each carrying the resource hash encrypted with
-the link key — drive the peer to a failed state. Rate-adaptive window escalation (fast/very-slow),
-and compression remain future slices.
+the link key — drive the peer to a failed state. Rate-adaptive window escalation (fast/very-slow)
+remains a future slice.
+
+Resource payloads are transparently compressed with bzip2 before encryption when it shrinks them: the
+sender sets a compression flag in the advertisement and ships the compressed stream, and the receiver
+decompresses on assembly (the resource hash stays over the original data). Compression is byte-for-byte
+identical to Python-RNS 1.3.8 (a vendored copy of the reference libbzip2). Incompressible payloads are sent
+uncompressed automatically.
 
 ### Large resources: hashmap-update (HMU)
 
@@ -244,7 +250,7 @@ Once a link is established, a resource is sent end-to-end through the public API
   `resourceConcluded(linkID:resourceHash:)` / `resourceFailed(linkID:resourceHash:)` on either side.
 
 `ResourceTransfer` instances live inside their `LinkSession` (link-scoped). Terminal transfers (concluded or failed) are removed from their `LinkSession` automatically; MTU/SDU
-negotiation, multi-segment, and compression remain future slices.
+negotiation and multi-segment remain future slices.
 
 ### Live endpoint test (opt-in)
 
