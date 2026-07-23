@@ -21,6 +21,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "ReTiCA"),
+        .target(name: "Cbzip2"),
         .target(
             name: "ReTiCAInterfaces",
             dependencies: [
@@ -44,6 +45,7 @@ let package = Package(
             name: "ReTiCATransport",
             dependencies: [
                 "ReTiCA",
+                "Cbzip2",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
             ]
         ),

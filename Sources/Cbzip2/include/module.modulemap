@@ -1,0 +1,4 @@
+module Cbzip2 {
+    header "bzlib.h"
+    export *
+}
