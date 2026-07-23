@@ -58,7 +58,12 @@ public struct ResourceTransfer {
             self.linkID = linkID
             self.sessionKey = sessionKey
             self.randomHash = randomHash
-            let stream = Resource.buildStream(data: data, prefix: prefix, sessionKey: sessionKey)
+            // Compress before encryption; use the compressed payload only when it is actually smaller
+            // (matches RNS). The resource hash and dataSize stay over the ORIGINAL data.
+            let compressed = Bzip2.compress(data)
+            let didCompress = (compressed?.count ?? .max) < data.count
+            let payload = didCompress ? compressed! : data
+            let stream = Resource.buildStream(data: payload, prefix: prefix, sessionKey: sessionKey)
             let chunks = Resource.parts(stream: stream, sdu: sdu)
             let mapHashes = chunks.map { Resource.mapHash(chunk: $0, randomHash: randomHash) }
             let h = Resource.resourceHash(data: data, randomHash: randomHash)
@@ -68,7 +73,7 @@ public struct ResourceTransfer {
             self.expectedProof = Resource.expectedProof(data: data, hash: h)
             self.expectedParts = UInt64(chunks.count)
             self.receivedParts = [:]
-            let advFlags: UInt8 = 0x01 | (requestID != nil ? (isResponse ? 0x10 : 0x08) : 0)
+            let advFlags: UInt8 = 0x01 | (didCompress ? 0x02 : 0) | (requestID != nil ? (isResponse ? 0x10 : 0x08) : 0)
             self.advertisement = ResourceAdvertisement(
                 transferSize: UInt64(stream.count), dataSize: UInt64(data.count),
                 numberOfParts: UInt64(chunks.count), hash: h, randomHash: randomHash, originalHash: h,
@@ -356,11 +361,26 @@ public struct ResourceTransfer {
                         state.retriesLeft = Const.maxRetries
                         return requestNextWindow(&state)
                     }
-                    // all parts in: assemble + verify + prove (cancel the watchdog)
+                    // all parts in: assemble, decompress if flagged, verify + prove (cancel the watchdog)
                     let ordered = (0..<Int(state.expectedParts)).compactMap { state.receivedParts[$0] }
                     guard ordered.count == Int(state.expectedParts),
-                          let out = Resource.assemble(parts: ordered, sessionKey: state.sessionKey),
-                          Resource.verify(data: out, randomHash: state.randomHash, hash: state.resourceHash)
+                          let payload = Resource.assemble(parts: ordered, sessionKey: state.sessionKey)
+                    else {
+                        state.status = .failed
+                        return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                    }
+                    let out: Data
+                    if adv.isCompressed {
+                        guard let decompressed = Bzip2.decompress(payload, expectedSize: Int(adv.dataSize))
+                        else {
+                            state.status = .failed
+                            return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                        }
+                        out = decompressed
+                    } else {
+                        out = payload
+                    }
+                    guard Resource.verify(data: out, randomHash: state.randomHash, hash: state.resourceHash)
                     else {
                         state.status = .failed
                         return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))

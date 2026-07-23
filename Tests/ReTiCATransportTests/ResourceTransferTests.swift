@@ -9,6 +9,20 @@ private let linkID = Data(repeating: 0xAB, count: 16)
 private let prefix = Data([0x0A, 0x0B, 0x0C, 0x0D])
 private let r = Data([0x01, 0x02, 0x03, 0x04])
 
+/// Returns `count` bytes of SHA256-derived pseudorandom data. SHA256 output is incompressible
+/// (cryptographically indistinguishable from random), so bzip2 cannot shrink it — this is used
+/// wherever a test needs a stable part-count that compression must not change.
+private func incompressibleData(count: Int, seed: UInt8 = 0) -> Data {
+    var result = Data()
+    var i = 0
+    while result.count < count {
+        let chunk = Crypto.fullHash(Data([seed, UInt8(i & 0xff), UInt8((i >> 8) & 0xff), UInt8((i >> 16) & 0xff)]))
+        result.append(contentsOf: chunk.prefix(min(chunk.count, count - result.count)))
+        i += 1
+    }
+    return result
+}
+
 private func senderState(_ data: Data, sdu: Int = 24) -> ResourceTransfer.State {
     ResourceTransfer.State(sending: data, linkID: linkID, sessionKey: key, interfaceID: InterfaceID("s"),
                            prefix: prefix, randomHash: r, sdu: sdu)
@@ -165,7 +179,9 @@ private func receiverStore(_ clock: TestClock<Duration>) -> TestStore<ResourceTr
 }
 
 @Test @MainActor func receiverAcceptRequestsFirstWindowOnly() async {
-    let data = Data(repeating: 0x33, count: 160)          // 160+4 prefix -> stream > 6 parts at sdu 24
+    // Use incompressible data so transferSize == dataSize and part count is predictable.
+    // SHA256-derived: bzip2 cannot shrink it. 160 bytes → stream=ceil_16(164)=176 → 8 parts at sdu=24.
+    let data = incompressibleData(count: 160)   // 160+4 prefix -> stream > 6 parts at sdu 24
     let sender = senderState(data)
     let clock = TestClock<Duration>()
     let store = receiverStore(clock)
@@ -215,7 +231,8 @@ private func receiverStore(_ clock: TestClock<Duration>) -> TestStore<ResourceTr
 }
 
 @Test @MainActor func receiverRetransmitsThenFailsAfterMaxRetries() async {
-    let data = Data(repeating: 0x5A, count: 160)
+    // Incompressible so transferSize and part count are stable.
+    let data = incompressibleData(count: 160)
     let sender = senderState(data)
     let clock = TestClock<Duration>()
     let store = receiverStore(clock)
@@ -245,12 +262,13 @@ private func receiverStore(_ clock: TestClock<Duration>) -> TestStore<ResourceTr
 }
 
 @Test @MainActor func endToEndWindowedTransferWithADroppedPart() async {
-    // 142-byte payload → 9 parts at sdu=24 (stream = 208 bytes).
-    // Window starts at 4, so the transfer spans at least 3 rounds (4 + 3 + 3 = 10 > 9 part slots),
+    // 144-byte incompressible payload → stream = Token(PKCS7(prefix(4)+data(144))) = 16+160+32 = 208 bytes
+    // → 9 parts at sdu=24. Window starts at 4, so the transfer spans 3 rounds (4 + 3 + 3 = 10 > 9),
     // and a dropped part forces a timeout+retransmit, proving all four required properties:
     //   1. receiver reconstructs EXACT original data; 2. both sides reach .complete;
     //   3. window advances across multiple rounds; 4. dropped part recovered via retransmission.
-    let data = Data("End-to-end windowed resource transfer with retransmission of a dropped part, spanning multiple request rounds so the window actually advances.".utf8)
+    // SHA256-derived data ensures bzip2 cannot reduce the stream below 9 parts.
+    let data = incompressibleData(count: 144)
     let senderClock = TestClock<Duration>()
     let receiverClock = TestClock<Duration>()
     let sender = TestStore(initialState: senderState(data)) { ResourceTransfer() }
@@ -329,7 +347,8 @@ private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
 }
 
 @Test @MainActor func receiverFailsOnInboundInitiatorCancel() async {
-    let data = Data(repeating: 0x22, count: 100)
+    // Incompressible so resourceHash is deterministic and unaffected by compression logic.
+    let data = incompressibleData(count: 100)
     let sender = senderState(data)
     let clock = TestClock<Duration>()
     let store = receiverStore(clock)
@@ -352,7 +371,8 @@ private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
 }
 
 @Test @MainActor func externalCancelEmitsReceiverCancelPacket() async {
-    let data = Data(repeating: 0x77, count: 100)
+    // Incompressible so resourceHash is stable.
+    let data = incompressibleData(count: 100)
     let sender = senderState(data)
     let clock = TestClock<Duration>()
     let store = receiverStore(clock)
@@ -367,7 +387,8 @@ private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
 }
 
 @Test @MainActor func inboundCancelWithWrongHashIsIgnored() async {
-    let data = Data(repeating: 0x22, count: 100)
+    // Incompressible so resourceHash is stable.
+    let data = incompressibleData(count: 100)
     let sender = senderState(data)
     let clock = TestClock<Duration>()
     let store = receiverStore(clock)
@@ -387,8 +408,8 @@ private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
 /// If the watchdog arm is removed from requestNextWindow, the clock advance produces nothing and
 /// the test hangs/times-out waiting for the auto-fired action, causing a mutation failure.
 @Test @MainActor func receiverWatchdogAutoFiresAfterWindowRequest() async {
-    // 160 bytes → 7 parts at sdu 24 (stream includes 4-byte prefix = 164 bytes / 24 ≈ 7 parts).
-    let data = Data(repeating: 0x33, count: 160)
+    // 160 bytes incompressible → stream = ceil_16(164) = 176 / 24 = 8 parts (> window=4, multi-part).
+    let data = incompressibleData(count: 160)
     let sender = senderState(data)
     let clock = TestClock<Duration>()
     let store = receiverStore(clock)
@@ -462,7 +483,8 @@ private func exhaustedRequestPacket(_ s: ResourceTransfer.State, lastMapHash: Da
 }
 
 @Test @MainActor func senderAdvertisementCapsHashmapAt74() async {
-    let data = Data(repeating: 0x5A, count: 800)          // > 74 parts at sdu 8
+    // SHA256-derived incompressible data: stream = ceil_16(804) = 816 / 8 = 102 parts at sdu=8.
+    let data = incompressibleData(count: 800)   // > 74 parts at sdu 8
     let s = senderState(data, sdu: 8)
     #expect(s.parts.count > 74)
     #expect(s.advertisement!.hashmap.count == 74 * 4)     // capped, not the full N*4
@@ -470,7 +492,8 @@ private func exhaustedRequestPacket(_ s: ResourceTransfer.State, lastMapHash: Da
 }
 
 @Test @MainActor func senderRepliesWithHmuChunkOnExhaustedRequest() async {
-    let data = Data(repeating: 0x5A, count: 800)
+    // SHA256-derived incompressible data: stream = ceil_16(804) = 816 / 8 = 102 parts at sdu=8.
+    let data = incompressibleData(count: 800)
     let s = senderState(data, sdu: 8)
     let clock = TestClock<Duration>()
     let store = TestStore(initialState: s) { ResourceTransfer() }
@@ -494,7 +517,8 @@ private func exhaustedRequestPacket(_ s: ResourceTransfer.State, lastMapHash: Da
 }
 
 @Test @MainActor func senderCancelsOnNonBoundaryHmuRequest() async {
-    let data = Data(repeating: 0x5A, count: 800)
+    // SHA256-derived incompressible data: stream = ceil_16(804) = 816 / 8 = 102 parts at sdu=8.
+    let data = incompressibleData(count: 800)
     let s = senderState(data, sdu: 8)
     let clock = TestClock<Duration>()
     let store = TestStore(initialState: s) { ResourceTransfer() }
@@ -525,7 +549,8 @@ private func hmuPacket(_ hash: Data, chunk: Int, hashes: Data) -> Data {
 }
 
 @Test @MainActor func receiverEmitsExhaustedRequestWhenHashmapRunsOut() async {
-    let data = Data(repeating: 0x33, count: 800)          // > 74 parts at sdu 8
+    // SHA256-derived incompressible data: stream = ceil_16(804) = 816 / 8 = 102 parts at sdu=8.
+    let data = incompressibleData(count: 800)
     let sender = senderState(data, sdu: 8)
     let clock = TestClock<Duration>()
     let store = receiverStore(clock)
@@ -565,7 +590,8 @@ private func hmuPacket(_ hash: Data, chunk: Int, hashes: Data) -> Data {
 }
 
 @Test @MainActor func receiverIngestsHmuAndExtendsHashmap() async {
-    let data = Data(repeating: 0x33, count: 800)
+    // SHA256-derived incompressible data: stream = ceil_16(804) = 816 / 8 = 102 parts at sdu=8.
+    let data = incompressibleData(count: 800)
     let sender = senderState(data, sdu: 8)
     let clock = TestClock<Duration>()
     let store = receiverStore(clock)
@@ -612,7 +638,8 @@ private func expectedSenderTransmits(_ reqFrame: Data) -> Int {
 }
 
 @Test @MainActor func endToEndTransferWithHmuAcrossHashmapBoundary() async {
-    let data = Data((0..<900).map { UInt8($0 & 0xff) })   // ~113 parts at sdu 8 → ≥1 HMU round
+    // SHA256-derived incompressible data: stream = ceil_16(904) = 912 / 8 = 114 parts at sdu=8 → ≥1 HMU round.
+    let data = incompressibleData(count: 900)
     let senderClock = TestClock<Duration>()
     let receiverClock = TestClock<Duration>()
     let sender = TestStore(initialState: senderState(data, sdu: 8)) { ResourceTransfer() }
@@ -661,9 +688,82 @@ private func expectedSenderTransmits(_ reqFrame: Data) -> Int {
     #expect(sender.state.status == .complete)
 }
 
+// MARK: - Compression round-trip tests
+
+/// Drives a complete sender → receiver transfer with no dropped parts and returns the recovered data.
+/// Reuses the idiom from endToEndWindowedTransferWithADroppedPart: advertise → accept → window loop
+/// until receiver reaches .complete, then captures `.delegate(.received(_))`.
+@MainActor
+private func driveTransferToReceived(sender senderState: ResourceTransfer.State, key: Data) async -> Data? {
+    let senderClock = TestClock<Duration>()
+    let receiverClock = TestClock<Duration>()
+    let senderStore = TestStore(initialState: senderState) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = senderClock }
+    senderStore.exhaustivity = .off
+    let receiverStore = TestStore(initialState: receiverState()) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = receiverClock }
+    receiverStore.exhaustivity = .off
+
+    // Advertise → accept → first window request.
+    await senderStore.send(.advertise)
+    let adv = (await captureTransmits(senderStore, count: 1))[0]
+    await receiverStore.send(.accept(adv))
+    var req = (await captureTransmits(receiverStore, count: 1))[0]
+
+    let got = LockIsolated<Data?>(nil)
+    var guardCount = 0
+    while receiverStore.state.status != .complete && guardCount < 400 {
+        guardCount += 1
+        // Sender serves all parts (+ HMU if exhausted) in response to req.
+        let n = expectedSenderTransmits(req)
+        await senderStore.send(.received(req))
+        let outs = await captureTransmits(senderStore, count: n)
+        for frame in outs { await receiverStore.send(.received(frame)) }
+        if receiverStore.state.status == .complete {
+            await receiverStore.receive { if case .delegate(.transmit) = $0 { return true }; return false }  // PRF
+            await receiverStore.receive { action in
+                if case let .delegate(.received(d)) = action { got.setValue(d); return true }
+                return false
+            }
+            break
+        }
+        req = (await captureTransmits(receiverStore, count: 1))[0]
+    }
+    // Feed proof to sender so it concludes (cancels its watchdog).
+    let proof = Resource.proofData(data: got.value ?? Data(), hash: senderStore.state.resourceHash)
+    let pkt = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                     destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
+                     destinationHash: linkID, transportId: nil, payload: proof)
+    await senderStore.send(.received(try! pkt.packed()))
+    await senderStore.receive(.delegate(.concluded))
+    return got.value
+}
+
+@Test @MainActor func compressibleResourceSetsFlagAndRoundTrips() async {
+    let original = Data(String(repeating: "reticulum compresses this well ", count: 30).utf8)
+    let sender = ResourceTransfer.State(sending: original, linkID: linkID, sessionKey: key,
+        interfaceID: InterfaceID("i"), prefix: prefix, randomHash: r, sdu: 64)
+    #expect(sender.advertisement!.isCompressed == true)                       // flag set
+    #expect(sender.advertisement!.dataSize == UInt64(original.count))         // dataSize over original
+    #expect(sender.advertisement!.transferSize < UInt64(original.count))      // compressed stream is smaller
+    // Drive the sender's parts into a receiver and assert exact recovery.
+    let recovered = await driveTransferToReceived(sender: sender, key: key)
+    #expect(recovered == original)
+}
+
+@Test @MainActor func incompressibleResourceStaysUncompressedAndRoundTrips() async {
+    let original = Data((0..<400).map { UInt8(($0 * 37 + 11) & 0xff) })       // random-ish → bz2 not smaller
+    let sender = ResourceTransfer.State(sending: original, linkID: linkID, sessionKey: key,
+        interfaceID: InterfaceID("i"), prefix: prefix, randomHash: r, sdu: 64)
+    #expect(sender.advertisement!.isCompressed == false)                      // flag clear
+    let recovered = await driveTransferToReceived(sender: sender, key: key)
+    #expect(recovered == original)
+}
+
 @Test func senderRequestResourceSetsIsRequestFlagAndRequestID() {
     let rid = Data(repeating: 0xCD, count: 16)
-    let s = ResourceTransfer.State(sending: Data(repeating: 0x33, count: 40), linkID: linkID, sessionKey: key,
+    // Incompressible data (SHA256-derived): bzip2 cannot shrink it, so flags must not get 0x02 set.
+    let s = ResourceTransfer.State(sending: incompressibleData(count: 40), linkID: linkID, sessionKey: key,
                                    interfaceID: InterfaceID("s"), prefix: prefix, randomHash: r, sdu: 24,
                                    requestID: rid, isResponse: false)
     #expect(s.advertisement!.requestID == rid)
@@ -674,7 +774,8 @@ private func expectedSenderTransmits(_ reqFrame: Data) -> Int {
 
 @Test func senderResponseResourceSetsIsResponseFlag() {
     let rid = Data(repeating: 0xCD, count: 16)
-    let s = ResourceTransfer.State(sending: Data(repeating: 0x33, count: 40), linkID: linkID, sessionKey: key,
+    // Incompressible data (SHA256-derived): bzip2 cannot shrink it, so flags must not get 0x02 set.
+    let s = ResourceTransfer.State(sending: incompressibleData(count: 40), linkID: linkID, sessionKey: key,
                                    interfaceID: InterfaceID("s"), prefix: prefix, randomHash: r, sdu: 24,
                                    requestID: rid, isResponse: true)
     #expect(s.advertisement!.requestID == rid)
@@ -684,7 +785,8 @@ private func expectedSenderTransmits(_ reqFrame: Data) -> Int {
 }
 
 @Test func senderPlainResourceHasNoRequestID() {
-    let s = ResourceTransfer.State(sending: Data(repeating: 0x33, count: 40), linkID: linkID, sessionKey: key,
+    // Incompressible data (SHA256-derived): bzip2 cannot shrink it, so flags must not get 0x02 set.
+    let s = ResourceTransfer.State(sending: incompressibleData(count: 40), linkID: linkID, sessionKey: key,
                                    interfaceID: InterfaceID("s"), prefix: prefix, randomHash: r, sdu: 24)
     #expect(s.advertisement!.requestID == nil)
     #expect(s.advertisement!.flags == 0x01)
