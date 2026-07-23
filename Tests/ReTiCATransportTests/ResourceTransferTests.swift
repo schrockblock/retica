@@ -760,6 +760,25 @@ private func driveTransferToReceived(sender senderState: ResourceTransfer.State,
     #expect(recovered == original)
 }
 
+/// Drives a COMPRESSED resource through the HMU (hashmap-update) path by ensuring the
+/// bzip2-compressed stream still spans MORE THAN 74 parts at sdu=8, forcing a hashmap-update
+/// round. The payload is 3000 bytes of the repeating 0x00..0xFF byte pattern: bzip2 shrinks
+/// it to ~665 bytes (< 3000, so isCompressed=true) but the Token-encrypted stream is still
+/// ~90 parts at sdu=8, well beyond the 74-part HMU boundary. This proves that the compressed
+/// decompress path in the receiver is exercised even after many windowed + HMU rounds.
+@Test @MainActor func compressedMultiPartResourceCrossesHmuAndRoundTrips() async {
+    // 0x00..0xFF cycling (period=256) — bzip2 ~665 bytes compressed, ~90 parts at sdu=8.
+    // dataSize must be over the ORIGINAL (pre-compress) payload.
+    let original = Data((0..<3000).map { UInt8($0 % 256) })
+    let sender = ResourceTransfer.State(sending: original, linkID: linkID, sessionKey: key,
+        interfaceID: InterfaceID("i"), prefix: prefix, randomHash: r, sdu: 8)
+    #expect(sender.advertisement!.isCompressed == true)                        // compressed path taken
+    #expect(sender.parts.count > 74)                                           // crosses HMU boundary
+    #expect(sender.advertisement!.dataSize == UInt64(original.count))          // dataSize over original
+    let recovered = await driveTransferToReceived(sender: sender, key: key)
+    #expect(recovered == original)                                             // exact recovery
+}
+
 @Test func senderRequestResourceSetsIsRequestFlagAndRequestID() {
     let rid = Data(repeating: 0xCD, count: 16)
     // Incompressible data (SHA256-derived): bzip2 cannot shrink it, so flags must not get 0x02 set.
