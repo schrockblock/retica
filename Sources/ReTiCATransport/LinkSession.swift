@@ -20,6 +20,7 @@ public struct LinkSession {
     static let keepaliveReplyByte: UInt8 = 0xFE
     static let resourceSDU = 464
     static let requestMDU = 431
+    public static let maxEfficientSize = 1_048_575
 
     @ObservableState
     public struct State: Equatable {
@@ -41,6 +42,15 @@ public struct LinkSession {
         public var remoteIdentity: Identity?
         public var pendingRequests: Set<Data>
         public var transfers: IdentifiedArrayOf<ResourceTransfer.State> = []
+        public struct SegmentedSend: Equatable, Sendable {
+            public var remaining: [Data]        // segment payloads not yet sent (index order, cursor at front)
+            public var nextIndex: UInt64         // 1-based index of the NEXT segment to send
+            public var total: UInt64
+            public var originalHash: Data
+            public var totalDataSize: UInt64
+            public var currentTransferID: UUID   // the hosted transfer for the segment in flight
+        }
+        public var segmentedSend: SegmentedSend? = nil
         public var establishmentTimeout: TimeInterval
         public var keepaliveInterval: TimeInterval
         var staleTime: TimeInterval { keepaliveInterval * 2 }
@@ -347,14 +357,37 @@ public struct LinkSession {
 
             case let .sendResource(data):
                 guard state.status == .active else { return .none }
-                let r = Data(randomBytes(8))
-                let prefix = Data(r[r.startIndex ..< r.startIndex + 4])
-                let randomHash = Data(r[r.startIndex + 4 ..< r.startIndex + 8])
+                let rnd = Data(randomBytes(8))
+                let prefix = Data(rnd[rnd.startIndex ..< rnd.startIndex + 4])
+                let randomHash = Data(rnd[rnd.startIndex + 4 ..< rnd.startIndex + 8])
                 let newID = uuid()
+                if data.count <= Self.maxEfficientSize {
+                    state.transfers.append(ResourceTransfer.State(
+                        sending: data, linkID: state.linkID, sessionKey: state.sessionKey,
+                        interfaceID: state.interfaceID, prefix: prefix, randomHash: randomHash,
+                        sdu: Self.resourceSDU, rtt: .seconds(state.rtt ?? 1), id: newID))
+                    return .send(.transfer(.element(id: newID, action: .advertise)))
+                }
+                // Split into ceil(count / maxEfficientSize) segments (index order).
+                var segments: [Data] = []
+                var off = data.startIndex
+                while off < data.endIndex {
+                    let end = data.index(off, offsetBy: Self.maxEfficientSize, limitedBy: data.endIndex) ?? data.endIndex
+                    segments.append(Data(data[off ..< end]))
+                    off = end
+                }
+                let total = UInt64(segments.count)
+                let seg0 = segments[0]
                 state.transfers.append(ResourceTransfer.State(
-                    sending: data, linkID: state.linkID, sessionKey: state.sessionKey,
+                    sending: seg0, linkID: state.linkID, sessionKey: state.sessionKey,
                     interfaceID: state.interfaceID, prefix: prefix, randomHash: randomHash,
-                    sdu: Self.resourceSDU, rtt: .seconds(state.rtt ?? 1), id: newID))
+                    sdu: Self.resourceSDU, segmentIndex: 1, totalSegments: total,
+                    originalHash: nil, totalDataSize: UInt64(data.count),
+                    rtt: .seconds(state.rtt ?? 1), id: newID))
+                let originalHash = state.transfers[id: newID]?.resourceHash ?? Data()
+                state.segmentedSend = State.SegmentedSend(
+                    remaining: Array(segments.dropFirst()), nextIndex: 2, total: total,
+                    originalHash: originalHash, totalDataSize: UInt64(data.count), currentTransferID: newID)
                 return .send(.transfer(.element(id: newID, action: .advertise)))
 
             case let .identify(identity):
@@ -498,6 +531,30 @@ public struct LinkSession {
                 let hash = state.transfers[id: elementID]?.resourceHash
                 state.transfers.remove(id: elementID)
                 if adv?.isRequest == true || adv?.isResponse == true { return .none }   // internal req/resp delivery
+                // Segmented send in progress on this element?
+                if var send = state.segmentedSend, send.currentTransferID == elementID {
+                    if send.remaining.isEmpty {
+                        // last segment concluded → surface the whole once
+                        state.segmentedSend = nil
+                        return .send(.delegate(.resourceConcluded(send.originalHash)))
+                    }
+                    let nextData = send.remaining.removeFirst()
+                    let idx = send.nextIndex
+                    let rnd = Data(randomBytes(8))
+                    let prefix = Data(rnd[rnd.startIndex ..< rnd.startIndex + 4])
+                    let randomHash = Data(rnd[rnd.startIndex + 4 ..< rnd.startIndex + 8])
+                    let nextID = uuid()
+                    state.transfers.append(ResourceTransfer.State(
+                        sending: nextData, linkID: state.linkID, sessionKey: state.sessionKey,
+                        interfaceID: state.interfaceID, prefix: prefix, randomHash: randomHash,
+                        sdu: Self.resourceSDU, segmentIndex: idx, totalSegments: send.total,
+                        originalHash: send.originalHash, totalDataSize: send.totalDataSize,
+                        rtt: .seconds(state.rtt ?? 1), id: nextID))
+                    send.nextIndex += 1
+                    send.currentTransferID = nextID
+                    state.segmentedSend = send
+                    return .send(.transfer(.element(id: nextID, action: .advertise)))
+                }
                 guard let hash else { return .none }
                 return .send(.delegate(.resourceConcluded(hash)))
             case let .transfer(.element(elementID, .delegate(.failed))):
@@ -509,6 +566,11 @@ public struct LinkSession {
                                   .send(.delegate(.requestFailed(requestID: rid))))
                 }
                 if t?.advertisement?.isRequest == true || t?.advertisement?.isResponse == true { return .none }
+                // Segmented send in progress on this element?
+                if let send = state.segmentedSend, send.currentTransferID == elementID {
+                    state.segmentedSend = nil
+                    return .send(.delegate(.resourceFailed(send.originalHash)))
+                }
                 guard let hash = t?.resourceHash else { return .none }
                 return .send(.delegate(.resourceFailed(hash)))
             case .transfer:

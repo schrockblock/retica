@@ -181,3 +181,47 @@ private func activeLinkHostingPlainTransfer()
     await store.send(.sendResource(Data("nope".utf8)))
     #expect(store.state.transfers.isEmpty)
 }
+
+// MARK: - Multi-segment (oversize) send
+
+/// SHA256-derived incompressible bytes: bzip2 cannot shrink them, ensuring the payload
+/// stays above the split threshold under all compression paths.
+private func incompressibleData(count: Int, seed: UInt8 = 0) -> Data {
+    var result = Data()
+    var i = 0
+    while result.count < count {
+        let chunk = Crypto.fullHash(Data([seed, UInt8(i & 0xff), UInt8((i >> 8) & 0xff), UInt8((i >> 16) & 0xff)]))
+        result.append(contentsOf: chunk.prefix(min(chunk.count, count - result.count)))
+        i += 1
+    }
+    return result
+}
+
+@Test @MainActor func sendResourceSplitsOversizeIntoSequentialSegments() async {
+    let clock = TestClock<Duration>()
+    let store = activeLinkStore(clock)               // existing active-link store helper
+    store.exhaustivity = .off
+    // 2 segments: maxEfficientSize + 100. Use incompressible so it doesn't shrink under threshold.
+    let whole = incompressibleData(count: LinkSession.maxEfficientSize + 100)
+    await store.send(.sendResource(whole))
+    // Segment 1 is advertised now: i=1, l=2, isSplit, d=whole.
+    let t0 = store.state.transfers[0]
+    #expect(t0.advertisement!.segmentIndex == 1)
+    #expect(t0.advertisement!.totalSegments == 2)
+    #expect(t0.advertisement!.isSplit == true)
+    #expect(t0.advertisement!.dataSize == UInt64(whole.count))
+    #expect(store.state.segmentedSend != nil)
+    let oh = store.state.segmentedSend!.originalHash
+    // Segment 1 concludes → segment 2 is advertised (i=2, same originalHash), no resourceConcluded yet.
+    await store.send(.transfer(.element(id: t0.id, action: .delegate(.concluded))))
+    let t1 = store.state.transfers.first { $0.advertisement?.segmentIndex == 2 }
+    #expect(t1 != nil)
+    #expect(t1!.advertisement!.originalHash == oh)
+    #expect(t1!.advertisement!.totalSegments == 2)
+    // Segment 2 concludes → resourceConcluded(originalHash) once, segmentedSend cleared.
+    await store.send(.transfer(.element(id: t1!.id, action: .delegate(.concluded))))
+    await store.receive { if case let .delegate(.resourceConcluded(h)) = $0 { return h == oh }; return false }
+    #expect(store.state.segmentedSend == nil)
+    // Quiesce any spawned sender watchdogs.
+    await clock.advance(by: .seconds(300))
+}
