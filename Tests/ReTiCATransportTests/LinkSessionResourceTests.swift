@@ -98,7 +98,7 @@ private func partPacket(_ chunk: Data) -> Data {
         return false
     }
     #expect(got.value == data)
-    #expect(store.state.transfers[0].status == .complete)
+    #expect(store.state.transfers.filter { $0.role == .receiver }.isEmpty)  // receiver GC'd on .received
 }
 
 @Test @MainActor func sendResourceSpawnsSenderAndEmitsEncryptedAdvertisement() async {
@@ -304,4 +304,78 @@ private func resourceStoreHostingSplitReceivers(
     store.exhaustivity = .off
     await store.send(.transfer(.element(id: id1, action: .delegate(.failed))))
     await store.receive { if case let .delegate(.resourceFailed(h)) = $0 { return h == oh }; return false }
+}
+
+// MARK: - GC: completed receiver transfer removal on .received
+
+/// Builds an active-link store pre-loaded with ONE plain (non-request, non-response, non-split)
+/// receiver `ResourceTransfer.State` whose `advertisement` has flags `0x01` (encrypted only).
+/// No effects are running for the transfer — injected directly into state — so firing
+/// `.delegate(.received(_))` on the parent `LinkSession` is clean.
+/// Returns `(store, transferID)`.
+@MainActor
+private func activeLinkHostingPlainReceiver(
+    _ clock: TestClock<Duration>
+) -> (TestStore<LinkSession.State, LinkSession.Action>, UUID) {
+    let resHash = Data(repeating: 0xAA, count: 32)
+    let adv = ResourceAdvertisement(
+        transferSize: 50,
+        dataSize: 50,
+        numberOfParts: 1,
+        hash: resHash,
+        randomHash: Data(repeating: 0xBB, count: 4),
+        originalHash: resHash,
+        segmentIndex: 0,
+        totalSegments: 0,
+        requestID: nil,
+        flags: 0x01,   // encrypted only — plain resource (not request, not response, not split)
+        hashmap: Data()
+    )
+    var t = ResourceTransfer.State(receivingOn: resLinkID, sessionKey: resKey,
+                                   interfaceID: InterfaceID("i"), rtt: .seconds(1),
+                                   id: UUID())
+    t.advertisement = adv
+    t.resourceHash = resHash
+
+    var s = LinkSession.State(responderFor: Identity(),
+                              destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .active
+    s.sessionKey = resKey
+    s.linkID = resLinkID
+    s.rtt = 1.0
+    s.transfers.append(t)
+
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = clock
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    return (store, t.id)
+}
+
+@Test @MainActor func completedPlainReceiverIsRemovedFromTransfers() async {
+    let clock = TestClock<Duration>()
+    let (store, tid) = activeLinkHostingPlainReceiver(clock)
+    store.exhaustivity = .off
+    await store.send(.transfer(.element(id: tid, action: .delegate(.received(Data("payload".utf8))))))
+    await store.receive { if case .delegate(.resourceReceived(Data("payload".utf8))) = $0 { return true }; return false }
+    #expect(store.state.transfers[id: tid] == nil)             // GC'd
+}
+
+@Test @MainActor func completedSplitSegmentReceiversAreRemovedAsTheyArrive() async {
+    let clock = TestClock<Duration>()
+    let oh = Data(repeating: 0x11, count: 32)
+    let seg1 = Data("hello ".utf8), seg2 = Data("world".utf8)
+    let store = resourceStoreHostingSplitReceivers(oh: oh, total: 2, clock)   // existing helper (multi-seg slice)
+    let (id1, id2) = (store.state.transfers[0].id, store.state.transfers[1].id)
+    store.exhaustivity = .off
+    await store.send(.transfer(.element(id: id1, action: .delegate(.received(seg1)))))
+    #expect(store.state.transfers[id: id1] == nil)             // segment 1 receiver GC'd (payload buffered)
+    #expect(store.state.incomingSegments[oh]?.parts.count == 1)
+    await store.send(.transfer(.element(id: id2, action: .delegate(.received(seg2)))))
+    await store.receive { if case let .delegate(.resourceReceived(d)) = $0 { return d == seg1 + seg2 }; return false }
+    #expect(store.state.transfers[id: id2] == nil)             // segment 2 receiver GC'd
+    #expect(store.state.transfers.isEmpty)                     // no inert receivers left
 }

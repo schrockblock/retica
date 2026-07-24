@@ -467,7 +467,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         }
     }
     #expect(got.value == payload)
-    #expect(b.state.links[0].transfers[0].status == .complete)  // receiver transfer stays until link closes
+    #expect(b.state.links[0].transfers.filter { $0.role == .receiver }.isEmpty)  // receiver GC'd on .received
     // PRF → A: A validates and concludes.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
@@ -1226,6 +1226,10 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
 
     let got = LockIsolated<Data?>(nil)
     // Pump seg2 in a windowed loop identical to seg1, but smaller (K=400 → ~1 part).
+    // Exit paths:
+    //   (a) countExpectedSenderFrames returns 0 → sentB.value.last! is the PRF; break.
+    //   (b) receiver transfer is nil (GC'd after .received) → PRF already in queue; break.
+    // After the loop, resourceReceived is awaited unconditionally (both paths need it).
     var seg2GuardCount = 0
     while seg2GuardCount < 100 {
         seg2GuardCount += 1
@@ -1242,25 +1246,29 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
             eventsB.yield(.data(frame))
             await b.receive(\.transport.received)
         }
-        // Check completion: status set synchronously by reducer when last part verified.
+        // Check if receiver transfer is gone (GC'd on .received) or still completing.
         let bSeg2 = b.state.links.first?.transfers.first(where: { $0.role == .receiver })
-        if bSeg2?.status == .complete {
-            // Seg2 complete: capture PRF (B's next send) then resourceReceived.
+        if bSeg2 == nil || bSeg2?.status == .complete {
+            // Seg2 complete: PRF already in queue or about to be emitted.
+            // Await the PRF interface.send so sentB.value.last! becomes the PRF frame.
             await b.receive { if case .interface(.send) = $0 { return true }; return false }   // PRF
             await Task.yield()   // flush tcpConnection.send for PRF
-            await b.receive { action in
-                if case let .delegate(.resourceReceived(lid, d)) = action, lid == linkID {
-                    got.setValue(d); return true
-                }
-                return false
-            }
             break
         }
         // Not done yet; B emits next REQ.
         await b.receive { if case .interface(.send) = $0 { return true }; return false }
         await Task.yield()
     }
+    // resourceReceived fires as B's next delegate action after PRF (split assembly completes).
+    await b.receive { action in
+        if case let .delegate(.resourceReceived(lid, d)) = action, lid == linkID {
+            got.setValue(d); return true
+        }
+        return false
+    }
     #expect(got.value == payload, "B must receive the exact original payload (both segments concatenated)")
+    #expect(b.state.links[0].transfers.filter { $0.role == .receiver }.isEmpty,
+            "B must have no lingering receiver transfers after multi-segment assembly")
 
     // PRF for seg2 → A concludes seg2 → surfaces resourceConcluded.
     await Task.yield()   // flush .run { tcpConnection.send(prf2_framed) } from the PRF above

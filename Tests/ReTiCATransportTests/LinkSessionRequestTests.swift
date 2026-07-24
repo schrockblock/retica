@@ -236,6 +236,7 @@ private func responderStoreWith(_ transfer: ResourceTransfer.State, _ pending: S
     }
     #expect(got.value?.0 == Crypto.truncatedHash(Data("svc/x".utf8)))
     #expect(got.value?.1 == Data("body".utf8))
+    #expect(store.state.transfers[id: t.id] == nil)          // receiver GC'd on .received
 }
 
 @Test @MainActor func completedResponseResourceRoutesToResponseReceivedAndClearsPending() async {
@@ -252,6 +253,7 @@ private func responderStoreWith(_ transfer: ResourceTransfer.State, _ pending: S
     }
     #expect(got.value == Data("answer".utf8))
     #expect(!store.state.pendingRequests.contains(rid))
+    #expect(store.state.transfers[id: t.id] == nil)          // receiver GC'd on .received
 }
 
 @Test @MainActor func responseAdvertisementNotPendingIsIgnored() async {

@@ -517,6 +517,7 @@ public struct LinkSession {
                 return .send(.delegate(.transmit(ifID, raw)))
             case let .transfer(.element(elementID, .delegate(.received(payload)))):
                 let adv = state.transfers[id: elementID]?.advertisement
+                state.transfers.remove(id: elementID)          // GC the completed receiver
                 if adv?.isRequest == true {
                     guard case let .array(items)? = MsgPack.decodeValue(payload), items.count == 3,
                           case let .bin(pathHash) = items[1], case let .bin(data) = items[2] else { return .none }
@@ -530,8 +531,7 @@ public struct LinkSession {
                     return .merge(.cancel(id: CancelID.request(rid)),
                                   .send(.delegate(.responseReceived(requestID: rid, data: data))))
                 }
-                let advR = state.transfers[id: elementID]?.advertisement
-                if advR?.isSplit == true, let a = advR {
+                if adv?.isSplit == true, let a = adv {
                     var acc = state.incomingSegments[a.originalHash] ?? State.SegmentAccumulator(total: a.totalSegments, parts: [:])
                     acc.parts[a.segmentIndex] = payload
                     if UInt64(acc.parts.count) == acc.total {
