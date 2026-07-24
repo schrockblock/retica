@@ -59,10 +59,12 @@ public struct LinkSession {
         public var establishmentTimeout: TimeInterval
         public var keepaliveInterval: TimeInterval
         var staleTime: TimeInterval { keepaliveInterval * 2 }
+        public var relayNextHop: Data? = nil
         /// Initiator: link to a known destination identity.
         public init(id: UUID = UUID(), initiatorTo destinationIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
-                    establishmentTimeout: TimeInterval = 15, keepaliveInterval: TimeInterval = 30) {
+                    establishmentTimeout: TimeInterval = 15, keepaliveInterval: TimeInterval = 30,
+                    relayNextHop: Data? = nil) {
             self.id = id
             self.role = .initiator
             self.status = .pending
@@ -82,6 +84,7 @@ public struct LinkSession {
             self.pendingRequests = []
             self.establishmentTimeout = establishmentTimeout
             self.keepaliveInterval = keepaliveInterval
+            self.relayNextHop = relayNextHop
         }
 
         /// Responder: accept links for a destination owned by `owningIdentity`.
@@ -186,12 +189,18 @@ public struct LinkSession {
                 guard state.role == .initiator, state.status == .pending, state.linkID.isEmpty
                 else { return .none }
                 let payload = state.ephemeral.publicKey + Link.signallingBytes
-                let packet = Packet(headerType: .header1, packetType: .linkRequest,
-                                    transportType: .broadcast, destinationType: .single,
-                                    context: .none, contextFlag: false, hops: 0,
-                                    destinationHash: state.destinationHash, transportId: nil,
-                                    payload: payload)
-                state.linkID = Link.linkID(requestPacket: packet)
+                let packet: Packet
+                if let relay = state.relayNextHop {
+                    // Destination is via a relay → HEADER_2 LINKREQUEST to the next hop.
+                    packet = Packet(headerType: .header2, packetType: .linkRequest, transportType: .transport,
+                                    destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: state.destinationHash, transportId: relay, payload: payload)
+                } else {
+                    packet = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                                    destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: state.destinationHash, transportId: nil, payload: payload)
+                }
+                state.linkID = Link.linkID(requestPacket: packet)     // header-independent — same id either way
                 state.requestedAt = date.now.timeIntervalSince1970
                 guard let raw = try? packet.packed() else { return .none }
                 let id = state.interfaceID

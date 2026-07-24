@@ -1320,3 +1320,61 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     await store.receive(\.transport.setTransportIdentity)
     #expect(store.state.transport.transportIdentity == id)
 }
+
+// MARK: – HEADER_2 LINKREQUEST (via-relay) Endpoint wiring
+
+/// Build a raw HEADER_2 ANNOUNCE for `identity`, carrying `transportId` as the relay next hop.
+private func makeRelayAnnouncePacket(identity: Identity, appName: String, aspects: [String],
+                                     hops: UInt8, emitted: UInt64, transportId: Data) -> (Data, Data) {
+    let nameHash = Destination.nameHash(appName: appName, aspects: aspects)
+    let destHash = Destination.hash(identityHash: identity.hash, appName: appName, aspects: aspects)
+    let randomHash = Announce.randomHash(now: emitted, randomPrefix: Data(repeating: 0xC7, count: 5))
+    let payload = Announce.buildPayload(identity: identity, destinationHash: destHash,
+                                        nameHash: nameHash, randomHash: randomHash, appData: nil)
+    let packet = Packet(headerType: .header2, packetType: .announce, transportType: .transport,
+                        destinationType: .single, context: .none, contextFlag: false, hops: hops,
+                        destinationHash: destHash, transportId: transportId, payload: payload)
+    return (try! packet.packed(), destHash)
+}
+
+@Test @MainActor func openLinkToRelayedDestinationEmitsHeader2LinkRequest() async {
+    // Seed a learned path via a relay: drive a HEADER_2 announce so that
+    // learned[dest].nextHop == relayHash (not == destHash).
+    // Then openLink → assert the LINKREQUEST emitted is HEADER_2 with transportId == relayHash.
+    let (store, events) = makeStore()
+    let remoteIdentity = Identity()
+    let relayHash = Data(repeating: 0x5A, count: 16)
+    let (announceRaw, destHash) = makeRelayAnnouncePacket(identity: remoteIdentity,
+                                                          appName: "app", aspects: ["relay-svc"],
+                                                          hops: 2, emitted: 2000,
+                                                          transportId: relayHash)
+    await store.send(.connect)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+
+    // Feed the HEADER_2 announce so the path is learned with nextHop == relayHash.
+    events.yield(.data(HDLC.frame(announceRaw)))
+    await store.receive(\.transport.received)
+    await store.receive(\.delegate.pathLearned)
+    #expect(store.state.transport.learned[destHash]?.nextHop == relayHash)
+
+    // openLink → LINKREQUEST
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.openLink(destinationHash: destHash))
+    await store.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
+    await store.receive { action in
+        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    #expect(store.state.links.count == 1)
+    let p = Packet(raw: captured.value!)!
+    #expect(p.packetType == .linkRequest)
+    #expect(p.headerType == .header2)
+    #expect(p.transportId == relayHash)
+    // Link id parity: the id stored in state == Link.linkID of the packet.
+    #expect(store.state.links[0].linkID == Link.linkID(requestPacket: p))
+
+    await store.send(.disconnect)
+    await store.receive(\.interface.disconnect)
+}

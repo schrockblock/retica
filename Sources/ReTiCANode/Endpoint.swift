@@ -124,8 +124,11 @@ public struct Endpoint {
                     return .send(.delegate(.linkFailed(destinationHash: destinationHash)))
                 }
                 let newID = uuid()
+                // Via a relay (learned nextHop != the destination) → HEADER_2 LINKREQUEST to the relay.
+                let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
                 state.links.append(LinkSession.State(id: newID, initiatorTo: learned.identity,
-                                                     destinationHash: destinationHash, interfaceID: id))
+                                                     destinationHash: destinationHash, interfaceID: id,
+                                                     relayNextHop: relayNextHop))
                 return .send(.link(.element(id: newID, action: .establish)))
 
             case let .sendOverLink(linkID, data):

@@ -587,3 +587,53 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 //   • The responder's inactivity IS reset by synthetic pings (proving .keepalive reset path);
 //   • Starvation causes .closed(.timedOut) (the spec's key assertion).
 // These are the same semantic assertions as the brief's original test.
+
+// MARK: - HEADER_2 LINKREQUEST (via-relay)
+
+@Test @MainActor func initiatorViaRelayBuildsHeader2LinkRequest() async {
+    let clock = TestClock<Duration>()
+    let relay = Data(repeating: 0x5A, count: 16)
+    let s = LinkSession.State(initiatorTo: Identity(), destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"), relayNextHop: relay)
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.establish)
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    let p = Packet(raw: captured.value!)!
+    #expect(p.headerType == .header2)
+    #expect(p.transportType == .transport)
+    #expect(p.transportId == relay)
+    #expect(p.packetType == .linkRequest)
+    // link_id is header-independent: the id LinkSession stored == Link.linkID of the packet.
+    #expect(store.state.linkID == Link.linkID(requestPacket: p))
+    await clock.advance(by: .seconds(store.state.establishmentTimeout))    // quiesce the establishment timer
+}
+
+@Test @MainActor func initiatorDirectBuildsHeader1LinkRequest() async {
+    // relayNextHop == nil → HEADER_1 as before.
+    let clock = TestClock<Duration>()
+    let s = LinkSession.State(initiatorTo: Identity(), destinationHash: Data(repeating: 0x03, count: 16),
+                              interfaceID: InterfaceID("i"), relayNextHop: nil)
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.establish)
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    let p = Packet(raw: captured.value!)!
+    #expect(p.headerType == .header1)
+    #expect(p.transportId == nil)
+    #expect(p.packetType == .linkRequest)
+    #expect(store.state.linkID == Link.linkID(requestPacket: p))
+    await clock.advance(by: .seconds(store.state.establishmentTimeout))    // quiesce the establishment timer
+}
