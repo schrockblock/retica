@@ -51,6 +51,11 @@ public struct LinkSession {
             public var currentTransferID: UUID   // the hosted transfer for the segment in flight
         }
         public var segmentedSend: SegmentedSend? = nil
+        public struct SegmentAccumulator: Equatable, Sendable {
+            public var total: UInt64
+            public var parts: [UInt64: Data]     // segmentIndex (1-based) -> segment data
+        }
+        public var incomingSegments: [Data: SegmentAccumulator] = [:]   // keyed by originalHash
         public var establishmentTimeout: TimeInterval
         public var keepaliveInterval: TimeInterval
         var staleTime: TimeInterval { keepaliveInterval * 2 }
@@ -525,6 +530,20 @@ public struct LinkSession {
                     return .merge(.cancel(id: CancelID.request(rid)),
                                   .send(.delegate(.responseReceived(requestID: rid, data: data))))
                 }
+                let advR = state.transfers[id: elementID]?.advertisement
+                if advR?.isSplit == true, let a = advR {
+                    var acc = state.incomingSegments[a.originalHash] ?? State.SegmentAccumulator(total: a.totalSegments, parts: [:])
+                    acc.parts[a.segmentIndex] = payload
+                    if UInt64(acc.parts.count) == acc.total {
+                        // All segments in → concatenate in index order (1..total) → surface once.
+                        state.incomingSegments[a.originalHash] = nil
+                        var whole = Data()
+                        for i in 1...acc.total { whole.append(acc.parts[i] ?? Data()) }
+                        return .send(.delegate(.resourceReceived(whole)))
+                    }
+                    state.incomingSegments[a.originalHash] = acc
+                    return .none    // wait for the next segment
+                }
                 return .send(.delegate(.resourceReceived(payload)))
             case let .transfer(.element(elementID, .delegate(.concluded))):
                 let adv = state.transfers[id: elementID]?.advertisement
@@ -570,6 +589,10 @@ public struct LinkSession {
                 if let send = state.segmentedSend, send.currentTransferID == elementID {
                     state.segmentedSend = nil
                     return .send(.delegate(.resourceFailed(send.originalHash)))
+                }
+                if let a = t?.advertisement, a.isSplit == true {
+                    state.incomingSegments[a.originalHash] = nil
+                    return .send(.delegate(.resourceFailed(a.originalHash)))
                 }
                 guard let hash = t?.resourceHash else { return .none }
                 return .send(.delegate(.resourceFailed(hash)))

@@ -225,3 +225,83 @@ private func incompressibleData(count: Int, seed: UInt8 = 0) -> Data {
     // Quiesce any spawned sender watchdogs.
     await clock.advance(by: .seconds(300))
 }
+
+// MARK: - Multi-segment receive accumulator
+
+/// Builds an active-link store pre-loaded with `total` receiver ResourceTransfer.State objects,
+/// each carrying a split advertisement (isSplit=true, segmentIndex=1..total, totalSegments=total,
+/// originalHash=oh). No effects are running for these transfers — they are injected directly into
+/// initial state — so firing .delegate(.received/.failed) on the parent LinkSession is clean.
+@MainActor
+private func resourceStoreHostingSplitReceivers(
+    oh: Data,
+    total: Int,
+    _ clock: TestClock<Duration>
+) -> TestStore<LinkSession.State, LinkSession.Action> {
+    var s = LinkSession.State(responderFor: Identity(),
+                              destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .active
+    s.sessionKey = resKey
+    s.linkID = resLinkID
+    s.rtt = 1.0
+
+    for i in 1...total {
+        // Each segment has its own distinct hash (segment's own data hash).
+        let segHash = Data(repeating: UInt8(0x20 + i), count: 32)
+        let adv = ResourceAdvertisement(
+            transferSize: 100,
+            dataSize: UInt64(total) * 100,
+            numberOfParts: 1,
+            hash: segHash,
+            randomHash: Data(repeating: UInt8(0x30 + i), count: 4),
+            originalHash: oh,
+            segmentIndex: UInt64(i),
+            totalSegments: UInt64(total),
+            requestID: nil,
+            flags: 0x01 | 0x04,   // encrypted | isSplit
+            hashmap: Data()
+        )
+        var t = ResourceTransfer.State(receivingOn: resLinkID, sessionKey: resKey,
+                                       interfaceID: InterfaceID("i"), rtt: .seconds(1),
+                                       id: UUID())
+        t.advertisement = adv
+        t.resourceHash = segHash
+        s.transfers.append(t)
+    }
+
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = clock
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    return store
+}
+
+@Test @MainActor func receivedSplitSegmentsReassembleAndSurfaceOnce() async {
+    let clock = TestClock<Duration>()
+    let oh = Data(repeating: 0x11, count: 32)
+    let seg1 = Data("hello ".utf8), seg2 = Data("world".utf8)
+    // Host two receiver transfers with split advertisements (i=1 and i=2, l=2, shared o=oh).
+    let store = resourceStoreHostingSplitReceivers(oh: oh, total: 2, clock)   // helper: see note
+    let (id1, id2) = (store.state.transfers[0].id, store.state.transfers[1].id)
+    store.exhaustivity = .off
+    // Segment 1 received → buffered, nothing surfaced yet.
+    await store.send(.transfer(.element(id: id1, action: .delegate(.received(seg1)))))
+    #expect(store.state.incomingSegments[oh]?.parts.count == 1)
+    // Segment 2 received → whole surfaced once = seg1 ‖ seg2.
+    await store.send(.transfer(.element(id: id2, action: .delegate(.received(seg2)))))
+    await store.receive { if case let .delegate(.resourceReceived(d)) = $0 { return d == seg1 + seg2 }; return false }
+    #expect(store.state.incomingSegments[oh] == nil)
+}
+
+@Test @MainActor func splitSegmentFailureFailsTheWhole() async {
+    let clock = TestClock<Duration>()
+    let oh = Data(repeating: 0x11, count: 32)
+    let store = resourceStoreHostingSplitReceivers(oh: oh, total: 2, clock)
+    let id1 = store.state.transfers[0].id
+    store.exhaustivity = .off
+    await store.send(.transfer(.element(id: id1, action: .delegate(.failed))))
+    await store.receive { if case let .delegate(.resourceFailed(h)) = $0 { return h == oh }; return false }
+}
