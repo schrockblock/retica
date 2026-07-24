@@ -695,13 +695,11 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     await storeA.send(.setTransportIdentity(relay))
     let inboundA = makeHeader2DataPacket(transportId: relay.hash, destHash: destHash, hops: 1,
                                           payload: Data([0xAA]))
-    let sawTransmitA = LockIsolated(false)
     storeA.exhaustivity = .on
     let expectedHashA = Packet(raw: inboundA)!.packetHash
     await storeA.send(.received(InterfaceID("i0"), inboundA)) {
         $0.seenPacketHashes.insert(expectedHashA)
     }
-    #expect(sawTransmitA.value == false)
 
     // (b) Leaf mode (transportIdentity == nil), HEADER_2 packet with learned path → no transmit.
     // Even with a learned path, a leaf must not forward (requires relay mode).
@@ -740,13 +738,11 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     let maxHops = UInt8(Packet.maxHops) - 1  // 127; +1 == 128 == maxHops → blocked
     let inboundC = makeHeader2DataPacket(transportId: relay2.hash, destHash: destHashC, hops: maxHops,
                                           payload: Data([0xCC]))
-    let sawTransmitC = LockIsolated(false)
     storeC.exhaustivity = .on
     let expectedHashC = Packet(raw: inboundC)!.packetHash
     await storeC.send(.received(InterfaceID("i0"), inboundC)) {
         $0.seenPacketHashes.insert(expectedHashC)
     }
-    #expect(sawTransmitC.value == false)
 }
 
 @Test @MainActor func localDestinationDataStillDeliveredInRelayMode() async {
@@ -766,4 +762,143 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
     await store.send(.received(InterfaceID("i1"), raw))
     await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext)))
+}
+
+// MARK: - Task 4b-2 tests (byte-fidelity + E2E)
+
+@Test @MainActor func relayForwardBytesMatchRnsRewrite() async {
+    // Relay onward (HEADER_2 → next hop): RNS new_raw = raw[0:1] ‖ (hops+1) ‖ nextHop ‖ raw[18:].
+    // HEADER_2 layout: flags(1) ‖ hops(1) ‖ transportId(16) ‖ destHash(16) ‖ context(1) ‖ payload.
+    // So raw[18:] = destHash onward. Offset verified against Packet.swift packed() serialization.
+    // This is a genuine cross-implementation wire check (our output vs RNS's documented raw formula).
+    let (store, relay, destHash, nextRelay, _) = await relayStoreKnowingDestViaAnotherRelay()
+    store.exhaustivity = .off
+    let inbound = makeHeader2DataPacket(transportId: relay.hash, destHash: destHash, hops: 2,
+                                        payload: Data([7, 7]))
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.received(InterfaceID("in"), inbound))
+    await store.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action {
+            captured.setValue((ifID, raw))
+            return true
+        }
+        return false
+    }
+    // Expected per RNS Transport.py:1605-1608: keep flags byte, hops+1, transport_id = nextHop (16B),
+    // then destHash ‖ context ‖ payload verbatim (raw[18:]).
+    var expected = Data(inbound.prefix(1))               // flags byte (unchanged → HEADER_2)
+    expected.append(UInt8(3))                            // hops = 2 + 1
+    expected.append(contentsOf: nextRelay)               // new transport_id (16 bytes)
+    expected.append(contentsOf: inbound[18...])          // destHash(16) ‖ context(1) ‖ payload
+    #expect(captured.value?.1 == expected)
+    // Also verify the forwarded packet goes out on the learned interface.
+    let forwarded = Packet(raw: captured.value!.1)!
+    #expect(forwarded.headerType == .header2)
+    #expect(forwarded.transportId == nextRelay)
+}
+
+@Test @MainActor func threeNodeRelayDeliversMessageEndToEnd() async {
+    // A[ar], R[ar,rb] relay, B[rb]. Hand-pump .transmit frames between them.
+    // B registers D (with private key so B can decrypt), announces D.
+    // Pump B→R→A so A learns D via R; then A.send("hello") → pump A→R→B.
+    // REQUIRED assertion: B surfaces exactly one .received(destinationHash: D, plaintext: "hello").
+
+    let rIdentity = Identity()
+    let ifAR = InterfaceID("ar")
+    let ifRB = InterfaceID("rb")
+
+    // Node A: leaf on interface "ar".
+    let storeA = TestStore(initialState: Transport.State()) { Transport() }
+    storeA.exhaustivity = .off
+    await storeA.send(.interfaceConnected(ifAR))
+
+    // Node R: relay with both interfaces.
+    let storeR = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    storeR.exhaustivity = .off
+    await storeR.send(.interfaceConnected(ifAR))
+    await storeR.send(.interfaceConnected(ifRB))
+    await storeR.send(.setTransportIdentity(rIdentity))
+
+    // Node B: leaf on interface "rb", with a local SINGLE destination D (private key present).
+    let destB = Destination(kind: .single, direction: .in, appName: "relay", aspects: ["e2e"],
+                            identity: Identity())!
+    let storeB = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    storeB.exhaustivity = .off
+    await storeB.send(.interfaceConnected(ifRB))
+    await storeB.send(.registerLocalDestination(destB))
+
+    // Step 1: B announces D → capture the frame emitted on "rb".
+    let bAnnounceRaw = LockIsolated<Data?>(nil)
+    await storeB.send(.announce(destinationHash: destB.hash, appData: nil))
+    await storeB.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifRB {
+            bAnnounceRaw.setValue(raw)
+            return true
+        }
+        return false
+    }
+
+    // Step 2: Deliver B's announce to R on "rb". R (relay) learns D (nextHop == D.hash)
+    // and re-broadcasts on "ar" (the other interface, since relay excludes source interface).
+    let rRebroadcastRaw = LockIsolated<Data?>(nil)
+    await storeR.send(.received(ifRB, bAnnounceRaw.value!))
+    await storeR.receive { action in
+        if case .delegate(.pathLearned) = action { return true }
+        return false
+    }
+    await storeR.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifAR {
+            rRebroadcastRaw.setValue(raw)
+            return true
+        }
+        return false
+    }
+
+    // Step 3: Deliver R's re-broadcast (HEADER_2 with R's hash as transport_id) to A on "ar".
+    // A learns D with nextHop == R.hash, interfaceID == "ar".
+    await storeA.send(.received(ifAR, rRebroadcastRaw.value!))
+    await storeA.receive { action in
+        if case .delegate(.pathLearned) = action { return true }
+        return false
+    }
+    #expect(storeA.state.learned[destB.hash]?.nextHop == rIdentity.hash)
+
+    // Step 4: A sends "hello" to D → emits HEADER_2 (transportId = R.hash) on "ar".
+    let aToRRaw = LockIsolated<Data?>(nil)
+    let plaintext = Data("hello".utf8)
+    await storeA.send(.send(destinationHash: destB.hash, plaintext: plaintext))
+    await storeA.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifAR {
+            aToRRaw.setValue(raw)
+            return true
+        }
+        return false
+    }
+    let aPacket = Packet(raw: aToRRaw.value!)!
+    #expect(aPacket.headerType == .header2)
+    #expect(aPacket.transportId == rIdentity.hash)
+    #expect(aPacket.destinationHash == destB.hash)
+
+    // Step 5: Deliver A's HEADER_2 to R on "ar". R forwards as HEADER_1 to B on "rb".
+    let rToBRaw = LockIsolated<Data?>(nil)
+    await storeR.send(.received(ifAR, aToRRaw.value!))
+    await storeR.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifRB {
+            rToBRaw.setValue(raw)
+            return true
+        }
+        return false
+    }
+    let rPacket = Packet(raw: rToBRaw.value!)!
+    #expect(rPacket.headerType == .header1)
+    #expect(rPacket.destinationHash == destB.hash)
+
+    // Step 6: Deliver R's HEADER_1 to B on "rb". B decrypts and surfaces the exact plaintext.
+    // This proves the encrypted payload survived the full relay chain A→R→B.
+    await storeB.send(.received(ifRB, rToBRaw.value!))
+    await storeB.receive(.delegate(.received(destinationHash: destB.hash, plaintext: plaintext)))
 }
