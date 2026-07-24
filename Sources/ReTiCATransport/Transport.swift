@@ -74,6 +74,12 @@ public struct Transport {
                 if packet.packetType == .linkRequest, state.localDestinations[packet.destinationHash] != nil {
                     return .send(.delegate(.linkRequest(destinationHash: packet.destinationHash, data: data)))
                 }
+                // NOTE (relay, 4b): packetHash is over `hashablePart`, which EXCLUDES hops and
+                // transport_id — so a relayed announce shares the ORIGINAL's packet hash. A node
+                // that already heard the original therefore drops the relayed copy here. That is
+                // loop-protective (safe for 4b-1's re-broadcast), but means a relay-improved path
+                // is not adopted for an already-seen announce. 4b-3's random-blob anti-replay
+                // (keyed on the announce random_hash + transport_id, like RNS) is where that is fixed.
                 guard state.seenPacketHashes.insert(packet.packetHash) else { return .none }
 
                 switch packet.packetType {
