@@ -1077,3 +1077,51 @@ private func relayHostingLinkTableEntry(rcvdIf: String, nhIf: String)
     #expect(captured.value?.0 == unknownLinkID)
     #expect(captured.value?.1 == lp)
 }
+
+// MARK: - Task 4 (link_id parity cross-validation)
+
+@Test @MainActor func linkIDParityAcrossHeader2ToHeader1Rewrite() async {
+    // Wire-compat guarantee: link_id is header-independent (matches RNS link_id_from_lr_packet).
+    // Build an initiator HEADER_2 LINKREQUEST (transport_id = relay R), feed it through the relay
+    // (Task 2 forward path), and assert that all three independently derived link_ids agree:
+    //   Link.linkID(initiatorHeader2) == Link.linkID(relayForwardedHeader1) == linkTable key.
+    //
+    // This proves that after the relay rewrites HEADER_2 → HEADER_1 (stripping transport_id,
+    // incrementing hops), the deterministic link_id computed from the packet's hashable part
+    // remains byte-identical — so all three nodes agree on the link_id without coordination.
+    let (store, relay, destHash, outIf) = await relayStoreKnowingDestDirectly()
+    store.exhaustivity = .off
+
+    // Build a valid LINKREQUEST payload: ephemeral public key (64 bytes) + signalling (3 bytes).
+    let ephemeral = Identity()
+    let lrPayload = ephemeral.publicKey + Link.signallingBytes
+
+    // Initiator's HEADER_2 LINKREQUEST (transport_id = relay.hash).
+    let header2LR = makeHeader2LinkRequestPacket(transportId: relay.hash, destHash: destHash,
+                                                  hops: 0, payload: lrPayload)
+    let header2Packet = Packet(raw: header2LR)!
+    let initiatorLinkID = Link.linkID(requestPacket: header2Packet)
+
+    // Feed it through the relay's Task-2 forward path → relay records linkTable + emits HEADER_1.
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.received(InterfaceID("in"), header2LR))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, r)) = action { captured.setValue((i, r)); return true }
+        return false
+    }
+
+    // The forwarded HEADER_1 LINKREQUEST (transport_id stripped, hops+1).
+    let forwardedRaw = captured.value!.1
+    let forwardedPacket = Packet(raw: forwardedRaw)!
+    let forwardedLinkID = Link.linkID(requestPacket: forwardedPacket)
+
+    // The linkTable key the relay stored.
+    let linkTableKey = store.state.linkTable.keys.first!
+
+    // All three agree — header-independent link_id is the wire-compat guarantee.
+    #expect(forwardedPacket.headerType == .header1)
+    #expect(forwardedPacket.transportId == nil)
+    #expect(initiatorLinkID == forwardedLinkID)
+    #expect(initiatorLinkID == linkTableKey)
+    #expect(captured.value?.0 == outIf)
+}

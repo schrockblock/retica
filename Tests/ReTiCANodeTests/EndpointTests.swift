@@ -1378,3 +1378,242 @@ private func makeRelayAnnouncePacket(identity: Identity, appName: String, aspect
     await store.send(.disconnect)
     await store.receive(\.interface.disconnect)
 }
+
+// MARK: - 3-node A—R—B link end-to-end (Task 4b-2b)
+
+/// Deframe a single packet from an HDLC-framed buffer (as produced by TCPClientInterface.send).
+private func deframeOne(_ hdlcFramed: Data) -> Data {
+    var df = HDLCDeframer()
+    let frames = df.ingest(hdlcFramed)
+    return frames[0]
+}
+
+@Test @MainActor func threeNodeRelayLinkEstablishesAndCarriesData() async {
+    // THE PAYOFF: A (Endpoint/"ar") ↔ R (relay Transport/"ar"+"rb") ↔ B (Endpoint/"rb").
+    // Proves that a Reticulum Link establishes end-to-end through a relay (HEADER_2→HEADER_1
+    // rewrite) and carries bidirectional encrypted data.
+    //
+    // Frame relay idiom: Endpoints exchange HDLC-framed data via sentX arrays and event
+    // continuations; the relay Transport receives/emits raw (unframed) packets.
+    // Bridge: deframe sentX.value.last! before handing to R; HDLC.frame(R's raw transmit)
+    // before yielding to A/B events.
+    //
+    // Required assertions (NOT weakened):
+    //   1. Both A and B surface linkEstablished for the SAME link_id.
+    //   2. A→B link data arrives at B with the EXACT plaintext.
+    //   3. B→A link data arrives at A with the EXACT plaintext.
+
+    let clock = TestClock()
+    let rIdentity = Identity()
+    let ifAR = InterfaceID("ar")
+    let ifRB = InterfaceID("rb")
+    let bIdentity = Identity()
+    let destB = Destination(kind: .single, direction: .in, appName: "relay", aspects: ["link3"],
+                            identity: bIdentity)!
+
+    // Helper: build an Endpoint store with a given interfaceID (not the default "tcp").
+    func makeEndpoint(_ host: String, _ ifID: InterfaceID, _ sent: LockIsolated<[Data]>)
+        -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let evStream = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(
+            initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false,
+                                         interfaceID: ifID)
+        ) { Endpoint() } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in evStream.stream },
+                                             send: { d in sent.withValue { $0.append(d) } },
+                                             close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, evStream.continuation)
+    }
+
+    let sentA = LockIsolated<[Data]>([])
+    let sentB = LockIsolated<[Data]>([])
+    let (a, eventsA) = makeEndpoint("node-a", ifAR, sentA)
+    let (b, eventsB) = makeEndpoint("node-b", ifRB, sentB)
+
+    // Node R: relay Transport with both interfaces.
+    let storeR = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    storeR.exhaustivity = .off
+    await storeR.send(.interfaceConnected(ifAR))
+    await storeR.send(.interfaceConnected(ifRB))
+    await storeR.send(.setTransportIdentity(rIdentity))
+
+    // Connect A and B.
+    await b.send(.registerLocalDestination(destB))
+    await a.send(.connect)
+    eventsA.yield(.connected)
+    await a.receive(\.transport.interfaceConnected)
+    await b.send(.connect)
+    eventsB.yield(.connected)
+    await b.receive(\.transport.interfaceConnected)
+
+    // ── Step 1: B announces D → R rebroadcasts → A learns D via R ────────────────────────────
+    await b.send(.announce(destinationHash: destB.hash, appData: nil))
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    let bAnnounceRaw = deframeOne(sentB.value.last!)
+
+    // R receives B's HEADER_1 announce on "rb", rebroadcasts as HEADER_2 on "ar".
+    let rRebroadcastRaw = LockIsolated<Data?>(nil)
+    await storeR.send(.received(ifRB, bAnnounceRaw))
+    await storeR.receive { action in
+        if case .delegate(.pathLearned) = action { return true }
+        return false
+    }
+    await storeR.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifAR {
+            rRebroadcastRaw.setValue(raw)
+            return true
+        }
+        return false
+    }
+
+    // A receives R's rebroadcast and learns D with nextHop == rIdentity.hash.
+    eventsA.yield(.data(HDLC.frame(rRebroadcastRaw.value!)))
+    await a.receive(\.transport.received)
+    await a.receive(\.delegate.pathLearned)
+    #expect(a.state.transport.learned[destB.hash]?.nextHop == rIdentity.hash)
+
+    // ── Step 2: A opens a link → HEADER_2 LINKREQUEST → R → B ────────────────────────────────
+    await a.send(.openLink(destinationHash: destB.hash))
+    await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await a.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    let aLinkRequestRaw = deframeOne(sentA.value.last!)
+    let lrPacket = Packet(raw: aLinkRequestRaw)!
+    #expect(lrPacket.headerType == .header2)
+    #expect(lrPacket.transportId == rIdentity.hash)
+
+    // R receives HEADER_2 LINKREQUEST on "ar"; records linkTable; forwards HEADER_1 to B on "rb".
+    let rToB_LR = LockIsolated<Data?>(nil)
+    await storeR.send(.received(ifAR, aLinkRequestRaw))
+    await storeR.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifRB {
+            rToB_LR.setValue(raw)
+            return true
+        }
+        return false
+    }
+    let fwdLR = Packet(raw: rToB_LR.value!)!
+    #expect(fwdLR.headerType == .header1)
+    #expect(fwdLR.destinationHash == destB.hash)
+    // linkTable must be populated with the link_id.
+    let linkID = Link.linkID(requestPacket: lrPacket)
+    #expect(storeR.state.linkTable[linkID] != nil)
+
+    // B receives HEADER_1 LINKREQUEST → creates responder LinkSession → emits LRPROOF.
+    eventsB.yield(.data(HDLC.frame(rToB_LR.value!)))
+    await b.receive(\.transport.received)
+    await b.receive(\.transport.delegate.linkRequest)
+    await b.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    let bProofRaw = deframeOne(sentB.value.last!)
+    let proofPkt = Packet(raw: bProofRaw)!
+    #expect(proofPkt.destinationType == .link)
+    #expect(proofPkt.destinationHash == linkID)
+
+    // ── Step 3: LRPROOF B→R→A → A active, emits LRRTT ───────────────────────────────────────
+    let rToA_Proof = LockIsolated<Data?>(nil)
+    await storeR.send(.received(ifRB, bProofRaw))
+    await storeR.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifAR {
+            rToA_Proof.setValue(raw)
+            return true
+        }
+        return false
+    }
+
+    eventsA.yield(.data(HDLC.frame(rToA_Proof.value!)))
+    await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }  // LRRTT out
+    await a.receive(\.delegate.linkEstablished)
+    #expect(a.state.links[0].status == .active)
+    let aLinkID = a.state.links[0].linkID
+    let aRTTRaw = deframeOne(sentA.value.last!)
+
+    // ── Step 4: LRRTT A→R→B → B active ──────────────────────────────────────────────────────
+    let rToB_RTT = LockIsolated<Data?>(nil)
+    await storeR.send(.received(ifAR, aRTTRaw))
+    await storeR.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifRB {
+            rToB_RTT.setValue(raw)
+            return true
+        }
+        return false
+    }
+
+    eventsB.yield(.data(HDLC.frame(rToB_RTT.value!)))
+    await b.receive(\.transport.received)
+    await b.receive(\.delegate.linkEstablished)
+    #expect(b.state.links[0].status == .active)
+    let bLinkID = b.state.links[0].linkID
+
+    // REQUIRED: both sides agree on the same link_id.
+    #expect(aLinkID == bLinkID)
+
+    // ── Step 5: A sends data over link → relay → B ───────────────────────────────────────────
+    let atobPayload = Data("hello from A via relay".utf8)
+    await a.send(.sendOverLink(linkID: aLinkID, data: atobPayload))
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    let aDataRaw = deframeOne(sentA.value.last!)
+
+    let rToB_Data = LockIsolated<Data?>(nil)
+    await storeR.send(.received(ifAR, aDataRaw))
+    await storeR.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifRB {
+            rToB_Data.setValue(raw)
+            return true
+        }
+        return false
+    }
+
+    let gotAtoBData = LockIsolated<Data?>(nil)
+    eventsB.yield(.data(HDLC.frame(rToB_Data.value!)))
+    await b.receive(\.transport.received)
+    await b.receive { action in
+        if case let .delegate(.linkDataReceived(lid, d)) = action, lid == bLinkID {
+            gotAtoBData.setValue(d)
+            return true
+        }
+        return false
+    }
+    // REQUIRED: A→B data arrives at B with the EXACT plaintext.
+    #expect(gotAtoBData.value == atobPayload)
+
+    // ── Step 6: B sends data over link → relay → A ───────────────────────────────────────────
+    let btoaPayload = Data("hello from B via relay".utf8)
+    await b.send(.sendOverLink(linkID: bLinkID, data: btoaPayload))
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    let bDataRaw = deframeOne(sentB.value.last!)
+
+    let rToA_Data = LockIsolated<Data?>(nil)
+    await storeR.send(.received(ifRB, bDataRaw))
+    await storeR.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == ifAR {
+            rToA_Data.setValue(raw)
+            return true
+        }
+        return false
+    }
+
+    let gotBtoAData = LockIsolated<Data?>(nil)
+    eventsA.yield(.data(HDLC.frame(rToA_Data.value!)))
+    await a.receive(\.transport.received)
+    await a.receive { action in
+        if case let .delegate(.linkDataReceived(lid, d)) = action, lid == aLinkID {
+            gotBtoAData.setValue(d)
+            return true
+        }
+        return false
+    }
+    // REQUIRED: B→A data arrives at A with the EXACT plaintext.
+    #expect(gotBtoAData.value == btoaPayload)
+
+    await a.send(.disconnect)
+    await b.send(.disconnect)
+}
