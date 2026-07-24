@@ -261,7 +261,7 @@ Once a link is established, a resource is sent end-to-end through the public API
 - Completion surfaces as `Endpoint` delegates: `resourceReceived(linkID:data:)` on the receiver, and
   `resourceConcluded(linkID:resourceHash:)` / `resourceFailed(linkID:resourceHash:)` on either side.
 
-`ResourceTransfer` instances live inside their `LinkSession` (link-scoped). Terminal transfers (concluded or failed) are removed from their `LinkSession` automatically. MTU/SDU negotiation remains a future slice.
+`ResourceTransfer` instances live inside their `LinkSession` (link-scoped). Both sender and receiver terminal transfers are removed from their `LinkSession` automatically: senders on proof-validated (`.concluded`) or failed (`.failed`), and receivers on assembly-complete (`.received`). This means terminal transfers — including every segment receiver of a multi-segment resource — do not accumulate on the link. MTU/SDU negotiation remains a future slice.
 
 ### Live endpoint test (opt-in)
 
