@@ -1311,3 +1311,12 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     }
     #expect(store.state.links[id: elementID] == nil)           // removed
 }
+
+@Test @MainActor func enableRelaySetsTransportIdentity() async {
+    let (store, _) = makeStore()
+    store.exhaustivity = .off
+    let id = Identity()
+    await store.send(.enableRelay(id))
+    await store.receive(\.transport.setTransportIdentity)
+    #expect(store.state.transport.transportIdentity == id)
+}

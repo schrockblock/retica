@@ -35,6 +35,7 @@ public struct Endpoint {
         case registerLocalDestination(Destination)
         case announce(destinationHash: Data, appData: Data?)
         case send(destinationHash: Data, plaintext: Data)
+        case enableRelay(Identity)
         case openLink(destinationHash: Data)
         case sendOverLink(linkID: Data, data: Data)
         case sendResourceOverLink(linkID: Data, data: Data)
@@ -82,6 +83,7 @@ public struct Endpoint {
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
             case let .announce(h, a):               return .send(.transport(.announce(destinationHash: h, appData: a)))
             case let .send(h, p):                   return .send(.transport(.send(destinationHash: h, plaintext: p)))
+            case let .enableRelay(identity):        return .send(.transport(.setTransportIdentity(identity)))
 
             case let .interface(.delegate(.packetReceived(data))):
                 return .send(.transport(.received(id, data)))
