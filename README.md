@@ -317,7 +317,7 @@ A three-node end-to-end test (`threeNodeRelayLinkEstablishesAndCarriesData`) pro
 
 **Minimal-robustness deferrals** (future work): relay-side proof validation, per-hop proof timeout, `link_table` expiry, MTU negotiation, shared-interface hop-matching, and multi-relay chains remain unimplemented.
 
-Bidirectional links-over-a-relay and re-broadcast robustness (retries, rate-limiting, expiry) remain subsequent sub-slices (4b-2b / 4b-3).
+Re-broadcast robustness (retries, rate-limiting, expiry) remains a subsequent sub-slice (4b-3).
 
 ## Not Yet Implemented
 
