@@ -990,3 +990,90 @@ private func makeHeader2LinkRequestPacket(transportId: Data, destHash: Data, hop
     await storeB.send(.received(ifRB, rToBRaw.value!))
     await storeB.receive(.delegate(.received(destinationHash: destB.hash, plaintext: plaintext)))
 }
+
+// MARK: - Task 4b-2b-t3 helpers
+
+/// Build a HEADER_1 .link-addressed packet (destType == .link, destHash == linkID).
+/// This is the wire shape of LRPROOF and all established link traffic (keepalive, data, close).
+private func makeLinkPacket(linkID: Data, hops: UInt8, payload: Data) -> Data {
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: .none, contextFlag: false, hops: hops,
+                   destinationHash: linkID, transportId: nil, payload: payload)
+    return try! p.packed()
+}
+
+/// Build a relay store whose linkTable already contains one entry:
+///   linkTable[link_id] = (rcvdIf: rcvdIf, nhIf: nhIf)
+/// The link_id is synthesised from a HEADER_2 LINKREQUEST that the relay would have received;
+/// we seed it directly into initial state so the test is self-contained and does not depend
+/// on the Task-2 flow path.
+/// Returns (store, linkID).
+@MainActor
+private func relayHostingLinkTableEntry(rcvdIf: String, nhIf: String)
+    async -> (TestStore<Transport.State, Transport.Action>, Data) {
+    let linkID = Data(repeating: 0xEE, count: 16)   // synthetic link_id (16-byte dest hash)
+    var initialState = Transport.State()
+    initialState.interfaces = [InterfaceID(rcvdIf), InterfaceID(nhIf)]
+    initialState.linkTable[linkID] = Transport.State.LinkTableEntry(
+        rcvdIf: InterfaceID(rcvdIf), nhIf: InterfaceID(nhIf))
+    let store = TestStore(initialState: initialState) { Transport() }
+    store.exhaustivity = .off
+    return (store, linkID)
+}
+
+// MARK: - Task 4b-2b-t3 tests
+
+@Test @MainActor func relayForwardsLinkPacketTowardDest() async {
+    // linkTable[link_id] = (rcvdIf: "ar", nhIf: "rb"). A link packet arriving on "ar" → forwarded out "rb".
+    let (store, linkID) = await relayHostingLinkTableEntry(rcvdIf: "ar", nhIf: "rb")
+    store.exhaustivity = .off
+    let lp = makeLinkPacket(linkID: linkID, hops: 0, payload: Data([1, 2, 3]))
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.received(InterfaceID("ar"), lp))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, r)) = action { captured.setValue((i, r)); return true }
+        return false
+    }
+    #expect(captured.value?.0 == InterfaceID("rb"))
+    let f = Packet(raw: captured.value!.1)!
+    #expect(f.hops == 1)
+    #expect(f.destinationType == .link)
+    #expect(f.destinationHash == linkID)
+    #expect(f.payload == Data([1, 2, 3]))
+}
+
+@Test @MainActor func relayForwardsLinkPacketTowardInitiator() async {
+    // Same entry; a packet arriving on "rb" (nhIf) → forwarded out "ar" (rcvdIf).
+    let (store, linkID) = await relayHostingLinkTableEntry(rcvdIf: "ar", nhIf: "rb")
+    store.exhaustivity = .off
+    let lp = makeLinkPacket(linkID: linkID, hops: 1, payload: Data([4, 5, 6]))
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.received(InterfaceID("rb"), lp))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, r)) = action { captured.setValue((i, r)); return true }
+        return false
+    }
+    #expect(captured.value?.0 == InterfaceID("ar"))
+    let f = Packet(raw: captured.value!.1)!
+    #expect(f.hops == 2)
+    #expect(f.destinationType == .link)
+    #expect(f.destinationHash == linkID)
+    #expect(f.payload == Data([4, 5, 6]))
+}
+
+@Test @MainActor func unknownLinkIdSurfacesLinkPacketDelegate() async {
+    // No linkTable entry for this link_id → the linkPacket delegate is emitted (not forwarded).
+    // This also covers leaf mode (linkTable always empty).
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    let unknownLinkID = Data(repeating: 0x77, count: 16)
+    let lp = makeLinkPacket(linkID: unknownLinkID, hops: 0, payload: Data([0xAB]))
+    let captured = LockIsolated<(Data, Data)?>(nil)
+    await store.send(.received(InterfaceID("i"), lp))
+    await store.receive { action in
+        if case let .delegate(.linkPacket(l, d)) = action { captured.setValue((l, d)); return true }
+        return false
+    }
+    #expect(captured.value?.0 == unknownLinkID)
+    #expect(captured.value?.1 == lp)
+}

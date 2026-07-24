@@ -98,6 +98,19 @@ public struct Transport {
                 // byte-identical keepalives share a packet hash and must not be deduped, and a
                 // retried link request should still reach us.
                 if packet.destinationType == .link {
+                    // Relay: a transited link's packets (LRPROOF + established traffic) are forwarded
+                    // direction-aware by link_id; a local link surfaces to the endpoint as today.
+                    if let entry = state.linkTable[packet.destinationHash],
+                       Int(packet.hops) + 1 < Int(Packet.maxHops) {
+                        let outIf: InterfaceID
+                        if interfaceID == entry.rcvdIf { outIf = entry.nhIf }        // toward dest
+                        else if interfaceID == entry.nhIf { outIf = entry.rcvdIf }   // toward initiator
+                        else { return .none }
+                        var fwd = packet
+                        fwd.hops = packet.hops + 1
+                        guard let raw = try? fwd.packed() else { return .none }
+                        return .send(.delegate(.transmit(outIf, raw)))
+                    }
                     return .send(.delegate(.linkPacket(linkID: packet.destinationHash, data: data)))
                 }
                 if packet.packetType == .linkRequest, state.localDestinations[packet.destinationHash] != nil {
