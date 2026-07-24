@@ -127,6 +127,8 @@ public struct Transport {
                         guard let entry = state.learned[packet.destinationHash],
                               Int(packet.hops) + 1 < Int(Packet.maxHops) else { return .none }
                         let fwd: Packet
+                        // `entry.nextHop` is never nil post-4b-1 (learn sets `transportId ?? destinationHash`),
+                        // so nextHop == destHash means the dest was heard directly (final hop), else onward.
                         if entry.nextHop == packet.destinationHash {
                             // Final hop → strip transport headers, HEADER_1 direct (context_flag dropped).
                             fwd = Packet(headerType: .header1, packetType: packet.packetType,

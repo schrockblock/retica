@@ -797,6 +797,33 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     #expect(forwarded.transportId == nextRelay)
 }
 
+@Test @MainActor func relayFinalHopBytesMatchRnsRewrite() async {
+    // Relay final hop (HEADER_2 → HEADER_1 direct): RNS Transport.py:1609-1614
+    //   new_flags = HEADER_1<<6 | BROADCAST<<4 | (flags & 0x0F);  new_raw = new_flags ‖ (hops+1) ‖ raw[18:]
+    // i.e. header/context/transport bits zeroed, destType+packetType kept; transport_id STRIPPED, payload verbatim.
+    let (store, relay, destHash, outIf) = await relayStoreKnowingDestDirectly()   // nextHop == destHash
+    store.exhaustivity = .off
+    let inbound = makeHeader2DataPacket(transportId: relay.hash, destHash: destHash, hops: 4,
+                                        payload: Data([9, 9]))
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.received(InterfaceID("in"), inbound))
+    await store.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action {
+            captured.setValue((ifID, raw))
+            return true
+        }
+        return false
+    }
+    var expected = Data([inbound.first! & 0x0F])         // HEADER_1(0)<<6 | BROADCAST(0)<<4 | (flags & 0x0F)
+    expected.append(UInt8(5))                            // hops = 4 + 1
+    expected.append(contentsOf: inbound[18...])          // destHash(16) ‖ context(1) ‖ payload — transport_id stripped
+    #expect(captured.value?.1 == expected)
+    #expect(captured.value?.0 == outIf)
+    let forwarded = Packet(raw: captured.value!.1)!
+    #expect(forwarded.headerType == .header1)
+    #expect(forwarded.transportId == nil)
+}
+
 @Test @MainActor func threeNodeRelayDeliversMessageEndToEnd() async {
     // A[ar], R[ar,rb] relay, B[rb]. Hand-pump .transmit frames between them.
     // B registers D (with private key so B can decrypt), announces D.
