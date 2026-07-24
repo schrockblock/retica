@@ -810,3 +810,25 @@ private func driveTransferToReceived(sender senderState: ResourceTransfer.State,
     #expect(s.advertisement!.requestID == nil)
     #expect(s.advertisement!.flags == 0x01)
 }
+
+@Test func singleSegmentAdvertisesIndexOneNotSplit() {
+    let s = ResourceTransfer.State(sending: incompressibleData(count: 40), linkID: linkID, sessionKey: key,
+                                   interfaceID: InterfaceID("s"), prefix: prefix, randomHash: r, sdu: 24)
+    #expect(s.advertisement!.segmentIndex == 1)          // RNS uses 1-based (was 0)
+    #expect(s.advertisement!.totalSegments == 1)
+    #expect(s.advertisement!.originalHash == s.advertisement!.hash)
+    #expect(s.advertisement!.isSplit == false)
+}
+
+@Test func segmentParamsPopulateAdvertisement() {
+    let whole: UInt64 = 3_000_000
+    let oh = Data(repeating: 0xAB, count: 32)
+    let s = ResourceTransfer.State(sending: incompressibleData(count: 500), linkID: linkID, sessionKey: key,
+                                   interfaceID: InterfaceID("s"), prefix: prefix, randomHash: r, sdu: 24,
+                                   segmentIndex: 2, totalSegments: 3, originalHash: oh, totalDataSize: whole)
+    #expect(s.advertisement!.segmentIndex == 2)
+    #expect(s.advertisement!.totalSegments == 3)
+    #expect(s.advertisement!.originalHash == oh)          // inherited, NOT this segment's hash
+    #expect(s.advertisement!.dataSize == whole)           // whole size, not this segment's
+    #expect(s.advertisement!.isSplit == true)             // l > 1
+}

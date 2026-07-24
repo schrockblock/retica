@@ -136,7 +136,7 @@ res_hashmap  = b"".join(RNS.Identity.full_hash(p + res_r)[:4] for p in res_parts
 _adv = RNSResourceAdvertisement()
 _adv.t = len(res_stream); _adv.d = len(res_data); _adv.n = len(res_parts)
 _adv.h = res_hash; _adv.r = res_r; _adv.o = res_hash
-_adv.i = 0; _adv.l = 1; _adv.q = None; _adv.f = 0x01; _adv.m = res_hashmap
+_adv.i = 1; _adv.l = 1; _adv.q = None; _adv.f = 0x01; _adv.m = res_hashmap
 res_adv_msgpack = _adv.pack(segment=0)
 
 # --- Resource request plaintext (single-window, hashmap not exhausted): 0x00 ‖ hash ‖ hashmap ---

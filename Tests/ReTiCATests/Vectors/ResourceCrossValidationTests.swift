@@ -36,7 +36,7 @@ import Foundation
     let adv = ResourceAdvertisement(
         transferSize: UInt64(stream.count), dataSize: UInt64(Data(hexString: f.resourceData)!.count),
         numberOfParts: UInt64(parts.count), hash: h, randomHash: r, originalHash: h,
-        segmentIndex: 0, totalSegments: 1, requestID: nil, flags: 0x01,
+        segmentIndex: 1, totalSegments: 1, requestID: nil, flags: 0x01,
         hashmap: Resource.hashmap(parts: parts, randomHash: r))
     #expect(adv.pack() == Data(hexString: f.resourceAdvMsgpack))
 }
@@ -53,7 +53,7 @@ import Foundation
     let expected = Resource.expectedProof(data: data, hash: h)
     let adv = ResourceAdvertisement(
         transferSize: UInt64(stream.count), dataSize: UInt64(data.count), numberOfParts: UInt64(parts.count),
-        hash: h, randomHash: r, originalHash: h, segmentIndex: 0, totalSegments: 1,
+        hash: h, randomHash: r, originalHash: h, segmentIndex: 1, totalSegments: 1,
         requestID: nil, flags: 0x01, hashmap: Resource.hashmap(parts: parts, randomHash: r))
 
     // Receiver
