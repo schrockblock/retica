@@ -278,9 +278,17 @@ RETICA_LIVE_HOST=127.0.0.1 RETICA_LIVE_PORT=4242 swift test --filter LiveEndpoin
 - **`ReTiCATransport`** — TCA endpoint-core Transport (interface-agnostic).
 - **`ReTiCANode`** — composition of interface + transport into a working endpoint.
 
+## Transport relay mode (announce propagation)
+
+A node can be put in **relay mode** by calling `enableRelay(identity)` on the `Endpoint` (or `setTransportIdentity(identity)` on `Transport` directly). In relay mode, the node re-broadcasts every announce it hears for a non-local destination with the RNS header rewrite: HEADER_2, `transport_id` = the relay's 16-byte identity hash, and `hops+1`. The re-broadcast is sent to every interface *except* the one the announce arrived on, so the mesh learns multi-hop paths. The path table records the `transport_id` of each relayed announce as the next hop toward that destination.
+
+Relay announce propagation is cross-validated against a genuine Python-RNS 1.3.8 announce packet: the test feeds the real fixture into the relay and asserts that the re-broadcast is HEADER_2, carries the relay's hash as `transport_id`, increments hops by 1, preserves the payload byte-for-byte, and that the original Python-RNS Ed25519 signature still validates in the re-broadcast payload (proving no corruption).
+
+**Data-packet forwarding** and re-broadcast robustness (retries, rate-limiting, expiry) are subsequent sub-slices (4b-2 / 4b-3).
+
 ## Not Yet Implemented
 
-Transport-node relaying, path requests, and Resource delivery are **not** part of this sub-project and will be addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
+Path requests, and other deferred relay robustness features are addressed in subsequent deliverables of the decomposition. Other interfaces (TCP server, UDP, AutoInterface, RNode) are likewise future work. Multi-interface composition (connecting `Endpoint` to more than one `TCPClientInterface`) is likewise deferred.
 
 The **Link session lifecycle** is now substantially complete: establishment (PENDING → HANDSHAKE → ACTIVE), encrypted application data, explicit link close, keepalive/inactivity watchdog, inline identify (IDENTIFY payload + Ed25519 verification), and request/response (both inline ≤ 431 bytes and large Resource-based, matched by `request_id`). All are wire-compatible with Python-RNS 1.3.8 and verified by cross-validation vectors.
 
