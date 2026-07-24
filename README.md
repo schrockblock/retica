@@ -284,7 +284,18 @@ A node can be put in **relay mode** by calling `enableRelay(identity)` on the `E
 
 Relay announce propagation is cross-validated against a genuine Python-RNS 1.3.8 announce packet: the test feeds the real fixture into the relay and asserts that the re-broadcast is HEADER_2, carries the relay's hash as `transport_id`, increments hops by 1, preserves the payload byte-for-byte, and that the original Python-RNS Ed25519 signature still validates in the re-broadcast payload (proving no corruption).
 
-**Data-packet forwarding** and re-broadcast robustness (retries, rate-limiting, expiry) are subsequent sub-slices (4b-2 / 4b-3).
+### Data-packet forwarding (one-way multi-hop)
+
+A relay now **forwards data packets** addressed to it toward the destination. When a HEADER_2 data packet arrives naming the relay's identity hash as its `transport_id`, the relay looks up the destination in its path table and forwards:
+
+- **Final hop** (`nextHop == destinationHash`): strips the transport header and emits a HEADER_1 packet (broadcast, `context_flag` cleared) directly to the destination.
+- **Onward hop** (`nextHop != destinationHash`): keeps HEADER_2, swaps `transport_id` to the next relay, and increments `hops` by 1.
+
+An originator that has learned a destination via a relay sends a HEADER_2 packet (setting `transport_id` to the first relay's hash), so a connectionless message travels multi-hop A→R→B in a single send, wire-compatible with Python-RNS 1.3.8.
+
+The forwarding rewrite (`flags ‖ hops+1 ‖ nextHop ‖ destHash ‖ context ‖ payload`) is verified byte-for-byte against RNS `Transport.py:1605-1608`, and a three-node end-to-end test (A→R→B) confirms that the encrypted payload survives the full relay chain from originator to recipient, with B successfully decrypting A's message.
+
+Bidirectional links-over-a-relay and re-broadcast robustness (retries, rate-limiting, expiry) remain subsequent sub-slices (4b-2b / 4b-3).
 
 ## Not Yet Implemented
 
