@@ -176,8 +176,7 @@ handling remains available.
 
 ### Resource primitives (`Resource`, `ResourceAdvertisement`)
 
-The `Resource` namespace (pure core) implements the single-segment, uncompressed representation
-primitives of a Reticulum Resource — the chunked large-object transfer that rides over a link:
+The `Resource` namespace (pure core) implements the Reticulum Resource primitives — the chunked large-object transfer that rides over a link:
 
 - `Resource.buildStream` / `parts` — the data is prefixed with a 4-byte random hash, encrypted as
   one stream under the link's session key (`Token`), then split into SDU-sized ciphertext parts.
@@ -188,11 +187,11 @@ primitives of a Reticulum Resource — the chunked large-object transfer that ri
   proof and the sender's validation.
 - `ResourceAdvertisement.pack` / `unpack` — the `RESOURCE_ADV` MessagePack dictionary
   (`t,d,n,h,r,o,i,l,q,f,m`), built on a `MsgPack` value codec (uint/bin/string/nil/ordered-map).
+  Multi-segment fields (`i` index, `l` total, `o` original-hash, `f` flags) are fully encoded and
+  decoded, cross-validated byte-for-byte against genuine Python-RNS 1.3.8 advertisements.
 
-All of it is cross-validated against Python-RNS 1.3.8 (msgpack bytes, hashes, `Token` decrypt, and a
-genuine `ResourceAdvertisement.pack`). Multi-segment resources and the transfer state
-machine (advertise → request → send → assemble → prove, with windowing/retransmission) are future
-slices, as is wiring resources over a live `LinkSession`.
+All of it is cross-validated against Python-RNS 1.3.8 (msgpack bytes, hashes, `Token` decrypt, and
+genuine `ResourceAdvertisement.pack` output, including multi-segment segment advertisements).
 
 ### Resource transfer (`ResourceTransfer`)
 
@@ -233,8 +232,21 @@ A resource with more than `HASHMAP_MAX_LEN` = 74 parts (~34 KB at SDU 464) is tr
 first 74 map-hashes; as the receiver's window reaches an unknown slot it sends an exhausted-flagged
 `RESOURCE_REQ` (`0xFF ‖ last-hash ‖ hash ‖ requested`), and the sender replies with the next 74-hash
 `RESOURCE_HMU` chunk (`hash ‖ msgpack([chunkIndex, hashes])`, encrypted). This lifts the single-transfer
-ceiling to ~1 MB, wire-compatible with Python-RNS 1.3.8. Resources larger than that (true multi-segment
-sub-resources) remain a future slice.
+ceiling to ~1 MB, wire-compatible with Python-RNS 1.3.8.
+
+### Multi-segment resources (> 1 MB)
+
+Payloads larger than `LinkSession.maxEfficientSize` (1,048,575 bytes) are automatically split into
+sequential segments and transferred as a series of individual `ResourceTransfer`s. Each segment
+advertisement carries the segment index (`i`), total count (`l`), original-hash (`o`, equal to the
+first segment's resource hash), and a split flag (`f & 0x04`). The sender tracks outstanding segments
+in a `SegmentedSend` and emits the next segment's advertisement only after the previous proof is
+received. The receiver accumulates completed segment payloads in a `SegmentAccumulator` keyed by
+`originalHash` and surfaces exactly one `resourceReceived(linkID:data:)` delegate action — containing
+the full reassembled payload — once all segments are in. A two-Endpoint end-to-end test round-trips a
+2-segment resource (1,048,975 bytes) with full windowed transfer, HMU rounds for segment 1, and
+payload equality verified against the original. Multi-segment advertisements are cross-validated
+byte-for-byte against genuine Python-RNS 1.3.8 output.
 
 ### Sending resources over a link (`Endpoint`)
 
@@ -249,8 +261,7 @@ Once a link is established, a resource is sent end-to-end through the public API
 - Completion surfaces as `Endpoint` delegates: `resourceReceived(linkID:data:)` on the receiver, and
   `resourceConcluded(linkID:resourceHash:)` / `resourceFailed(linkID:resourceHash:)` on either side.
 
-`ResourceTransfer` instances live inside their `LinkSession` (link-scoped). Terminal transfers (concluded or failed) are removed from their `LinkSession` automatically; MTU/SDU
-negotiation and multi-segment remain future slices.
+`ResourceTransfer` instances live inside their `LinkSession` (link-scoped). Terminal transfers (concluded or failed) are removed from their `LinkSession` automatically. MTU/SDU negotiation remains a future slice.
 
 ### Live endpoint test (opt-in)
 
