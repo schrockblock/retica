@@ -9,6 +9,19 @@ struct TransportVectorFixtures: Decodable {
     let bz2Original: String
     let bz2Compressed: String
     let bz2OriginalLen: Int
+    // Multi-segment resource cross-validation fields
+    let msMaxEfficientSize: Int
+    let msTotalSize: Int
+    let msSeg1Adv: String
+    let msSeg2Adv: String
+    let msSeg1I: Int
+    let msSeg1L: Int
+    let msSeg1O: String
+    let msSeg1D: Int
+    let msSeg1F: Int
+    let msSeg2I: Int
+    let msSeg2O: String
+    let msSeg2F: Int
 
     enum CodingKeys: String, CodingKey {
         case announceDestHash = "announce_dest_hash"
@@ -19,6 +32,18 @@ struct TransportVectorFixtures: Decodable {
         case bz2Original = "bz2_original"
         case bz2Compressed = "bz2_compressed"
         case bz2OriginalLen = "bz2_original_len"
+        case msMaxEfficientSize = "ms_max_efficient_size"
+        case msTotalSize = "ms_total_size"
+        case msSeg1Adv = "ms_seg1_adv"
+        case msSeg2Adv = "ms_seg2_adv"
+        case msSeg1I = "ms_seg1_i"
+        case msSeg1L = "ms_seg1_l"
+        case msSeg1O = "ms_seg1_o"
+        case msSeg1D = "ms_seg1_d"
+        case msSeg1F = "ms_seg1_f"
+        case msSeg2I = "ms_seg2_i"
+        case msSeg2O = "ms_seg2_o"
+        case msSeg2F = "ms_seg2_f"
     }
 
     static func load() throws -> TransportVectorFixtures {

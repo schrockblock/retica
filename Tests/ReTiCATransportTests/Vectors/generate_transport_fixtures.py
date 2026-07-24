@@ -7,6 +7,7 @@
 # make Transport learn the reference destination (identity hash, app_data, hops).
 import json, os, time, bz2
 import RNS
+from RNS.Resource import Resource, ResourceAdvertisement
 
 identity = RNS.Identity()
 app, aspect = "reticula", "endpoint"
@@ -30,6 +31,32 @@ announce_packet = bytes([flags, hops]) + dest_hash + bytes([0x00]) + payload
 bz2_original = b"reticulum resource payload for cross validation " * 6
 bz2_compressed = bz2.compress(bz2_original, 9)
 
+# --- Multi-segment resource cross-validation ---
+# Monkeypatch RNS.Packet to bypass real part-packet construction (needs a full link).
+_RealPacket = RNS.Packet
+class _FakePacket:
+    RESOURCE = _RealPacket.RESOURCE
+    def __init__(self, *a, **k): self.map_hash = None; self.data = None
+    def pack(self, *a, **k): return b""
+RNS.Packet = _FakePacket
+
+class _StubLink:
+    mtu = None
+    mdu = 200000          # large SDU → few parts → fast; segmentation is sdu-independent
+    rtt = 0.1
+    traffic_timeout_factor = 1.5
+    def encrypt(self, data): return data
+
+_MAX = Resource.MAX_EFFICIENT_SIZE      # 1048575
+_total = _MAX + 100                     # 2 segments
+_payload = os.urandom(_total)           # distinct parts → avoids RNS's collision-remap loop
+_link = _StubLink()
+_seg1 = Resource(_payload, _link, advertise=False, auto_compress=False, segment_index=1)
+_seg2 = Resource(_seg1.input_file, _link, advertise=False, auto_compress=False,
+                 segment_index=2, original_hash=_seg1.original_hash)
+_a1, _a2 = ResourceAdvertisement(_seg1), ResourceAdvertisement(_seg2)
+RNS.Packet = _RealPacket                # restore
+
 print(json.dumps({
     "announce_dest_hash": dest_hash.hex(),
     "announce_identity_hash": identity.hash.hex(),
@@ -39,4 +66,10 @@ print(json.dumps({
     "bz2_original": bz2_original.hex(),
     "bz2_compressed": bz2_compressed.hex(),
     "bz2_original_len": len(bz2_original),
+    "ms_max_efficient_size": _MAX,
+    "ms_total_size": _total,
+    "ms_seg1_adv": _a1.pack().hex(),
+    "ms_seg2_adv": _a2.pack().hex(),
+    "ms_seg1_i": _a1.i, "ms_seg1_l": _a1.l, "ms_seg1_o": _a1.o.hex(), "ms_seg1_d": _a1.d, "ms_seg1_f": _a1.f,
+    "ms_seg2_i": _a2.i, "ms_seg2_o": _a2.o.hex(), "ms_seg2_f": _a2.f,
 }, indent=2))

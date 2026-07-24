@@ -1061,6 +1061,220 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     await a.send(.disconnect); await b.send(.disconnect)
 }
 
+// MARK: – Multi-segment (>maxEfficientSize) end-to-end round-trip
+
+/// SHA256-derived incompressible bytes for the multi-segment E2E test: bzip2 cannot shrink them,
+/// so the payload genuinely exceeds maxEfficientSize post-compression and stays 2 segments.
+private func incompressibleData(count: Int) -> Data {
+    var result = Data()
+    var i = 0
+    while result.count < count {
+        let chunk = Crypto.fullHash(Data([UInt8(i & 0xff), UInt8((i >> 8) & 0xff), UInt8((i >> 16) & 0xff), 0x7A]))
+        result.append(contentsOf: chunk.prefix(min(chunk.count, count - result.count)))
+        i += 1
+    }
+    return result
+}
+
+/// Given an HDLC-framed RESOURCE_REQ packet (as stored in sentA/sentB after
+/// `await Task.yield()` has flushed the async tcpConnection.send write) and the link session key,
+/// returns how many frames the sender will emit: one per requested map-hash, plus one RESOURCE_HMU
+/// if the request is exhausted (0xFF flag).
+private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int {
+    var deframer = HDLCDeframer()
+    let frames = deframer.ingest(reqFrame)
+    guard let rawPacket = frames.first,
+          let packet = Packet(raw: rawPacket),
+          let plain = Link.decrypt(packet.payload, sessionKey: sessionKey)
+    else { return 0 }
+    let p = Data(plain)
+    guard let flag = p.first else { return 0 }
+    let exhausted = flag == 0xFF
+    let pad = exhausted ? 5 : 1
+    let reqBytes = max(0, p.count - pad - 32)
+    let parts = reqBytes / 4
+    return parts + (exhausted ? 1 : 0)
+}
+
+@Test @MainActor func twoEndpointsTransferMultiSegmentResourceOverALink() async {
+    let clock = TestClock()
+    let bIdentity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
+
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            Endpoint()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } },
+                                             close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
+    let (a, eventsA) = make("a", sentA)
+    let (b, eventsB) = make("b", sentB)
+
+    // --- Establish the link (mirrors twoEndpointsTransferAResourceOverALink steps 1–4) ---
+    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await b.send(.registerLocalDestination(dest))
+    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.announce(destinationHash: dest.hash, appData: nil))
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
+    await a.send(.openLink(destinationHash: dest.hash))
+    await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive(\.delegate.linkEstablished)
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
+    let linkID = a.state.links[0].linkID
+    let sessionKey = a.state.links[0].sessionKey
+    #expect(a.state.links[0].status == .active && b.state.links[0].status == .active)
+
+    // --- A sends a 2-segment resource (> maxEfficientSize) to B ---
+    // Use incompressible data so the payload stays above the threshold post-compression.
+    // K = 400 bytes → segment 2 encodes to 1 part at SDU 464; one REQ/serve round for seg2.
+    let k = 400
+    let payload = incompressibleData(count: LinkSession.maxEfficientSize + k)
+    #expect(payload.count == LinkSession.maxEfficientSize + k)
+
+    await a.send(.sendResourceOverLink(linkID: linkID, data: payload))
+    // A emits ADV for segment 1 immediately.
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    // Task.yield() lets the async .run { tcpConnection.send(framed) } task write sentA.value.last.
+    await Task.yield()
+    #expect(a.state.links[0].transfers.count == 1)
+    let seg1Adv = a.state.links[0].transfers[0].advertisement!
+    #expect(seg1Adv.segmentIndex == 1)
+    #expect(seg1Adv.totalSegments == 2)
+    #expect(seg1Adv.isSplit == true)
+    #expect(seg1Adv.dataSize == UInt64(payload.count))
+
+    // --- Pump segment 1 (≈2261 parts at SDU 464, windowed + HMU rounds) ---
+    // Deliver seg1 ADV to B.
+    eventsB.yield(.data(sentA.value.last!))
+    await b.receive(\.transport.received)
+    // B spawns a receiver and emits RESOURCE_REQ for the first window.
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await Task.yield()   // flush tcpConnection.send for the REQ
+
+    // Windowed pump loop: each iteration delivers one window of parts to B.
+    // Loops until B's receiver transfer reaches .complete OR countExpectedSenderFrames returns 0
+    // (which happens when the PRF is captured in sentB.value.last instead of a REQ).
+    // In either case, sentB.value.last! holds the PRF when the loop exits.
+    var seg1GuardCount = 0
+    while seg1GuardCount < 3000 {
+        seg1GuardCount += 1
+        let reqFrame = sentB.value.last!
+        let n = countExpectedSenderFrames(reqFrame: reqFrame, sessionKey: sessionKey)
+        guard n > 0 else { break }   // sentB.value.last! is the PRF — loop is done
+        // Deliver the REQ to A; A serves N frames (parts + optional HMU).
+        eventsA.yield(.data(reqFrame))
+        await a.receive(\.transport.received)
+        for _ in 0..<n {
+            await a.receive { if case .interface(.send) = $0 { return true }; return false }
+        }
+        // After n interface.send awaits, each .run { tcpConnection.send } has had time to run.
+        let frames = Array(sentA.value.suffix(n))
+        // Deliver each of A's N frames to B.
+        for frame in frames {
+            eventsB.yield(.data(frame))
+            await b.receive(\.transport.received)
+        }
+        // Check if seg1 receiver is complete: if so, capture PRF and break.
+        let bSeg1 = b.state.links.first?.transfers.first(where: { $0.role == .receiver })
+        if bSeg1?.status == .complete {
+            // B has already emitted PRF as part of completion. Capture it.
+            await b.receive { if case .interface(.send) = $0 { return true }; return false }
+            await Task.yield()   // flush tcpConnection.send for the PRF
+            break
+        }
+        // B emits the next REQ; flush the async write before reading sentB.value.last.
+        await b.receive { if case .interface(.send) = $0 { return true }; return false }
+        await Task.yield()
+    }
+
+    // sentB.value.last! is now the PRF frame (either captured in loop via status check,
+    // or via countExpectedSenderFrames returning 0 on the PRF bytes).
+    // Deliver it to A so A concludes seg1 and advances to seg2.
+    await Task.yield()   // ensure the PRF frame write is flushed
+    let prf1Frame = sentB.value.last!
+    eventsA.yield(.data(prf1Frame))
+    await a.receive(\.transport.received)
+    // A concludes segment 1 → segmentedSend advances → emits ADV for segment 2.
+    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await Task.yield()
+
+    // --- Pump segment 2 (K = 400 bytes → 1 part at SDU 464, fits in 1 window, no HMU) ---
+    eventsB.yield(.data(sentA.value.last!))  // seg2 ADV → B
+    await b.receive(\.transport.received)
+    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // REQ out
+    await Task.yield()
+
+    let got = LockIsolated<Data?>(nil)
+    // Pump seg2 in a windowed loop identical to seg1, but smaller (K=400 → ~1 part).
+    var seg2GuardCount = 0
+    while seg2GuardCount < 100 {
+        seg2GuardCount += 1
+        let seg2ReqFrame = sentB.value.last!
+        let seg2n = countExpectedSenderFrames(reqFrame: seg2ReqFrame, sessionKey: sessionKey)
+        guard seg2n > 0 else { break }   // sentB.value.last! is a PRF → done
+        eventsA.yield(.data(seg2ReqFrame))
+        await a.receive(\.transport.received)
+        for _ in 0..<seg2n {
+            await a.receive { if case .interface(.send) = $0 { return true }; return false }
+        }
+        let seg2Parts = Array(sentA.value.suffix(seg2n))
+        for frame in seg2Parts {
+            eventsB.yield(.data(frame))
+            await b.receive(\.transport.received)
+        }
+        // Check completion: status set synchronously by reducer when last part verified.
+        let bSeg2 = b.state.links.first?.transfers.first(where: { $0.role == .receiver })
+        if bSeg2?.status == .complete {
+            // Seg2 complete: capture PRF (B's next send) then resourceReceived.
+            await b.receive { if case .interface(.send) = $0 { return true }; return false }   // PRF
+            await Task.yield()   // flush tcpConnection.send for PRF
+            await b.receive { action in
+                if case let .delegate(.resourceReceived(lid, d)) = action, lid == linkID {
+                    got.setValue(d); return true
+                }
+                return false
+            }
+            break
+        }
+        // Not done yet; B emits next REQ.
+        await b.receive { if case .interface(.send) = $0 { return true }; return false }
+        await Task.yield()
+    }
+    #expect(got.value == payload, "B must receive the exact original payload (both segments concatenated)")
+
+    // PRF for seg2 → A concludes seg2 → surfaces resourceConcluded.
+    await Task.yield()   // flush .run { tcpConnection.send(prf2_framed) } from the PRF above
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive(\.transport.received)
+    await a.receive { action in
+        if case .delegate(.resourceConcluded) = action { return true }
+        return false
+    }
+    #expect(a.state.links[0].segmentedSend == nil)
+
+    await a.send(.disconnect); await b.send(.disconnect)
+}
+
 // MARK: – GC: closed/failed links are removed from the collection
 
 @Test @MainActor func closedLinkIsRemovedFromEndpoint() async {
