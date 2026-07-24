@@ -343,6 +343,151 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     #expect(store.state.learned.isEmpty)
 }
 
+// Convenience: build a HEADER_1 announce for a synthetic remote identity at the given hop count.
+// Returns (raw packet bytes, destinationHash).
+private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, Data) {
+    makeAnnouncePacket(identity: Identity(), appName: "relay", aspects: ["svc"],
+                       hops: hops, emitted: emitted)
+}
+
+@Test @MainActor func relayRebroadcastsAnnounceWithHeader2AndOurTransportId() async {
+    let relay = Identity()
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))
+
+    // A genuine-shape HEADER_1 announce for a REMOTE destination, heard on i0 at hops = 2.
+    let (announceRaw, destHash) = makeAnnouncePacket(hops: 2)
+    // Verify exactly 2 interfaces are registered before the announce arrives.
+    #expect(store.state.interfaces == [InterfaceID("i0"), InterfaceID("i1")])
+
+    await store.send(.received(InterfaceID("i0"), announceRaw))
+
+    // Drain pathLearned (direct match).
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+
+    // Drain the single re-broadcast transmit.
+    let capturedIfID = LockIsolated<InterfaceID?>(nil)
+    let capturedRaw = LockIsolated<Data?>(nil)
+    await store.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action {
+            capturedIfID.setValue(ifID)
+            capturedRaw.setValue(raw)
+            return true
+        }
+        return false
+    }
+
+    // Path learned with HEADER_1 fallback: nextHop == destHash.
+    #expect(store.state.learned[destHash]?.nextHop == destHash)
+
+    // Exactly one re-broadcast on i1 (NOT i0), HEADER_2, relay's transport_id, hops+1, same payload.
+    #expect(capturedIfID.value == InterfaceID("i1"))
+    let rb = Packet(raw: capturedRaw.value!)!
+    #expect(rb.headerType == .header2)
+    #expect(rb.transportType == .transport)
+    #expect(rb.transportId == relay.hash)
+    #expect(rb.hops == 3)   // received 2 + 1
+    #expect(rb.destinationHash == destHash)
+    let orig = Packet(raw: announceRaw)!
+    #expect(rb.payload == orig.payload)  // payload verbatim (signature intact)
+}
+
+@Test @MainActor func leafDoesNotRebroadcast() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    // transportIdentity stays nil → leaf mode.
+    let (announceRaw, destHash) = makeAnnouncePacket(hops: 2)
+
+    await store.send(.received(InterfaceID("i0"), announceRaw))
+    // Drain the only expected effect (pathLearned); switch exhaustive ON afterward so any
+    // spurious transmit left in the queue would cause teardown to fail.
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    store.exhaustivity = .on
+    // No transmit pending → exhaustive teardown passes.
+    #expect(store.state.learned[destHash]?.nextHop == destHash)  // fallback still applied
+}
+
+@Test @MainActor func relayDoesNotRebroadcastForLocalDestinationOrPastHopLimit() async {
+    let relay = Identity()
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))
+
+    // (a) Announce for a LOCAL destination → not learned, not re-broadcast.
+    let localDest = Destination(kind: .single, direction: .in, appName: "local", aspects: ["svc"],
+                                identity: Identity())!
+    let (localRaw, _) = makeAnnouncePacket(identity: localDest.identity!, appName: "local",
+                                           aspects: ["svc"], hops: 1, emitted: 500)
+    await store.send(.registerLocalDestination(localDest))
+
+    let sawTransmitA = LockIsolated(false)
+    store.exhaustivity = .on
+    let expectedHashA = Packet(raw: localRaw)!.packetHash
+    await store.send(.received(InterfaceID("i0"), localRaw)) {
+        $0.seenPacketHashes.insert(expectedHashA)
+    }
+    #expect(sawTransmitA.value == false)
+
+    store.exhaustivity = .off
+
+    // (b) Announce at hops == maxHops-1 → not re-broadcast (hop limit).
+    let hopLimit = UInt8(Packet.maxHops) - 1
+    let (limitRaw, limitDestHash) = makeAnnouncePacket(hops: hopLimit, emitted: 999)
+    let sawTransmitB = LockIsolated(false)
+    await store.send(.received(InterfaceID("i0"), limitRaw))
+    await store.receive { action in
+        if case .delegate(.transmit) = action { sawTransmitB.setValue(true) }
+        if case .delegate(.pathLearned) = action { return true }
+        return false
+    }
+    #expect(sawTransmitB.value == false)
+    #expect(store.state.learned[limitDestHash]?.nextHop == limitDestHash)  // still learned
+}
+
+@Test @MainActor func relayLearnsNextHopFromHeader2Announce() async {
+    let relay = Identity()
+    let intermediateTid = Data(repeating: 0x42, count: 16)  // simulated upstream relay hash
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.setTransportIdentity(relay))
+
+    // Build a HEADER_2 announce (already relayed by an upstream relay).
+    let remoteID = Identity()
+    let (_, destHash) = makeAnnouncePacket(identity: remoteID, appName: "app", aspects: ["x"],
+                                           hops: 3, emitted: 777)
+    let nameHash = Destination.nameHash(appName: "app", aspects: ["x"])
+    let randomHash = Announce.randomHash(now: 777, randomPrefix: Data(repeating: 0xA5, count: 5))
+    let payload = Announce.buildPayload(identity: remoteID, destinationHash: destHash,
+                                        nameHash: nameHash, randomHash: randomHash, appData: nil)
+    // Wrap as HEADER_2 with intermediateTid as the transport_id.
+    let header2Packet = Packet(headerType: .header2, packetType: .announce, transportType: .transport,
+                               destinationType: .single, context: .none, contextFlag: false, hops: 3,
+                               destinationHash: destHash, transportId: intermediateTid, payload: payload)
+    let header2Raw = try! header2Packet.packed()
+
+    await store.send(.received(InterfaceID("i0"), header2Raw))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+
+    // HEADER_2 announce: nextHop == the announce's transportId (the upstream relay).
+    #expect(store.state.learned[destHash]?.nextHop == intermediateTid)
+}
+
 @Test @MainActor func announceFansOutToAllInterfaces() async {
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
                            identity: Identity())!

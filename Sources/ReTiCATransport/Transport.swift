@@ -12,6 +12,7 @@ public struct Transport {
         public var localDestinations: [Data: Destination] = [:]
         public var learned: [Data: LearnedDestination] = [:]
         public var interfaces: Set<InterfaceID> = []
+        public var transportIdentity: Identity? = nil
         var seenPacketHashes = RingSet()
         public init() {}
     }
@@ -22,6 +23,7 @@ public struct Transport {
         case interfaceConnected(InterfaceID)
         case interfaceDisconnected(InterfaceID)
         case registerLocalDestination(Destination)
+        case setTransportIdentity(Identity?)
         case received(InterfaceID, Data)
         case announce(destinationHash: Data, appData: Data?)
         case send(destinationHash: Data, plaintext: Data)
@@ -57,6 +59,10 @@ public struct Transport {
                 state.localDestinations[destination.hash] = destination
                 return .none
 
+            case let .setTransportIdentity(identity):
+                state.transportIdentity = identity
+                return .none
+
             case let .received(interfaceID, data):
                 guard let packet = Packet(raw: data) else { return .none }
                 // Link traffic is recognized and routed up BEFORE the announce/data dedup:
@@ -79,19 +85,33 @@ public struct Transport {
                                                       contextFlagSet: packet.contextFlag)
                     else { return .none }
                     let emitted = Transport.announceEmitted(parsed.randomHash)
-                    // `nextHop` is the raw transport id (nil for a directly-heard HEADER_1
-                    // announce). The reference's `received_from = transport_id ?? destination_hash`
-                    // fallback is deferred to the relaying slice (4b), which is the only consumer
-                    // of `nextHop`; the leaf endpoint routes by `interfaceID`.
+                    // Path-table next hop: relayed (HEADER_2) → its transport_id; directly heard → the dest.
+                    let nextHop = packet.transportId ?? packet.destinationHash
                     let candidate = LearnedDestination(
                         identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
-                        interfaceID: interfaceID, hops: packet.hops, nextHop: packet.transportId,
+                        interfaceID: interfaceID, hops: packet.hops, nextHop: nextHop,
                         announceEmitted: emitted)
                     guard Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate)
                     else { return .none }
                     state.learned[packet.destinationHash] = candidate
-                    return .send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
-                                                        hops: packet.hops)))
+                    let learnedEffect = Effect<Action>.send(.delegate(.pathLearned(
+                        destinationHash: packet.destinationHash, hops: packet.hops)))
+                    // Relay mode: re-broadcast the announce (same payload, HEADER_2, our transport_id,
+                    // hops+1) to every interface except the one it arrived on — but respect the hop limit.
+                    guard let relayID = state.transportIdentity,
+                          Int(packet.hops) + 1 < Int(Packet.maxHops)
+                    else { return learnedEffect }
+                    let rebroadcast = Packet(
+                        headerType: .header2, packetType: .announce, transportType: .transport,
+                        destinationType: packet.destinationType, context: packet.context,
+                        contextFlag: packet.contextFlag, hops: packet.hops + 1,
+                        destinationHash: packet.destinationHash, transportId: relayID.hash,
+                        payload: packet.payload)
+                    guard let rebroadcastRaw = try? rebroadcast.packed() else { return learnedEffect }
+                    let out = state.interfaces
+                        .filter { $0 != interfaceID }
+                        .map { Effect<Action>.send(.delegate(.transmit($0, rebroadcastRaw))) }
+                    return .merge([learnedEffect] + out)
                 case .data:
                     guard let destination = state.localDestinations[packet.destinationHash],
                           destination.kind == packet.destinationType,
