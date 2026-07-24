@@ -119,6 +119,32 @@ public struct Transport {
                         .map { Effect<Action>.send(.delegate(.transmit($0, rebroadcastRaw))) }
                     return .merge([learnedEffect] + out)
                 case .data:
+                    // Relay: a HEADER_2 data packet naming us as the next hop, for a REMOTE destination,
+                    // is forwarded toward the destination (nextHop-based; RNS Transport.py:1603-1614).
+                    if let relayID = state.transportIdentity, packet.headerType == .header2,
+                       packet.transportId == relayID.hash,
+                       state.localDestinations[packet.destinationHash] == nil {
+                        guard let entry = state.learned[packet.destinationHash],
+                              Int(packet.hops) + 1 < Int(Packet.maxHops) else { return .none }
+                        let fwd: Packet
+                        if entry.nextHop == packet.destinationHash {
+                            // Final hop → strip transport headers, HEADER_1 direct (context_flag dropped).
+                            fwd = Packet(headerType: .header1, packetType: packet.packetType,
+                                         transportType: .broadcast, destinationType: packet.destinationType,
+                                         context: packet.context, contextFlag: false, hops: packet.hops + 1,
+                                         destinationHash: packet.destinationHash, transportId: nil,
+                                         payload: packet.payload)
+                        } else {
+                            // Relay onward → keep HEADER_2, swap transport_id to the next hop.
+                            fwd = Packet(headerType: .header2, packetType: packet.packetType,
+                                         transportType: .transport, destinationType: packet.destinationType,
+                                         context: packet.context, contextFlag: packet.contextFlag,
+                                         hops: packet.hops + 1, destinationHash: packet.destinationHash,
+                                         transportId: entry.nextHop, payload: packet.payload)
+                        }
+                        guard let raw = try? fwd.packed() else { return .none }
+                        return .send(.delegate(.transmit(entry.interfaceID, raw)))
+                    }
                     guard let destination = state.localDestinations[packet.destinationHash],
                           destination.kind == packet.destinationType,
                           let plaintext = destination.decrypt(packet.payload)
@@ -135,11 +161,18 @@ public struct Transport {
                                                        reason: .notLearned)))
                 }
                 let ciphertext = entry.identity.encrypt(plaintext, ratchet: entry.ratchet)
-                let packet = Packet(headerType: .header1, packetType: .data,
-                                    transportType: .broadcast, destinationType: .single,
-                                    context: .none, contextFlag: false, hops: 0,
-                                    destinationHash: destinationHash, transportId: nil,
-                                    payload: ciphertext)
+                let packet: Packet
+                if let nh = entry.nextHop, nh != destinationHash {
+                    // Destination is reached via a relay → send HEADER_2 to the next hop.
+                    packet = Packet(headerType: .header2, packetType: .data, transportType: .transport,
+                                    destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: destinationHash, transportId: nh, payload: ciphertext)
+                } else {
+                    // Directly reachable → HEADER_1 as before.
+                    packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                    destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: destinationHash, transportId: nil, payload: ciphertext)
+                }
                 guard let raw = try? packet.packed() else {
                     return .send(.delegate(.sendFailed(destinationHash: destinationHash,
                                                        reason: .tooLarge)))
