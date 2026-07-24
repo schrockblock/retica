@@ -295,6 +295,28 @@ An originator that has learned a destination via a relay sends a HEADER_2 packet
 
 The forwarding rewrite (`flags ‖ hops+1 ‖ nextHop ‖ destHash ‖ context ‖ payload`) is verified byte-for-byte against RNS `Transport.py:1605-1608`, and a three-node end-to-end test (A→R→B) confirms that the encrypted payload survives the full relay chain from originator to recipient, with B successfully decrypting A's message.
 
+### Links over a relay (bidirectional, established through a relay node)
+
+A full Reticulum **Link** now establishes and carries bidirectional encrypted traffic across a relay node (A—R—B). The mechanics:
+
+1. **Initiator HEADER_2 LINKREQUEST.** When the originator A has learned destination B's hash via relay R (i.e. `learned[B].nextHop == R.hash`), `openLink(destinationHash: B)` emits a HEADER_2 LINKREQUEST with `transport_id = R.hash` — the same header rewrite used for data packets.
+
+2. **Relay `link_table` + LINKREQUEST forward.** R receives the HEADER_2 LINKREQUEST (naming it as `transport_id`), records a reverse-routing entry in its `link_table` keyed by the link's `link_id`:
+   `linkTable[link_id] = (rcvdIf: ifAR, nhIf: ifRB)`,
+   then forwards the LINKREQUEST toward B as a HEADER_1 packet (transport header stripped, `hops+1`).
+
+3. **Bidirectional link-packet forward.** Once the `link_table` entry exists, every link-addressed packet (LRPROOF, LRRTT, data, keepalive, close) is forwarded direction-aware by `link_id`: a packet arriving on `rcvdIf` ("ar", from the initiator) is forwarded out `nhIf` ("rb", toward the responder), and vice versa. This is the same path for all link phases — handshake and established traffic.
+
+4. **Link establishment.** The LRPROOF from B travels R→A over the relay; A validates the proof, derives the session key, emits the LRRTT, and surfaces `linkEstablished`. The LRRTT travels A→R→B; B validates it and also surfaces `linkEstablished`. Both sides hold the same `link_id` and derived session key — wire-compatible with Python-RNS 1.3.8.
+
+5. **Data flow.** `sendOverLink(linkID:data:)` on either side encrypts the payload under the shared session key and emits a `.link`-addressed DATA packet; R forwards it to the other side transparently. The receiver decrypts and surfaces `linkDataReceived`. Resources, requests, and responses also ride this path, enabling full multi-hop link semantics.
+
+**link_id parity** (wire-compat guarantee): `Link.linkID(requestPacket:)` is header-independent — it produces the same 16-byte value from the HEADER_2 LINKREQUEST (with `transport_id`), the relay-forwarded HEADER_1 LINKREQUEST (with `transport_id` stripped), and the `link_table` key. This matches RNS `link_id_from_lr_packet` exactly, so all three nodes agree on the `link_id` without coordination.
+
+A three-node end-to-end test (`threeNodeRelayLinkEstablishesAndCarriesData`) proves the complete flow: B registers and announces a destination; A learns it via R; A opens a link; the HEADER_2 LINKREQUEST is relayed by R to B; B's LRPROOF is relayed back to A; both reach `linkEstablished` with the same `link_id`; A→B and B→A data each arrive with the exact plaintext.
+
+**Minimal-robustness deferrals** (future work): relay-side proof validation, per-hop proof timeout, `link_table` expiry, MTU negotiation, shared-interface hop-matching, and multi-relay chains remain unimplemented.
+
 Bidirectional links-over-a-relay and re-broadcast robustness (retries, rate-limiting, expiry) remain subsequent sub-slices (4b-2b / 4b-3).
 
 ## Not Yet Implemented
