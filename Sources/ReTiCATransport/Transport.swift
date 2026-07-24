@@ -14,7 +14,17 @@ public struct Transport {
         public var interfaces: Set<InterfaceID> = []
         public var transportIdentity: Identity? = nil
         var seenPacketHashes = RingSet()
+        public var linkTable: [Data: LinkTableEntry] = [:]
         public init() {}
+
+        public struct LinkTableEntry: Equatable, Sendable {
+            public var rcvdIf: InterfaceID
+            public var nhIf: InterfaceID
+            public init(rcvdIf: InterfaceID, nhIf: InterfaceID) {
+                self.rcvdIf = rcvdIf
+                self.nhIf = nhIf
+            }
+        }
     }
 
     public enum SendFailure: Equatable, Sendable { case notLearned, tooLarge }
@@ -46,6 +56,25 @@ public struct Transport {
 
     public var body: some ReducerOf<Self> {
         Reduce { state, action in
+            // Shared helper: rewrite a packet for forwarding toward its destination.
+            // Final hop (nextHop == destHash) → HEADER_1 direct; onward → HEADER_2 to next hop.
+            func forwardTowardDest(_ packet: Packet, _ entry: LearnedDestination) -> Data? {
+                let fwd: Packet
+                if entry.nextHop == packet.destinationHash {
+                    fwd = Packet(headerType: .header1, packetType: packet.packetType, transportType: .broadcast,
+                                 destinationType: packet.destinationType, context: packet.context,
+                                 contextFlag: false, hops: packet.hops + 1,
+                                 destinationHash: packet.destinationHash, transportId: nil, payload: packet.payload)
+                } else {
+                    fwd = Packet(headerType: .header2, packetType: packet.packetType, transportType: .transport,
+                                 destinationType: packet.destinationType, context: packet.context,
+                                 contextFlag: packet.contextFlag, hops: packet.hops + 1,
+                                 destinationHash: packet.destinationHash, transportId: entry.nextHop,
+                                 payload: packet.payload)
+                }
+                return try? fwd.packed()
+            }
+
             switch action {
             case let .interfaceConnected(id):
                 state.interfaces.insert(id)
@@ -126,25 +155,7 @@ public struct Transport {
                        state.localDestinations[packet.destinationHash] == nil {
                         guard let entry = state.learned[packet.destinationHash],
                               Int(packet.hops) + 1 < Int(Packet.maxHops) else { return .none }
-                        let fwd: Packet
-                        // `entry.nextHop` is never nil post-4b-1 (learn sets `transportId ?? destinationHash`),
-                        // so nextHop == destHash means the dest was heard directly (final hop), else onward.
-                        if entry.nextHop == packet.destinationHash {
-                            // Final hop → strip transport headers, HEADER_1 direct (context_flag dropped).
-                            fwd = Packet(headerType: .header1, packetType: packet.packetType,
-                                         transportType: .broadcast, destinationType: packet.destinationType,
-                                         context: packet.context, contextFlag: false, hops: packet.hops + 1,
-                                         destinationHash: packet.destinationHash, transportId: nil,
-                                         payload: packet.payload)
-                        } else {
-                            // Relay onward → keep HEADER_2, swap transport_id to the next hop.
-                            fwd = Packet(headerType: .header2, packetType: packet.packetType,
-                                         transportType: .transport, destinationType: packet.destinationType,
-                                         context: packet.context, contextFlag: packet.contextFlag,
-                                         hops: packet.hops + 1, destinationHash: packet.destinationHash,
-                                         transportId: entry.nextHop, payload: packet.payload)
-                        }
-                        guard let raw = try? fwd.packed() else { return .none }
+                        guard let raw = forwardTowardDest(packet, entry) else { return .none }
                         return .send(.delegate(.transmit(entry.interfaceID, raw)))
                     }
                     guard let destination = state.localDestinations[packet.destinationHash],
@@ -153,6 +164,20 @@ public struct Transport {
                     else { return .none }
                     return .send(.delegate(.received(destinationHash: packet.destinationHash,
                                                      plaintext: plaintext)))
+                case .linkRequest:
+                    // Relay: a HEADER_2 LINKREQUEST naming us as next hop, for a REMOTE destination, is
+                    // forwarded toward the dest and a link_table entry is recorded for reverse routing.
+                    if let relayID = state.transportIdentity, packet.headerType == .header2,
+                       packet.transportId == relayID.hash,
+                       state.localDestinations[packet.destinationHash] == nil {
+                        guard let entry = state.learned[packet.destinationHash],
+                              Int(packet.hops) + 1 < Int(Packet.maxHops) else { return .none }
+                        let linkID = Link.linkID(requestPacket: packet)
+                        state.linkTable[linkID] = State.LinkTableEntry(rcvdIf: interfaceID, nhIf: entry.interfaceID)
+                        guard let raw = forwardTowardDest(packet, entry) else { return .none }
+                        return .send(.delegate(.transmit(entry.interfaceID, raw)))
+                    }
+                    return .none
                 default:
                     return .none
                 }

@@ -824,6 +824,67 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     #expect(forwarded.transportId == nil)
 }
 
+// MARK: - Task 4b-2b helpers
+
+/// Build a raw HEADER_2 LINKREQUEST packet addressed to destHash, naming transportId as the next hop.
+/// Payload shape: ephemeral(64) + signalling(3) bytes, matching the RNS link-request wire format.
+private func makeHeader2LinkRequestPacket(transportId: Data, destHash: Data, hops: UInt8,
+                                          payload: Data) -> Data {
+    let p = Packet(headerType: .header2, packetType: .linkRequest, transportType: .transport,
+                   destinationType: .single, context: .none, contextFlag: false, hops: hops,
+                   destinationHash: destHash, transportId: transportId, payload: payload)
+    return try! p.packed()
+}
+
+// MARK: - Task 4b-2b tests
+
+@Test @MainActor func relayForwardsLinkRequestAndRecordsLinkTable() async {
+    // Relay knows dest D directly (nextHop == D). Inbound HEADER_2 LINKREQUEST, transport_id == R.
+    let (store, relay, destHash, outIf) = await relayStoreKnowingDestDirectly()
+    store.exhaustivity = .off
+    let payload = Data(repeating: 0x11, count: 64) + Data([0x00, 0x00, 0x00])   // ephemeral(64) + signalling(3)
+    let lr = makeHeader2LinkRequestPacket(transportId: relay.hash, destHash: destHash, hops: 0, payload: payload)
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.received(InterfaceID("in"), lr))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, r)) = action { captured.setValue((i, r)); return true }
+        return false
+    }
+    // A linkTable entry keyed by the LINKREQUEST's link_id, rcvdIf = arrival, nhIf = toward dest.
+    let linkID = Link.linkID(requestPacket: Packet(raw: lr)!)
+    #expect(store.state.linkTable[linkID]?.rcvdIf == InterfaceID("in"))
+    #expect(store.state.linkTable[linkID]?.nhIf == outIf)
+    // Forwarded HEADER_1 LINKREQUEST toward the dest, on outIf.
+    #expect(captured.value?.0 == outIf)
+    let f = Packet(raw: captured.value!.1)!
+    #expect(f.headerType == .header1)
+    #expect(f.packetType == .linkRequest)
+    #expect(f.destinationHash == destHash)
+    #expect(Link.linkID(requestPacket: f) == linkID)     // same link_id after the rewrite
+}
+
+@Test @MainActor func dataForwardStillWorksAfterHelperExtraction() async {
+    // Regression: the .data forward (refactored to use forwardTowardDest) still produces the same bytes.
+    let (store, relay, destHash, outIf) = await relayStoreKnowingDestDirectly()
+    let inbound = makeHeader2DataPacket(transportId: relay.hash, destHash: destHash, hops: 1,
+                                        payload: Data([1, 2, 3]))
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.received(InterfaceID("in"), inbound))
+    await store.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action { captured.setValue((ifID, raw)); return true }
+        return false
+    }
+    // Must still be a HEADER_1 final-hop forward with hops+1 and payload verbatim.
+    #expect(captured.value?.0 == outIf)
+    let f = Packet(raw: captured.value!.1)!
+    #expect(f.headerType == .header1)
+    #expect(f.transportType == .broadcast)
+    #expect(f.transportId == nil)
+    #expect(f.hops == 2)
+    #expect(f.destinationHash == destHash)
+    #expect(f.payload == Data([1, 2, 3]))
+}
+
 @Test @MainActor func threeNodeRelayDeliversMessageEndToEnd() async {
     // A[ar], R[ar,rb] relay, B[rb]. Hand-pump .transmit frames between them.
     // B registers D (with private key so B can decrypt), announces D.
