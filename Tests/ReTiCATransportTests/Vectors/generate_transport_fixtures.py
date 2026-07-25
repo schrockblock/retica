@@ -96,4 +96,6 @@ print(json.dumps({
     "rb_announce2": _rb_ann2,
     "rb_blob2": _rb_blob2,
     "pathfinder_rw": RNS.Transport.PATHFINDER_RW,
+    "local_rebroadcasts_max": RNS.Transport.LOCAL_REBROADCASTS_MAX,
+    "pathfinder_g": RNS.Transport.PATHFINDER_G,
 }, indent=2))

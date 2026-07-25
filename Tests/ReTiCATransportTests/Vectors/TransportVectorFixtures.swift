@@ -27,6 +27,8 @@ struct TransportVectorFixtures: Decodable {
     let rbAnnounce2: String
     let rbBlob2: String
     let pathfinderRw: Double
+    let localRebroadcastsMax: Int
+    let pathfinderG: Double
 
     enum CodingKeys: String, CodingKey {
         case announceDestHash = "announce_dest_hash"
@@ -54,6 +56,8 @@ struct TransportVectorFixtures: Decodable {
         case rbAnnounce2 = "rb_announce2"
         case rbBlob2 = "rb_blob2"
         case pathfinderRw = "pathfinder_rw"
+        case localRebroadcastsMax = "local_rebroadcasts_max"
+        case pathfinderG = "pathfinder_g"
     }
 
     static func load() throws -> TransportVectorFixtures {

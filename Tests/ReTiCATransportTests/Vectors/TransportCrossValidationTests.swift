@@ -65,3 +65,10 @@ import ComposableArchitecture
     #expect(maxDelay < Transport.announceRebroadcastWindow)
     #expect(maxDelay >= 0)
 }
+
+/// Our announce retry constants match RNS's LOCAL_REBROADCASTS_MAX and PATHFINDER_G.
+@Test func announceRetryConstantsMatchRns() throws {
+    let f = try TransportVectorFixtures.load()
+    #expect(Transport.announceMaxRebroadcasts == f.localRebroadcastsMax)
+    #expect(Transport.announceRetryGrace == f.pathfinderG)
+}
