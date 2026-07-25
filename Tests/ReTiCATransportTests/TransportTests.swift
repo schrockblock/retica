@@ -1480,3 +1480,118 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     #expect(store.state.announceTable[destHash] == nil)
 }
+
+// MARK: - 4b-3b-3 collaborative announce suppression
+
+/// Build a HEADER_2 "re-broadcast" of a HEADER_1 announce `originalRaw`, with the SAME payload
+/// (→ same random_hash → same blob, i.e. a replay) at a chosen hop count and a peer transport_id.
+private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
+    let orig = Packet(raw: originalRaw)!
+    let p = Packet(headerType: .header2, packetType: .announce, transportType: .transport,
+                   destinationType: orig.destinationType, context: orig.context,
+                   contextFlag: orig.contextFlag, hops: hops,
+                   destinationHash: orig.destinationHash,
+                   transportId: Data(repeating: 0x99, count: 16), payload: orig.payload)
+    return try! p.packed()
+}
+
+/// After our first send (retry pending), two peer re-broadcasts (hops == rebroadcastHops) reach the
+/// cap and cancel the pending retry.
+@Test @MainActor func peerRebroadcastsCancelPendingRetryAtCap() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)   // arrival 2 → rebroadcastHops 3
+    let store = await makeTimedRelayStore(Identity(), clock, jitterByte: 128)
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await clock.advance(by: .seconds(0.25))              // send #1 → rebroadcasts=1, retry pending
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)
+    #expect(store.state.announceTable[destHash]?.rebroadcastHops == 3)
+    // Peer re-broadcast #1: counts, no cancel.
+    await store.send(.received(InterfaceID("i0"), peerRebroadcast(of: raw, hops: 3)))
+    #expect(store.state.announceTable[destHash]?.localRebroadcasts == 1)
+    #expect(store.state.announceTable[destHash] != nil)
+    // Peer re-broadcast #2: reaches the cap (2) → cancel the retry.
+    await store.send(.received(InterfaceID("i0"), peerRebroadcast(of: raw, hops: 3)))
+    #expect(store.state.announceTable[destHash] == nil)
+    // Retry was cancelled: advancing past the grace fires nothing.
+    await clock.advance(by: .seconds(5.5))
+    #expect(store.state.announceTable[destHash] == nil)
+}
+
+/// A downstream re-broadcast (hops == rebroadcastHops + 1) cancels the pending retry immediately.
+@Test @MainActor func downstreamRebroadcastCancelsPendingRetry() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeTimedRelayStore(Identity(), clock, jitterByte: 128)
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    // hops == rebroadcastHops + 1 == 4 → cancel.
+    await store.send(.received(InterfaceID("i0"), peerRebroadcast(of: raw, hops: 4)))
+    #expect(store.state.announceTable[destHash] == nil)
+    await clock.advance(by: .seconds(5.5))
+    #expect(store.state.announceTable[destHash] == nil)
+}
+
+/// Peer re-broadcasts BEFORE the first send (initial jitter window, rebroadcasts==0) count but do
+/// NOT cancel — the initial send is never suppressed.
+@Test @MainActor func peerRebroadcastsBeforeFirstSendDoNotCancel() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeTimedRelayStore(Identity(), clock, jitterByte: 128)
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 0)   // holding the initial send
+    await store.send(.received(InterfaceID("i0"), peerRebroadcast(of: raw, hops: 3)))
+    await store.send(.received(InterfaceID("i0"), peerRebroadcast(of: raw, hops: 3)))
+    #expect(store.state.announceTable[destHash]?.localRebroadcasts == 2)
+    #expect(store.state.announceTable[destHash] != nil)              // NOT cancelled (rebroadcasts==0)
+    // Initial send still fires; drain both sends of the (un-suppressed) lifecycle.
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // send #1
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)
+    await clock.advance(by: .seconds(5.5))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry (send #2)
+}
+
+/// A same-blob HEADER_2 replay whose hops match neither rebroadcastHops nor +1 leaves the pending
+/// retry untouched.
+@Test @MainActor func nonMatchingHopsReplayDoesNotSuppress() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeTimedRelayStore(Identity(), clock, jitterByte: 128)
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.send(.received(InterfaceID("i0"), peerRebroadcast(of: raw, hops: 7)))   // neither 3 nor 4
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)
+    #expect(store.state.announceTable[destHash]?.localRebroadcasts == 0)
+    await clock.advance(by: .seconds(5.5))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry still fires
+}
+
+/// A HEADER_1 replay (transport_id == nil) is not a relay re-broadcast → no suppression, no count.
+@Test @MainActor func header1ReplayDoesNotSuppress() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeTimedRelayStore(Identity(), clock, jitterByte: 128)
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    // Same-blob HEADER_1 replay at hops == rebroadcastHops: transportId nil → not counted.
+    let orig = Packet(raw: raw)!
+    let h1 = try! Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
+                         destinationType: orig.destinationType, context: orig.context,
+                         contextFlag: orig.contextFlag, hops: 3,
+                         destinationHash: orig.destinationHash, transportId: nil,
+                         payload: orig.payload).packed()
+    await store.send(.received(InterfaceID("i0"), h1))
+    #expect(store.state.announceTable[destHash]?.localRebroadcasts == 0)
+    #expect(store.state.announceTable[destHash] != nil)
+    await clock.advance(by: .seconds(5.5))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry still fires
+}

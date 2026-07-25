@@ -24,8 +24,13 @@ public struct Transport {
             public var raw: Data
             public var arrivalInterface: InterfaceID
             public var rebroadcasts: Int
-            public init(raw: Data, arrivalInterface: InterfaceID, rebroadcasts: Int = 0) {
-                self.raw = raw; self.arrivalInterface = arrivalInterface; self.rebroadcasts = rebroadcasts
+            public var rebroadcastHops: UInt8     // hops our re-broadcast carries (= arrival packet.hops + 1)
+            public var localRebroadcasts: Int     // heard peer re-broadcasts (RNS IDX_AT_LCL_RBRD)
+            public init(raw: Data, arrivalInterface: InterfaceID, rebroadcastHops: UInt8,
+                        rebroadcasts: Int = 0, localRebroadcasts: Int = 0) {
+                self.raw = raw; self.arrivalInterface = arrivalInterface
+                self.rebroadcastHops = rebroadcastHops
+                self.rebroadcasts = rebroadcasts; self.localRebroadcasts = localRebroadcasts
             }
         }
         /// Fresh announces held for a jittered re-broadcast, keyed by destinationHash (4b-3b-1).
@@ -162,7 +167,29 @@ public struct Transport {
                     // Do NOT narrow this to RNS's should_add gating: that would weaken anti-replay.
                     var ring = state.announceBlobs[packet.destinationHash]
                         ?? RingSet(capacity: Transport.announceBlobRingSize)
-                    guard ring.insert(parsed.randomHash) else { return .none }
+                    guard ring.insert(parsed.randomHash) else {
+                        // REPLAY. A peer/downstream re-broadcast of an announce we are holding is a
+                        // same-blob replay. Collaborative suppression: cancel our pending RETRY once
+                        // neighbours have propagated it (RNS Transport.py:1774-1791).
+                        guard var entry = state.announceTable[packet.destinationHash],
+                              packet.transportId != nil    // HEADER_2 re-broadcast (RNS transport_id != None)
+                        else { return .none }
+                        if packet.hops == entry.rebroadcastHops {           // a peer re-broadcast
+                            entry.localRebroadcasts += 1                     // count always (RNS increments unconditionally)
+                            if entry.rebroadcasts >= 1,                      // a retry is pending (RNS IDX_AT_RETRIES > 0)
+                               entry.localRebroadcasts >= Transport.announceMaxRebroadcasts {
+                                state.announceTable[packet.destinationHash] = nil
+                                return .cancel(id: CancelID.announceRetransmit(packet.destinationHash))
+                            }
+                            state.announceTable[packet.destinationHash] = entry
+                            return .none
+                        }
+                        if packet.hops == entry.rebroadcastHops + 1, entry.rebroadcasts >= 1 {  // passed on downstream
+                            state.announceTable[packet.destinationHash] = nil
+                            return .cancel(id: CancelID.announceRetransmit(packet.destinationHash))
+                        }
+                        return .none
+                    }
                     state.announceBlobs[packet.destinationHash] = ring
 
                     let emitted = Transport.announceEmitted(parsed.randomHash)
@@ -194,7 +221,8 @@ public struct Transport {
                         if let rebroadcastRaw = try? rebroadcast.packed() {
                             let destHash = packet.destinationHash
                             state.announceTable[destHash] = State.PendingAnnounce(
-                                raw: rebroadcastRaw, arrivalInterface: interfaceID)
+                                raw: rebroadcastRaw, arrivalInterface: interfaceID,
+                                rebroadcastHops: packet.hops + 1)
                             let jitter = Transport.announceJitter(randomBytes(1).first ?? 0)
                             effects.append(.run { send in
                                 try await clock.sleep(for: .seconds(jitter))
