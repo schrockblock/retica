@@ -249,8 +249,9 @@ public struct Transport {
                     return sends.isEmpty ? .none : .merge(sends)
                 }
                 state.announceTable[destinationHash] = entry            // keep for the next retry
-                let delay = Transport.announceRetryGrace
-                    + Transport.announceJitter(randomBytes(1).first ?? 0)
+                // Retry delay is a FIXED PATHFINDER_G + PATHFINDER_RW (RNS Transport.py:603 adds the
+                // constants, not a rand()*window draw). Only the initial send is jittered.
+                let delay = Transport.announceRetryGrace + Transport.announceRebroadcastWindow
                 let retry = Effect<Action>.run { send in
                     try await clock.sleep(for: .seconds(delay))
                     await send(.announceRetransmitDue(destinationHash: destinationHash))

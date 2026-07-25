@@ -24,10 +24,12 @@ link. Without retries, a single dropped re-broadcast silently truncates propagat
 ## Goal
 
 Turn 4b-3b-1's single send into RNS's bounded retry lifecycle: **2 total re-broadcasts** per fresh
-announce — the initial one after jitter `∈ [0, PATHFINDER_RW)`, then one retry after
-`PATHFINDER_G + PATHFINDER_RW` (grace + fresh jitter) — capped by `LOCAL_REBROADCASTS_MAX`. Each
-re-broadcast is byte-identical (the same held `raw`). Path learning, blob-dedup, and the jitter
-window are all unchanged. Constants cross-validated against genuine RNS.
+announce — the initial one after jitter `∈ [0, PATHFINDER_RW)`, then one retry after a **fixed**
+`PATHFINDER_G + PATHFINDER_RW` (= 5.0 + 0.5 = 5.5s) — capped by `LOCAL_REBROADCASTS_MAX`. (RNS
+`Transport.py:603` adds the two *constants* for the retry timeout — it is NOT a `rand()*PATHFINDER_RW`
+draw; only the *initial* send is jittered, `Transport.py:1925`.) Each re-broadcast is byte-identical
+(the same held `raw`). Path learning, blob-dedup, and the jitter window are all unchanged. Constants
+cross-validated against genuine RNS.
 
 ## Scope
 
@@ -93,7 +95,8 @@ case let .announceRetransmitDue(destinationHash):
         return sends.isEmpty ? .none : .merge(sends)
     }
     state.announceTable[destinationHash] = entry            // keep for the next retry
-    let delay = Transport.announceRetryGrace + Transport.announceJitter(randomBytes(1).first ?? 0)
+    // Fixed PATHFINDER_G + PATHFINDER_RW (RNS Transport.py:603 adds the constants; no rand draw).
+    let delay = Transport.announceRetryGrace + Transport.announceRebroadcastWindow
     let retry = Effect<Action>.run { send in
         try await clock.sleep(for: .seconds(delay))
         await send(.announceRetransmitDue(destinationHash: destinationHash))

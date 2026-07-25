@@ -1320,7 +1320,7 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     #expect(rb.headerType == .header2)
     #expect(rb.transportId == relay.hash)
     #expect(Int(rb.hops) == 3)
-    await clock.advance(by: .seconds(5.25))               // grace(5) + jitter(0.25) → fire send #2
+    await clock.advance(by: .seconds(5.5))                // grace(5) + window(0.5) fixed → fire send #2
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     #expect(store.state.announceTable[destHash] == nil)   // lifecycle complete at the cap
 }
@@ -1337,7 +1337,7 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     await clock.advance(by: .seconds(0.01))               // 0.50s > 0.498 → fired send #1
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)  // retained for retry
-    await clock.advance(by: .seconds(5.498))              // grace(5) + jitter(~0.498) → fire send #2
+    await clock.advance(by: .seconds(5.5))               // grace(5) + window(0.5) fixed → fire send #2
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     #expect(store.state.announceTable[destHash] == nil)   // lifecycle complete at the cap
 }
@@ -1366,7 +1366,7 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     }
     #expect(Packet(raw: out.value!)!.payload == Packet(raw: a2)!.payload)   // newer superseded
     #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)         // retained for retry
-    await clock.advance(by: .seconds(5.25))               // grace(5) + jitter(0.25) → retry
+    await clock.advance(by: .seconds(5.5))                // grace(5) + window(0.5) fixed → retry
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     #expect(store.state.announceTable[destHash] == nil)   // lifecycle complete at the cap
 }
@@ -1420,7 +1420,7 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     let relay = Identity()
     let clock = TestClock()
     let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
-    let store = await makeTimedRelayStore(relay, clock, jitterByte: 128)   // jitter 0.25; retry 5.25
+    let store = await makeTimedRelayStore(relay, clock, jitterByte: 128)   // jitter 0.25; retry 5.5 fixed
     await store.send(.received(InterfaceID("i0"), raw))
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
     #expect(store.state.announceTable[destHash]?.rebroadcasts == 0)
@@ -1433,7 +1433,7 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     }
     #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)   // retained, one send done
 
-    await clock.advance(by: .seconds(5.25))                    // grace(5) + jitter(0.25) → send #2
+    await clock.advance(by: .seconds(5.5))                     // grace(5) + window(0.5) fixed → send #2
     let second = LockIsolated<Data?>(nil)
     await store.receive { action in
         if case let .delegate(.transmit(_, d)) = action { second.setValue(d); return true }
@@ -1442,7 +1442,7 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     #expect(second.value == first.value)                       // identical held bytes
     #expect(store.state.announceTable[destHash] == nil)        // lifecycle complete at the cap
 
-    await clock.advance(by: .seconds(5.25))                    // no third send scheduled
+    await clock.advance(by: .seconds(5.5))                     // no third send scheduled
     #expect(store.state.announceTable[destHash] == nil)
 }
 
@@ -1464,7 +1464,7 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)
 
-    // Supersede during the grace window (before a1's retry at +5.25).
+    // Supersede during the grace window (before a1's retry at +5.5).
     await store.send(.received(InterfaceID("i0"), a2))
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
     #expect(store.state.announceTable[destHash]?.rebroadcasts == 0)          // reset by supersede
@@ -1476,7 +1476,7 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
         return false
     }
     #expect(Packet(raw: out.value!)!.payload == Packet(raw: a2)!.payload)    // newer announce won
-    await clock.advance(by: .seconds(5.25))                    // a2 retry
+    await clock.advance(by: .seconds(5.5))                     // a2 retry
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     #expect(store.state.announceTable[destHash] == nil)
 }
