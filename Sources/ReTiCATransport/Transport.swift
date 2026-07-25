@@ -194,8 +194,7 @@ public struct Transport {
                             let destHash = packet.destinationHash
                             state.announceTable[destHash] = State.PendingAnnounce(
                                 raw: rebroadcastRaw, arrivalInterface: interfaceID)
-                            let jitter = Double(randomBytes(1).first ?? 0) / 256.0
-                                * Transport.announceRebroadcastWindow
+                            let jitter = Transport.announceJitter(randomBytes(1).first ?? 0)
                             effects.append(.run { send in
                                 try await clock.sleep(for: .seconds(jitter))
                                 await send(.announceRetransmitDue(destinationHash: destHash))
@@ -293,6 +292,12 @@ public struct Transport {
     static let announceBlobRingSize = 64
     /// RNS PATHFINDER_RW (Transport.py:70): the random window for an announce re-broadcast, seconds.
     static let announceRebroadcastWindow = 0.5
+
+    /// Jitter delay for an announce re-broadcast: `byte/256` of the window — the deterministic
+    /// analogue of RNS's `rand() * PATHFINDER_RW` (Transport.py:1925). Always in `[0, window)`.
+    static func announceJitter(_ byte: UInt8) -> Double {
+        Double(byte) / 256.0 * announceRebroadcastWindow
+    }
 
     /// Emission time from an announce's random hash: big-endian of `randomHash[5..<10]`.
     static func announceEmitted(_ randomHash: Data) -> UInt64 {

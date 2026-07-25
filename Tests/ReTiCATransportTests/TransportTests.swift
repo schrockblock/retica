@@ -1386,3 +1386,13 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
     #expect(store.state.announceTable[destHash] == nil)  // no other interface → not held
 }
+
+/// The jitter formula maps a random byte to `byte/256` of the window, always within `[0, window)`.
+/// Pins the exact delay value directly (the clock/async tests can only observe that *a* delay
+/// elapsed, not the precise fraction).
+@Test func announceJitterMapsByteToWindowFraction() {
+    #expect(Transport.announceJitter(0) == 0.0)
+    #expect(Transport.announceJitter(128) == 0.25)                                  // 128/256 * 0.5
+    #expect(Transport.announceJitter(255) == Double(255) / 256.0 * 0.5)
+    #expect(Transport.announceJitter(255) < Transport.announceRebroadcastWindow)    // strictly inside
+}
