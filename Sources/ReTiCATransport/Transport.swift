@@ -140,6 +140,11 @@ public struct Transport {
                     else { return .none }
                     // Anti-replay: a previously-seen random-blob for this destination is a replay.
                     // RingSet.insert both tests and records; false → already present → drop.
+                    // NOTE: we record the blob for EVERY fresh announce here. RNS only appends the
+                    // blob inside its `should_add` path-adopt branch (Transport.py:1934-1936); we
+                    // remember more eagerly on purpose — a strict superset of RNS's anti-replay
+                    // memory (never drops a fresh announce RNS keeps, never keeps a replay RNS drops).
+                    // Do NOT narrow this to RNS's should_add gating: that would weaken anti-replay.
                     var ring = state.announceBlobs[packet.destinationHash]
                         ?? RingSet(capacity: Transport.announceBlobRingSize)
                     guard ring.insert(parsed.randomHash) else { return .none }
