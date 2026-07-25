@@ -359,6 +359,7 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, D
     let relay = Identity()
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = ImmediateClock()
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i0")))
@@ -907,6 +908,7 @@ private func makeHeader2LinkRequestPacket(transportId: Data, destHash: Data, hop
     // Node R: relay with both interfaces.
     let storeR = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = ImmediateClock()
     }
     storeR.exhaustivity = .off
     await storeR.send(.interfaceConnected(ifAR))
@@ -1137,6 +1139,7 @@ private func relayHostingLinkTableEntry(rcvdIf: String, nhIf: String)
 private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.State, Transport.Action> {
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = ImmediateClock()
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i0")))
@@ -1265,4 +1268,121 @@ private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.Stat
     await store.send(.received(InterfaceID("i0"), raw))
     #expect(store.state.announceBlobs[dest.hash] == nil) // not blob-tracked
     store.exhaustivity = .on                             // no re-broadcast/pathLearned
+}
+
+// MARK: - 4b-3b-1 jittered delayed re-broadcast
+
+/// A relay with two interfaces and a controllable clock/jitter.
+@MainActor
+private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>, jitterByte: UInt8)
+    async -> TestStore<Transport.State, Transport.Action> {
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = clock
+        $0.randomBytes = RandomBytesGenerator { _ in Data([jitterByte]) }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))
+    return store
+}
+
+/// A fresh announce learns the path immediately but re-broadcasts only after the jitter elapses,
+/// to every interface except the arrival one, with the 4b-1 HEADER_2 bytes.
+@Test @MainActor func freshAnnounceRebroadcastIsDeferredUntilJitterElapses() async {
+    let relay = Identity()
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeTimedRelayStore(relay, clock, jitterByte: 128)   // 128/256 * 0.5 = 0.25s
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    // Path learned + held, but NOT yet re-broadcast.
+    #expect(store.state.learned[destHash] != nil)
+    #expect(store.state.announceTable[destHash] != nil)
+    await clock.advance(by: .seconds(0.24))
+    #expect(store.state.announceTable[destHash] != nil)   // still holding, just before deadline
+    await clock.advance(by: .seconds(0.01))               // reach 0.25s → fire
+    let out = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.receive { action in
+        if case let .delegate(.transmit(i, d)) = action { out.setValue((i, d)); return true }
+        return false
+    }
+    #expect(out.value?.0 == InterfaceID("i1"))            // to the OTHER interface only
+    #expect(store.state.announceTable[destHash] == nil)   // entry removed after the single send
+    let rb = Packet(raw: out.value!.1)!
+    #expect(rb.headerType == .header2)
+    #expect(rb.transportId == relay.hash)
+    #expect(Int(rb.hops) == 3)
+}
+
+/// The maximum jitter byte still yields a delay strictly inside the window (< PATHFINDER_RW).
+@Test @MainActor func maxJitterByteStaysWithinWindow() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeTimedRelayStore(Identity(), clock, jitterByte: 255)  // 255/256*0.5 ≈ 0.498s
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await clock.advance(by: .seconds(0.49))
+    #expect(store.state.announceTable[destHash] != nil)   // not yet (~0.498s)
+    await clock.advance(by: .seconds(0.01))               // 0.50s > 0.498 → fired (delay < window)
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceTable[destHash] == nil)
+}
+
+/// A second fresh announce for the same destination within the window supersedes the first: the
+/// single re-broadcast carries the newer announce's payload.
+@Test @MainActor func secondFreshAnnounceSupersedesPendingRebroadcast() async {
+    let id = Identity()
+    let clock = TestClock()
+    let (a1, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["s"], hops: 2,
+                                            emitted: 1000, appData: Data("AAA".utf8),
+                                            randomPrefix: Data([1, 0, 0, 0, 0]))
+    let (a2, _)        = makeAnnouncePacket(identity: id, appName: "app", aspects: ["s"], hops: 2,
+                                            emitted: 2000, appData: Data("BBB".utf8),
+                                            randomPrefix: Data([2, 0, 0, 0, 0]))
+    let store = await makeTimedRelayStore(id, clock, jitterByte: 128)
+    await store.send(.received(InterfaceID("i0"), a1))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await store.send(.received(InterfaceID("i0"), a2))    // newer → replaces the held entry, re-arms
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    let out = LockIsolated<Data?>(nil)
+    await store.receive { action in
+        if case let .delegate(.transmit(_, d)) = action { out.setValue(d); return true }
+        return false
+    }
+    #expect(Packet(raw: out.value!)!.payload == Packet(raw: a2)!.payload)   // newer superseded
+    #expect(store.state.announceTable[destHash] == nil)
+}
+
+/// A non-relay node never holds or re-broadcasts an announce.
+@Test @MainActor func nonRelayNodeDoesNotScheduleRebroadcast() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    // No setTransportIdentity → leaf.
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.announceTable.isEmpty)            // nothing held
+}
+
+/// A relay with only one interface has nowhere to re-broadcast, so it schedules nothing.
+@Test @MainActor func singleInterfaceRelayDoesNotSchedule() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("only")))
+    await store.send(.setTransportIdentity(Identity()))
+    await store.send(.received(InterfaceID("only"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.announceTable[destHash] == nil)  // no other interface → not held
 }

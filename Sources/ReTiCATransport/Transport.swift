@@ -20,6 +20,15 @@ public struct Transport {
         /// (RNS Transport.py:1824 `not random_blob in random_blobs`). Bounded to
         /// `announceBlobRingSize` per destination (RNS MAX_RANDOM_BLOBS).
         public var announceBlobs: [Data: RingSet] = [:]
+        public struct PendingAnnounce: Equatable, Sendable {
+            public var raw: Data
+            public var arrivalInterface: InterfaceID
+            public init(raw: Data, arrivalInterface: InterfaceID) {
+                self.raw = raw; self.arrivalInterface = arrivalInterface
+            }
+        }
+        /// Fresh announces held for a jittered re-broadcast, keyed by destinationHash (4b-3b-1).
+        public var announceTable: [Data: PendingAnnounce] = [:]
         public init() {}
 
         public struct LinkTableEntry: Equatable, Sendable {
@@ -42,6 +51,7 @@ public struct Transport {
         case received(InterfaceID, Data)
         case announce(destinationHash: Data, appData: Data?)
         case send(destinationHash: Data, plaintext: Data)
+        case announceRetransmitDue(destinationHash: Data)
         case delegate(Delegate)
 
         @CasePathable
@@ -56,11 +66,15 @@ public struct Transport {
     }
 
     @Dependency(\.date) var date
+    @Dependency(\.continuousClock) var clock
+    @Dependency(\.randomBytes) var randomBytes
+
+    private enum CancelID: Hashable { case announceRetransmit(Data) }
 
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { state, action in
+        Reduce { [clock, randomBytes] state, action in
             // Shared helper: rewrite a packet for forwarding toward its destination.
             // Final hop (nextHop == destHash) → HEADER_1 direct; onward → HEADER_2 to next hop.
             func forwardTowardDest(_ packet: Packet, _ entry: LearnedDestination) -> Data? {
@@ -164,10 +178,12 @@ public struct Transport {
                         effects.append(.send(.delegate(.pathLearned(
                             destinationHash: packet.destinationHash, hops: packet.hops))))
                     }
-                    // Relay mode: re-broadcast EVERY fresh announce (not just path-improving ones),
-                    // subject to the hop limit — same HEADER_2 packet as 4b-1, payload verbatim.
+                    // Relay mode: instead of re-broadcasting now, HOLD this fresh announce and
+                    // re-broadcast it once after a jittered delay in [0, PATHFINDER_RW) — RNS
+                    // Transport.py:1925. Only schedule when there is somewhere to send it.
                     if let relayID = state.transportIdentity,
-                       Int(packet.hops) + 1 < Int(Packet.maxHops) {
+                       Int(packet.hops) + 1 < Int(Packet.maxHops),
+                       state.interfaces.contains(where: { $0 != interfaceID }) {
                         let rebroadcast = Packet(
                             headerType: .header2, packetType: .announce, transportType: .transport,
                             destinationType: packet.destinationType, context: packet.context,
@@ -175,9 +191,15 @@ public struct Transport {
                             destinationHash: packet.destinationHash, transportId: relayID.hash,
                             payload: packet.payload)
                         if let rebroadcastRaw = try? rebroadcast.packed() {
-                            effects.append(contentsOf: state.interfaces
-                                .filter { $0 != interfaceID }
-                                .map { Effect<Action>.send(.delegate(.transmit($0, rebroadcastRaw))) })
+                            let destHash = packet.destinationHash
+                            state.announceTable[destHash] = State.PendingAnnounce(
+                                raw: rebroadcastRaw, arrivalInterface: interfaceID)
+                            let jitter = Double(randomBytes(1).first ?? 0) / 256.0
+                                * Transport.announceRebroadcastWindow
+                            effects.append(.run { send in
+                                try await clock.sleep(for: .seconds(jitter))
+                                await send(.announceRetransmitDue(destinationHash: destHash))
+                            }.cancellable(id: CancelID.announceRetransmit(destHash), cancelInFlight: true))
                         }
                     }
                     return effects.isEmpty ? .none : .merge(effects)
@@ -215,6 +237,14 @@ public struct Transport {
                 default:
                     return .none
                 }
+
+            case let .announceRetransmitDue(destinationHash):
+                guard let entry = state.announceTable[destinationHash] else { return .none }
+                state.announceTable[destinationHash] = nil
+                let sends = state.interfaces
+                    .filter { $0 != entry.arrivalInterface }
+                    .map { Effect<Action>.send(.delegate(.transmit($0, entry.raw))) }
+                return sends.isEmpty ? .none : .merge(sends)
 
             case let .send(destinationHash, plaintext):
                 guard let entry = state.learned[destinationHash] else {
@@ -261,6 +291,8 @@ public struct Transport {
 
     /// Per-destination announce random-blob memory size (RNS Transport.MAX_RANDOM_BLOBS, Transport.py:98).
     static let announceBlobRingSize = 64
+    /// RNS PATHFINDER_RW (Transport.py:70): the random window for an announce re-broadcast, seconds.
+    static let announceRebroadcastWindow = 0.5
 
     /// Emission time from an announce's random hash: big-endian of `randomHash[5..<10]`.
     static func announceEmitted(_ randomHash: Data) -> UInt64 {

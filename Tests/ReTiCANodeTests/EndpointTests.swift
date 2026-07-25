@@ -1438,6 +1438,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     // Node R: relay Transport with both interfaces.
     let storeR = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = ImmediateClock()
     }
     storeR.exhaustivity = .off
     await storeR.send(.interfaceConnected(ifAR))

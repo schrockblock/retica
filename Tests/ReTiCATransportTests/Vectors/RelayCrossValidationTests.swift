@@ -15,6 +15,7 @@ import ComposableArchitecture
 
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = ImmediateClock()
     }
     store.exhaustivity = .off
 
