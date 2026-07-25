@@ -57,6 +57,25 @@ _seg2 = Resource(_seg1.input_file, _link, advertise=False, auto_compress=False,
 _a1, _a2 = ResourceAdvertisement(_seg1), ResourceAdvertisement(_seg2)
 RNS.Packet = _RealPacket                # restore
 
+# --- 4b-3a: announce random-blob anti-replay cross-validation ---
+# Two GENUINE announces for the SAME destination with distinct random_hashes. For each, also emit
+# the random_blob RNS itself would extract (Transport.py:1807) so the Swift side can assert its
+# parsed randomHash byte-equals RNS's key.
+_KS = RNS.Identity.KEYSIZE // 8
+_NH = RNS.Identity.NAME_HASH_LENGTH // 8
+def _build_announce(rnd_hash, hops_):
+    signed_ = dest_hash + identity.get_public_key() + name_hash + rnd_hash + ratchet + app_data
+    sig_ = identity.sign(signed_)
+    payload_ = identity.get_public_key() + name_hash + rnd_hash + ratchet + sig_ + app_data
+    packet_ = bytes([flags, hops_]) + dest_hash + bytes([0x00]) + payload_
+    blob_ = payload_[_KS + _NH : _KS + _NH + 10]   # RNS Transport.py:1807 slice of packet.data
+    return packet_.hex(), blob_.hex()
+
+_rh1 = RNS.Identity.get_random_hash()[:5] + int(time.time()).to_bytes(5, "big")
+_rh2 = RNS.Identity.get_random_hash()[:5] + (int(time.time()) + 1).to_bytes(5, "big")  # newer
+_rb_ann1, _rb_blob1 = _build_announce(_rh1, 2)
+_rb_ann2, _rb_blob2 = _build_announce(_rh2, 2)
+
 print(json.dumps({
     "announce_dest_hash": dest_hash.hex(),
     "announce_identity_hash": identity.hash.hex(),
@@ -72,4 +91,8 @@ print(json.dumps({
     "ms_seg2_adv": _a2.pack().hex(),
     "ms_seg1_i": _a1.i, "ms_seg1_l": _a1.l, "ms_seg1_o": _a1.o.hex(), "ms_seg1_d": _a1.d, "ms_seg1_f": _a1.f,
     "ms_seg2_i": _a2.i, "ms_seg2_o": _a2.o.hex(), "ms_seg2_f": _a2.f,
+    "rb_announce1": _rb_ann1,
+    "rb_blob1": _rb_blob1,
+    "rb_announce2": _rb_ann2,
+    "rb_blob2": _rb_blob2,
 }, indent=2))

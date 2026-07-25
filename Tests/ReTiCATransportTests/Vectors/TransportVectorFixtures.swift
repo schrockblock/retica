@@ -22,6 +22,10 @@ struct TransportVectorFixtures: Decodable {
     let msSeg2I: Int
     let msSeg2O: String
     let msSeg2F: Int
+    let rbAnnounce1: String
+    let rbBlob1: String
+    let rbAnnounce2: String
+    let rbBlob2: String
 
     enum CodingKeys: String, CodingKey {
         case announceDestHash = "announce_dest_hash"
@@ -44,6 +48,10 @@ struct TransportVectorFixtures: Decodable {
         case msSeg2I = "ms_seg2_i"
         case msSeg2O = "ms_seg2_o"
         case msSeg2F = "ms_seg2_f"
+        case rbAnnounce1 = "rb_announce1"
+        case rbBlob1 = "rb_blob1"
+        case rbAnnounce2 = "rb_announce2"
+        case rbBlob2 = "rb_blob2"
     }
 
     static func load() throws -> TransportVectorFixtures {
