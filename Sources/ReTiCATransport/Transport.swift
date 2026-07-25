@@ -15,6 +15,11 @@ public struct Transport {
         public var transportIdentity: Identity? = nil
         var seenPacketHashes = RingSet()
         public var linkTable: [Data: LinkTableEntry] = [:]
+        /// Per-destination ring of recently-seen announce random-blobs (the 10-byte announce
+        /// random_hash). Replaces packetHash dedup for announces: a repeated blob is a replay
+        /// (RNS Transport.py:1824 `not random_blob in random_blobs`). Bounded to
+        /// `announceBlobRingSize` per destination (RNS MAX_RANDOM_BLOBS).
+        public var announceBlobs: [Data: RingSet] = [:]
         public init() {}
 
         public struct LinkTableEntry: Equatable, Sendable {
@@ -116,13 +121,14 @@ public struct Transport {
                 if packet.packetType == .linkRequest, state.localDestinations[packet.destinationHash] != nil {
                     return .send(.delegate(.linkRequest(destinationHash: packet.destinationHash, data: data)))
                 }
-                // NOTE (relay, 4b): packetHash is over `hashablePart`, which EXCLUDES hops and
-                // transport_id — so a relayed announce shares the ORIGINAL's packet hash. A node
-                // that already heard the original therefore drops the relayed copy here. That is
-                // loop-protective (safe for 4b-1's re-broadcast), but means a relay-improved path
-                // is not adopted for an already-seen announce. 4b-3's random-blob anti-replay
-                // (keyed on the announce random_hash + transport_id, like RNS) is where that is fixed.
-                guard state.seenPacketHashes.insert(packet.packetHash) else { return .none }
+                // Announces are deduped by per-destination random-blob (in the `.announce` case
+                // below), NOT by packetHash: keying on the unforgeable-per-announce random_hash
+                // prevents replays that mutate non-blob bytes (appData/signature/hops/transport_id)
+                // from bypassing dedup, and matches RNS (Transport.py:1807/1824). Non-announce
+                // packets keep packetHash dedup for loop protection.
+                if packet.packetType != .announce {
+                    guard state.seenPacketHashes.insert(packet.packetHash) else { return .none }
+                }
 
                 switch packet.packetType {
                 case .announce:
@@ -132,6 +138,13 @@ public struct Transport {
                                                       destinationHash: packet.destinationHash,
                                                       contextFlagSet: packet.contextFlag)
                     else { return .none }
+                    // Anti-replay: a previously-seen random-blob for this destination is a replay.
+                    // RingSet.insert both tests and records; false → already present → drop.
+                    var ring = state.announceBlobs[packet.destinationHash]
+                        ?? RingSet(capacity: Transport.announceBlobRingSize)
+                    guard ring.insert(parsed.randomHash) else { return .none }
+                    state.announceBlobs[packet.destinationHash] = ring
+
                     let emitted = Transport.announceEmitted(parsed.randomHash)
                     // Path-table next hop: relayed (HEADER_2) → its transport_id; directly heard → the dest.
                     let nextHop = packet.transportId ?? packet.destinationHash
@@ -139,27 +152,30 @@ public struct Transport {
                         identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
                         interfaceID: interfaceID, hops: packet.hops, nextHop: nextHop,
                         announceEmitted: emitted)
-                    guard Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate)
-                    else { return .none }
-                    state.learned[packet.destinationHash] = candidate
-                    let learnedEffect = Effect<Action>.send(.delegate(.pathLearned(
-                        destinationHash: packet.destinationHash, hops: packet.hops)))
-                    // Relay mode: re-broadcast the announce (same payload, HEADER_2, our transport_id,
-                    // hops+1) to every interface except the one it arrived on — but respect the hop limit.
-                    guard let relayID = state.transportIdentity,
-                          Int(packet.hops) + 1 < Int(Packet.maxHops)
-                    else { return learnedEffect }
-                    let rebroadcast = Packet(
-                        headerType: .header2, packetType: .announce, transportType: .transport,
-                        destinationType: packet.destinationType, context: packet.context,
-                        contextFlag: packet.contextFlag, hops: packet.hops + 1,
-                        destinationHash: packet.destinationHash, transportId: relayID.hash,
-                        payload: packet.payload)
-                    guard let rebroadcastRaw = try? rebroadcast.packed() else { return learnedEffect }
-                    let out = state.interfaces
-                        .filter { $0 != interfaceID }
-                        .map { Effect<Action>.send(.delegate(.transmit($0, rebroadcastRaw))) }
-                    return .merge([learnedEffect] + out)
+                    var effects: [Effect<Action>] = []
+                    // Update the path only if this fresh announce improves it (unchanged logic).
+                    if Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate) {
+                        state.learned[packet.destinationHash] = candidate
+                        effects.append(.send(.delegate(.pathLearned(
+                            destinationHash: packet.destinationHash, hops: packet.hops))))
+                    }
+                    // Relay mode: re-broadcast EVERY fresh announce (not just path-improving ones),
+                    // subject to the hop limit — same HEADER_2 packet as 4b-1, payload verbatim.
+                    if let relayID = state.transportIdentity,
+                       Int(packet.hops) + 1 < Int(Packet.maxHops) {
+                        let rebroadcast = Packet(
+                            headerType: .header2, packetType: .announce, transportType: .transport,
+                            destinationType: packet.destinationType, context: packet.context,
+                            contextFlag: packet.contextFlag, hops: packet.hops + 1,
+                            destinationHash: packet.destinationHash, transportId: relayID.hash,
+                            payload: packet.payload)
+                        if let rebroadcastRaw = try? rebroadcast.packed() {
+                            effects.append(contentsOf: state.interfaces
+                                .filter { $0 != interfaceID }
+                                .map { Effect<Action>.send(.delegate(.transmit($0, rebroadcastRaw))) })
+                        }
+                    }
+                    return effects.isEmpty ? .none : .merge(effects)
                 case .data:
                     // Relay: a HEADER_2 data packet naming us as the next hop, for a REMOTE destination,
                     // is forwarded toward the destination (nextHop-based; RNS Transport.py:1603-1614).
@@ -237,6 +253,9 @@ public struct Transport {
             }
         }
     }
+
+    /// Per-destination announce random-blob memory size (RNS Transport.MAX_RANDOM_BLOBS, Transport.py:98).
+    static let announceBlobRingSize = 64
 
     /// Emission time from an announce's random hash: big-endian of `randomHash[5..<10]`.
     static func announceEmitted(_ randomHash: Data) -> UInt64 {

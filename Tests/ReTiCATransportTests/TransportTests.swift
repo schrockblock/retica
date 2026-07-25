@@ -60,10 +60,11 @@ import ComposableArchitecture
 
 // Builds a raw ANNOUNCE packet (HEADER_1) for a synthetic identity.
 private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [String],
-                                hops: UInt8, emitted: UInt64, appData: Data? = nil) -> (Data, Data) {
+                                hops: UInt8, emitted: UInt64, appData: Data? = nil,
+                                randomPrefix: Data = Data(repeating: 0xA5, count: 5)) -> (Data, Data) {
     let nameHash = Destination.nameHash(appName: appName, aspects: aspects)
     let destHash = Destination.hash(identityHash: identity.hash, appName: appName, aspects: aspects)
-    let randomHash = Announce.randomHash(now: emitted, randomPrefix: Data(repeating: 0xA5, count: 5))
+    let randomHash = Announce.randomHash(now: emitted, randomPrefix: randomPrefix)
     let payload = Announce.buildPayload(identity: identity, destinationHash: destHash,
                                         nameHash: nameHash, randomHash: randomHash, appData: appData)
     let packet = Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
@@ -234,8 +235,12 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
 
 @Test @MainActor func recencyEqualEmissionPrefersFewerHops() async {
     let id = Identity()
-    let (farther, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 6, emitted: 300)
-    let (closer, _)         = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 2, emitted: 300)
+    // Two DISTINCT physical announces (same emission time, different random prefixes → different
+    // random-blobs, as real announces would have). Equal emission + fewer hops must still replace.
+    let (farther, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 6,
+                                                 emitted: 300, randomPrefix: Data(repeating: 0x01, count: 5))
+    let (closer, _)         = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 2,
+                                                 emitted: 300, randomPrefix: Data(repeating: 0x02, count: 5))
     let store = TestStore(initialState: Transport.State()) { Transport() }
     store.exhaustivity = .off
     await store.send(.received(InterfaceID("i1"), farther))
@@ -435,10 +440,9 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, D
 
     let sawTransmitA = LockIsolated(false)
     store.exhaustivity = .on
-    let expectedHashA = Packet(raw: localRaw)!.packetHash
-    await store.send(.received(InterfaceID("i0"), localRaw)) {
-        $0.seenPacketHashes.insert(expectedHashA)
-    }
+    // Announce packets are no longer inserted into seenPacketHashes (blob-dedup replaced it for
+    // announces). A local-dest announce returns early before the blob ring, so state is unchanged.
+    await store.send(.received(InterfaceID("i0"), localRaw))
     #expect(sawTransmitA.value == false)
 
     store.exhaustivity = .off
@@ -1124,4 +1128,141 @@ private func relayHostingLinkTableEntry(rcvdIf: String, nhIf: String)
     #expect(initiatorLinkID == forwardedLinkID)
     #expect(initiatorLinkID == linkTableKey)
     #expect(captured.value?.0 == outIf)
+}
+
+// MARK: - 4b-3a announce random-blob anti-replay
+
+/// A relay setup helper: two interfaces (i0 arrival, i1 onward) + our transport identity.
+@MainActor
+private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.State, Transport.Action> {
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))
+    return store
+}
+
+/// An exact replay of an announce is dropped by blob-dedup: no second path learn AND (in relay
+/// mode, where every fresh announce is re-broadcast) no second re-broadcast.
+@Test @MainActor func exactReplayAnnounceIsDroppedAndNotRebroadcast() async {
+    let id = Identity()
+    let (raw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                             hops: 2, emitted: 1000)
+    let store = await makeRelayStore(Identity())
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // first re-broadcast
+    // Exact replay → same blob → dropped: no pathLearned, no re-broadcast.
+    await store.send(.received(InterfaceID("i0"), raw))
+    store.exhaustivity = .on   // any pending re-broadcast/pathLearned now fails at cleanup
+}
+
+/// The discriminator vs packetHash: same destination + same random_hash but DIFFERENT appData →
+/// different packetHash, same blob. The second is dropped by blob-dedup (packetHash-dedup would
+/// have let it through), so no second re-broadcast.
+@Test @MainActor func forgeReplayWithMutatedAppDataIsDropped() async {
+    let id = Identity()
+    let prefix = Data(repeating: 0x7A, count: 5)
+    let (first, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                               hops: 2, emitted: 1000, appData: Data("aaa".utf8),
+                                               randomPrefix: prefix)
+    let (forged, _)       = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                               hops: 2, emitted: 1000, appData: Data("bbb".utf8),
+                                               randomPrefix: prefix)
+    #expect(first != forged) // different bytes (different appData) → different packetHash
+    let store = await makeRelayStore(Identity())
+    await store.send(.received(InterfaceID("i0"), first))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    // Same blob → dropped despite different packetHash: no re-broadcast.
+    await store.send(.received(InterfaceID("i0"), forged))
+    store.exhaustivity = .on
+}
+
+/// The propagation change vs 4b-1: a fresh (new-blob) announce that does NOT improve the path is
+/// still re-broadcast in relay mode. Under 4b-1 this produced `.none` (no re-broadcast).
+@Test @MainActor func nonImprovingFreshAnnounceIsStillRebroadcast() async {
+    let id = Identity()
+    // First: newer emission → adopted.
+    let (newer, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                               hops: 2, emitted: 2000,
+                                               randomPrefix: Data(repeating: 0x01, count: 5))
+    // Second: fresh blob but OLDER emission → shouldReplace false (path NOT updated).
+    let (older, _)        = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                               hops: 2, emitted: 1000,
+                                               randomPrefix: Data(repeating: 0x02, count: 5))
+    let store = await makeRelayStore(Identity())
+    await store.send(.received(InterfaceID("i0"), newer))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    // Older fresh announce: no pathLearned, but IS re-broadcast.
+    let rebroadcast = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("i0"), older))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, d)) = action { rebroadcast.setValue(d); return true }
+        return false
+    }
+    #expect(rebroadcast.value != nil)                       // re-broadcast happened
+    #expect(store.state.learned[destHash]?.announceEmitted == 2000) // path NOT downgraded
+}
+
+/// The per-destination blob ring is bounded to `announceBlobRingSize` (64): after 65 distinct
+/// blobs for one destination, the oldest (#0) is evicted and the newest (#64) retained. Asserted
+/// on state (non-relay store) to avoid coupling to the re-broadcast action queue.
+@Test @MainActor func blobRingEvictsOldestAfterCapacity() async {
+    let id = Identity()
+    let app = "app", aspects = ["svc"]
+    let destHash = Destination.hash(identityHash: id.hash, appName: app, aspects: aspects)
+    func announceRaw(_ i: Int) -> Data {
+        makeAnnouncePacket(identity: id, appName: app, aspects: aspects, hops: 2, emitted: 1000,
+                           randomPrefix: Data([UInt8(i), 0, 0, 0, 0])).0
+    }
+    func blob(_ i: Int) -> Data {
+        Announce.randomHash(now: 1000, randomPrefix: Data([UInt8(i), 0, 0, 0, 0]))
+    }
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    // 65 distinct blobs (#0...#64) for one destination; capacity 64 evicts the oldest (#0).
+    for i in 0...64 { await store.send(.received(InterfaceID("i"), announceRaw(i))) }
+    #expect(store.state.announceBlobs[destHash]?.contains(blob(0)) == false)   // #0 evicted
+    #expect(store.state.announceBlobs[destHash]?.contains(blob(64)) == true)   // #64 retained
+}
+
+/// Regression: a duplicate .data packet to a local destination is still deduped by packetHash
+/// (announces leaving the shared guard must not disturb non-announce dedup).
+@Test @MainActor func duplicateDataStillDedupedByPacketHash() async {
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: Identity())!
+    let plaintext = Data("hello".utf8)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
+    let ciphertext = dest.encrypt(plaintext)
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: dest.hash, transportId: nil, payload: ciphertext)
+    let raw = try! packet.packed()
+    await store.send(.received(InterfaceID("i"), raw))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext)))
+    // Duplicate → deduped by packetHash: no second delivery.
+    await store.send(.received(InterfaceID("i"), raw))
+    store.exhaustivity = .on
+}
+
+/// Regression: an announce for one of our own local destinations is ignored — not blob-tracked,
+/// not re-broadcast.
+@Test @MainActor func ownDestinationAnnounceIsIgnored() async {
+    let id = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: id)!
+    let (raw, _) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                      hops: 2, emitted: 1000)
+    let store = await makeRelayStore(Identity())
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations[dest.hash] = dest }
+    await store.send(.received(InterfaceID("i0"), raw))
+    #expect(store.state.announceBlobs[dest.hash] == nil) // not blob-tracked
+    store.exhaustivity = .on                             // no re-broadcast/pathLearned
 }
