@@ -54,3 +54,14 @@ import ComposableArchitecture
     #expect(store.state.announceBlobs[destHash]?.contains(blob1) == true)
     #expect(store.state.announceBlobs[destHash]?.contains(blob2) == true)
 }
+
+/// Our announce re-broadcast jitter window equals RNS's PATHFINDER_RW, and the jitter mapping keeps
+/// every possible delay strictly within [0, window).
+@Test @MainActor func announceRebroadcastWindowMatchesRnsPathfinderRw() throws {
+    let f = try TransportVectorFixtures.load()
+    #expect(Transport.announceRebroadcastWindow == f.pathfinderRw)
+    // Delay for any random byte 0…255 is byte/256 * window ∈ [0, window).
+    let maxDelay = Double(255) / 256.0 * Transport.announceRebroadcastWindow
+    #expect(maxDelay < Transport.announceRebroadcastWindow)
+    #expect(maxDelay >= 0)
+}

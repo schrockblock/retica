@@ -95,4 +95,5 @@ print(json.dumps({
     "rb_blob1": _rb_blob1,
     "rb_announce2": _rb_ann2,
     "rb_blob2": _rb_blob2,
+    "pathfinder_rw": RNS.Transport.PATHFINDER_RW,
 }, indent=2))
