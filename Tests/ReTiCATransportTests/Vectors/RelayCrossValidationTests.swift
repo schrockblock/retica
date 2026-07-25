@@ -38,6 +38,7 @@ import ComposableArchitecture
         }
         return false
     }
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry re-broadcast
 
     // --- Shape assertions: correct HEADER_2 rewrite ---
     let rb = Packet(raw: captured.value!)!

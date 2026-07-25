@@ -23,8 +23,9 @@ public struct Transport {
         public struct PendingAnnounce: Equatable, Sendable {
             public var raw: Data
             public var arrivalInterface: InterfaceID
-            public init(raw: Data, arrivalInterface: InterfaceID) {
-                self.raw = raw; self.arrivalInterface = arrivalInterface
+            public var rebroadcasts: Int
+            public init(raw: Data, arrivalInterface: InterfaceID, rebroadcasts: Int = 0) {
+                self.raw = raw; self.arrivalInterface = arrivalInterface; self.rebroadcasts = rebroadcasts
             }
         }
         /// Fresh announces held for a jittered re-broadcast, keyed by destinationHash (4b-3b-1).
@@ -238,12 +239,23 @@ public struct Transport {
                 }
 
             case let .announceRetransmitDue(destinationHash):
-                guard let entry = state.announceTable[destinationHash] else { return .none }
-                state.announceTable[destinationHash] = nil
+                guard var entry = state.announceTable[destinationHash] else { return .none }
                 let sends = state.interfaces
                     .filter { $0 != entry.arrivalInterface }
                     .map { Effect<Action>.send(.delegate(.transmit($0, entry.raw))) }
-                return sends.isEmpty ? .none : .merge(sends)
+                entry.rebroadcasts += 1
+                if entry.rebroadcasts >= Transport.announceMaxRebroadcasts {
+                    state.announceTable[destinationHash] = nil          // lifecycle complete
+                    return sends.isEmpty ? .none : .merge(sends)
+                }
+                state.announceTable[destinationHash] = entry            // keep for the next retry
+                let delay = Transport.announceRetryGrace
+                    + Transport.announceJitter(randomBytes(1).first ?? 0)
+                let retry = Effect<Action>.run { send in
+                    try await clock.sleep(for: .seconds(delay))
+                    await send(.announceRetransmitDue(destinationHash: destinationHash))
+                }.cancellable(id: CancelID.announceRetransmit(destinationHash), cancelInFlight: true)
+                return .merge(sends + [retry])
 
             case let .send(destinationHash, plaintext):
                 guard let entry = state.learned[destinationHash] else {
@@ -290,6 +302,10 @@ public struct Transport {
 
     /// Per-destination announce random-blob memory size (RNS Transport.MAX_RANDOM_BLOBS, Transport.py:98).
     static let announceBlobRingSize = 64
+    /// RNS LOCAL_REBROADCASTS_MAX (Transport.py:77): total local re-broadcasts of one announce.
+    static let announceMaxRebroadcasts = 2
+    /// RNS PATHFINDER_G (Transport.py:69): grace between announce re-broadcast retries, seconds.
+    static let announceRetryGrace = 5.0
     /// RNS PATHFINDER_RW (Transport.py:70): the random window for an announce re-broadcast, seconds.
     static let announceRebroadcastWindow = 0.5
 

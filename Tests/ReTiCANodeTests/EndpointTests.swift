@@ -1473,6 +1473,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
         }
         return false
     }
+    await storeR.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry re-broadcast
 
     // A receives R's rebroadcast and learns D with nextHop == rIdentity.hash.
     eventsA.yield(.data(HDLC.frame(rRebroadcastRaw.value!)))

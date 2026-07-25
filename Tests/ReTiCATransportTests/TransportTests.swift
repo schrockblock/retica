@@ -387,6 +387,7 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, D
         }
         return false
     }
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry re-broadcast
 
     // Path learned with HEADER_1 fallback: nextHop == destHash.
     #expect(store.state.learned[destHash]?.nextHop == destHash)
@@ -951,6 +952,7 @@ private func makeHeader2LinkRequestPacket(transportId: Data, destHash: Data, hop
         }
         return false
     }
+    await storeR.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry re-broadcast
 
     // Step 3: Deliver R's re-broadcast (HEADER_2 with R's hash as transport_id) to A on "ar".
     // A learns D with nextHop == R.hash, interfaceID == "ar".
@@ -1158,6 +1160,7 @@ private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.Stat
     await store.send(.received(InterfaceID("i0"), raw))
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // first re-broadcast
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry re-broadcast
     // Exact replay → same blob → dropped: no pathLearned, no re-broadcast.
     await store.send(.received(InterfaceID("i0"), raw))
     store.exhaustivity = .on   // any pending re-broadcast/pathLearned now fails at cleanup
@@ -1180,6 +1183,7 @@ private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.Stat
     await store.send(.received(InterfaceID("i0"), first))
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry re-broadcast
     // Same blob → dropped despite different packetHash: no re-broadcast.
     await store.send(.received(InterfaceID("i0"), forged))
     store.exhaustivity = .on
@@ -1201,6 +1205,7 @@ private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.Stat
     await store.send(.received(InterfaceID("i0"), newer))
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry re-broadcast for newer
     // Older fresh announce: no pathLearned, but IS re-broadcast.
     let rebroadcast = LockIsolated<Data?>(nil)
     await store.send(.received(InterfaceID("i0"), older))
@@ -1208,6 +1213,7 @@ private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.Stat
         if case let .delegate(.transmit(_, d)) = action { rebroadcast.setValue(d); return true }
         return false
     }
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry re-broadcast for older
     #expect(rebroadcast.value != nil)                       // re-broadcast happened
     #expect(store.state.learned[destHash]?.announceEmitted == 2000) // path NOT downgraded
 }
@@ -1302,18 +1308,21 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     #expect(store.state.announceTable[destHash] != nil)
     await clock.advance(by: .seconds(0.24))
     #expect(store.state.announceTable[destHash] != nil)   // still holding, just before deadline
-    await clock.advance(by: .seconds(0.01))               // reach 0.25s → fire
+    await clock.advance(by: .seconds(0.01))               // reach 0.25s → fire send #1
     let out = LockIsolated<(InterfaceID, Data)?>(nil)
     await store.receive { action in
         if case let .delegate(.transmit(i, d)) = action { out.setValue((i, d)); return true }
         return false
     }
     #expect(out.value?.0 == InterfaceID("i1"))            // to the OTHER interface only
-    #expect(store.state.announceTable[destHash] == nil)   // entry removed after the single send
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)  // retained for retry
     let rb = Packet(raw: out.value!.1)!
     #expect(rb.headerType == .header2)
     #expect(rb.transportId == relay.hash)
     #expect(Int(rb.hops) == 3)
+    await clock.advance(by: .seconds(5.25))               // grace(5) + jitter(0.25) → fire send #2
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceTable[destHash] == nil)   // lifecycle complete at the cap
 }
 
 /// The maximum jitter byte still yields a delay strictly inside the window (< PATHFINDER_RW).
@@ -1325,9 +1334,12 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
     await clock.advance(by: .seconds(0.49))
     #expect(store.state.announceTable[destHash] != nil)   // not yet (~0.498s)
-    await clock.advance(by: .seconds(0.01))               // 0.50s > 0.498 → fired (delay < window)
+    await clock.advance(by: .seconds(0.01))               // 0.50s > 0.498 → fired send #1
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
-    #expect(store.state.announceTable[destHash] == nil)
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)  // retained for retry
+    await clock.advance(by: .seconds(5.498))              // grace(5) + jitter(~0.498) → fire send #2
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceTable[destHash] == nil)   // lifecycle complete at the cap
 }
 
 /// A second fresh announce for the same destination within the window supersedes the first: the
@@ -1353,7 +1365,10 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
         return false
     }
     #expect(Packet(raw: out.value!)!.payload == Packet(raw: a2)!.payload)   // newer superseded
-    #expect(store.state.announceTable[destHash] == nil)
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)         // retained for retry
+    await clock.advance(by: .seconds(5.25))               // grace(5) + jitter(0.25) → retry
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceTable[destHash] == nil)   // lifecycle complete at the cap
 }
 
 /// A non-relay node never holds or re-broadcasts an announce.
@@ -1395,4 +1410,73 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     #expect(Transport.announceJitter(128) == 0.25)                                  // 128/256 * 0.5
     #expect(Transport.announceJitter(255) == Double(255) / 256.0 * 0.5)
     #expect(Transport.announceJitter(255) < Transport.announceRebroadcastWindow)    // strictly inside
+}
+
+// MARK: - 4b-3b-2 announce re-broadcast retries + grace
+
+/// A fresh announce is re-broadcast twice (initial after jitter, one retry after grace+jitter),
+/// with identical bytes, then the lifecycle completes and no third send occurs.
+@Test @MainActor func announceRebroadcastRetriesTwiceThenStops() async {
+    let relay = Identity()
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeTimedRelayStore(relay, clock, jitterByte: 128)   // jitter 0.25; retry 5.25
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 0)
+
+    await clock.advance(by: .seconds(0.25))                    // fire send #1
+    let first = LockIsolated<Data?>(nil)
+    await store.receive { action in
+        if case let .delegate(.transmit(_, d)) = action { first.setValue(d); return true }
+        return false
+    }
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)   // retained, one send done
+
+    await clock.advance(by: .seconds(5.25))                    // grace(5) + jitter(0.25) → send #2
+    let second = LockIsolated<Data?>(nil)
+    await store.receive { action in
+        if case let .delegate(.transmit(_, d)) = action { second.setValue(d); return true }
+        return false
+    }
+    #expect(second.value == first.value)                       // identical held bytes
+    #expect(store.state.announceTable[destHash] == nil)        // lifecycle complete at the cap
+
+    await clock.advance(by: .seconds(5.25))                    // no third send scheduled
+    #expect(store.state.announceTable[destHash] == nil)
+}
+
+/// A superseding fresh announce during the grace window resets the retry lifecycle: the pending
+/// retry is cancelled and a new single-then-retry chain starts for the newer announce.
+@Test @MainActor func supersedingAnnounceResetsRetryLifecycle() async {
+    let id = Identity()
+    let clock = TestClock()
+    let (a1, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["s"], hops: 2,
+                                            emitted: 1000, appData: Data("AAA".utf8),
+                                            randomPrefix: Data([1, 0, 0, 0, 0]))
+    let (a2, _)        = makeAnnouncePacket(identity: id, appName: "app", aspects: ["s"], hops: 2,
+                                            emitted: 2000, appData: Data("BBB".utf8),
+                                            randomPrefix: Data([2, 0, 0, 0, 0]))
+    let store = await makeTimedRelayStore(id, clock, jitterByte: 128)
+    await store.send(.received(InterfaceID("i0"), a1))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await clock.advance(by: .seconds(0.25))                    // a1 send #1
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 1)
+
+    // Supersede during the grace window (before a1's retry at +5.25).
+    await store.send(.received(InterfaceID("i0"), a2))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.announceTable[destHash]?.rebroadcasts == 0)          // reset by supersede
+
+    await clock.advance(by: .seconds(0.25))                    // a2 send #1
+    let out = LockIsolated<Data?>(nil)
+    await store.receive { action in
+        if case let .delegate(.transmit(_, d)) = action { out.setValue(d); return true }
+        return false
+    }
+    #expect(Packet(raw: out.value!)!.payload == Packet(raw: a2)!.payload)    // newer announce won
+    await clock.advance(by: .seconds(5.25))                    // a2 retry
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceTable[destHash] == nil)
 }
