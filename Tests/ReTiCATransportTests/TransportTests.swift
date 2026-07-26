@@ -1871,3 +1871,142 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     await requester.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
     #expect(requester.state.learned[dest.hash]?.identity.hash == identity.hash)
 }
+
+// MARK: - #4c-2 relay answers from cache
+
+/// A relay's PATH_REQUEST: destHash ‖ requestor_transport_id ‖ tag.
+private func makeRelayPathRequest(for destHash: Data, requestorTransportId: Data,
+                                  tag: Data = Data(repeating: 0x5A, count: 16)) -> Data {
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .plain, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
+                        payload: destHash + requestorTransportId + tag)
+    return try! packet.packed()
+}
+
+/// A relay that has learned a path answers a PATH_REQUEST from cache with a HEADER_2
+/// pathResponse announce (our transport_id, hops = learned+1, verbatim cached payload)
+/// on the arrival interface.
+@Test @MainActor func relayAnswersPathRequestFromCache() async {
+    let relay = Identity()
+    let (announceRaw, destHash) = makeAnnouncePacket(hops: 2)
+    let cachedPayload = Packet(raw: announceRaw)!.payload
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.setTransportIdentity(relay))
+    // Learn a path to destHash (HEADER_1 announce, directly heard → nextHop == destHash).
+    await store.send(.received(InterfaceID("i0"), announceRaw))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: destHash)))
+    await store.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == InterfaceID("i0") {
+            captured.setValue(raw); return true
+        }
+        return false
+    }
+    let resp = Packet(raw: captured.value!)!
+    #expect(resp.packetType == .announce)
+    #expect(resp.headerType == .header2)
+    #expect(resp.transportType == .transport)
+    #expect(resp.context == .pathResponse)
+    #expect(resp.transportId == relay.hash)
+    #expect(resp.destinationHash == destHash)
+    #expect(resp.hops == 3)                       // learned hops (2) + 1
+    #expect(resp.payload == cachedPayload)        // verbatim → signature intact
+}
+
+/// A non-relay (transportIdentity == nil) never answers from cache — that is the relay-only path.
+@Test @MainActor func nonRelayDoesNotAnswerPathRequestFromCache() async {
+    let (announceRaw, destHash) = makeAnnouncePacket(hops: 2)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.received(InterfaceID("i0"), announceRaw))     // learns + caches, but leaf mode
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: destHash)))
+    store.exhaustivity = .on                                        // no transmit
+}
+
+/// A relay with no cached path for the requested destination does not answer (bounds the
+/// relay-answer to known paths; recursive re-broadcast is #4c-3).
+@Test @MainActor func relayWithoutCachedPathDoesNotAnswer() async {
+    let relay = Identity()
+    let unknown = Data(repeating: 0x77, count: 16)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: unknown)))
+    store.exhaustivity = .on                                        // no transmit
+}
+
+/// Loop guard: a relay does not answer when the requester's transport_id equals our next hop
+/// toward the destination (RNS Transport.py:2987) — but answers when it differs.
+@Test @MainActor func relayLoopGuardOnRequestorEqualsNextHop() async {
+    let relay = Identity()
+    // Learn the path via a HEADER_2 announce so nextHop == the relaying transport_id we choose.
+    let upstream = Identity()
+    let (h1Raw, destHash) = makeAnnouncePacket(hops: 2)
+    let h1 = Packet(raw: h1Raw)!
+    let relayedAnnounce = Packet(headerType: .header2, packetType: .announce, transportType: .transport,
+                                 destinationType: .single, context: .none, contextFlag: false, hops: 2,
+                                 destinationHash: destHash, transportId: upstream.hash, payload: h1.payload)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.received(InterfaceID("i0"), try! relayedAnnounce.packed()))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    #expect(store.state.learned[destHash]?.nextHop == upstream.hash)
+
+    // Requester IS our next hop → do not answer.
+    await store.send(.received(InterfaceID("i0"),
+                               makeRelayPathRequest(for: destHash, requestorTransportId: upstream.hash)))
+    store.exhaustivity = .on
+
+    // Different requestor transport_id → we answer.
+    store.exhaustivity = .off
+    let other = Data(repeating: 0x33, count: 16)
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("i0"),
+                               makeRelayPathRequest(for: destHash, requestorTransportId: other)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    #expect(Packet(raw: captured.value!)?.context == .pathResponse)
+}
+
+/// End-to-end: a requester learns the destination from the relay's cache path-response.
+@Test @MainActor func relayCachePathResponseIsLearnedByRequester() async {
+    let relay = Identity()
+    let (announceRaw, destHash) = makeAnnouncePacket(hops: 2)
+    let identityHash = Announce.parse(payload: Packet(raw: announceRaw)!.payload,
+                                      destinationHash: destHash, contextFlagSet: false)!.identity.hash
+    let relayStore = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    relayStore.exhaustivity = .off
+    await relayStore.send(.interfaceConnected(InterfaceID("i0")))
+    await relayStore.send(.setTransportIdentity(relay))
+    await relayStore.send(.received(InterfaceID("i0"), announceRaw))
+    await relayStore.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    let response = LockIsolated<Data?>(nil)
+    await relayStore.send(.received(InterfaceID("i0"), makePathRequest(for: destHash)))
+    await relayStore.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { response.setValue(raw); return true }
+        return false
+    }
+    // Requester learns from the relay's path-response like any announce.
+    let requester = TestStore(initialState: Transport.State()) { Transport() }
+    requester.exhaustivity = .off
+    await requester.send(.received(InterfaceID("up"), response.value!))
+    await requester.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    #expect(requester.state.learned[destHash]?.identity.hash == identityHash)
+    #expect(requester.state.learned[destHash]?.nextHop == relay.hash)   // reachable via the relay
+}

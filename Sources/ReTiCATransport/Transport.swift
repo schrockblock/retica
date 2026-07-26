@@ -273,17 +273,41 @@ public struct Transport {
                     if packet.destinationHash == Transport.pathRequestDestinationHash {
                         guard packet.payload.count >= 16 else { return .none }
                         let requested = Data(packet.payload.prefix(16))
-                        guard let dest = state.localDestinations[requested],
-                              let identity = dest.identity, identity.privateKey != nil
-                        else { return .none }
-                        let now = UInt64(date.now.timeIntervalSince1970)
-                        let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
-                        let respPayload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
-                                                                nameHash: dest.nameHash, randomHash: randomHash,
-                                                                ratchet: nil, appData: nil)
-                        let response = Packet.announce(from: dest, payload: respPayload, pathResponse: true)
-                        guard let raw = try? response.packed() else { return .none }
-                        return .send(.delegate(.transmit(interfaceID, raw)))
+                        // (1) We OWN the requested destination → answer with a fresh path-response.
+                        if let dest = state.localDestinations[requested],
+                           let identity = dest.identity, identity.privateKey != nil {
+                            let now = UInt64(date.now.timeIntervalSince1970)
+                            let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
+                            let respPayload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
+                                                                    nameHash: dest.nameHash, randomHash: randomHash,
+                                                                    ratchet: nil, appData: nil)
+                            let response = Packet.announce(from: dest, payload: respPayload, pathResponse: true)
+                            guard let raw = try? response.packed() else { return .none }
+                            return .send(.delegate(.transmit(interfaceID, raw)))
+                        }
+                        // (2) We are a relay that has learned + cached a path to the destination →
+                        // re-emit the cached announce (verbatim payload, original signature) as a
+                        // HEADER_2 pathResponse so the requester learns the destination via us.
+                        // RNS Transport.py:2972-3033 (get_cached_packet + rebroadcast as path response).
+                        if let relayID = state.transportIdentity,
+                           let cachedPayload = state.announceCache[requested],
+                           let entry = state.learned[requested],
+                           Int(entry.hops) + 1 < Int(Packet.maxHops) {
+                            // Loop guard: a relay requester carries its transport_id (48-byte payload).
+                            // If that equals our next hop toward the destination, the requester is
+                            // already on our path — do not answer (RNS Transport.py:2987).
+                            let requestorTransportId: Data? = packet.payload.count > 32
+                                ? Data(packet.payload.dropFirst(16).prefix(16)) : nil
+                            guard requestorTransportId != entry.nextHop else { return .none }
+                            let response = Packet(
+                                headerType: .header2, packetType: .announce, transportType: .transport,
+                                destinationType: .single, context: .pathResponse,
+                                contextFlag: entry.ratchet != nil, hops: entry.hops + 1,
+                                destinationHash: requested, transportId: relayID.hash, payload: cachedPayload)
+                            guard let raw = try? response.packed() else { return .none }
+                            return .send(.delegate(.transmit(interfaceID, raw)))
+                        }
+                        return .none
                     }
                     // Relay: a HEADER_2 data packet naming us as the next hop, for a REMOTE destination,
                     // is forwarded toward the destination (nextHop-based; RNS Transport.py:1603-1614).
