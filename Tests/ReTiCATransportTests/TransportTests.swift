@@ -1595,3 +1595,103 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     await clock.advance(by: .seconds(5.5))
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false } // retry still fires
 }
+
+// MARK: - 4b-3c-1 maintenance tick + expiry
+
+/// An aged-out learned path (and its random-blob ring) is swept once now − learnedAt > pathExpiry;
+/// a not-yet-expired path survives an earlier tick.
+@Test @MainActor func expiredPathAndBlobsAreSweptByMaintenanceTick() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.learned[destHash] != nil)
+    #expect(store.state.announceBlobs[destHash] != nil)
+
+    await store.send(.startMaintenance)
+    // Not yet expired: a tick within the window sweeps nothing.
+    now.setValue(Date(timeIntervalSince1970: 100))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] != nil)
+    // Past the expiry: the next tick sweeps the path and its blob ring.
+    now.setValue(Date(timeIntervalSince1970: Transport.pathExpiry + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] == nil)
+    #expect(store.state.announceBlobs[destHash] == nil)
+    await store.send(.stopMaintenance)
+}
+
+/// A stale relay linkTable entry is swept; an entry refreshed by a link-packet forward survives.
+@Test @MainActor func staleLinkEntrySweptButRefreshedSurvives() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let relay = Identity(), remote = Identity()
+    let outIf = InterfaceID("i-out")
+    let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
+                                                     aspects: ["d"], hops: 1, emitted: 2000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+        $0.randomBytes = RandomBytesGenerator { _ in Data([0]) }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(outIf))          // one interface → announce won't re-broadcast
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.received(outIf, announceRaw))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    // Create a linkTable entry (refreshedAt = 0) via a HEADER_2 LINKREQUEST arriving on "in".
+    let payload = Data(repeating: 0x11, count: 64) + Data([0, 0, 0])
+    let lr = makeHeader2LinkRequestPacket(transportId: relay.hash, destHash: destHash, hops: 0, payload: payload)
+    let linkID = Link.linkID(requestPacket: Packet(raw: lr)!)
+    await store.send(.received(InterfaceID("in"), lr))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.linkTable[linkID] != nil)
+
+    // Refresh the entry by forwarding a link packet arriving on rcvdIf ("in") at t = 10.
+    now.setValue(Date(timeIntervalSince1970: 10))
+    let linkPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                            destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                            destinationHash: linkID, transportId: nil, payload: Data([9]))
+    await store.send(.received(InterfaceID("in"), try! linkPacket.packed()))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.linkTable[linkID]?.refreshedAt == Date(timeIntervalSince1970: 10))
+
+    await store.send(.startMaintenance)
+    // now = expiry+1 (901): age since CREATION(0) = 901 > 900, but age since REFRESH(10) = 891 < 900.
+    // So the entry survives ONLY because it was refreshed — the refresh discriminator.
+    now.setValue(Date(timeIntervalSince1970: Transport.linkTableExpiry + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.linkTable[linkID] != nil)          // survived: refreshed at 10
+    // now = 10 + expiry + 1 (911): age since refresh(10) = 901 > 900 → swept.
+    now.setValue(Date(timeIntervalSince1970: 10 + Transport.linkTableExpiry + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.linkTable[linkID] == nil)
+    await store.send(.stopMaintenance)
+}
+
+/// stopMaintenance cancels the tick — no further sweeps fire.
+@Test @MainActor func stopMaintenanceCancelsTheTick() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.startMaintenance)
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)                  // one tick fired
+    await store.send(.stopMaintenance)
+    store.exhaustivity = .on                               // any further emitted action now fails at cleanup
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval * 3))  // no tick → cancelled
+}

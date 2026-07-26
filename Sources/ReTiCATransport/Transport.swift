@@ -2,6 +2,22 @@ import Foundation
 import ComposableArchitecture
 import ReTiCA
 
+// A Transport-internal date key whose testValue returns epoch-0, so that tests that exercise
+// path-learning or link-packet forwarding without providing an explicit date dependency do not
+// trigger an "unimplemented" failure. Tests that need a controllable date set $0.transportDate.
+private enum TransportDateKey: DependencyKey {
+    static let liveValue    = DateGenerator { Date() }
+    static let testValue    = DateGenerator { Date(timeIntervalSince1970: 0) }
+    static let previewValue = liveValue
+}
+extension DependencyValues {
+    /// Date generator used internally by Transport for stamping learnedAt / refreshedAt.
+    public var transportDate: DateGenerator {
+        get { self[TransportDateKey.self] }
+        set { self[TransportDateKey.self] = newValue }
+    }
+}
+
 /// The Reticulum Transport layer, endpoint (leaf) subset: learns paths from announces,
 /// delivers inbound packets to local destinations, and routes outbound packets to learned
 /// destinations. Interface-agnostic — interfaces are referenced by `InterfaceID`.
@@ -40,9 +56,12 @@ public struct Transport {
         public struct LinkTableEntry: Equatable, Sendable {
             public var rcvdIf: InterfaceID
             public var nhIf: InterfaceID
-            public init(rcvdIf: InterfaceID, nhIf: InterfaceID) {
+            public var refreshedAt: Date
+            public init(rcvdIf: InterfaceID, nhIf: InterfaceID,
+                        refreshedAt: Date = Date(timeIntervalSince1970: 0)) {
                 self.rcvdIf = rcvdIf
                 self.nhIf = nhIf
+                self.refreshedAt = refreshedAt
             }
         }
     }
@@ -58,6 +77,9 @@ public struct Transport {
         case announce(destinationHash: Data, appData: Data?)
         case send(destinationHash: Data, plaintext: Data)
         case announceRetransmitDue(destinationHash: Data)
+        case startMaintenance
+        case stopMaintenance
+        case maintenanceTick
         case delegate(Delegate)
 
         @CasePathable
@@ -71,16 +93,16 @@ public struct Transport {
         }
     }
 
-    @Dependency(\.date) var date
+    @Dependency(\.transportDate) var date
     @Dependency(\.continuousClock) var clock
     @Dependency(\.randomBytes) var randomBytes
 
-    private enum CancelID: Hashable { case announceRetransmit(Data) }
+    private enum CancelID: Hashable { case announceRetransmit(Data); case maintenance }
 
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { [clock, randomBytes] state, action in
+        Reduce { [clock, date, randomBytes] state, action in
             // Shared helper: rewrite a packet for forwarding toward its destination.
             // Final hop (nextHop == destHash) → HEADER_1 direct; onward → HEADER_2 to next hop.
             func forwardTowardDest(_ packet: Packet, _ entry: LearnedDestination) -> Data? {
@@ -131,6 +153,7 @@ public struct Transport {
                         if interfaceID == entry.rcvdIf { outIf = entry.nhIf }        // toward dest
                         else if interfaceID == entry.nhIf { outIf = entry.rcvdIf }   // toward initiator
                         else { return .none }
+                        state.linkTable[packet.destinationHash]?.refreshedAt = date.now   // keep active links alive
                         var fwd = packet
                         fwd.hops = packet.hops + 1
                         guard let raw = try? fwd.packed() else { return .none }
@@ -198,7 +221,7 @@ public struct Transport {
                     let candidate = LearnedDestination(
                         identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
                         interfaceID: interfaceID, hops: packet.hops, nextHop: nextHop,
-                        announceEmitted: emitted)
+                        announceEmitted: emitted, learnedAt: date.now)
                     var effects: [Effect<Action>] = []
                     // Update the path only if this fresh announce improves it (unchanged logic).
                     if Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate) {
@@ -257,7 +280,8 @@ public struct Transport {
                         guard let entry = state.learned[packet.destinationHash],
                               Int(packet.hops) + 1 < Int(Packet.maxHops) else { return .none }
                         let linkID = Link.linkID(requestPacket: packet)
-                        state.linkTable[linkID] = State.LinkTableEntry(rcvdIf: interfaceID, nhIf: entry.interfaceID)
+                        state.linkTable[linkID] = State.LinkTableEntry(
+                            rcvdIf: interfaceID, nhIf: entry.interfaceID, refreshedAt: date.now)
                         guard let raw = forwardTowardDest(packet, entry) else { return .none }
                         return .send(.delegate(.transmit(entry.interfaceID, raw)))
                     }
@@ -265,6 +289,30 @@ public struct Transport {
                 default:
                     return .none
                 }
+
+            case .startMaintenance:
+                return .run { send in
+                    while true {
+                        try await clock.sleep(for: .seconds(Transport.maintenanceTickInterval))
+                        await send(.maintenanceTick)
+                    }
+                }.cancellable(id: CancelID.maintenance, cancelInFlight: true)
+
+            case .stopMaintenance:
+                return .cancel(id: CancelID.maintenance)
+
+            case .maintenanceTick:
+                let now = date.now
+                for (dest, entry) in state.learned
+                where now.timeIntervalSince(entry.learnedAt) > Transport.pathExpiry {
+                    state.learned[dest] = nil
+                    state.announceBlobs[dest] = nil          // blob GC piggybacks on path expiry
+                }
+                for (link, entry) in state.linkTable
+                where now.timeIntervalSince(entry.refreshedAt) > Transport.linkTableExpiry {
+                    state.linkTable[link] = nil
+                }
+                return .none
 
             case let .announceRetransmitDue(destinationHash):
                 guard var entry = state.announceTable[destinationHash] else { return .none }
@@ -328,6 +376,13 @@ public struct Transport {
             }
         }
     }
+
+    /// RNS DESTINATION_TIMEOUT (Transport.py:91): learned paths expire after one week unused, seconds.
+    static let pathExpiry: TimeInterval = 60 * 60 * 24 * 7      // 604800
+    /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
+    static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
+    /// Sweep cadence — a local tuning constant (NOT wire-visible, NOT cross-validated).
+    static let maintenanceTickInterval: TimeInterval = 60
 
     /// Per-destination announce random-blob memory size (RNS Transport.MAX_RANDOM_BLOBS, Transport.py:98).
     static let announceBlobRingSize = 64

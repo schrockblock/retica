@@ -10,9 +10,11 @@ public struct LearnedDestination: Equatable, Sendable {
     public var hops: UInt8
     public var nextHop: Data?         // transport_id, or nil if directly heard
     public var announceEmitted: UInt64
+    public var learnedAt: Date
 
     public init(identity: Identity, appData: Data?, ratchet: Data?, interfaceID: InterfaceID,
-                hops: UInt8, nextHop: Data?, announceEmitted: UInt64) {
+                hops: UInt8, nextHop: Data?, announceEmitted: UInt64,
+                learnedAt: Date = Date(timeIntervalSince1970: 0)) {
         self.identity = identity
         self.appData = appData
         self.ratchet = ratchet
@@ -20,5 +22,6 @@ public struct LearnedDestination: Equatable, Sendable {
         self.hops = hops
         self.nextHop = nextHop
         self.announceEmitted = announceEmitted
+        self.learnedAt = learnedAt
     }
 }
