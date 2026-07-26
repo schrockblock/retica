@@ -98,4 +98,6 @@ print(json.dumps({
     "pathfinder_rw": RNS.Transport.PATHFINDER_RW,
     "local_rebroadcasts_max": RNS.Transport.LOCAL_REBROADCASTS_MAX,
     "pathfinder_g": RNS.Transport.PATHFINDER_G,
+    "destination_timeout": RNS.Transport.DESTINATION_TIMEOUT,
+    "link_timeout": RNS.Transport.LINK_TIMEOUT,
 }, indent=2))

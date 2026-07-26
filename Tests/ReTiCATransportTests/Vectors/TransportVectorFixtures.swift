@@ -29,6 +29,8 @@ struct TransportVectorFixtures: Decodable {
     let pathfinderRw: Double
     let localRebroadcastsMax: Int
     let pathfinderG: Double
+    let destinationTimeout: Double
+    let linkTimeout: Double
 
     enum CodingKeys: String, CodingKey {
         case announceDestHash = "announce_dest_hash"
@@ -58,6 +60,8 @@ struct TransportVectorFixtures: Decodable {
         case pathfinderRw = "pathfinder_rw"
         case localRebroadcastsMax = "local_rebroadcasts_max"
         case pathfinderG = "pathfinder_g"
+        case destinationTimeout = "destination_timeout"
+        case linkTimeout = "link_timeout"
     }
 
     static func load() throws -> TransportVectorFixtures {

@@ -72,3 +72,10 @@ import ComposableArchitecture
     #expect(Transport.announceMaxRebroadcasts == f.localRebroadcastsMax)
     #expect(Transport.announceRetryGrace == f.pathfinderG)
 }
+
+/// Our path/link expiry constants match RNS's DESTINATION_TIMEOUT and LINK_TIMEOUT.
+@Test func expiryConstantsMatchRns() throws {
+    let f = try TransportVectorFixtures.load()
+    #expect(Transport.pathExpiry == f.destinationTimeout)
+    #expect(Transport.linkTableExpiry == f.linkTimeout)
+}
