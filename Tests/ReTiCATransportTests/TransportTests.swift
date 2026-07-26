@@ -1897,7 +1897,43 @@ private func makeTaglessPathRequest(for destHash: Data) -> Data {
 
 /// A duplicate tagged request is ignored; a fresh tag is answered again (RNS discovery_pr_tags,
 /// Transport.py:2924-2934). Exercised on the owner-answer path.
+/// A duplicate tagged request is ignored (RNS discovery_pr_tags, Transport.py:2924-2934). Uses two
+/// requests with the SAME (destHash ‖ tag) but DIFFERENT transport_ids, so their bytes differ and
+/// seenPacketHashes does NOT dedup them — the tag gate must. The dup is sent last, then the store
+/// goes exhaustive: a stray answer is an un-received delegate action caught at teardown (removing
+/// the dedup guard breaks this).
 @Test @MainActor func duplicateTaggedPathRequestIsIgnored() async {
+    let identity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: identity)!
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations[dest.hash] = dest }
+    let tag = Data(repeating: 0xA1, count: 16)
+    let tid1 = Data(repeating: 0x11, count: 16)
+    let tid2 = Data(repeating: 0x22, count: 16)
+
+    // Fresh tag → answered.
+    let first = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("in"),
+                               makeRelayPathRequest(for: dest.hash, requestorTransportId: tid1, tag: tag)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { first.setValue(raw); return true }
+        return false
+    }
+    #expect(Packet(raw: first.value!)?.context == .pathResponse)
+
+    // Same tag, different transport_id → distinct bytes (passes seenPacketHashes) but same unique_tag
+    // → tag-deduped. Flip to .on with nothing after: a stray transmit fails teardown.
+    await store.send(.received(InterfaceID("in"),
+                               makeRelayPathRequest(for: dest.hash, requestorTransportId: tid2, tag: tag)))
+    store.exhaustivity = .on
+}
+
+/// Distinct tags are each answered — the dedup is not over-broad (it keys on destHash ‖ tag).
+@Test @MainActor func distinctTagPathRequestsAreEachAnswered() async {
     let identity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
                            identity: identity)!
@@ -1909,26 +1945,15 @@ private func makeTaglessPathRequest(for destHash: Data) -> Data {
     let tagA = Data(repeating: 0xA1, count: 16)
     let tagB = Data(repeating: 0xB2, count: 16)
 
-    // Fresh tag A → answered.
-    let first = LockIsolated<Data?>(nil)
-    await store.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash, tag: tagA)))
-    await store.receive { action in
-        if case let .delegate(.transmit(_, raw)) = action { first.setValue(raw); return true }
-        return false
+    for tag in [tagA, tagB] {
+        let captured = LockIsolated<Data?>(nil)
+        await store.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash, tag: tag)))
+        await store.receive { action in
+            if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+            return false
+        }
+        #expect(Packet(raw: captured.value!)?.context == .pathResponse)
     }
-    #expect(Packet(raw: first.value!)?.context == .pathResponse)
-
-    // Same tag A again → ignored (no transmit).
-    await store.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash, tag: tagA)))
-
-    // Different tag B → answered again.
-    let third = LockIsolated<Data?>(nil)
-    await store.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash, tag: tagB)))
-    await store.receive { action in
-        if case let .delegate(.transmit(_, raw)) = action { third.setValue(raw); return true }
-        return false
-    }
-    #expect(Packet(raw: third.value!)?.context == .pathResponse)
 }
 
 // MARK: - #4c-2 relay answers from cache
