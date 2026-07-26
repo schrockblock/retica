@@ -31,6 +31,9 @@ struct TransportVectorFixtures: Decodable {
     let pathfinderG: Double
     let destinationTimeout: Double
     let linkTimeout: Double
+    let prControlHash: String
+    let prRequestedDest: String
+    let prRequestPayload: String
 
     enum CodingKeys: String, CodingKey {
         case announceDestHash = "announce_dest_hash"
@@ -62,6 +65,9 @@ struct TransportVectorFixtures: Decodable {
         case pathfinderG = "pathfinder_g"
         case destinationTimeout = "destination_timeout"
         case linkTimeout = "link_timeout"
+        case prControlHash = "pr_control_hash"
+        case prRequestedDest = "pr_requested_dest"
+        case prRequestPayload = "pr_request_payload"
     }
 
     static func load() throws -> TransportVectorFixtures {

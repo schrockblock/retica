@@ -76,6 +76,11 @@ _rh2 = RNS.Identity.get_random_hash()[:5] + (int(time.time()) + 1).to_bytes(5, "
 _rb_ann1, _rb_blob1 = _build_announce(_rh1, 2)
 _rb_ann2, _rb_blob2 = _build_announce(_rh2, 2)
 
+# --- #4c-1 path request cross-validation ---
+_pr_control_hash = RNS.Destination.hash(None, RNS.Transport.APP_NAME, "path", "request")
+_pr_tag = RNS.Identity.get_random_hash()                  # 16-byte request tag (like request_path)
+_pr_request_payload = dest_hash + _pr_tag                 # non-relay path_request_data
+
 print(json.dumps({
     "announce_dest_hash": dest_hash.hex(),
     "announce_identity_hash": identity.hash.hex(),
@@ -100,4 +105,7 @@ print(json.dumps({
     "pathfinder_g": RNS.Transport.PATHFINDER_G,
     "destination_timeout": RNS.Transport.DESTINATION_TIMEOUT,
     "link_timeout": RNS.Transport.LINK_TIMEOUT,
+    "pr_control_hash": _pr_control_hash.hex(),
+    "pr_requested_dest": dest_hash.hex(),
+    "pr_request_payload": _pr_request_payload.hex(),
 }, indent=2))

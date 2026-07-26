@@ -79,3 +79,12 @@ import ComposableArchitecture
     #expect(Transport.pathExpiry == f.destinationTimeout)
     #expect(Transport.linkTableExpiry == f.linkTimeout)
 }
+
+/// Our path-request control-destination hash equals genuine RNS's, and our responder extracts the
+/// correct requested destination from a genuine RNS PATH_REQUEST payload (data[:16]).
+@Test func pathRequestControlHashAndSlicingMatchRns() throws {
+    let f = try TransportVectorFixtures.load()
+    #expect(Transport.pathRequestDestinationHash == Data(hexString: f.prControlHash)!)
+    let payload = Data(hexString: f.prRequestPayload)!
+    #expect(Data(payload.prefix(16)) == Data(hexString: f.prRequestedDest)!)   // our data[:16] slicing == RNS
+}
