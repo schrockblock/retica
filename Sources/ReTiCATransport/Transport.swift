@@ -36,6 +36,10 @@ public struct Transport {
         /// (RNS Transport.py:1824 `not random_blob in random_blobs`). Bounded to
         /// `announceBlobRingSize` per destination (RNS MAX_RANDOM_BLOBS).
         public var announceBlobs: [Data: RingSet] = [:]
+        /// destHash → the announce payload (carries the destination's valid signature)
+        /// for the currently-learned path. Enables a relay to re-emit a cached announce as
+        /// a path response (RNS get_cached_packet, Transport.py:2973). GC'd with the path.
+        public var announceCache: [Data: Data] = [:]
         public struct PendingAnnounce: Equatable, Sendable {
             public var raw: Data
             public var arrivalInterface: InterfaceID
@@ -233,6 +237,7 @@ public struct Transport {
                     // Update the path only if this fresh announce improves it (unchanged logic).
                     if Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate) {
                         state.learned[packet.destinationHash] = candidate
+                        state.announceCache[packet.destinationHash] = packet.payload
                         effects.append(.send(.delegate(.pathLearned(
                             destinationHash: packet.destinationHash, hops: packet.hops))))
                     }
@@ -332,6 +337,7 @@ public struct Transport {
                 where now.timeIntervalSince(entry.learnedAt) > Transport.pathExpiry {
                     state.learned[dest] = nil
                     state.announceBlobs[dest] = nil          // blob GC piggybacks on path expiry
+                    state.announceCache[dest] = nil          // cached announce GC piggybacks too
                 }
                 for (link, entry) in state.linkTable
                 where now.timeIntervalSince(entry.refreshedAt) > Transport.linkTableExpiry {

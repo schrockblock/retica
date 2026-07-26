@@ -355,6 +355,19 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, D
                        hops: hops, emitted: emitted)
 }
 
+// MARK: - #4c-2 announce cache
+
+/// Learning a path caches the announce payload verbatim (for later relay path-responses).
+@Test @MainActor func learningPathCachesAnnouncePayload() async {
+    let (raw, destHash) = makeAnnouncePacket(hops: 2)
+    let expectedPayload = Packet(raw: raw)!.payload
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.announceCache[destHash] == expectedPayload)
+}
+
 @Test @MainActor func relayRebroadcastsAnnounceWithHeader2AndOurTransportId() async {
     let relay = Identity()
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
@@ -1613,6 +1626,7 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
     #expect(store.state.learned[destHash] != nil)
     #expect(store.state.announceBlobs[destHash] != nil)
+    #expect(store.state.announceCache[destHash] != nil)
 
     await store.send(.startMaintenance)
     // Not yet expired: a tick within the window sweeps nothing.
@@ -1626,6 +1640,7 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     await store.receive(.maintenanceTick)
     #expect(store.state.learned[destHash] == nil)
     #expect(store.state.announceBlobs[destHash] == nil)
+    #expect(store.state.announceCache[destHash] == nil)
     await store.send(.stopMaintenance)
 }
 
