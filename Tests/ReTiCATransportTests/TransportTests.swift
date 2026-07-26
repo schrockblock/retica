@@ -1695,3 +1695,42 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     store.exhaustivity = .on                               // any further emitted action now fails at cleanup
     await clock.advance(by: .seconds(Transport.maintenanceTickInterval * 3))  // no tick → cancelled
 }
+
+/// Stopping relaying cancels a pending announce re-broadcast retry and clears the announce table.
+@Test @MainActor func relayStopCancelsPendingRebroadcastAndClearsAnnounceTable() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 0))
+        $0.randomBytes = RandomBytesGenerator { _ in Data([128]) }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(Identity()))
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await clock.advance(by: .seconds(0.25))                     // send #1 → retry pending
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceTable[destHash] != nil)
+    // Stop relaying → cancel the pending retry + clear the table.
+    await store.send(.setTransportIdentity(nil))
+    #expect(store.state.announceTable.isEmpty)
+    // The retry timer was cancelled: advancing past the retry fires no re-broadcast.
+    store.exhaustivity = .on
+    await clock.advance(by: .seconds(10))
+}
+
+/// Stopping relaying clears the link table (relay reverse-routing is meaningless without relay mode).
+@Test @MainActor func relayStopClearsLinkTable() async {
+    let (store, relay, destHash, _) = await relayStoreKnowingDestDirectly()
+    let payload = Data(repeating: 0x11, count: 64) + Data([0, 0, 0])
+    let lr = makeHeader2LinkRequestPacket(transportId: relay.hash, destHash: destHash, hops: 0, payload: payload)
+    let linkID = Link.linkID(requestPacket: Packet(raw: lr)!)
+    await store.send(.received(InterfaceID("in"), lr))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.linkTable[linkID] != nil)
+    await store.send(.setTransportIdentity(nil))
+    #expect(store.state.linkTable.isEmpty)
+}

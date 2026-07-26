@@ -1619,3 +1619,47 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     await a.send(.disconnect)
     await b.send(.disconnect)
 }
+
+// MARK: - 4b-3c-2 maintenance lifecycle
+
+/// Connecting an Endpoint starts the maintenance tick: a learned path is swept once it ages past
+/// pathExpiry and the tick fires. (End-to-end proof the Endpoint auto-started GC.)
+@Test @MainActor func endpointStartsGcOnConnectAndSweepsExpiredPath() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let events = AsyncStream<TCPEvent>.makeStream()
+    let store = TestStore(initialState: Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false)) {
+        Endpoint()
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in events.stream }, send: { _ in }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.transportDate = DateGenerator { now.value }
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    let id = Identity()
+    let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                                     hops: 3, emitted: 1000)
+    await store.send(.connect)
+    events.continuation.yield(.connected)               // → interfaceConnected + startMaintenance
+    await store.receive(\.transport.interfaceConnected)
+    events.continuation.yield(.data(HDLC.frame(announceRaw)))
+    await store.receive(\.delegate.pathLearned)
+    #expect(store.state.transport.learned[destHash] != nil)
+    // Age past pathExpiry and fire the tick → path swept.
+    now.setValue(Date(timeIntervalSince1970: Transport.pathExpiry + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(\.transport.maintenanceTick)
+    #expect(store.state.transport.learned[destHash] == nil)
+}
+
+/// Disconnecting an Endpoint stops the maintenance tick (the Endpoint forwards .stopMaintenance).
+@Test @MainActor func endpointStopsMaintenanceOnDisconnect() async {
+    let (store, events) = makeStore()
+    await store.send(.connect)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+    events.yield(.disconnected(reason: nil))              // → interfaceDisconnected + stopMaintenance
+    await store.receive(\.transport.stopMaintenance)
+}

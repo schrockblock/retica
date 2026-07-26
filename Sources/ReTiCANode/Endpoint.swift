@@ -88,9 +88,11 @@ public struct Endpoint {
             case let .interface(.delegate(.packetReceived(data))):
                 return .send(.transport(.received(id, data)))
             case .interface(.connectionEvent(.connected)):
-                return .send(.transport(.interfaceConnected(id)))
+                return .merge(.send(.transport(.interfaceConnected(id))),
+                              .send(.transport(.startMaintenance)))
             case .interface(.connectionEvent(.disconnected)):
-                return .send(.transport(.interfaceDisconnected(id)))
+                return .merge(.send(.transport(.interfaceDisconnected(id))),
+                              .send(.transport(.stopMaintenance)))
 
             case let .transport(.delegate(.transmit(txID, raw))):
                 guard txID == id else { return .none }

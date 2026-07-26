@@ -137,7 +137,13 @@ public struct Transport {
 
             case let .setTransportIdentity(identity):
                 state.transportIdentity = identity
-                return .none
+                guard identity == nil else { return .none }
+                // Stopped relaying: cancel pending re-broadcasts and drop relay-only routing state.
+                let cancels = state.announceTable.keys
+                    .map { Effect<Action>.cancel(id: CancelID.announceRetransmit($0)) }
+                state.announceTable = [:]
+                state.linkTable = [:]
+                return cancels.isEmpty ? .none : .merge(cancels)
 
             case let .received(interfaceID, data):
                 guard let packet = Packet(raw: data) else { return .none }
