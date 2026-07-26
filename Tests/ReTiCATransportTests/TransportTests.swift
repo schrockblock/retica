@@ -1872,6 +1872,65 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     #expect(requester.state.learned[dest.hash]?.identity.hash == identity.hash)
 }
 
+/// A tagless PATH_REQUEST: just the 16-byte destination hash, no tag (RNS ignores these).
+private func makeTaglessPathRequest(for destHash: Data) -> Data {
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .plain, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
+                        payload: destHash)
+    return try! packet.packed()
+}
+
+/// A tagless (16-byte, no tag) request to an OWNED destination is ignored (RNS Transport.py:2935).
+@Test @MainActor func taglessPathRequestToOwnedDestinationIsIgnored() async {
+    let identity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: identity)!
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations[dest.hash] = dest }
+    await store.send(.received(InterfaceID("in"), makeTaglessPathRequest(for: dest.hash)))
+    store.exhaustivity = .on          // no transmit — the tagless request produced no answer
+}
+
+/// A duplicate tagged request is ignored; a fresh tag is answered again (RNS discovery_pr_tags,
+/// Transport.py:2924-2934). Exercised on the owner-answer path.
+@Test @MainActor func duplicateTaggedPathRequestIsIgnored() async {
+    let identity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: identity)!
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations[dest.hash] = dest }
+    let tagA = Data(repeating: 0xA1, count: 16)
+    let tagB = Data(repeating: 0xB2, count: 16)
+
+    // Fresh tag A → answered.
+    let first = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash, tag: tagA)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { first.setValue(raw); return true }
+        return false
+    }
+    #expect(Packet(raw: first.value!)?.context == .pathResponse)
+
+    // Same tag A again → ignored (no transmit).
+    await store.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash, tag: tagA)))
+
+    // Different tag B → answered again.
+    let third = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash, tag: tagB)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { third.setValue(raw); return true }
+        return false
+    }
+    #expect(Packet(raw: third.value!)?.context == .pathResponse)
+}
+
 // MARK: - #4c-2 relay answers from cache
 
 /// A relay's PATH_REQUEST: destHash ‖ requestor_transport_id ‖ tag.

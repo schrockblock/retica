@@ -40,6 +40,10 @@ public struct Transport {
         /// for the currently-learned path. Enables a relay to re-emit a cached announce as
         /// a path response (RNS get_cached_packet, Transport.py:2973). GC'd with the path.
         public var announceCache: [Data: Data] = [:]
+        /// unique_tag (destHash ‖ tag) ring for PATH_REQUEST dedup — a duplicate tagged request is
+        /// ignored rather than re-answered (RNS discovery_pr_tags, Transport.py:2924-2934). Bounded
+        /// (auto-evicts oldest at capacity), so no separate GC pass.
+        public var discoveryPrTags = RingSet(capacity: Transport.pathRequestTagRingSize)
         public struct PendingAnnounce: Equatable, Sendable {
             public var raw: Data
             public var arrivalInterface: InterfaceID
@@ -273,6 +277,17 @@ public struct Transport {
                     if packet.destinationHash == Transport.pathRequestDestinationHash {
                         guard packet.payload.count >= 16 else { return .none }
                         let requested = Data(packet.payload.prefix(16))
+                        // Entry gate (RNS path_request_handler:2905-2934). Parse the request tag;
+                        // ignore tagless requests and duplicate (destHash ‖ tag) requests.
+                        let tag: Data
+                        if packet.payload.count > 32 {
+                            tag = Data(packet.payload.dropFirst(32).prefix(16))   // after destHash + transport_id
+                        } else if packet.payload.count > 16 {
+                            tag = Data(packet.payload.dropFirst(16).prefix(16))   // after destHash
+                        } else {
+                            return .none                                          // tagless (== 16) → ignore
+                        }
+                        guard state.discoveryPrTags.insert(requested + tag) else { return .none }
                         // (1) We OWN the requested destination → answer with a fresh path-response.
                         if let dest = state.localDestinations[requested],
                            let identity = dest.identity, identity.privateKey != nil {
@@ -458,6 +473,7 @@ public struct Transport {
     static let pathRequestDestinationHash: Data =
         Destination.hash(identityHash: nil, appName: "rnstransport", aspects: ["path", "request"])
 
+    static let pathRequestTagRingSize = 32000      // RNS max_pr_tags (Transport.py:127)
     /// Per-destination announce random-blob memory size (RNS Transport.MAX_RANDOM_BLOBS, Transport.py:98).
     static let announceBlobRingSize = 64
     /// RNS LOCAL_REBROADCASTS_MAX (Transport.py:77): total local re-broadcasts of one announce.
