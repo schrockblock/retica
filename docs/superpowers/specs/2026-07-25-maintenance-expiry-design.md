@@ -24,11 +24,19 @@ entries: aged-out learned paths (removing their random-blob rings too) and stale
 This bounds table growth. Expiry timing is not wire-visible; the load-bearing timeout **constants**
 are cross-validated against genuine RNS.
 
+**Trigger — explicit, not automatic.** A diagnostic confirmed the test-default `continuousClock` is
+*unimplemented*, so auto-starting the tick on a common action (e.g. `interfaceConnected`) would make
+its `clock.sleep` fail every bare interface-connecting test (~29 sites). The tick is therefore started
+by an explicit **`.startMaintenance`** action (and cancelled by `.stopMaintenance`). Existing tests do
+not call it, so migration is near-zero; the production consumer (the Node/Endpoint layer or the app)
+sends `.startMaintenance` once to enable GC — a small wiring follow-up, tracked but out of this slice.
+
 ## Scope
 
 **In scope (4b-3c-1):**
-- A self-rescheduling `.maintenanceTick`, started on the first `interfaceConnected` and cancelled when
-  `interfaces` becomes empty.
+- A self-rescheduling `.maintenanceTick`, started by an explicit `.startMaintenance` action and
+  cancelled by `.stopMaintenance` (both under a `CancelID.maintenance`, `cancelInFlight: true` so a
+  double-start is idempotent).
 - Timestamps on `LearnedDestination` (`learnedAt`) and `LinkTableEntry` (`refreshedAt`), with
   `linkTable` refreshed on link-packet forward (active links survive).
 - The sweep: expire `learned` (+ its `announceBlobs`) by `pathExpiry`; expire `linkTable` by
@@ -104,15 +112,12 @@ retry), so no existing entry is ever swept.
 
 ### 4. The tick and its lifecycle
 
-New action `case maintenanceTick`, and `private enum CancelID` gains `case maintenance`.
+New actions `case startMaintenance`, `case stopMaintenance`, `case maintenanceTick`; `private enum
+CancelID` gains `case maintenance`. `interfaceConnected` / `interfaceDisconnected` are UNCHANGED.
 
-- **`interfaceConnected(id)`**: if `state.interfaces.isEmpty` *before* inserting, then after inserting
-  start the tick:
+- **`startMaintenance`**: start the self-rescheduling tick (idempotent via `cancelInFlight`):
   ```swift
-  case let .interfaceConnected(id):
-      let wasEmpty = state.interfaces.isEmpty
-      state.interfaces.insert(id)
-      guard wasEmpty else { return .none }
+  case .startMaintenance:
       return .run { send in
           while true {
               try await clock.sleep(for: .seconds(Transport.maintenanceTickInterval))
@@ -120,8 +125,7 @@ New action `case maintenanceTick`, and `private enum CancelID` gains `case maint
           }
       }.cancellable(id: CancelID.maintenance, cancelInFlight: true)
   ```
-- **`interfaceDisconnected(id)`**: after removing, if `state.interfaces.isEmpty` →
-  `.cancel(id: CancelID.maintenance)`.
+- **`stopMaintenance`**: `return .cancel(id: CancelID.maintenance)`.
 - **`maintenanceTick`**: sweep, return `.none` (the `while` loop reschedules).
   ```swift
   case .maintenanceTick:
@@ -142,19 +146,15 @@ New action `case maintenanceTick`, and `private enum CancelID` gains `case maint
   re-broadcast bytes. The link-forward branch gains only the `refreshedAt` write; the `.announce`
   candidate gains only `learnedAt`.
 
-## Test-migration impact (empirically sized)
+## Test-migration impact (near-zero)
 
-Adding an auto-started standing tick was verified against the harness:
-- A `.off` (non-exhaustive) `TestStore` **tolerates** an in-flight standing timer at deinit — so the
-  ~40 interface-connecting `.off` tests are **unaffected** (their tick never fires and is tolerated).
-- Flipping to `.on` **rejects** an in-flight standing timer. The ~4 relay tests that flip to `.on`
-  after connecting interfaces (`exactReplayAnnounceIsDroppedAndNotRebroadcast`,
-  `forgeReplayWithMutatedAppDataIsDropped`, `ownDestinationAnnounceIsIgnored`,
-  `relayDoesNotRebroadcastForLocalDestinationOrPastHopLimit`) each need
-  `await store.skipInFlightEffects()` immediately before `store.exhaustivity = .on`.
-
-The plan enumerates the exact sites and confirms none advances the clock past 60 s (so none triggers
-a spurious sweep).
+With the explicit `.startMaintenance` trigger, **no existing test is affected** — none sends
+`.startMaintenance`, so none starts the tick and none touches `continuousClock` via the tick. The two
+new timestamp fields are defaulted, so existing `LearnedDestination` / `LinkTableEntry` constructors
+compile unchanged. Only the new expiry tests exercise `.startMaintenance` (with a `TestClock` and a
+mutable `date`). Diagnostics that informed this decision (kept for the record): a `.off` TestStore
+tolerates an in-flight standing timer at deinit, but a bare TestStore's default `continuousClock` is
+unimplemented and fails if used — hence the explicit opt-in trigger.
 
 ## Testing
 
