@@ -81,6 +81,23 @@ _pr_control_hash = RNS.Destination.hash(None, RNS.Transport.APP_NAME, "path", "r
 _pr_tag = RNS.Identity.get_random_hash()                  # 16-byte request tag (like request_path)
 _pr_request_payload = dest_hash + _pr_tag                 # non-relay path_request_data
 
+# --- #4c-2 relay cache path-response cross-validation ---
+# Genuine RNS packs the HEADER_2 PATH_RESPONSE announce a relay re-emits from cache
+# (mirrors Transport.py:616-629). Drives real RNS.Packet.pack() — the wire serializer —
+# wrapping the SAME reference announce payload above (non-circular: payload + packing both genuine).
+_pr_relay = RNS.Identity()                          # the relay's transport identity
+_pr_ann_dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app, aspect)
+_pr_ann_dest.hash = dest_hash
+_pr_resp_hops = 4
+_pr_resp_pkt = RNS.Packet(_pr_ann_dest, payload, RNS.Packet.ANNOUNCE,
+                          context=RNS.Packet.PATH_RESPONSE,
+                          header_type=RNS.Packet.HEADER_2,
+                          transport_type=RNS.Transport.TRANSPORT,
+                          transport_id=_pr_relay.hash,
+                          context_flag=RNS.Packet.FLAG_UNSET)
+_pr_resp_pkt.hops = _pr_resp_hops
+_pr_resp_pkt.pack()
+
 print(json.dumps({
     "announce_dest_hash": dest_hash.hex(),
     "announce_identity_hash": identity.hash.hex(),
@@ -108,4 +125,8 @@ print(json.dumps({
     "pr_control_hash": _pr_control_hash.hex(),
     "pr_requested_dest": dest_hash.hex(),
     "pr_request_payload": _pr_request_payload.hex(),
+    "pr_resp_relay_hash": _pr_relay.hash.hex(),
+    "pr_resp_payload": payload.hex(),
+    "pr_resp_hops": _pr_resp_hops,
+    "pr_resp_packet": _pr_resp_pkt.raw.hex(),
 }, indent=2))

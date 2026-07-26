@@ -88,3 +88,17 @@ import ComposableArchitecture
     let payload = Data(hexString: f.prRequestPayload)!
     #expect(Data(payload.prefix(16)) == Data(hexString: f.prRequestedDest)!)   // our data[:16] slicing == RNS
 }
+
+/// Our HEADER_2 pathResponse announce serialization is byte-identical to what genuine RNS emits
+/// when a relay re-broadcasts a cached announce as a path response (RNS Transport.py:616-629).
+@Test func relayCachePathResponseSerializationMatchesRns() throws {
+    let f = try TransportVectorFixtures.load()
+    let response = Packet(
+        headerType: .header2, packetType: .announce, transportType: .transport,
+        destinationType: .single, context: .pathResponse, contextFlag: false,
+        hops: UInt8(f.prRespHops),
+        destinationHash: Data(hexString: f.announceDestHash)!,
+        transportId: Data(hexString: f.prRespRelayHash)!,
+        payload: Data(hexString: f.prRespPayload)!)
+    #expect(try response.packed() == Data(hexString: f.prRespPacket)!)
+}

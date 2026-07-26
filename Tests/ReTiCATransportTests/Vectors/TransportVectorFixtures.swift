@@ -34,6 +34,10 @@ struct TransportVectorFixtures: Decodable {
     let prControlHash: String
     let prRequestedDest: String
     let prRequestPayload: String
+    let prRespRelayHash: String
+    let prRespPayload: String
+    let prRespHops: Int
+    let prRespPacket: String
 
     enum CodingKeys: String, CodingKey {
         case announceDestHash = "announce_dest_hash"
@@ -68,6 +72,10 @@ struct TransportVectorFixtures: Decodable {
         case prControlHash = "pr_control_hash"
         case prRequestedDest = "pr_requested_dest"
         case prRequestPayload = "pr_request_payload"
+        case prRespRelayHash = "pr_resp_relay_hash"
+        case prRespPayload = "pr_resp_payload"
+        case prRespHops = "pr_resp_hops"
+        case prRespPacket = "pr_resp_packet"
     }
 
     static func load() throws -> TransportVectorFixtures {
