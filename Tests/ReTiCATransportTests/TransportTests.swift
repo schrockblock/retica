@@ -186,7 +186,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
                            identity: Identity())!
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
-        $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1_700_000_000))
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i1"))) { $0.interfaces = [InterfaceID("i1")] }
@@ -498,7 +498,7 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, D
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
                            identity: Identity())!
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
-        $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1_700_000_000))
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i1"))) { $0.interfaces = [InterfaceID("i1")] }
