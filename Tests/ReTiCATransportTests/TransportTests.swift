@@ -1735,3 +1735,124 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     await store.send(.setTransportIdentity(nil))
     #expect(store.state.linkTable.isEmpty)
 }
+
+// MARK: - #4c-1 path requests
+
+/// A helper to build a raw PATH_REQUEST for a destination (non-relay: destHash ‖ tag).
+private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5A, count: 16)) -> Data {
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .plain, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
+                        payload: destHash + tag)
+    return try! packet.packed()
+}
+
+/// requestPath broadcasts a DATA PATH_REQUEST to the control dest with destHash ‖ tag payload.
+@Test @MainActor func requestPathBuildsBroadcastPathRequest() async {
+    let destHash = Data(repeating: 0x22, count: 16)
+    let tag = Data(repeating: 0xAB, count: 16)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.randomBytes = RandomBytesGenerator { _ in tag }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.requestPath(destinationHash: destHash))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    let p = Packet(raw: captured.value!)!
+    #expect(p.packetType == .data)
+    #expect(p.transportType == .broadcast)
+    #expect(p.headerType == .header1)
+    #expect(p.destinationType == .plain)
+    #expect(p.destinationHash == Transport.pathRequestDestinationHash)
+    #expect(Data(p.payload.prefix(16)) == destHash)
+    #expect(Data(p.payload.dropFirst(16)) == tag)         // non-relay → no transport_id
+}
+
+/// A relay's PATH_REQUEST includes its transport_id: destHash ‖ transportId ‖ tag.
+@Test @MainActor func relayRequestPathIncludesTransportId() async {
+    let relay = Identity()
+    let destHash = Data(repeating: 0x22, count: 16)
+    let tag = Data(repeating: 0xAB, count: 16)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.randomBytes = RandomBytesGenerator { _ in tag }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.setTransportIdentity(relay))
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.requestPath(destinationHash: destHash))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    let payload = Packet(raw: captured.value!)!.payload
+    #expect(Data(payload.prefix(16)) == destHash)
+    #expect(Data(payload.dropFirst(16).prefix(16)) == relay.hash)
+    #expect(Data(payload.dropFirst(32)) == tag)
+}
+
+/// A node that OWNS the requested destination answers with a path-response announce on the arrival iface.
+@Test @MainActor func localDestinationAnswersPathRequestWithPathResponse() async {
+    let identity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: identity)!
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest)) { $0.localDestinations[dest.hash] = dest }
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash)))
+    await store.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == InterfaceID("in") {
+            captured.setValue(raw); return true
+        }
+        return false
+    }
+    let resp = Packet(raw: captured.value!)!
+    #expect(resp.packetType == .announce)
+    #expect(resp.context == .pathResponse)
+    #expect(resp.destinationHash == dest.hash)
+    let parsed = Announce.parse(payload: resp.payload, destinationHash: resp.destinationHash,
+                                contextFlagSet: resp.contextFlag)
+    #expect(parsed?.identity.hash == identity.hash)
+}
+
+/// A PATH_REQUEST for a destination we do not own is not answered.
+@Test @MainActor func pathRequestForNonLocalDestinationIsNotAnswered() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    let unknown = Data(repeating: 0x77, count: 16)
+    await store.send(.received(InterfaceID("in"), makePathRequest(for: unknown)))
+    store.exhaustivity = .on          // no transmit is emitted
+}
+
+/// End-to-end: the responder's path-response announce is learned by a second (requester) Transport.
+@Test @MainActor func pathResponseAnnounceIsLearnedByRequester() async {
+    let identity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: identity)!
+    // Owner produces a path-response announce.
+    let owner = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    owner.exhaustivity = .off
+    await owner.send(.registerLocalDestination(dest)) { $0.localDestinations[dest.hash] = dest }
+    let response = LockIsolated<Data?>(nil)
+    await owner.send(.received(InterfaceID("in"), makePathRequest(for: dest.hash)))
+    await owner.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { response.setValue(raw); return true }
+        return false
+    }
+    // Requester learns the path from that announce, like any announce.
+    let requester = TestStore(initialState: Transport.State()) { Transport() }
+    requester.exhaustivity = .off
+    await requester.send(.received(InterfaceID("up"), response.value!))
+    await requester.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    #expect(requester.state.learned[dest.hash]?.identity.hash == identity.hash)
+}

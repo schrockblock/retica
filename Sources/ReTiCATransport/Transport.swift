@@ -75,6 +75,7 @@ public struct Transport {
         case setTransportIdentity(Identity?)
         case received(InterfaceID, Data)
         case announce(destinationHash: Data, appData: Data?)
+        case requestPath(destinationHash: Data)
         case send(destinationHash: Data, plaintext: Data)
         case announceRetransmitDue(destinationHash: Data)
         case startMaintenance
@@ -261,6 +262,24 @@ public struct Transport {
                     }
                     return effects.isEmpty ? .none : .merge(effects)
                 case .data:
+                    // A PATH_REQUEST (RNS Transport.py:2894/2939): a PLAIN DATA packet to the
+                    // well-known control destination. If we OWN the requested destination, answer with
+                    // a path-response announce on the arrival interface.
+                    if packet.destinationHash == Transport.pathRequestDestinationHash {
+                        guard packet.payload.count >= 16 else { return .none }
+                        let requested = Data(packet.payload.prefix(16))
+                        guard let dest = state.localDestinations[requested],
+                              let identity = dest.identity, identity.privateKey != nil
+                        else { return .none }
+                        let now = UInt64(date.now.timeIntervalSince1970)
+                        let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
+                        let respPayload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
+                                                                nameHash: dest.nameHash, randomHash: randomHash,
+                                                                ratchet: nil, appData: nil)
+                        let response = Packet.announce(from: dest, payload: respPayload, pathResponse: true)
+                        guard let raw = try? response.packed() else { return .none }
+                        return .send(.delegate(.transmit(interfaceID, raw)))
+                    }
                     // Relay: a HEADER_2 data packet naming us as the next hop, for a REMOTE destination,
                     // is forwarded toward the destination (nextHop-based; RNS Transport.py:1603-1614).
                     if let relayID = state.transportIdentity, packet.headerType == .header2,
@@ -377,6 +396,20 @@ public struct Transport {
                 guard let raw = try? packet.packed() else { return .none }
                 return .merge(state.interfaces.map { .send(.delegate(.transmit($0, raw))) })
 
+            case let .requestPath(destinationHash):
+                // RNS request_path (Transport.py:2799): a DATA/BROADCAST/HEADER_1 packet to the
+                // well-known PLAIN control destination; payload = destHash [+ our transport_id] + tag.
+                var payload = destinationHash
+                if let relayID = state.transportIdentity { payload.append(relayID.hash) }
+                payload.append(randomBytes(16))                        // request tag (RNS get_random_hash)
+                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                    destinationType: .plain, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
+                                    payload: payload)
+                guard let raw = try? packet.packed() else { return .none }
+                let sends = state.interfaces.map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
+                return sends.isEmpty ? .none : .merge(sends)
+
             case .delegate:
                 return .none
             }
@@ -389,6 +422,11 @@ public struct Transport {
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
     /// Sweep cadence — a local tuning constant (NOT wire-visible, NOT cross-validated).
     static let maintenanceTickInterval: TimeInterval = 60
+
+    /// RNS Transport path-request control destination: PLAIN "rnstransport"/["path","request"]
+    /// (Transport.py:61,256). Deterministic (no identity). Cross-validated against genuine RNS.
+    static let pathRequestDestinationHash: Data =
+        Destination.hash(identityHash: nil, appName: "rnstransport", aspects: ["path", "request"])
 
     /// Per-destination announce random-blob memory size (RNS Transport.MAX_RANDOM_BLOBS, Transport.py:98).
     static let announceBlobRingSize = 64
