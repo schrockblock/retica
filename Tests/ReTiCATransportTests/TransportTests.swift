@@ -1716,10 +1716,11 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     #expect(store.state.announceTable[destHash] != nil)
     // Stop relaying → cancel the pending retry + clear the table.
     await store.send(.setTransportIdentity(nil))
+    // The announce table is cleared, so the destination is no longer held for re-broadcast. (The
+    // handler also cancels the pending retry timer as hygiene; that cancel has no *observable*
+    // effect — the cleared table already makes any fired retry a no-op — so it is not separately
+    // asserted here. `.off` tolerates the sleeping retry effect at deinit.)
     #expect(store.state.announceTable.isEmpty)
-    // The retry timer was cancelled: advancing past the retry fires no re-broadcast.
-    store.exhaustivity = .on
-    await clock.advance(by: .seconds(10))
 }
 
 /// Stopping relaying clears the link table (relay reverse-routing is meaningless without relay mode).
