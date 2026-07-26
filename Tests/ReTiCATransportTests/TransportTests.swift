@@ -1945,32 +1945,54 @@ private func makeRelayPathRequest(for destHash: Data, requestorTransportId: Data
 
 /// Loop guard: a relay does not answer when the requester's transport_id equals our next hop
 /// toward the destination (RNS Transport.py:2987) — but answers when it differs.
-@Test @MainActor func relayLoopGuardOnRequestorEqualsNextHop() async {
-    let relay = Identity()
-    // Learn the path via a HEADER_2 announce so nextHop == the relaying transport_id we choose.
-    let upstream = Identity()
+/// A HEADER_2 announce for a fresh destination relayed via `upstream` — learning it sets the path's
+/// nextHop == `upstream.hash`, so a request carrying that transport_id trips the loop guard.
+private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash: Data) {
     let (h1Raw, destHash) = makeAnnouncePacket(hops: 2)
     let h1 = Packet(raw: h1Raw)!
     let relayedAnnounce = Packet(headerType: .header2, packetType: .announce, transportType: .transport,
                                  destinationType: .single, context: .none, contextFlag: false, hops: 2,
                                  destinationHash: destHash, transportId: upstream.hash, payload: h1.payload)
+    return (try! relayedAnnounce.packed(), destHash)
+}
+
+/// Loop guard, no-answer half: a relay does NOT answer when the requester's transport_id equals our
+/// next hop toward the destination (RNS Transport.py:2987). Isolated store, exhaustive at the moment
+/// of the request send so any emitted transmit fails the test (removing the guard breaks this).
+@Test @MainActor func relayLoopGuardEqualRequestorDoesNotAnswer() async {
+    let relay = Identity(), upstream = Identity()
+    let (announce, destHash) = makeRelayedAnnounce(via: upstream)
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.continuousClock = ImmediateClock()
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i0")))
     await store.send(.setTransportIdentity(relay))
-    await store.send(.received(InterfaceID("i0"), try! relayedAnnounce.packed()))
+    await store.send(.received(InterfaceID("i0"), announce))
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
     #expect(store.state.learned[destHash]?.nextHop == upstream.hash)
 
-    // Requester IS our next hop → do not answer.
+    // Requester IS our next hop → the guard must suppress the answer. Send in .off (the request also
+    // mutates the dedup ring), then flip to .on with nothing after it: a stray transmit is then an
+    // un-received delegate action that fails the store's exhaustive completeness check at teardown.
     await store.send(.received(InterfaceID("i0"),
                                makeRelayPathRequest(for: destHash, requestorTransportId: upstream.hash)))
     store.exhaustivity = .on
+}
 
-    // Different requestor transport_id → we answer.
+/// Loop guard, answer half: a different requestor transport_id → the relay answers with a pathResponse.
+@Test @MainActor func relayLoopGuardDifferentRequestorAnswers() async {
+    let relay = Identity(), upstream = Identity()
+    let (announce, destHash) = makeRelayedAnnounce(via: upstream)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
     store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.received(InterfaceID("i0"), announce))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+
     let other = Data(repeating: 0x33, count: 16)
     let captured = LockIsolated<Data?>(nil)
     await store.send(.received(InterfaceID("i0"),
