@@ -415,6 +415,10 @@ public struct Transport {
                 where now.timeIntervalSince(entry.refreshedAt) > Transport.linkTableExpiry {
                     state.linkTable[link] = nil
                 }
+                for (dest, startedAt) in state.discoveryPathRequests
+                where now.timeIntervalSince(startedAt) > Transport.pathRequestTimeout {
+                    state.discoveryPathRequests[dest] = nil
+                }
                 return .none
 
             case let .announceRetransmitDue(destinationHash):
@@ -498,6 +502,7 @@ public struct Transport {
     static let pathExpiry: TimeInterval = 60 * 60 * 24 * 7      // 604800
     /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
+    static let pathRequestTimeout: TimeInterval = 15      // RNS PATH_REQUEST_TIMEOUT (Transport.py:79)
     /// Sweep cadence — a local tuning constant (NOT wire-visible, NOT cross-validated).
     static let maintenanceTickInterval: TimeInterval = 60
 

@@ -2189,6 +2189,40 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     store.exhaustivity = .on          // learned != nil → recursion suppressed → no transmit
 }
 
+/// An in-flight recursive search older than pathRequestTimeout is swept by maintenanceTick; a fresh
+/// one survives (RNS stale discovery_path_requests cull, Transport.py:3060).
+@Test @MainActor func staleRecursiveSearchIsSweptByMaintenanceTick() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let relay = Identity()
+    let unknown = Data(repeating: 0x99, count: 16)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.setRecursivePathRequests(true))
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: unknown)))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.discoveryPathRequests[unknown] != nil)
+
+    await store.send(.startMaintenance)
+    // Not yet expired: a tick within the window keeps the entry.
+    now.setValue(Date(timeIntervalSince1970: 5))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.discoveryPathRequests[unknown] != nil)
+    // Past the timeout: the next tick sweeps it.
+    now.setValue(Date(timeIntervalSince1970: Transport.pathRequestTimeout + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.discoveryPathRequests[unknown] == nil)
+    await store.send(.stopMaintenance)
+}
+
 /// A second unknown-path request for the SAME destination (fresh tag) does not re-broadcast again
 /// while the first search is in flight (RNS discovery_path_requests dedup, Transport.py:3045).
 @Test @MainActor func duplicateDestinationDoesNotRebroadcastTwice() async {
