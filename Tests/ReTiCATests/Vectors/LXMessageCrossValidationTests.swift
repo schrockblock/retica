@@ -34,3 +34,19 @@ import Foundation
     #expect(unpacked?.hash == Data(hexString: f.hash)!)
     #expect(unpacked?.validateSignature(source: source) == true)
 }
+
+/// A genuine LXMF opportunistic payload is `packed[16:]`; reconstructing it with our
+/// `fromOpportunistic` (prepending the delivery destination hash) recovers the genuine reference
+/// message and validates its signature.
+@Test func fromOpportunisticReconstructsReferenceMessage() throws {
+    let f = try LXMFVectorFixtures.load()
+    let refPacked = Data(hexString: f.packed)!
+    let destHash = Data(hexString: f.destinationHash)!
+    let source = Identity(privateKey: Data(hexString: f.sourcePrivateKey)!)!
+    let opportunistic = Data(refPacked.dropFirst(16))          // what RNS.Packet carries as payload
+    let recovered = LXMessage.fromOpportunistic(destinationHash: destHash, payload: opportunistic)
+    #expect(recovered != nil)
+    #expect(recovered?.hash == Data(hexString: f.hash)!)
+    #expect(recovered?.content == Data(hexString: f.content)!)
+    #expect(recovered?.validateSignature(source: source) == true)
+}

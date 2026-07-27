@@ -57,3 +57,31 @@ import Foundation
     let bogus = Data(count: 16) + Data(count: 16) + Data(count: 64) + payload
     #expect(LXMessage.unpack(bogus) == nil)
 }
+
+@Test func opportunisticPayloadStripsLeadingDestinationHash() {
+    let source = Identity()
+    let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+    let msg = LXMessage.create(source: source, destinationHash: destHash,
+                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi".utf8))
+    #expect(msg.opportunisticPayload == Data(msg.packed.dropFirst(16)))
+    #expect(msg.opportunisticPayload.count == msg.packed.count - 16)
+}
+
+@Test func fromOpportunisticReconstructsAndValidates() {
+    let source = Identity()
+    let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+    let msg = LXMessage.create(source: source, destinationHash: destHash,
+                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi".utf8))
+    // Receiver reconstructs from its delivery-destination hash + the decrypted payload.
+    let recovered = LXMessage.fromOpportunistic(destinationHash: destHash, payload: msg.opportunisticPayload)
+    #expect(recovered != nil)
+    #expect(recovered?.hash == msg.hash)
+    #expect(recovered?.content == Data("hi".utf8))
+    #expect(recovered?.sourceHash == LXMessage.deliveryHash(identityHash: source.hash))
+    #expect(recovered?.validateSignature(source: source) == true)
+}
+
+@Test func fromOpportunisticRejectsMalformed() {
+    // destinationHash + payload shorter than the LXMF header (16+16+64) → nil.
+    #expect(LXMessage.fromOpportunistic(destinationHash: Data(count: 16), payload: Data(count: 10)) == nil)
+}
