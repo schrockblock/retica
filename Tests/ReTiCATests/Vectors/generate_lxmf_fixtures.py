@@ -2,14 +2,12 @@
 # Run in the conda `rns` env by absolute path:
 #   /Users/ell/opt/anaconda3/envs/rns/bin/python generate_lxmf_fixtures.py > lxmf_fixtures.json
 #
-# Emits a genuine lxmf 1.1.0 LXMessage (fixed timestamp) so the Swift LXMessage can be cross-validated:
-# our create() must reproduce .packed/.hash/.signature byte-for-byte, and our unpack() must recover
-# the fields and validate the signature.
-#
-# NOTE: We patch src.hash = src_id.hash before packing so that the source hash in the packed message
-# is the identity hash (SHA-256(pubkey)[:16]) — the same value our Swift LXMessage.create() uses
-# (Identity.hash). Reference LXMF would use the delivery-destination hash for src.hash, but our
-# LXMF-1 implementation uses identity hash directly. All signing/hashing/msgpack logic is genuine.
+# Emits a genuine lxmf 1.1.0 LXMessage (fixed timestamp) so the Swift LXMessage can be cross-validated.
+# source_hash / destination_hash are the parties' genuine `<identity>.lxmf.delivery` destination hashes
+# (what real LXMF packs), NOT raw identity hashes. Our Swift create() derives sourceHash the same way
+# (LXMessage.deliveryHash). The cross-val byte-matches the DETERMINISTIC wire regions and the message
+# hash, and VALIDATES the signature (ReTiCA's Ed25519 is hedged/randomized, so the signature bytes are
+# not reproducible — see the ed25519-hedged-nondeterministic note).
 import json
 import RNS
 import LXMF
@@ -22,10 +20,6 @@ dst_id = RNS.Identity()
 src = RNS.Destination(src_id, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
 dst = RNS.Destination(dst_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
 
-# Override src.hash to the identity hash so packed[16:32] == src_id.hash, matching our
-# LXMessage.create() which uses source.hash (Identity.hash = SHA-256(pubkey)[:16]).
-src.hash = src_id.hash
-
 title = b"greeting"
 content = b"hello world"
 msg = LXMF.LXMessage(dst, src, content=content, title=title)
@@ -34,8 +28,8 @@ msg.pack()
 
 print(json.dumps({
     "source_private_key": src_id.get_private_key().hex(),
-    "destination_hash": dst.hash.hex(),
-    "source_hash": src_id.hash.hex(),
+    "destination_hash": dst.hash.hex(),      # recipient lxmf.delivery destination hash
+    "source_hash": src.hash.hex(),           # sender lxmf.delivery destination hash
     "timestamp": msg.timestamp,
     "title": title.hex(),
     "content": content.hex(),

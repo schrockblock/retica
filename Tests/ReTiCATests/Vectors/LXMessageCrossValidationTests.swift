@@ -11,11 +11,13 @@ import Foundation
     let source = Identity(privateKey: Data(hexString: f.sourcePrivateKey)!)!
     let destHash = Data(hexString: f.destinationHash)!
     let refPacked = Data(hexString: f.packed)!
-    #expect(source.hash == Data(hexString: f.sourceHash)!)     // private-key round-trip → same identity
 
     let msg = LXMessage.create(source: source, destinationHash: destHash,
                                timestamp: f.timestamp, title: Data(hexString: f.title)!,
                                content: Data(hexString: f.content)!)
+    // Our derived lxmf.delivery source hash matches genuine LXMF's (also proves the private key
+    // loaded into the same identity).
+    #expect(msg.sourceHash == Data(hexString: f.sourceHash)!)
     #expect(msg.hash == Data(hexString: f.hash)!)              // SHA-256 message-ID byte-parity
     // Deterministic wire regions match byte-for-byte: destHash‖sourceHash (bytes 0..<32) and the
     // msgpack payload (bytes 96..). The 64-byte signature region (32..<96) is randomized → validated,

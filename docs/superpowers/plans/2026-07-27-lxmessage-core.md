@@ -238,7 +238,7 @@ git commit -F /tmp/ReTiCA/commit-lxmf1-t1.txt
 **Interfaces:**
 - Consumes: `LXMessage.create/packed/unpack/validateSignature` (Task 1), `Identity(privateKey:)`.
 
-**Context:** `Identity(privateKey:)` already round-trips RNS private keys (exercised by the existing `swiftDecryptsReferenceIdentityToken` cross-val), and Ed25519 is deterministic, so a byte-identical signature is expected. If the signature does NOT match, escalate per the spec's load-bearing-assumption note — do not weaken the assertion.
+**Context — IMPORTANT (revised after Task 1):** ReTiCA's CryptoKit Ed25519 is **hedged (randomized)** on this platform — signing the same message twice yields different signature bytes. So our signature can NEVER byte-match RNS's deterministic signature, and `msg.packed` (which contains the signature) can't be byte-compared wholesale. Cross-validate by (a) byte-comparing the **deterministic** wire regions — `destinationHash ‖ sourceHash` and the `msgpack(payload)` — plus the message `hash` (SHA-256, excludes the signature), and (b) **validating** our produced signature and the reference's signature via `validateSignature`. This still fully proves wire-compat: every deterministic byte matches, both signatures verify, and we accept genuine LXMF messages. `Identity(privateKey:)` round-trips RNS private keys (exercised by the existing `swiftDecryptsReferenceIdentityToken` cross-val), so the loaded identity is correct.
 
 - [ ] **Step 1: Write the fixture generator**
 
@@ -342,23 +342,31 @@ import Testing
 import Foundation
 @testable import ReTiCA
 
-/// Our LXMessage pack/hash/sign reproduces genuine lxmf 1.1.0 byte-for-byte, and our unpack recovers
-/// and validates a genuine reference message.
+/// Our LXMessage reproduces genuine lxmf 1.1.0's DETERMINISTIC wire bytes (destination/source hashes,
+/// payload) and message-ID, produces a valid signature, and unpacks + validates a genuine reference
+/// message. The signature bytes are NOT compared (ReTiCA's Ed25519 is hedged/randomized) — they are
+/// validated instead.
 @Test func lxMessageMatchesReferenceLXMF() throws {
     let f = try LXMFVectorFixtures.load()
     let source = Identity(privateKey: Data(hexString: f.sourcePrivateKey)!)!
     let destHash = Data(hexString: f.destinationHash)!
+    let refPacked = Data(hexString: f.packed)!
     #expect(source.hash == Data(hexString: f.sourceHash)!)     // private-key round-trip → same identity
 
     let msg = LXMessage.create(source: source, destinationHash: destHash,
                                timestamp: f.timestamp, title: Data(hexString: f.title)!,
                                content: Data(hexString: f.content)!)
-    #expect(msg.hash == Data(hexString: f.hash)!)              // SHA-256 message-ID parity
-    #expect(msg.signature == Data(hexString: f.signature)!)    // Ed25519 signature parity (deterministic)
-    #expect(msg.packed == Data(hexString: f.packed)!)          // full wire byte-parity
+    #expect(msg.hash == Data(hexString: f.hash)!)              // SHA-256 message-ID byte-parity
+    // Deterministic wire regions match byte-for-byte: destHash‖sourceHash (bytes 0..<32) and the
+    // msgpack payload (bytes 96..). The 64-byte signature region (32..<96) is randomized → validated,
+    // not compared.
+    let ourPacked = msg.packed
+    #expect(ourPacked.prefix(32) == refPacked.prefix(32))
+    #expect(Data(ourPacked.dropFirst(96)) == Data(refPacked.dropFirst(96)))
+    #expect(msg.validateSignature(source: source) == true)     // our signature is valid
 
-    // Our unpack recovers a genuine reference message and validates its signature.
-    let unpacked = LXMessage.unpack(Data(hexString: f.packed)!)
+    // Our unpack recovers a genuine reference message and validates its (deterministic) signature.
+    let unpacked = LXMessage.unpack(refPacked)
     #expect(unpacked != nil)
     #expect(unpacked?.content == Data(hexString: f.content)!)
     #expect(unpacked?.hash == Data(hexString: f.hash)!)
@@ -368,12 +376,12 @@ import Foundation
 
 - [ ] **Step 6: Run to verify it passes**
 
-Run: `swift test --filter "LXMessageCrossValidation\|lxMessageMatchesReference" 2>&1 | tail -20`
-Expected: PASS on the real comparison. If `msg.signature` mismatches, the private-key sig-seed offset diverges — escalate per the spec (do not edit the expected bytes). Also run `swift test --filter "CrossValidation"` to confirm the sibling pure-core cross-val tests still pass after the Package.swift resource change.
+Run: `swift test --filter "lxMessageMatchesReference" 2>&1 | tail -20`
+Expected: PASS. The deterministic-region byte-compares (hashes + payload) and both `validateSignature` checks hold; the signature is intentionally not byte-compared (hedged Ed25519). If a deterministic-region compare fails, our encoding diverges from genuine LXMF — investigate/escalate, do not weaken. If `validateSignature` on the reference message fails, our validation or the loaded identity is wrong — escalate. Also run `swift test --filter "CrossValidation"` to confirm the sibling pure-core cross-val tests still pass after the Package.swift resource change.
 
 - [ ] **Step 7: Mutation-verify**
 
-Mutate the test: change `timestamp: f.timestamp` to `timestamp: f.timestamp + 1` and confirm all three byte-parity assertions fail (different timestamp → different payload → different hash/signature/packed); revert and confirm pass. (Confirms the parity assertions are load-bearing on the exact inputs.)
+Mutate the test: change `timestamp: f.timestamp` to `timestamp: f.timestamp + 1` and confirm the deterministic-region assertions fail (different timestamp → different payload → `msg.hash != f.hash` and the payload-region byte-compare `ourPacked.dropFirst(96) != refPacked.dropFirst(96)` differ); revert and confirm pass. (Confirms the parity assertions are load-bearing on the exact inputs.)
 
 - [ ] **Step 8: Commit**
 

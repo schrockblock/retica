@@ -16,21 +16,35 @@ public struct LXMessage: Equatable {
     public let hash: Data                         // 32 — message ID
     public let signature: Data                    // 64
 
+    /// LXMF app name and delivery aspect. A message's source/destination hashes are the hashes of the
+    /// parties' `<identity>.lxmf.delivery` destinations — NOT raw identity hashes. A receiver recalls
+    /// the source identity from `sourceHash` (RNS Identity.recall of the delivery-destination hash)
+    /// to validate the signature (LXMessage.py:776-809).
+    public static let appName = "lxmf"
+    public static let deliveryAspects = ["delivery"]
+
+    /// The `lxmf.delivery` destination hash for an identity — what LXMF stores as source/destination hash.
+    public static func deliveryHash(identityHash: Data) -> Data {
+        Destination.hash(identityHash: identityHash, appName: appName, aspects: deliveryAspects)
+    }
+
     /// The msgpack of the 4-element payload [timestamp, title, content, {}] — the exact bytes the
     /// reference packs (empty fields map as the 4th element).
     private static func payloadBytes(timestamp: Double, title: Data, content: Data) -> Data {
         MsgPack.encode(.array([.double(timestamp), .bin(title), .bin(content), .map([])]))
     }
 
-    /// Build and sign a message from the source identity (which supplies `sourceHash` and the
-    /// Ed25519 signature). `title`/`content` are raw utf-8 bytes.
+    /// Build and sign a message from the source identity. `sourceHash` is derived as the source's
+    /// `lxmf.delivery` destination hash; `destinationHash` is the recipient's `lxmf.delivery`
+    /// destination hash. `title`/`content` are raw utf-8 bytes.
     public static func create(source: Identity, destinationHash: Data,
                               timestamp: Double, title: Data, content: Data) -> LXMessage {
+        let sourceHash = deliveryHash(identityHash: source.hash)
         let payload = payloadBytes(timestamp: timestamp, title: title, content: content)
-        let hashedPart = destinationHash + source.hash + payload
+        let hashedPart = destinationHash + sourceHash + payload
         let hash = Crypto.fullHash(hashedPart)
         let signature = source.sign(hashedPart + hash)
-        return LXMessage(destinationHash: destinationHash, sourceHash: source.hash,
+        return LXMessage(destinationHash: destinationHash, sourceHash: sourceHash,
                          timestamp: timestamp, title: title, content: content,
                          hash: hash, signature: signature)
     }

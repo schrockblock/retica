@@ -11,7 +11,7 @@ import Foundation
     let unpacked = LXMessage.unpack(msg.packed)
     #expect(unpacked != nil)
     #expect(unpacked?.destinationHash == destHash)
-    #expect(unpacked?.sourceHash == source.hash)
+    #expect(unpacked?.sourceHash == LXMessage.deliveryHash(identityHash: source.hash))
     #expect(unpacked?.timestamp == 1700000000.5)
     #expect(unpacked?.title == Data("greeting".utf8))
     #expect(unpacked?.content == Data("hello world".utf8))
