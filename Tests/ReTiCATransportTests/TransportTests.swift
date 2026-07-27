@@ -2142,6 +2142,9 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(p.packetType == .data)
     #expect(p.payload == unknown + relay.hash + tag)    // dest ‖ our transport_id ‖ same tag
     #expect(store.state.discoveryPathRequests[unknown] != nil)
+    // Exactly one re-broadcast (arrival interface excluded): a second transmit to i0 would be an
+    // un-received delegate action caught at teardown. Makes the fan-out filter load-bearing.
+    store.exhaustivity = .on
 }
 
 /// Recursion disabled (flag false) → no re-broadcast.
