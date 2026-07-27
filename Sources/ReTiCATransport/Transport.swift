@@ -40,10 +40,12 @@ public struct Transport {
         /// for the currently-learned path. Enables a relay to re-emit a cached announce as
         /// a path response (RNS get_cached_packet, Transport.py:2973). GC'd with the path.
         public var announceCache: [Data: Data] = [:]
+
         /// unique_tag (destHash ‖ tag) ring for PATH_REQUEST dedup — a duplicate tagged request is
         /// ignored rather than re-answered (RNS discovery_pr_tags, Transport.py:2924-2934). Bounded
         /// (auto-evicts oldest at capacity), so no separate GC pass.
         public var discoveryPrTags = RingSet(capacity: Transport.pathRequestTagRingSize)
+
         public struct PendingAnnounce: Equatable, Sendable {
             public var raw: Data
             public var arrivalInterface: InterfaceID

@@ -1895,8 +1895,6 @@ private func makeTaglessPathRequest(for destHash: Data) -> Data {
     store.exhaustivity = .on          // no transmit — the tagless request produced no answer
 }
 
-/// A duplicate tagged request is ignored; a fresh tag is answered again (RNS discovery_pr_tags,
-/// Transport.py:2924-2934). Exercised on the owner-answer path.
 /// A duplicate tagged request is ignored (RNS discovery_pr_tags, Transport.py:2924-2934). Uses two
 /// requests with the SAME (destHash ‖ tag) but DIFFERENT transport_ids, so their bytes differ and
 /// seenPacketHashes does NOT dedup them — the tag gate must. The dup is sent last, then the store
