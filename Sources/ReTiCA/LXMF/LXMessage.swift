@@ -72,7 +72,9 @@ public struct LXMessage: Equatable {
               case let .bin(content) = items[2],
               case let .map(pairs) = items[3], pairs.isEmpty
         else { return nil }
-        // Hash is recomputed from the received payload bytes (== msgpack(payload) for LXMF-1).
+        // Hash is recomputed from the received payload bytes (== msgpack(payload) for LXMF-1). The
+        // reference re-packs payload[:4] when stripping a stamp (5th element); we reject stamped/rich
+        // messages above, so packedPayload is always the exact hashed bytes here (LXMF-5 will revisit).
         let hash = Crypto.fullHash(destinationHash + sourceHash + packedPayload)
         return LXMessage(destinationHash: destinationHash, sourceHash: sourceHash,
                          timestamp: timestamp, title: title, content: content,

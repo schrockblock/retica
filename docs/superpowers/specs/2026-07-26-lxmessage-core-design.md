@@ -70,7 +70,8 @@ public struct LXMessage: Equatable {
 ### API
 
 - `static func create(source: Identity, destinationHash: Data, timestamp: Double, title: Data, content: Data) -> LXMessage`
-  - `sourceHash = source.hash`; builds `payload = [timestamp, title, content, emptyMap]`; `hashedPart = destinationHash ‖ sourceHash ‖ msgpack(payload)`; `hash = Crypto.fullHash(hashedPart)`; `signedPart = hashedPart ‖ hash`; `signature = source.sign(signedPart)`. Returns the fully-populated value.
+  - **`sourceHash` is the source's `lxmf.delivery` destination hash** — `Destination.hash(identityHash: source.hash, appName: "lxmf", aspects: ["delivery"])`, NOT the raw identity hash. (Corrected during implementation: genuine LXMF packs the parties' `<identity>.lxmf.delivery` destination hashes, and a receiver recalls the source identity from `sourceHash` to validate the signature — LXMessage.py:776-809. `destinationHash` is likewise the recipient's `lxmf.delivery` destination hash, supplied by the caller.)
+  - Builds `payload = [timestamp, title, content, emptyMap]`; `hashedPart = destinationHash ‖ sourceHash ‖ msgpack(payload)`; `hash = Crypto.fullHash(hashedPart)`; `signedPart = hashedPart ‖ hash`; `signature = source.sign(signedPart)`. Returns the fully-populated value.
   - A `String` convenience overload encodes title/content as utf-8.
 
 - `var packed: Data`
@@ -109,14 +110,14 @@ Swift Testing, mutation-verified per the three-step protocol.
 **Task 1 (core):**
 1. **Round-trip** — `create` → `packed` → `unpack` recovers destinationHash/sourceHash/timestamp/title/content and the same `hash`; `validateSignature(source)` is `true`.
 2. **Tamper** — flip a byte in the content region of `packed` → `unpack` still parses but `validateSignature` is `false` (and the recomputed `hash` differs from a pristine message's).
-3. **Message-ID stability** — two `create` calls with identical inputs produce the same `hash` and the same `signature` (deterministic); differing content produces a different `hash`.
+3. **Message-ID stability** — two `create` calls with identical inputs produce the same `hash` (SHA-256, deterministic); differing content produces a different `hash`. (The *signature* is NOT compared: ReTiCA's CryptoKit Ed25519 is hedged/randomized — see the Cross-validation note.)
 4. **Malformed / rich-fields rejection** — `unpack` returns `nil` for truncated input and for a payload whose 4th element is a non-empty (integer-keyed) map.
 
 **Task 2 (cross-val vs genuine lxmf 1.1.0):**
 5. A generator (`generate_lxmf_fixtures.py`, run via the conda `rns` env) creates a genuine `LXMF.LXMessage`, assigns a **fixed** `timestamp`, packs it, and emits: the source identity's private key (`get_private_key()`), the destination hash, the timestamp, title, content, and the reference `.packed` / `.hash` / `.signature` (all hex).
-6. Our test loads the identity via `Identity(privateKey:)`, calls `create(...)` with the identical inputs, and asserts **byte-identical** `packed`, `hash`, and `signature`. It also `unpack`s the reference `.packed`, asserts the recovered fields match, and that `validateSignature(against the loaded identity)` is `true`. Ed25519 determinism makes the signature comparison exact. Non-circular: the reference bytes come from genuine LXMF; our independent implementation must reproduce them.
+6. Our test loads the identity via `Identity(privateKey:)`, calls `create(...)` with the identical inputs, and asserts the **deterministic** wire regions match byte-for-byte — `destinationHash ‖ sourceHash` (`packed.prefix(32)`) and the `msgpack(payload)` (`packed.dropFirst(96)`) — plus the message `hash`, plus that our derived `sourceHash` equals the genuine delivery hash. It **validates** (does not byte-compare) our produced signature and, after `unpack`ing the reference `.packed`, validates the reference's signature and checks the recovered fields. Non-circular: the reference bytes come from genuine LXMF (real `RNS.Destination(..., "lxmf", "delivery")` objects, no override), and our independent implementation reproduces every deterministic byte.
 
-**Load-bearing assumption:** the byte-identical `signature` comparison requires RNS `Identity.get_private_key()` bytes to load into ReTiCA's `Identity(privateKey:)` as the same key (ReTiCA expects `encSeed(halfKey) ‖ sigSeed(halfKey)`). This private-key round-trip has not been exercised before (prior cross-val recovered only public keys). If the formats differ, the signature match will fail; the fix is to reconcile the private-key layout (not to weaken the assertion) or, if genuinely incompatible, fall back to validating the reference signature with the reference public key (`Identity(publicKey:)`) plus a separate deterministic-pack check — escalate rather than paper over.
+**Hedged-Ed25519 note (discovered during implementation):** ReTiCA's CryptoKit Ed25519 is **hedged/randomized** — signing the same message twice yields different bytes. So our signature can never byte-match RNS's deterministic signature, and `packed` (which contains the signature) can't be byte-compared wholesale. Cross-validation therefore validates signatures rather than byte-comparing them; every other field (hashes, payload) is deterministic and byte-identical. `Identity(privateKey:)` round-trips RNS `get_private_key()` (64 bytes = `encSeed ‖ sigSeed`), already exercised by the existing `swiftDecryptsReferenceIdentityToken` cross-val. See the `ed25519-hedged-nondeterministic` memory.
 
 ## Cross-validation note (reference baseline shift)
 
