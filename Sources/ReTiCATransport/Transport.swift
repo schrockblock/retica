@@ -46,6 +46,14 @@ public struct Transport {
         /// (auto-evicts oldest at capacity), so no separate GC pass.
         public var discoveryPrTags = RingSet(capacity: Transport.pathRequestTagRingSize)
 
+        /// Opt-in: when set (and in relay mode), a PATH_REQUEST for an unknown destination is
+        /// re-broadcast onward for recursive discovery (RNS recursive_prs, Transport.py:2946).
+        public var recursivePathRequests = false
+
+        /// destHash → when a recursive search for it began. Coalesces concurrent searches for the
+        /// same destination; GC'd after pathRequestTimeout (RNS discovery_path_requests, Transport.py:3060).
+        public var discoveryPathRequests: [Data: Date] = [:]
+
         public struct PendingAnnounce: Equatable, Sendable {
             public var raw: Data
             public var arrivalInterface: InterfaceID
@@ -83,6 +91,7 @@ public struct Transport {
         case interfaceDisconnected(InterfaceID)
         case registerLocalDestination(Destination)
         case setTransportIdentity(Identity?)
+        case setRecursivePathRequests(Bool)
         case received(InterfaceID, Data)
         case announce(destinationHash: Data, appData: Data?)
         case requestPath(destinationHash: Data)
@@ -155,6 +164,10 @@ public struct Transport {
                 state.announceTable = [:]
                 state.linkTable = [:]
                 return cancels.isEmpty ? .none : .merge(cancels)
+
+            case let .setRecursivePathRequests(enabled):
+                state.recursivePathRequests = enabled
+                return .none
 
             case let .received(interfaceID, data):
                 guard let packet = Packet(raw: data) else { return .none }
@@ -323,6 +336,24 @@ public struct Transport {
                                 destinationHash: requested, transportId: relayID.hash, payload: cachedPayload)
                             guard let raw = try? response.packed() else { return .none }
                             return .send(.delegate(.transmit(interfaceID, raw)))
+                        }
+                        // (3) Path unknown: if recursion is enabled (relay + opt-in) and we are not
+                        // already searching for this destination, re-broadcast onward for recursive
+                        // discovery (RNS path_request:3044-3070). Reusing the tag makes a looped-back
+                        // copy die at the #4c-3a discoveryPrTags ring.
+                        if let relayID = state.transportIdentity, state.recursivePathRequests,
+                           state.learned[requested] == nil,
+                           state.discoveryPathRequests[requested] == nil {
+                            state.discoveryPathRequests[requested] = date.now
+                            let fwd = Packet(
+                                headerType: .header1, packetType: .data, transportType: .broadcast,
+                                destinationType: .plain, context: .none, contextFlag: false, hops: 0,
+                                destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
+                                payload: requested + relayID.hash + tag)
+                            guard let raw = try? fwd.packed() else { return .none }
+                            let sends = state.interfaces.filter { $0 != interfaceID }
+                                .map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
+                            return sends.isEmpty ? .none : .merge(sends)
                         }
                         return .none
                     }

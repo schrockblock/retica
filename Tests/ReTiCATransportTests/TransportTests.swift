@@ -2114,3 +2114,95 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(requester.state.learned[destHash]?.identity.hash == identityHash)
     #expect(requester.state.learned[destHash]?.nextHop == relay.hash)   // reachable via the relay
 }
+
+// MARK: - #4c-3b recursive path request re-broadcast
+
+/// An opt-in relay re-broadcasts an unknown-path request onto every interface except the arrival
+/// one, with payload dest ‖ our transport_id ‖ the same tag (RNS path_request:3044-3070).
+@Test @MainActor func recursiveRelayRebroadcastsUnknownPathRequest() async {
+    let relay = Identity()
+    let unknown = Data(repeating: 0x99, count: 16)
+    let tag = Data(repeating: 0x5A, count: 16)          // makePathRequest default tag
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.setRecursivePathRequests(true))
+    let captured = LockIsolated<(InterfaceID, Data)?>(nil)
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: unknown)))
+    await store.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action { captured.setValue((ifID, raw)); return true }
+        return false
+    }
+    let (ifID, raw) = captured.value!
+    #expect(ifID == InterfaceID("i1"))                  // re-broadcast on the non-arrival interface
+    let p = Packet(raw: raw)!
+    #expect(p.destinationHash == Transport.pathRequestDestinationHash)
+    #expect(p.packetType == .data)
+    #expect(p.payload == unknown + relay.hash + tag)    // dest ‖ our transport_id ‖ same tag
+    #expect(store.state.discoveryPathRequests[unknown] != nil)
+}
+
+/// Recursion disabled (flag false) → no re-broadcast.
+@Test @MainActor func recursionDisabledDoesNotRebroadcast() async {
+    let relay = Identity()
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))       // flag stays false
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: Data(repeating: 0x99, count: 16))))
+    store.exhaustivity = .on
+}
+
+/// A non-relay (transportIdentity == nil) never re-broadcasts, even with the flag set.
+@Test @MainActor func nonRelayDoesNotRebroadcast() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setRecursivePathRequests(true))    // flag on, but no transport identity
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: Data(repeating: 0x99, count: 16))))
+    store.exhaustivity = .on
+}
+
+/// A known path (learned) never recurses — even if its announce cache is empty (RNS elif structure:
+/// a path_table hit never falls through to should_search_for_unknown).
+@Test @MainActor func knownButUncachedPathDoesNotRecurse() async {
+    let relay = Identity()
+    let dest = Data(repeating: 0x99, count: 16)
+    var initial = Transport.State()
+    initial.interfaces = [InterfaceID("i0"), InterfaceID("i1")]
+    initial.transportIdentity = relay
+    initial.recursivePathRequests = true
+    initial.learned[dest] = LearnedDestination(
+        identity: Identity(), appData: nil, ratchet: nil, interfaceID: InterfaceID("i1"),
+        hops: 2, nextHop: nil, announceEmitted: 1000, learnedAt: Date(timeIntervalSince1970: 1000))
+    // Note: announceCache[dest] is intentionally absent → the #4c-2 relay-cache branch is skipped.
+    let store = TestStore(initialState: initial) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: dest)))
+    store.exhaustivity = .on          // learned != nil → recursion suppressed → no transmit
+}
+
+/// A second unknown-path request for the SAME destination (fresh tag) does not re-broadcast again
+/// while the first search is in flight (RNS discovery_path_requests dedup, Transport.py:3045).
+@Test @MainActor func duplicateDestinationDoesNotRebroadcastTwice() async {
+    let relay = Identity()
+    let unknown = Data(repeating: 0x99, count: 16)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.setRecursivePathRequests(true))
+    // First unknown request (tag A) → re-broadcasts.
+    await store.send(.received(InterfaceID("i0"),
+                               makePathRequest(for: unknown, tag: Data(repeating: 0xA1, count: 16))))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    // Second unknown request, same dest, different tag → deduped by discoveryPathRequests, no re-broadcast.
+    await store.send(.received(InterfaceID("i0"),
+                               makePathRequest(for: unknown, tag: Data(repeating: 0xB2, count: 16))))
+    store.exhaustivity = .on
+}
