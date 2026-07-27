@@ -89,6 +89,17 @@ import ComposableArchitecture
     #expect(Data(payload.prefix(16)) == Data(hexString: f.prRequestedDest)!)   // our data[:16] slicing == RNS
 }
 
+/// Our PATH_REQUEST tag slicing extracts the same tag genuine RNS placed in the request, and our
+/// unique_tag matches RNS's destHash ‖ tag (RNS path_request_handler:2905-2921).
+@Test func pathRequestTagSlicingMatchesRns() throws {
+    let f = try TransportVectorFixtures.load()
+    let payload = Data(hexString: f.prRequestPayload)!    // genuine RNS leaf request: destHash ‖ tag (32 bytes)
+    let requested = Data(payload.prefix(16))
+    let tag = Data(payload.dropFirst(16).prefix(16))      // our > 16 branch (count == 32)
+    #expect(tag == Data(hexString: f.prTag)!)
+    #expect(requested + tag == Data(hexString: f.prRequestedDest)! + Data(hexString: f.prTag)!)
+}
+
 /// Our HEADER_2 pathResponse announce serialization is byte-identical to what genuine RNS emits
 /// when a relay re-broadcasts a cached announce as a path response (RNS Transport.py:616-629).
 @Test func relayCachePathResponseSerializationMatchesRns() throws {

@@ -34,6 +34,7 @@ struct TransportVectorFixtures: Decodable {
     let prControlHash: String
     let prRequestedDest: String
     let prRequestPayload: String
+    let prTag: String
     let prRespRelayHash: String
     let prRespPayload: String
     let prRespHops: Int
@@ -72,6 +73,7 @@ struct TransportVectorFixtures: Decodable {
         case prControlHash = "pr_control_hash"
         case prRequestedDest = "pr_requested_dest"
         case prRequestPayload = "pr_request_payload"
+        case prTag = "pr_tag"
         case prRespRelayHash = "pr_resp_relay_hash"
         case prRespPayload = "pr_resp_payload"
         case prRespHops = "pr_resp_hops"

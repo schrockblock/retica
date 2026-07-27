@@ -125,6 +125,7 @@ print(json.dumps({
     "pr_control_hash": _pr_control_hash.hex(),
     "pr_requested_dest": dest_hash.hex(),
     "pr_request_payload": _pr_request_payload.hex(),
+    "pr_tag": _pr_tag.hex(),
     "pr_resp_relay_hash": _pr_relay.hash.hex(),
     "pr_resp_payload": payload.hex(),
     "pr_resp_hops": _pr_resp_hops,
