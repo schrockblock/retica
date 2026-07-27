@@ -81,6 +81,12 @@ _pr_control_hash = RNS.Destination.hash(None, RNS.Transport.APP_NAME, "path", "r
 _pr_tag = RNS.Identity.get_random_hash()                  # 16-byte request tag (like request_path)
 _pr_request_payload = dest_hash + _pr_tag                 # non-relay path_request_data
 
+# --- #4c-3b recursive (relay) path request cross-validation ---
+# Genuine RNS relay path-request payload: dest ‖ transport_id ‖ tag (RNS request_path with
+# transport_enabled, Transport.py:2811). transport_id is a genuine RNS identity hash.
+_pr_recursive_relay = RNS.Identity()
+_pr_recursive_payload = dest_hash + _pr_recursive_relay.hash + _pr_tag
+
 # --- #4c-2 relay cache path-response cross-validation ---
 # Genuine RNS packs the HEADER_2 PATH_RESPONSE announce a relay re-emits from cache
 # (mirrors Transport.py:616-629). Drives real RNS.Packet.pack() — the wire serializer —
@@ -130,4 +136,6 @@ print(json.dumps({
     "pr_resp_payload": payload.hex(),
     "pr_resp_hops": _pr_resp_hops,
     "pr_resp_packet": _pr_resp_pkt.raw.hex(),
+    "pr_recursive_relay_hash": _pr_recursive_relay.hash.hex(),
+    "pr_recursive_payload": _pr_recursive_payload.hex(),
 }, indent=2))

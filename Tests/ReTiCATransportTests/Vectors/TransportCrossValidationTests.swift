@@ -100,6 +100,20 @@ import ComposableArchitecture
     #expect(requested + tag == Data(hexString: f.prRequestedDest)! + Data(hexString: f.prTag)!)
 }
 
+/// Our slicing of a 48-byte relay PATH_REQUEST (dest ‖ transport_id ‖ tag) matches genuine RNS's
+/// layout — the transport_id (bytes 16..32, our #4c-2 loop guard) and tag (bytes 32..48, our #4c-3a
+/// gate) offsets. Extends the 32-byte non-relay slicing check to the relay case.
+@Test func relayPathRequestSlicingMatchesRns() throws {
+    let f = try TransportVectorFixtures.load()
+    let payload = Data(hexString: f.prRecursivePayload)!          // genuine RNS relay request (48 bytes)
+    #expect(Data(payload.prefix(16)) == Data(hexString: f.prRequestedDest)!)
+    #expect(Data(payload.dropFirst(16).prefix(16)) == Data(hexString: f.prRecursiveRelayHash)!)  // transport_id
+    #expect(Data(payload.dropFirst(32).prefix(16)) == Data(hexString: f.prTag)!)                  // tag
+    // And the recursive re-broadcast composes the payload the same way.
+    #expect(Data(hexString: f.prRequestedDest)! + Data(hexString: f.prRecursiveRelayHash)!
+            + Data(hexString: f.prTag)! == payload)
+}
+
 /// Our HEADER_2 pathResponse announce serialization is byte-identical to what genuine RNS emits
 /// when a relay re-broadcasts a cached announce as a path response (RNS Transport.py:616-629).
 @Test func relayCachePathResponseSerializationMatchesRns() throws {
