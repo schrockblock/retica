@@ -2119,6 +2119,24 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
 
 /// An opt-in relay re-broadcasts an unknown-path request onto every interface except the arrival
 /// one, with payload dest ‖ our transport_id ‖ the same tag (RNS path_request:3044-3070).
+/// De-relaying (setTransportIdentity(nil)) clears in-flight recursive searches, alongside the
+/// announce/link tables — discoveryPathRequests is relay-only transient state.
+@Test @MainActor func deRelayingClearsInFlightRecursiveSearches() async {
+    let relay = Identity()
+    let unknown = Data(repeating: 0x99, count: 16)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.setRecursivePathRequests(true))
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: unknown)))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.discoveryPathRequests[unknown] != nil)
+    await store.send(.setTransportIdentity(nil))
+    #expect(store.state.discoveryPathRequests.isEmpty)
+}
+
 @Test @MainActor func recursiveRelayRebroadcastsUnknownPathRequest() async {
     let relay = Identity()
     let unknown = Data(repeating: 0x99, count: 16)

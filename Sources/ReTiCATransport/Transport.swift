@@ -163,6 +163,7 @@ public struct Transport {
                     .map { Effect<Action>.cancel(id: CancelID.announceRetransmit($0)) }
                 state.announceTable = [:]
                 state.linkTable = [:]
+                state.discoveryPathRequests = [:]   // in-flight recursive searches are relay-only state
                 return cancels.isEmpty ? .none : .merge(cancels)
 
             case let .setRecursivePathRequests(enabled):
