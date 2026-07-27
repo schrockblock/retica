@@ -9,6 +9,10 @@ public enum Link {
     public static let signatureLength = 64
     static let publicKeyHalf = 32
 
+    /// Maximum single-packet data unit over a link (RNS `Link.MDU`, = 431). An LXMF DIRECT message
+    /// whose `packed` fits this is sent as one link packet, else as a Resource.
+    public static let mdu = 431
+
     /// Link MTU/mode signalling appended to link requests and proofs (RNS `LINK_MTU_SIZE`).
     /// Fixed to the default MTU (500) and AES-256-CBC mode; ReTiCA does not negotiate MTU, but the
     /// bytes are part of the reference wire format (`Link.signalling_bytes(500, MODE_AES256_CBC)`),

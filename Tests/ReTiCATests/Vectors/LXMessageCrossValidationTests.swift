@@ -35,6 +35,13 @@ import Foundation
     #expect(unpacked?.validateSignature(source: source) == true)
 }
 
+/// Our Link.mdu equals genuine RNS Link.MDU — the threshold LXMF uses to choose a link packet vs a
+/// Resource for DIRECT delivery.
+@Test func linkMduMatchesRns() throws {
+    let f = try LXMFVectorFixtures.load()
+    #expect(Link.mdu == f.linkMdu)
+}
+
 /// A genuine LXMF opportunistic payload is `packed[16:]`; reconstructing it with our
 /// `fromOpportunistic` (prepending the delivery destination hash) recovers the genuine reference
 /// message and validates its signature.

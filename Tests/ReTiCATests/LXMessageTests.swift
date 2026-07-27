@@ -85,3 +85,36 @@ import Foundation
     // destinationHash + payload shorter than the LXMF header (16+16+64) → nil.
     #expect(LXMessage.fromOpportunistic(destinationHash: Data(count: 16), payload: Data(count: 10)) == nil)
 }
+
+@Test func directRepresentationIsPacketForSmallAndResourceForLarge() {
+    let source = Identity()
+    let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+    let small = LXMessage.create(source: source, destinationHash: destHash,
+                                 timestamp: 1700000000.5, title: Data(), content: Data("hi".utf8))
+    #expect(small.packed.count <= Link.mdu)
+    #expect(small.directRepresentation == .packet)
+    let large = LXMessage.create(source: source, destinationHash: destHash,
+                                 timestamp: 1700000000.5, title: Data(), content: Data(repeating: 0x41, count: 1000))
+    #expect(large.packed.count > Link.mdu)
+    #expect(large.directRepresentation == .resource)
+}
+
+/// The boundary is exactly Link.mdu (packed.count == mdu → packet; +1 → resource), so the `<=` and
+/// the threshold value are load-bearing. Content length is tuned so `packed.count == Link.mdu`.
+@Test func directRepresentationBoundaryIsLinkMdu() {
+    let source = Identity()
+    let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+    func msg(_ contentLen: Int) -> LXMessage {
+        LXMessage.create(source: source, destinationHash: destHash, timestamp: 1700000000.5,
+                         title: Data(), content: Data(repeating: 0x41, count: contentLen))
+    }
+    // Probe in the bin16 range (>=256) so +1 content byte == +1 packed byte (stable 3-byte bin header).
+    let probeLen = 300
+    let atMduLen = probeLen + (Link.mdu - msg(probeLen).packed.count)   // → packed.count == Link.mdu
+    let atMdu = msg(atMduLen)
+    #expect(atMdu.packed.count == Link.mdu)
+    #expect(atMdu.directRepresentation == .packet)
+    let overMdu = msg(atMduLen + 1)
+    #expect(overMdu.packed.count == Link.mdu + 1)
+    #expect(overMdu.directRepresentation == .resource)
+}

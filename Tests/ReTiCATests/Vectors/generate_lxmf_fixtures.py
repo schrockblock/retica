@@ -36,4 +36,5 @@ print(json.dumps({
     "hash": msg.hash.hex(),
     "signature": msg.signature.hex(),
     "packed": msg.packed.hex(),
+    "link_mdu": RNS.Link.MDU,
 }, indent=2))
