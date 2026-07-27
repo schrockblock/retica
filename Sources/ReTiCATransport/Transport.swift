@@ -502,7 +502,8 @@ public struct Transport {
     static let pathExpiry: TimeInterval = 60 * 60 * 24 * 7      // 604800
     /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
-    static let pathRequestTimeout: TimeInterval = 15      // RNS PATH_REQUEST_TIMEOUT (Transport.py:79)
+    /// RNS PATH_REQUEST_TIMEOUT (Transport.py:79): in-flight recursive path searches expire, seconds.
+    static let pathRequestTimeout: TimeInterval = 15
     /// Sweep cadence — a local tuning constant (NOT wire-visible, NOT cross-validated).
     static let maintenanceTickInterval: TimeInterval = 60
 
