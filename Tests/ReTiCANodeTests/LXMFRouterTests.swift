@@ -124,7 +124,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 
 @Test @MainActor func routerSendsSmallMessageOpportunistically() async {
     let msg = makeMessage(source: Identity(), content: "small")
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .opportunistic))
     await store.receive { action in
@@ -164,7 +166,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let msg = makeMessage(source: Identity(), content: "direct")
     let bigMsg = makeMessage(source: Identity(), content: String(repeating: "y", count: 2000))
     let linkID = Data(repeating: 0xCD, count: 16)
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .direct))
     await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
@@ -173,7 +177,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     initial2.directLinks[bigMsg.destinationHash] = .establishing
     initial2.outboundQueue[bigMsg.destinationHash] = [bigMsg]
     #expect(bigMsg.directRepresentation == .resource)
-    let store2 = TestStore(initialState: initial2) { LXMFRouter() }
+    let store2 = TestStore(initialState: initial2) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
     store2.exhaustivity = .off
     await store2.send(.linkEstablished(destinationHash: bigMsg.destinationHash, linkID: linkID))
     await store2.receive { action in
@@ -201,7 +207,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let linkID = Data(repeating: 0xAB, count: 16)
     var initial = LXMFRouter.State()
     initial.directLinks[msg.destinationHash] = .active(linkID: linkID)
-    let store = TestStore(initialState: initial) { LXMFRouter() }
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .direct))
     await store.receive { action in
@@ -250,4 +258,90 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.receive { action in
         if case let .delegate(.messageDelivered(_, v)) = action { #expect(v == true); return true }; return false
     }
+}
+
+// MARK: - LXMF-4c-1 outbound retry
+
+@Test @MainActor func routerArmsRetryTimerOnOpportunisticSend() async {
+    let msg = makeMessage(source: Identity(), content: "small")
+    let clock = TestClock()
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    await store.send(.delivered(messageHash: msg.hash))   // clean up the pending timer before teardown
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+}
+
+@Test @MainActor func routerDeliveredConfirmsAndCancelsRetry() async {
+    let msg = makeMessage(source: Identity(), content: "small")
+    let clock = TestClock()
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }
+    await store.send(.delivered(messageHash: msg.hash))
+    await store.receive { action in
+        if case let .delegate(.deliveryConfirmed(h)) = action { #expect(h == msg.hash); return true }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash] == nil)
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))   // retry timer was cancelled → no retryDue
+    store.exhaustivity = .on
+}
+
+@Test @MainActor func routerRetriesThenFailsAtMaxAttempts() async {
+    let msg = makeMessage(source: Identity(), content: "small")
+    let clock = TestClock()
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }
+    // 4 retries re-emit the send (attempts 2..5); the 5th advance (attempts → 6 > max) fails.
+    for _ in 0..<(LXMFDelivery.maxAttempts - 1) {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+        await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }   // re-emit
+    }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash] == nil)
+}
+
+@Test @MainActor func routerArmsRetryForDrainedResourceMessage() async {
+    let big = makeMessage(source: Identity(), content: String(repeating: "x", count: 2000))
+    #expect(big.directRepresentation == .resource)
+    let clock = TestClock()
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: big, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    let linkID = Data(repeating: 0xCD, count: 16)
+    await store.send(.linkEstablished(destinationHash: big.destinationHash, linkID: linkID))
+    await store.receive { action in
+        if case let .delegate(.sendDirect(_, _, asResource)) = action { #expect(asResource == true); return true }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[big.hash]?.attempts == 1)   // drained send armed a retry
+    // A retry re-emits sendDirect with asResource preserved.
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { action in
+        if case let .delegate(.sendDirect(lid, _, asResource)) = action {
+            #expect(lid == linkID); #expect(asResource == true); return true
+        }
+        return false
+    }
+    await store.send(.delivered(messageHash: big.hash))
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
 }
