@@ -17,19 +17,30 @@ public struct LXMFRouter {
         var seen = RingSet(capacity: 10_000)
         /// sourceHash (sender's lxmf.delivery destination hash) → identity, for signature validation.
         public var knownIdentities: [Data: Identity] = [:]
+        /// destinationHash → direct-link state (reuse an active link, or one being established).
+        public var directLinks: [Data: LinkStatus] = [:]
+        /// destinationHash → messages queued until a direct link to it becomes active.
+        var outboundQueue: [Data: [LXMessage]] = [:]
         public init() {}
     }
 
     public enum DeliveryMethod: Equatable { case opportunistic, direct }
+    public enum LinkStatus: Equatable { case establishing; case active(linkID: Data) }
 
     public enum Action: Equatable {
         case learnedIdentity(destinationHash: Data, identity: Identity)
         case received(method: DeliveryMethod, destinationHash: Data, data: Data)
+        case send(message: LXMessage, desiredMethod: DeliveryMethod)
+        case linkEstablished(destinationHash: Data, linkID: Data)
+        case linkClosed(destinationHash: Data)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
             case messageDelivered(message: LXMessage, signatureValidated: Bool)
             case duplicateDropped(hash: Data)
+            case sendOpportunistic(destinationHash: Data, payload: Data)
+            case requestLink(destinationHash: Data)
+            case sendDirect(linkID: Data, data: Data, asResource: Bool)
         }
     }
 
@@ -57,6 +68,41 @@ public struct LXMFRouter {
                 let validated = state.knownIdentities[message.sourceHash]
                     .map { message.validateSignature(source: $0) } ?? false
                 return .send(.delegate(.messageDelivered(message: message, signatureValidated: validated)))
+
+            case let .send(message, desiredMethod):
+                let effective: DeliveryMethod =
+                    (desiredMethod == .opportunistic && !message.opportunisticFits) ? .direct : desiredMethod
+                switch effective {
+                case .opportunistic:
+                    return .send(.delegate(.sendOpportunistic(destinationHash: message.destinationHash,
+                                                              payload: message.opportunisticPayload)))
+                case .direct:
+                    let dest = message.destinationHash
+                    if case let .active(linkID) = state.directLinks[dest] {
+                        return .send(.delegate(.sendDirect(linkID: linkID, data: message.packed,
+                                                           asResource: message.directRepresentation == .resource)))
+                    }
+                    state.outboundQueue[dest, default: []].append(message)
+                    if state.directLinks[dest] == nil {
+                        state.directLinks[dest] = .establishing
+                        return .send(.delegate(.requestLink(destinationHash: dest)))
+                    }
+                    return .none   // a link request is already in flight
+                }
+
+            case let .linkEstablished(dest, linkID):
+                state.directLinks[dest] = .active(linkID: linkID)
+                let queued = state.outboundQueue[dest] ?? []
+                state.outboundQueue[dest] = nil
+                let sends = queued.map { m in
+                    Effect<Action>.send(.delegate(.sendDirect(linkID: linkID, data: m.packed,
+                                                              asResource: m.directRepresentation == .resource)))
+                }
+                return sends.isEmpty ? .none : .merge(sends)
+
+            case let .linkClosed(dest):
+                state.directLinks[dest] = nil
+                return .none
 
             case .delegate:
                 return .none

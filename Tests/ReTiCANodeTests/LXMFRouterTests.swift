@@ -120,6 +120,98 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
 }
 
+// MARK: - LXMF-4b outbound
+
+@Test @MainActor func routerSendsSmallMessageOpportunistically() async {
+    let msg = makeMessage(source: Identity(), content: "small")
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    await store.receive { action in
+        if case let .delegate(.sendOpportunistic(dest, payload)) = action {
+            #expect(dest == msg.destinationHash); #expect(payload == msg.opportunisticPayload); return true
+        }
+        return false
+    }
+}
+
+@Test @MainActor func routerFallsBackToDirectWhenOpportunisticTooLarge() async {
+    let big = makeMessage(source: Identity(), content: String(repeating: "x", count: 1000))
+    #expect(big.opportunisticFits == false)
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: big, desiredMethod: .opportunistic))   // desired opportunistic, too big
+    await store.receive { action in                                        // → treated as direct → requestLink
+        if case let .delegate(.requestLink(dest)) = action { #expect(dest == big.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.directLinks[big.destinationHash] == .establishing)
+}
+
+@Test @MainActor func routerDirectWithNoLinkRequestsAndQueues() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { action in
+        if case let .delegate(.requestLink(dest)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.directLinks[msg.destinationHash] == .establishing)
+}
+
+@Test @MainActor func routerLinkEstablishedDrainsQueueAsSendDirect() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let bigMsg = makeMessage(source: Identity(), content: String(repeating: "y", count: 2000))
+    let linkID = Data(repeating: 0xCD, count: 16)
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    // Enqueue a resource-sized message to the same destination to make asResource load-bearing
+    var initial2 = LXMFRouter.State()
+    initial2.directLinks[bigMsg.destinationHash] = .establishing
+    initial2.outboundQueue[bigMsg.destinationHash] = [bigMsg]
+    #expect(bigMsg.directRepresentation == .resource)
+    let store2 = TestStore(initialState: initial2) { LXMFRouter() }
+    store2.exhaustivity = .off
+    await store2.send(.linkEstablished(destinationHash: bigMsg.destinationHash, linkID: linkID))
+    await store2.receive { action in
+        if case let .delegate(.sendDirect(lid, data, asResource)) = action {
+            #expect(lid == linkID); #expect(data == bigMsg.packed)
+            #expect(asResource == true); return true
+        }
+        return false
+    }
+    #expect(store2.state.directLinks[bigMsg.destinationHash] == .active(linkID: linkID))
+    // Also verify the packet-sized drain
+    await store.send(.linkEstablished(destinationHash: msg.destinationHash, linkID: linkID))
+    await store.receive { action in
+        if case let .delegate(.sendDirect(lid, data, asResource)) = action {
+            #expect(lid == linkID); #expect(data == msg.packed)
+            #expect(asResource == (msg.directRepresentation == .resource)); return true
+        }
+        return false
+    }
+    #expect(store.state.directLinks[msg.destinationHash] == .active(linkID: linkID))
+}
+
+@Test @MainActor func routerDirectWithActiveLinkSendsImmediately() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let linkID = Data(repeating: 0xAB, count: 16)
+    var initial = LXMFRouter.State()
+    initial.directLinks[msg.destinationHash] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { action in
+        if case let .delegate(.sendDirect(lid, data, _)) = action {
+            #expect(lid == linkID); #expect(data == msg.packed); return true
+        }
+        return false
+    }
+}
+
 /// learnedIdentity flips a message from unvalidated to validated: the same sender's message is
 /// signatureValidated == false before the identity is learned and true after.
 @Test @MainActor func routerValidationDependsOnLearnedIdentity() async {
