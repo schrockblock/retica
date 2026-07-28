@@ -22,6 +22,9 @@ public struct LXMFRouter {
         public var knownIdentities: [Data: Identity] = [:]
         /// destinationHash → direct-link state (reuse an active link, or one being established).
         public var directLinks: [Data: LinkStatus] = [:]
+        /// destinationHash → we have a learned path to it. Gates direct-link establishment: with no
+        /// path, request one first (RNS process_outbound, LXMRouter.py:2829-2838).
+        public var knownPaths: Set<Data> = []
         /// destinationHash → messages queued until a direct link to it becomes active.
         var outboundQueue: [Data: [LXMessage]] = [:]
         /// message.hash → in-flight send awaiting a delivery outcome (with its resend info + attempts).
@@ -30,7 +33,7 @@ public struct LXMFRouter {
     }
 
     public enum DeliveryMethod: Equatable { case opportunistic, direct }
-    public enum LinkStatus: Equatable { case establishing; case active(linkID: Data) }
+    public enum LinkStatus: Equatable { case awaitingPath; case establishing; case active(linkID: Data) }
 
     public enum ResendInfo: Equatable {
         case opportunistic(destinationHash: Data, payload: Data)
@@ -44,6 +47,7 @@ public struct LXMFRouter {
         case send(message: LXMessage, desiredMethod: DeliveryMethod)
         case linkEstablished(destinationHash: Data, linkID: Data)
         case linkClosed(destinationHash: Data)
+        case learnedPath(destinationHash: Data)
         case delivered(messageHash: Data)
         case retryDue(messageHash: Data)
         case delegate(Delegate)
@@ -53,6 +57,7 @@ public struct LXMFRouter {
             case duplicateDropped(hash: Data)
             case sendOpportunistic(destinationHash: Data, payload: Data)
             case requestLink(destinationHash: Data)
+            case requestPath(destinationHash: Data)
             case sendDirect(linkID: Data, data: Data, asResource: Bool)
             case deliveryConfirmed(messageHash: Data)
             case deliveryFailed(messageHash: Data)
@@ -115,10 +120,14 @@ public struct LXMFRouter {
                     }
                     state.outboundQueue[dest, default: []].append(message)
                     if state.directLinks[dest] == nil {
-                        state.directLinks[dest] = .establishing
-                        return .send(.delegate(.requestLink(destinationHash: dest)))
+                        if state.knownPaths.contains(dest) {
+                            state.directLinks[dest] = .establishing
+                            return .send(.delegate(.requestLink(destinationHash: dest)))
+                        }
+                        state.directLinks[dest] = .awaitingPath
+                        return .send(.delegate(.requestPath(destinationHash: dest)))
                     }
-                    return .none   // a link request is already in flight
+                    return .none   // a link/path request is already in flight
                 }
 
             case let .linkEstablished(dest, linkID):
@@ -136,6 +145,14 @@ public struct LXMFRouter {
 
             case let .linkClosed(dest):
                 state.directLinks[dest] = nil
+                return .none
+
+            case let .learnedPath(dest):
+                state.knownPaths.insert(dest)
+                if state.directLinks[dest] == .awaitingPath {
+                    state.directLinks[dest] = .establishing
+                    return .send(.delegate(.requestLink(destinationHash: dest)))
+                }
                 return .none
 
             case let .delivered(hash):

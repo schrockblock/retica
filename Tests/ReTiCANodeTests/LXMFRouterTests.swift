@@ -140,7 +140,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 @Test @MainActor func routerFallsBackToDirectWhenOpportunisticTooLarge() async {
     let big = makeMessage(source: Identity(), content: String(repeating: "x", count: 1000))
     #expect(big.opportunisticFits == false)
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(big.destinationHash)   // path known → establishes directly
+    let store = TestStore(initialState: initial) { LXMFRouter() }
     store.exhaustivity = .off
     await store.send(.send(message: big, desiredMethod: .opportunistic))   // desired opportunistic, too big
     await store.receive { action in                                        // → treated as direct → requestLink
@@ -152,7 +154,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 
 @Test @MainActor func routerDirectWithNoLinkRequestsAndQueues() async {
     let msg = makeMessage(source: Identity(), content: "direct")
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(msg.destinationHash)   // path known → establishes directly
+    let store = TestStore(initialState: initial) { LXMFRouter() }
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .direct))
     await store.receive { action in
@@ -166,7 +170,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let msg = makeMessage(source: Identity(), content: "direct")
     let bigMsg = makeMessage(source: Identity(), content: String(repeating: "y", count: 2000))
     let linkID = Data(repeating: 0xCD, count: 16)
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+    var initial1 = LXMFRouter.State()
+    initial1.knownPaths.insert(msg.destinationHash)   // path known → establishes directly
+    let store = TestStore(initialState: initial1) { LXMFRouter() } withDependencies: {
         $0.continuousClock = TestClock()
     }
     store.exhaustivity = .off
@@ -229,7 +235,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let m1 = makeMessage(source: sender, recipientIdentityHash: recipient, content: "one")
     let m2 = makeMessage(source: sender, recipientIdentityHash: recipient, content: "two")
     #expect(m1.destinationHash == m2.destinationHash)   // same recipient delivery destination
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(m1.destinationHash)   // path known → establishes directly
+    let store = TestStore(initialState: initial) { LXMFRouter() }
     store.exhaustivity = .off
     await store.send(.send(message: m1, desiredMethod: .direct))
     await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
@@ -258,6 +266,81 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.receive { action in
         if case let .delegate(.messageDelivered(_, v)) = action { #expect(v == true); return true }; return false
     }
+}
+
+// MARK: - LXMF-4c-2 path request on no-path
+
+@Test @MainActor func routerDirectWithNoPathRequestsPath() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))   // no known path
+    await store.receive { action in
+        if case let .delegate(.requestPath(dest)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.directLinks[msg.destinationHash] == .awaitingPath)
+    #expect(store.state.outboundQueue[msg.destinationHash]?.count == 1)   // message parked
+    store.exhaustivity = .on   // a stray requestLink would fail teardown
+}
+
+/// After requesting a path, learning it transitions awaitingPath → establishing (emits requestLink);
+/// the queued message then drains as sendDirect once the link establishes.
+@Test @MainActor func routerLearnedPathTriggersLinkThenDrains() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let linkID = Data(repeating: 0xEE, count: 16)
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestPath) = $0 { return true }; return false }
+    #expect(store.state.directLinks[msg.destinationHash] == .awaitingPath)
+    await store.send(.learnedPath(destinationHash: msg.destinationHash))
+    await store.receive { action in
+        if case let .delegate(.requestLink(dest)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.directLinks[msg.destinationHash] == .establishing)
+    #expect(store.state.knownPaths.contains(msg.destinationHash))
+    await store.send(.linkEstablished(destinationHash: msg.destinationHash, linkID: linkID))
+    await store.receive { action in
+        if case let .delegate(.sendDirect(lid, data, _)) = action {
+            #expect(lid == linkID); #expect(data == msg.packed); return true
+        }
+        return false
+    }
+}
+
+/// Request-path-once: a second direct send to a still-awaitingPath destination is queued but does NOT
+/// emit a second requestPath. (Removing the `directLinks[dest] == nil` guard would fire a second
+/// requestPath — an un-received delegate caught by the exhaustive teardown.)
+@Test @MainActor func routerRequestsPathOnceWhileAwaitingPath() async {
+    let sender = Identity()
+    let recipient = Identity().hash
+    let m1 = makeMessage(source: sender, recipientIdentityHash: recipient, content: "one")
+    let m2 = makeMessage(source: sender, recipientIdentityHash: recipient, content: "two")
+    #expect(m1.destinationHash == m2.destinationHash)   // same recipient delivery destination
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: m1, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestPath) = $0 { return true }; return false }
+    #expect(store.state.directLinks[m1.destinationHash] == .awaitingPath)
+    await store.send(.send(message: m2, desiredMethod: .direct))   // still awaitingPath → enqueue only
+    #expect(store.state.outboundQueue[m1.destinationHash]?.count == 2)   // both queued
+    store.exhaustivity = .on   // a stray second requestPath would fail teardown
+}
+
+/// learnedPath for a destination with no awaitingPath entry records the path but starts no link
+/// machinery (no requestLink, no directLinks entry).
+@Test @MainActor func routerUnrelatedLearnedPathIsInert() async {
+    let other = LXMessage.deliveryHash(identityHash: Identity().hash)
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.learnedPath(destinationHash: other))
+    #expect(store.state.knownPaths.contains(other))   // recorded
+    #expect(store.state.directLinks[other] == nil)    // but no link/path machinery started
+    store.exhaustivity = .on   // a stray requestLink would fail teardown
 }
 
 // MARK: - LXMF-4c-1 outbound retry
@@ -321,7 +404,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let big = makeMessage(source: Identity(), content: String(repeating: "x", count: 2000))
     #expect(big.directRepresentation == .resource)
     let clock = TestClock()
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(big.destinationHash)   // path known → establishes directly
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
         $0.continuousClock = clock
     }
     store.exhaustivity = .off
