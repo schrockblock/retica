@@ -56,6 +56,12 @@ import Foundation
     #expect(LXMFDelivery.maxAttempts == f.maxDeliveryAttempts)
 }
 
+/// Our LXMF path-request wait matches genuine RNS LXMRouter.PATH_REQUEST_WAIT.
+@Test func pathRequestWaitMatchesRns() throws {
+    let f = try LXMFVectorFixtures.load()
+    #expect(LXMFDelivery.pathRequestWaitSeconds == f.pathRequestWait)
+}
+
 /// A genuine LXMF opportunistic payload is `packed[16:]`; reconstructing it with our
 /// `fromOpportunistic` (prepending the delivery destination hash) recovers the genuine reference
 /// message and validates its signature.

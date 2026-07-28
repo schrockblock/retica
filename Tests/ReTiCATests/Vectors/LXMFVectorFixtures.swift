@@ -14,6 +14,7 @@ struct LXMFVectorFixtures: Decodable {
     let encryptedPacketMdu: Int
     let deliveryRetryWait: Int
     let maxDeliveryAttempts: Int
+    let pathRequestWait: Int
 
     enum CodingKeys: String, CodingKey {
         case sourcePrivateKey = "source_private_key"
@@ -25,6 +26,7 @@ struct LXMFVectorFixtures: Decodable {
         case encryptedPacketMdu = "encrypted_packet_mdu"
         case deliveryRetryWait = "delivery_retry_wait"
         case maxDeliveryAttempts = "max_delivery_attempts"
+        case pathRequestWait = "path_request_wait"
     }
 
     static func load() throws -> LXMFVectorFixtures {
