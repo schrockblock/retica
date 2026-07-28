@@ -11,6 +11,7 @@ struct LXMFVectorFixtures: Decodable {
     let signature: String
     let packed: String
     let linkMdu: Int
+    let encryptedPacketMdu: Int
 
     enum CodingKeys: String, CodingKey {
         case sourcePrivateKey = "source_private_key"
@@ -19,6 +20,7 @@ struct LXMFVectorFixtures: Decodable {
         case timestamp
         case title, content, hash, signature, packed
         case linkMdu = "link_mdu"
+        case encryptedPacketMdu = "encrypted_packet_mdu"
     }
 
     static func load() throws -> LXMFVectorFixtures {

@@ -10,6 +10,16 @@ extension LXMessage {
         Data(packed.dropFirst(LXMessage.destinationLength))
     }
 
+    /// Max plaintext of a single opportunistic encrypted packet (RNS `ENCRYPTED_PACKET_MDU`, = 391).
+    public static let encryptedPacketMDU = 391
+
+    /// True if this message fits a single opportunistic packet (else DIRECT is required). Reference LXMF
+    /// falls back opportunistic→direct when `content_size > ENCRYPTED_PACKET_MAX_CONTENT`, which reduces
+    /// exactly to `opportunisticPayload.count <= ENCRYPTED_PACKET_MDU` (LXMessage.py:397-401).
+    public var opportunisticFits: Bool {
+        opportunisticPayload.count <= LXMessage.encryptedPacketMDU
+    }
+
     /// Reconstruct a message received opportunistically: prepend our `lxmf.delivery` destination hash
     /// (which the packet header carried, not the payload) to the decrypted `payload`, then unpack.
     /// `destinationHash` is our delivery-destination hash; `payload` is the decrypted inbound plaintext.

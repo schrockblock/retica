@@ -37,4 +37,5 @@ print(json.dumps({
     "signature": msg.signature.hex(),
     "packed": msg.packed.hex(),
     "link_mdu": RNS.Link.MDU,
+    "encrypted_packet_mdu": LXMF.LXMessage.ENCRYPTED_PACKET_MDU,
 }, indent=2))

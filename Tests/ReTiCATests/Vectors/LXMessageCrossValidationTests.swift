@@ -42,6 +42,13 @@ import Foundation
     #expect(Link.mdu == f.linkMdu)
 }
 
+/// Our encryptedPacketMDU equals genuine RNS/LXMF ENCRYPTED_PACKET_MDU — the opportunistic→direct
+/// size-fallback threshold.
+@Test func encryptedPacketMduMatchesRns() throws {
+    let f = try LXMFVectorFixtures.load()
+    #expect(LXMessage.encryptedPacketMDU == f.encryptedPacketMdu)
+}
+
 /// A genuine LXMF opportunistic payload is `packed[16:]`; reconstructing it with our
 /// `fromOpportunistic` (prepending the delivery destination hash) recovers the genuine reference
 /// message and validates its signature.

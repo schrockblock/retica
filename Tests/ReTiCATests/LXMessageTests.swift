@@ -118,3 +118,34 @@ import Foundation
     #expect(overMdu.packed.count == Link.mdu + 1)
     #expect(overMdu.directRepresentation == .resource)
 }
+
+@Test func opportunisticFitsSmallNotLarge() {
+    let source = Identity()
+    let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+    let small = LXMessage.create(source: source, destinationHash: destHash,
+                                 timestamp: 1700000000.5, title: Data(), content: Data("hi".utf8))
+    #expect(small.opportunisticPayload.count <= LXMessage.encryptedPacketMDU)
+    #expect(small.opportunisticFits == true)
+    let large = LXMessage.create(source: source, destinationHash: destHash,
+                                 timestamp: 1700000000.5, title: Data(), content: Data(repeating: 0x41, count: 1000))
+    #expect(large.opportunisticPayload.count > LXMessage.encryptedPacketMDU)
+    #expect(large.opportunisticFits == false)
+}
+
+/// Boundary at exactly encryptedPacketMDU (opportunisticPayload.count == MDU → fits; +1 → not).
+@Test func opportunisticFitsBoundary() {
+    let source = Identity()
+    let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+    func msg(_ n: Int) -> LXMessage {
+        LXMessage.create(source: source, destinationHash: destHash, timestamp: 1700000000.5,
+                         title: Data(), content: Data(repeating: 0x41, count: n))
+    }
+    let probeLen = 300   // bin16 range → +1 content == +1 opportunisticPayload byte
+    let atMduLen = probeLen + (LXMessage.encryptedPacketMDU - msg(probeLen).opportunisticPayload.count)
+    let atMdu = msg(atMduLen)
+    #expect(atMdu.opportunisticPayload.count == LXMessage.encryptedPacketMDU)
+    #expect(atMdu.opportunisticFits == true)
+    let overMdu = msg(atMduLen + 1)
+    #expect(overMdu.opportunisticPayload.count == LXMessage.encryptedPacketMDU + 1)
+    #expect(overMdu.opportunisticFits == false)
+}
