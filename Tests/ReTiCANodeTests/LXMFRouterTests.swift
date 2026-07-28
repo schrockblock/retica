@@ -212,6 +212,26 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
 }
 
+/// Establish-once: a second direct send to a still-establishing destination is queued but does NOT
+/// emit a second requestLink. (Removing the `directLinks[dest] == nil` guard would fire a second
+/// requestLink — an un-received delegate caught by the exhaustive teardown.)
+@Test @MainActor func routerEstablishesLinkOnceForConcurrentSends() async {
+    let sender = Identity()
+    let recipient = Identity().hash
+    let m1 = makeMessage(source: sender, recipientIdentityHash: recipient, content: "one")
+    let m2 = makeMessage(source: sender, recipientIdentityHash: recipient, content: "two")
+    #expect(m1.destinationHash == m2.destinationHash)   // same recipient delivery destination
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: m1, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    #expect(store.state.directLinks[m1.destinationHash] == .establishing)
+    // Second send to the same still-establishing destination → enqueued, no second requestLink.
+    await store.send(.send(message: m2, desiredMethod: .direct))
+    #expect(store.state.outboundQueue[m1.destinationHash]?.count == 2)   // both queued
+    store.exhaustivity = .on   // a stray second requestLink would fail teardown
+}
+
 /// learnedIdentity flips a message from unvalidated to validated: the same sender's message is
 /// signatureValidated == false before the identity is learned and true after.
 @Test @MainActor func routerValidationDependsOnLearnedIdentity() async {
