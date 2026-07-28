@@ -8,7 +8,7 @@ public enum LXMFDelivery {
     public static let retryWaitSeconds = 10
     /// Max delivery attempts before a message is failed (RNS `LXMRouter.MAX_DELIVERY_ATTEMPTS`).
     public static let maxAttempts = 5
-    /// Seconds to wait after requesting a path before the next opportunistic delivery attempt — longer
-    /// than `retryWaitSeconds` (RNS `LXMRouter.PATH_REQUEST_WAIT`).
+    /// Seconds to wait after requesting a path before the next opportunistic delivery attempt (RNS
+    /// `LXMRouter.PATH_REQUEST_WAIT`; distinct from `retryWaitSeconds`).
     public static let pathRequestWaitSeconds = 7
 }

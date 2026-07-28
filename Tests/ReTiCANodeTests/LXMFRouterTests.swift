@@ -381,7 +381,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 @Test @MainActor func routerRetriesThenFailsAtMaxAttempts() async {
     let msg = makeMessage(source: Identity(), content: "small")
     let clock = TestClock()
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(msg.destinationHash)   // path known → retries resend (not requestPath)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
         $0.continuousClock = clock
     }
     store.exhaustivity = .off
@@ -398,6 +400,104 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         return false
     }
     #expect(store.state.pendingDeliveries[msg.hash] == nil)
+}
+
+// MARK: - LXMF-4c-2 opportunistic pathless-retry
+
+@Test @MainActor func routerOpportunisticPathlessRetryRequestsPath() async {
+    let msg = makeMessage(source: Identity(), content: "small")
+    let clock = TestClock()
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }   // best-effort try #1
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    // No known path → the first retry requests a path instead of resending.
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { action in
+        if case let .delegate(.requestPath(dest)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 2)
+    // The post-request wait is pathRequestWaitSeconds (7): advancing it fires the next retry (another requestPath).
+    await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
+    await store.receive { if case .delegate(.requestPath) = $0 { return true }; return false }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 3)
+    await store.send(.delivered(messageHash: msg.hash))   // cancel the pending timer before teardown
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    store.exhaustivity = .on
+}
+
+/// Learning a path mid-flight lets the next opportunistic retry resume sending (not another requestPath).
+@Test @MainActor func routerOpportunisticResumesSendingAfterLearnedPath() async {
+    let msg = makeMessage(source: Identity(), content: "small")
+    let clock = TestClock()
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { if case .delegate(.requestPath) = $0 { return true }; return false }   // pathless retry
+    await store.send(.learnedPath(destinationHash: msg.destinationHash))
+    // Path now known → next retry resends opportunistically instead of requesting a path again.
+    await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
+    await store.receive { action in
+        if case let .delegate(.sendOpportunistic(dest, _)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    await store.send(.delivered(messageHash: msg.hash))
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    store.exhaustivity = .on
+}
+
+/// Known path from the start → opportunistic retries resend at retryWaitSeconds, never requestPath.
+@Test @MainActor func routerOpportunisticWithKnownPathResendsNotRequestsPath() async {
+    let msg = makeMessage(source: Identity(), content: "small")
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(msg.destinationHash)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }   // resend, not requestPath
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 2)
+    await store.send(.delivered(messageHash: msg.hash))
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    store.exhaustivity = .on
+}
+
+/// A DIRECT pending delivery retries over its link even with no known path — pathless-retry is
+/// opportunistic-only.
+@Test @MainActor func routerDirectRetryUnaffectedByMissingPath() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let linkID = Data(repeating: 0x9A, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.directLinks[msg.destinationHash] = .active(linkID: linkID)   // active link, but no knownPaths entry
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    // Direct retry resends over the link despite no known path (would be requestPath if pathless-retry leaked in).
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { action in
+        if case let .delegate(.sendDirect(lid, _, _)) = action { #expect(lid == linkID); return true }
+        return false
+    }
+    await store.send(.delivered(messageHash: msg.hash))
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    store.exhaustivity = .on
 }
 
 @Test @MainActor func routerArmsRetryForDrainedResourceMessage() async {
