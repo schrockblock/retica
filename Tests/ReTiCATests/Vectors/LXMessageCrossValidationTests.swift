@@ -49,6 +49,13 @@ import Foundation
     #expect(LXMessage.encryptedPacketMDU == f.encryptedPacketMdu)
 }
 
+/// Our LXMF delivery timing constants match genuine RNS LXMRouter.
+@Test func lxmfDeliveryConstantsMatchRns() throws {
+    let f = try LXMFVectorFixtures.load()
+    #expect(LXMFDelivery.retryWaitSeconds == f.deliveryRetryWait)
+    #expect(LXMFDelivery.maxAttempts == f.maxDeliveryAttempts)
+}
+
 /// A genuine LXMF opportunistic payload is `packed[16:]`; reconstructing it with our
 /// `fromOpportunistic` (prepending the delivery destination hash) recovers the genuine reference
 /// message and validates its signature.

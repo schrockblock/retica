@@ -38,4 +38,6 @@ print(json.dumps({
     "packed": msg.packed.hex(),
     "link_mdu": RNS.Link.MDU,
     "encrypted_packet_mdu": LXMF.LXMessage.ENCRYPTED_PACKET_MDU,
+    "delivery_retry_wait": LXMF.LXMRouter.DELIVERY_RETRY_WAIT,
+    "max_delivery_attempts": LXMF.LXMRouter.MAX_DELIVERY_ATTEMPTS,
 }, indent=2))
