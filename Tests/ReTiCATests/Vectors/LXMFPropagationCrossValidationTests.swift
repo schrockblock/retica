@@ -1,0 +1,35 @@
+import Testing
+import Foundation
+@testable import ReTiCA
+
+/// Our LXMFPropagation reproduces genuine lxmf 1.1.0's DETERMINISTIC propagation-container wire bytes:
+/// transient_id = full_hash(lxmf_data), and the msgpack([timestamp, [lxmf_data]]) container. The
+/// destination-encrypted tail inside lxmf_data is hedged/ephemeral, so it is opaque reference input —
+/// never byte-produced or byte-compared here.
+@Test func propagationContainerMatchesReferenceLXMF() throws {
+    let f = try LXMFPropagationFixtures.load()
+    let refPacked = Data(hexString: f.propagationPacked)!
+
+    // 1. Parse the genuine container.
+    let parsed = LXMFPropagation.parseContainer(refPacked)
+    #expect(parsed != nil)
+    #expect(parsed?.timestamp == f.containerTimestamp)
+    #expect(parsed?.entries.count == 1)
+    let lxmfData = parsed!.entries[0]
+
+    // 2. transient_id byte-parity (full_hash of the given lxmf_data).
+    #expect(LXMFPropagation.transientId(lxmfData: lxmfData) == Data(hexString: f.transientId)!)
+
+    // 3. destination hash split byte-parity.
+    #expect(LXMFPropagation.destinationHash(lxmfData: lxmfData) == Data(hexString: f.destinationHash)!)
+
+    // 4. Our container re-encode of the same values is byte-identical to genuine LXMF's.
+    #expect(LXMFPropagation.container(timestamp: parsed!.timestamp, entries: [lxmfData]) == refPacked)
+
+    // 5. The assemble helper reconstructs the exact entry from its destHash + encrypted tail.
+    let destHash = Data(lxmfData.prefix(LXMessage.destinationLength))
+    let encrypted = Data(lxmfData.dropFirst(LXMessage.destinationLength))
+    let reassembled = LXMFPropagation.lxmfData(destinationHash: destHash, encryptedData: encrypted)
+    #expect(reassembled == lxmfData)
+    #expect(LXMFPropagation.transientId(lxmfData: reassembled) == Data(hexString: f.transientId)!)
+}
