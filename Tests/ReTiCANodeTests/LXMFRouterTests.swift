@@ -799,3 +799,69 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 2)
 }
+
+// MARK: - LXMF-4d-4 client inbound sync
+
+@Test @MainActor func routerSyncActiveLinkRequestsDownload() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.syncFromPropagationNode)
+    await store.receive { action in
+        if case let .delegate(.requestMessageDownload(lid)) = action { #expect(lid == linkID); return true }
+        return false
+    }
+    #expect(store.state.pendingDownloadFromPN == false)
+}
+
+@Test @MainActor func routerSyncNoNodeIsNoOp() async {
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.syncFromPropagationNode)
+    #expect(store.state.pendingDownloadFromPN == false)
+    store.exhaustivity = .on   // no PN → no requestLink / requestMessageDownload; a stray fails teardown
+}
+
+@Test @MainActor func routerSyncEstablishesThenRequestsOnLinkEstablished() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.knownPaths.insert(pn)   // path known → establishes directly
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.syncFromPropagationNode)
+    await store.receive { action in
+        if case let .delegate(.requestLink(d)) = action { #expect(d == pn); return true }
+        return false
+    }
+    #expect(store.state.pendingDownloadFromPN == true)
+    await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
+    await store.receive { action in
+        if case let .delegate(.requestMessageDownload(lid)) = action { #expect(lid == linkID); return true }
+        return false
+    }
+    #expect(store.state.pendingDownloadFromPN == false)
+}
+
+@Test @MainActor func routerSyncFlagClearedNoDoubleRequest() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.knownPaths.insert(pn)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.syncFromPropagationNode)
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
+    await store.receive { if case .delegate(.requestMessageDownload) = $0 { return true }; return false }
+    // A second establish (e.g. link re-open) must NOT re-request the download — the flag was cleared.
+    await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
+    #expect(store.state.pendingDownloadFromPN == false)
+    store.exhaustivity = .on   // a stray requestMessageDownload would fail teardown
+}
