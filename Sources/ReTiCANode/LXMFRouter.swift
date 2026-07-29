@@ -37,7 +37,7 @@ public struct LXMFRouter {
 
     public enum ResendInfo: Equatable {
         case opportunistic(destinationHash: Data, payload: Data)
-        case direct(linkID: Data, data: Data, asResource: Bool)
+        case direct(destinationHash: Data, data: Data, asResource: Bool)
     }
     public struct PendingDelivery: Equatable { public var resend: ResendInfo; public var attempts: Int }
 
@@ -77,6 +77,14 @@ public struct LXMFRouter {
             func arm(_ state: inout State, _ hash: Data, _ resend: ResendInfo) {
                 state.pendingDeliveries[hash] = PendingDelivery(resend: resend, attempts: 1)
             }
+            func establish(_ state: inout State, _ dest: Data) -> Effect<Action> {
+                if state.knownPaths.contains(dest) {
+                    state.directLinks[dest] = .establishing
+                    return .send(.delegate(.requestLink(destinationHash: dest)))
+                }
+                state.directLinks[dest] = .awaitingPath
+                return .send(.delegate(.requestPath(destinationHash: dest)))
+            }
             switch action {
             case let .learnedIdentity(destinationHash, identity):
                 state.knownIdentities[destinationHash] = identity
@@ -113,19 +121,14 @@ public struct LXMFRouter {
                     let dest = message.destinationHash
                     if case let .active(linkID) = state.directLinks[dest] {
                         let asResource = message.directRepresentation == .resource
-                        arm(&state, message.hash, .direct(linkID: linkID, data: message.packed, asResource: asResource))
+                        arm(&state, message.hash, .direct(destinationHash: dest, data: message.packed, asResource: asResource))
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: message.packed,
                                                                   asResource: asResource))),
                                       retryTimer(message.hash, LXMFDelivery.retryWaitSeconds))
                     }
                     state.outboundQueue[dest, default: []].append(message)
                     if state.directLinks[dest] == nil {
-                        if state.knownPaths.contains(dest) {
-                            state.directLinks[dest] = .establishing
-                            return .send(.delegate(.requestLink(destinationHash: dest)))
-                        }
-                        state.directLinks[dest] = .awaitingPath
-                        return .send(.delegate(.requestPath(destinationHash: dest)))
+                        return establish(&state, dest)
                     }
                     return .none   // a link/path request is already in flight
                 }
@@ -137,7 +140,7 @@ public struct LXMFRouter {
                 var effects: [Effect<Action>] = []
                 for m in queued {
                     let asResource = m.directRepresentation == .resource
-                    arm(&state, m.hash, .direct(linkID: linkID, data: m.packed, asResource: asResource))
+                    arm(&state, m.hash, .direct(destinationHash: dest, data: m.packed, asResource: asResource))
                     effects.append(.send(.delegate(.sendDirect(linkID: linkID, data: m.packed, asResource: asResource))))
                     effects.append(retryTimer(m.hash, LXMFDelivery.retryWaitSeconds))
                 }
@@ -145,6 +148,14 @@ public struct LXMFRouter {
 
             case let .linkClosed(dest):
                 state.directLinks[dest] = nil
+                let hasPending = state.pendingDeliveries.values.contains {
+                    if case let .direct(d, _, _) = $0.resend { return d == dest }
+                    return false
+                }
+                let hasQueued = !(state.outboundQueue[dest]?.isEmpty ?? true)
+                if hasPending || hasQueued {
+                    return establish(&state, dest)
+                }
                 return .none
 
             case let .learnedPath(dest):
@@ -178,9 +189,14 @@ public struct LXMFRouter {
                     }
                     return .merge(.send(.delegate(.sendOpportunistic(destinationHash: destinationHash, payload: payload))),
                                   retryTimer(hash, LXMFDelivery.retryWaitSeconds))
-                case let .direct(linkID, data, asResource):
-                    return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: asResource))),
-                                  retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                case let .direct(destinationHash, data, asResource):
+                    if case let .active(linkID) = state.directLinks[destinationHash] {
+                        return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: asResource))),
+                                      retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                    }
+                    // Link is down or re-establishing: no live link to send on. Wait and re-check; the
+                    // attempt was already counted, so the saga stays bounded by maxAttempts.
+                    return retryTimer(hash, LXMFDelivery.retryWaitSeconds)
                 }
 
             case .delegate:

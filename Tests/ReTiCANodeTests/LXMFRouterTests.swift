@@ -530,3 +530,103 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.send(.delivered(messageHash: big.hash))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
 }
+
+// MARK: - LXMF-4c-3a link-CLOSED recovery
+
+@Test @MainActor func routerRecoversPendingOnNewLinkAfterClose() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let oldLinkID = Data(repeating: 0x01, count: 16)
+    let newLinkID = Data(repeating: 0x02, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.directLinks[msg.destinationHash] = .active(linkID: oldLinkID)
+    initial.knownPaths.insert(msg.destinationHash)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }   // sent on old link
+    await store.send(.linkClosed(destinationHash: msg.destinationHash))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }   // re-establish
+    await store.send(.linkEstablished(destinationHash: msg.destinationHash, linkID: newLinkID))
+    // The pending message resends on its retry tick — over the NEW link, never the dead one.
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { action in
+        if case let .delegate(.sendDirect(lid, data, _)) = action {
+            #expect(lid == newLinkID); #expect(data == msg.packed); return true
+        }
+        return false
+    }
+    await store.send(.delivered(messageHash: msg.hash))
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    store.exhaustivity = .on
+}
+
+/// Closing a link that has an in-flight (pending) direct message re-establishes and retains the pending.
+@Test @MainActor func routerLinkClosedWithPendingReestablishes() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let oldLinkID = Data(repeating: 0x01, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.directLinks[msg.destinationHash] = .active(linkID: oldLinkID)
+    initial.knownPaths.insert(msg.destinationHash)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    await store.send(.linkClosed(destinationHash: msg.destinationHash))
+    await store.receive { action in
+        if case let .delegate(.requestLink(dest)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.directLinks[msg.destinationHash] == .establishing)
+    #expect(store.state.pendingDeliveries[msg.hash] != nil)   // pending retained across the close
+    await store.send(.delivered(messageHash: msg.hash))       // cancel the pending timer before teardown
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    store.exhaustivity = .on
+}
+
+/// If the link never returns, a pending direct delivery ticks (link down → no send) until the attempt
+/// cap trips and it fails — bounded recovery.
+@Test @MainActor func routerDirectDeliveryBoundedWhenLinkNeverReturns() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let oldLinkID = Data(repeating: 0x01, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.directLinks[msg.destinationHash] = .active(linkID: oldLinkID)
+    initial.knownPaths.insert(msg.destinationHash)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
+    await store.send(.linkClosed(destinationHash: msg.destinationHash))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    // Link never re-establishes; each retry tick finds no active link (no send) but still counts.
+    for _ in 0..<(LXMFDelivery.maxAttempts - 1) {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash] == nil)
+}
+
+/// Closing a link with nothing pending/queued clears it and does NOT re-establish.
+@Test @MainActor func routerLinkClosedWithNothingPendingClears() async {
+    let dest = LXMessage.deliveryHash(identityHash: Identity().hash)
+    var initial = LXMFRouter.State()
+    initial.directLinks[dest] = .active(linkID: Data(repeating: 0x07, count: 16))
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.linkClosed(destinationHash: dest))
+    #expect(store.state.directLinks[dest] == nil)   // cleared, no re-establish
+    store.exhaustivity = .on   // a stray requestLink/requestPath would fail teardown
+}
