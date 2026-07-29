@@ -11,7 +11,7 @@ import ReTiCATransport
 @Reducer
 public struct LXMFRouter {
     @Dependency(\.continuousClock) var clock
-    private enum CancelID: Hashable { case retry(Data) }
+    private enum CancelID: Hashable { case retry(Data); case idle(Data) }
 
     @ObservableState
     public struct State: Equatable {
@@ -50,6 +50,7 @@ public struct LXMFRouter {
         case learnedPath(destinationHash: Data)
         case delivered(messageHash: Data)
         case retryDue(messageHash: Data)
+        case idleDeadline(destinationHash: Data)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -59,6 +60,7 @@ public struct LXMFRouter {
             case requestLink(destinationHash: Data)
             case requestPath(destinationHash: Data)
             case sendDirect(linkID: Data, data: Data, asResource: Bool)
+            case closeLink(destinationHash: Data)
             case deliveryConfirmed(messageHash: Data)
             case deliveryFailed(messageHash: Data)
         }
@@ -73,6 +75,12 @@ public struct LXMFRouter {
                     try await clock.sleep(for: .seconds(seconds))
                     await send(.retryDue(messageHash: hash))
                 }.cancellable(id: CancelID.retry(hash), cancelInFlight: true)
+            }
+            func idleTimer(_ dest: Data) -> Effect<Action> {
+                .run { send in
+                    try await clock.sleep(for: .seconds(LXMFDelivery.linkMaxInactivitySeconds))
+                    await send(.idleDeadline(destinationHash: dest))
+                }.cancellable(id: CancelID.idle(dest), cancelInFlight: true)
             }
             func arm(_ state: inout State, _ hash: Data, _ resend: ResendInfo) {
                 state.pendingDeliveries[hash] = PendingDelivery(resend: resend, attempts: 1)
@@ -124,7 +132,8 @@ public struct LXMFRouter {
                         arm(&state, message.hash, .direct(destinationHash: dest, data: message.packed, asResource: asResource))
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: message.packed,
                                                                   asResource: asResource))),
-                                      retryTimer(message.hash, LXMFDelivery.retryWaitSeconds))
+                                      retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
+                                      idleTimer(dest))
                     }
                     state.outboundQueue[dest, default: []].append(message)
                     if state.directLinks[dest] == nil {
@@ -144,6 +153,7 @@ public struct LXMFRouter {
                     effects.append(.send(.delegate(.sendDirect(linkID: linkID, data: m.packed, asResource: asResource))))
                     effects.append(retryTimer(m.hash, LXMFDelivery.retryWaitSeconds))
                 }
+                if !queued.isEmpty { effects.append(idleTimer(dest)) }
                 return effects.isEmpty ? .none : .merge(effects)
 
             case let .linkClosed(dest):
@@ -198,6 +208,11 @@ public struct LXMFRouter {
                     // attempt was already counted, so the saga stays bounded by maxAttempts.
                     return retryTimer(hash, LXMFDelivery.retryWaitSeconds)
                 }
+
+            case let .idleDeadline(dest):
+                guard case .active = state.directLinks[dest] else { return .none }
+                state.directLinks[dest] = nil
+                return .send(.delegate(.closeLink(destinationHash: dest)))
 
             case .delegate:
                 return .none

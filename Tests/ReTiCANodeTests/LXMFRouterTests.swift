@@ -497,7 +497,6 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     await store.send(.delivered(messageHash: msg.hash))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
-    store.exhaustivity = .on
 }
 
 @Test @MainActor func routerArmsRetryForDrainedResourceMessage() async {
@@ -560,7 +559,6 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     await store.send(.delivered(messageHash: msg.hash))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
-    store.exhaustivity = .on
 }
 
 /// Closing a link that has an in-flight (pending) direct message re-establishes and retains the pending.
@@ -587,7 +585,6 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.pendingDeliveries[msg.hash] != nil)   // pending retained across the close
     await store.send(.delivered(messageHash: msg.hash))       // cancel the pending timer before teardown
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
-    store.exhaustivity = .on
 }
 
 /// If the link never returns, a pending direct delivery ticks (link down → no send) until the attempt
@@ -629,4 +626,73 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.send(.linkClosed(destinationHash: dest))
     #expect(store.state.directLinks[dest] == nil)   // cleared, no re-establish
     store.exhaustivity = .on   // a stray requestLink/requestPath would fail teardown
+}
+
+// MARK: - LXMF-4c-3b idle-link teardown
+
+@Test @MainActor func routerTearsDownIdleLink() async {
+    let msg = makeMessage(source: Identity(), content: "direct")
+    let linkID = Data(repeating: 0x33, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(msg.destinationHash)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    await store.send(.linkEstablished(destinationHash: msg.destinationHash, linkID: linkID))
+    await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }   // drain arms idle timer
+    await store.send(.delivered(messageHash: msg.hash))   // clear pending + its retry timer; idle timer remains
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    #expect(store.state.directLinks[msg.destinationHash] == .active(linkID: linkID))
+    // No further activity for the inactivity window → the link is torn down.
+    await clock.advance(by: .seconds(LXMFDelivery.linkMaxInactivitySeconds))
+    await store.receive { action in
+        if case let .delegate(.closeLink(dest)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.directLinks[msg.destinationHash] == nil)
+}
+
+/// New activity on an active link restarts the idle timer, so teardown is deferred to the last send.
+@Test @MainActor func routerActivityRestartsIdleTimer() async {
+    let sender = Identity()
+    let recipient = Identity().hash
+    let msg = makeMessage(source: sender, recipientIdentityHash: recipient, content: "one")
+    let msg2 = makeMessage(source: sender, recipientIdentityHash: recipient, content: "two")
+    #expect(msg.destinationHash == msg2.destinationHash)   // same recipient delivery destination
+    let linkID = Data(repeating: 0x44, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.directLinks[msg.destinationHash] = .active(linkID: linkID)
+    initial.knownPaths.insert(msg.destinationHash)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    // First send arms the idle timer.
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
+    await store.send(.delivered(messageHash: msg.hash))
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    // Almost to the deadline — not torn down yet.
+    await clock.advance(by: .seconds(LXMFDelivery.linkMaxInactivitySeconds - 1))
+    #expect(store.state.directLinks[msg.destinationHash] == .active(linkID: linkID))
+    // A second send restarts the idle timer.
+    await store.send(.send(message: msg2, desiredMethod: .direct))
+    await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
+    await store.send(.delivered(messageHash: msg2.hash))
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    // Past the ORIGINAL deadline but before the restarted one → still active (proves the restart).
+    await clock.advance(by: .seconds(LXMFDelivery.linkMaxInactivitySeconds - 1))
+    #expect(store.state.directLinks[msg.destinationHash] == .active(linkID: linkID))
+    // The remainder of the restarted window elapses → torn down.
+    await clock.advance(by: .seconds(1))
+    await store.receive { action in
+        if case let .delegate(.closeLink(dest)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.directLinks[msg.destinationHash] == nil)
 }
