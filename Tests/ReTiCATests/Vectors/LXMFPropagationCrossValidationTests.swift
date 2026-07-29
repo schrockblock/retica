@@ -33,3 +33,36 @@ import Foundation
     #expect(reassembled == lxmfData)
     #expect(LXMFPropagation.transientId(lxmfData: reassembled) == Data(hexString: f.transientId)!)
 }
+
+/// open() recovers the genuine reference PROPAGATED message: decrypting the reference lxmf_data tail
+/// with the recipient identity yields a message whose content/destination match and whose signature
+/// validates against the source identity — proving our decrypt matches genuine LXMF's encrypt.
+@Test func propagationOpenRecoversReferenceMessage() throws {
+    let f = try LXMFPropagationFixtures.load()
+    let recipient = Identity(privateKey: Data(hexString: f.recipientPrivateKey)!)!
+    let source = Identity(privateKey: Data(hexString: f.sourcePrivateKey)!)!
+    let parsed = LXMFPropagation.parseContainer(Data(hexString: f.propagationPacked)!)!
+    let recovered = LXMFPropagation.open(lxmfData: parsed.entries[0], recipientIdentity: recipient)
+    #expect(recovered != nil)
+    #expect(recovered?.content == Data(hexString: f.content)!)
+    #expect(recovered?.destinationHash == Data(hexString: f.destinationHash)!)
+    #expect(recovered?.validateSignature(source: source) == true)
+}
+
+/// pack() then open() round-trips one of our own messages through hedged recipient encryption.
+@Test func propagationPackOpenRoundTrips() throws {
+    let f = try LXMFPropagationFixtures.load()
+    let recipient = Identity(privateKey: Data(hexString: f.recipientPrivateKey)!)!
+    let source = Identity(privateKey: Data(hexString: f.sourcePrivateKey)!)!
+    let msg = LXMessage.create(source: source, destinationHash: Data(hexString: f.destinationHash)!,
+                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("round trip".utf8))
+    let (packed, transientId) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient,
+                                                     timestamp: 1700000000.5)
+    let parsed = LXMFPropagation.parseContainer(packed)!
+    #expect(parsed.entries.count == 1)
+    #expect(transientId == LXMFPropagation.transientId(lxmfData: parsed.entries[0]))   // returned id self-consistent
+    let recovered = LXMFPropagation.open(lxmfData: parsed.entries[0], recipientIdentity: recipient)
+    #expect(recovered?.hash == msg.hash)
+    #expect(recovered?.content == Data("round trip".utf8))
+    #expect(recovered?.validateSignature(source: source) == true)
+}
