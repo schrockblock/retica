@@ -41,4 +41,5 @@ print(json.dumps({
     "delivery_retry_wait": LXMF.LXMRouter.DELIVERY_RETRY_WAIT,
     "max_delivery_attempts": LXMF.LXMRouter.MAX_DELIVERY_ATTEMPTS,
     "path_request_wait": LXMF.LXMRouter.PATH_REQUEST_WAIT,
+    "link_max_inactivity": LXMF.LXMRouter.LINK_MAX_INACTIVITY,
 }, indent=2))

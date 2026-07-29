@@ -15,6 +15,7 @@ struct LXMFVectorFixtures: Decodable {
     let deliveryRetryWait: Int
     let maxDeliveryAttempts: Int
     let pathRequestWait: Int
+    let linkMaxInactivity: Int
 
     enum CodingKeys: String, CodingKey {
         case sourcePrivateKey = "source_private_key"
@@ -27,6 +28,7 @@ struct LXMFVectorFixtures: Decodable {
         case deliveryRetryWait = "delivery_retry_wait"
         case maxDeliveryAttempts = "max_delivery_attempts"
         case pathRequestWait = "path_request_wait"
+        case linkMaxInactivity = "link_max_inactivity"
     }
 
     static func load() throws -> LXMFVectorFixtures {

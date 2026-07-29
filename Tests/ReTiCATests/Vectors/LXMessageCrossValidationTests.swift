@@ -62,6 +62,12 @@ import Foundation
     #expect(LXMFDelivery.pathRequestWaitSeconds == f.pathRequestWait)
 }
 
+/// Our LXMF idle-link teardown threshold matches genuine RNS LXMRouter.LINK_MAX_INACTIVITY.
+@Test func linkMaxInactivityMatchesRns() throws {
+    let f = try LXMFVectorFixtures.load()
+    #expect(LXMFDelivery.linkMaxInactivitySeconds == f.linkMaxInactivity)
+}
+
 /// A genuine LXMF opportunistic payload is `packed[16:]`; reconstructing it with our
 /// `fromOpportunistic` (prepending the delivery destination hash) recovers the genuine reference
 /// message and validates its signature.

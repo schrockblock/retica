@@ -11,4 +11,7 @@ public enum LXMFDelivery {
     /// Seconds to wait after requesting a path before the next opportunistic delivery attempt (RNS
     /// `LXMRouter.PATH_REQUEST_WAIT`; distinct from `retryWaitSeconds`).
     public static let pathRequestWaitSeconds = 7
+    /// Seconds a direct link may carry no LXMF traffic before the router tears it down — a higher GC
+    /// than the Link-level keepalive watchdog (RNS `LXMRouter.LINK_MAX_INACTIVITY`).
+    public static let linkMaxInactivitySeconds = 600
 }
