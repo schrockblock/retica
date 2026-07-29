@@ -696,3 +696,106 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     #expect(store.state.directLinks[msg.destinationHash] == nil)
 }
+
+// MARK: - LXMF-4d-2b PROPAGATED outbound
+
+@Test @MainActor func routerPropagationFailsWithNoNode() async {
+    let msg = makeMessage(source: Identity(), content: "prop")
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: Data("container".utf8)))
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
+        return false
+    }
+}
+
+@Test @MainActor func routerPropagationEstablishesLinkToNode() async {
+    let msg = makeMessage(source: Identity(), content: "prop")
+    let packed = Data("container".utf8)
+    let pn = Data(repeating: 0xBB, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.knownPaths.insert(pn)   // path known → establishes directly
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: packed))
+    await store.receive { action in
+        if case let .delegate(.requestLink(d)) = action { #expect(d == pn); return true }
+        return false
+    }
+    #expect(store.state.directLinks[pn] == .establishing)
+    #expect(store.state.propagationQueue[pn]?.count == 1)
+    store.exhaustivity = .on   // no sendPropagated yet (no active link); no timer armed → a stray fails teardown
+}
+
+@Test @MainActor func routerPropagationDrainsOnLinkEstablished() async {
+    let msg = makeMessage(source: Identity(), content: "prop")
+    let packed = Data("container-bytes".utf8)
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.knownPaths.insert(pn)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: packed))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
+    await store.receive { action in
+        if case let .delegate(.sendPropagated(lid, p)) = action {
+            #expect(lid == linkID); #expect(p == packed); return true
+        }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+}
+
+@Test @MainActor func routerPropagationSendsImmediatelyWithActiveLink() async {
+    let msg = makeMessage(source: Identity(), content: "prop")
+    let packed = Data("container-bytes".utf8)
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: packed))
+    await store.receive { action in
+        if case let .delegate(.sendPropagated(lid, p)) = action {
+            #expect(lid == linkID); #expect(p == packed); return true
+        }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+}
+
+@Test @MainActor func routerPropagationRetryResendsSameBytes() async {
+    let msg = makeMessage(source: Identity(), content: "prop")
+    let packed = Data("container-bytes".utf8)
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: packed))
+    await store.receive { if case .delegate(.sendPropagated) = $0 { return true }; return false }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive { action in
+        if case let .delegate(.sendPropagated(lid, p)) = action {
+            #expect(lid == linkID); #expect(p == packed); return true   // same bytes on retry
+        }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 2)
+}
