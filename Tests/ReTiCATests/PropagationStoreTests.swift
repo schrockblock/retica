@@ -1,0 +1,78 @@
+import Testing
+import Foundation
+@testable import ReTiCA
+
+/// Build a propagation container entry: destHash(16) ‖ arbitrary opaque tail (the store treats the
+/// encrypted tail as opaque, so the tail content is irrelevant to store behavior).
+private func entry(dest: UInt8, tail: String) -> Data {
+    Data(repeating: dest, count: LXMessage.destinationLength) + Data(tail.utf8)
+}
+private func container(_ entries: [Data]) -> Data {
+    LXMFPropagation.container(timestamp: 1700000000.5, entries: entries)
+}
+
+@Test func propagationStoreIngestsAndDedups() throws {
+    var store = PropagationStore()
+    let e = entry(dest: 0xAA, tail: "one")
+    let tid = LXMFPropagation.transientId(lxmfData: e)
+    let firstAdded = store.ingest(container: container([e]))
+    #expect(firstAdded == [tid])
+    #expect(store.count == 1)
+    #expect(store.contains(transientId: tid))
+    // Re-ingesting the identical container is a no-op (dedup by transient_id).
+    let secondAdded = store.ingest(container: container([e]))
+    #expect(secondAdded.isEmpty)
+    #expect(store.count == 1)
+}
+
+@Test func propagationStoreQueriesByDestination() throws {
+    var store = PropagationStore()
+    let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
+    let b1 = entry(dest: 0xBB, tail: "b1")
+    store.ingest(container: container([a1, b1, a2]))
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    let forA = store.entries(forDestination: destA)
+    #expect(forA.count == 2)
+    #expect(forA.allSatisfy { $0.destinationHash == destA })
+    #expect(forA.map { $0.lxmfData } == [a1, a2])   // oldest-first by insertion
+    let destB = Data(repeating: 0xBB, count: LXMessage.destinationLength)
+    #expect(store.entries(forDestination: destB).count == 1)
+}
+
+@Test func propagationStoreRemoves() throws {
+    var store = PropagationStore()
+    let e = entry(dest: 0xAA, tail: "x")
+    let tid = LXMFPropagation.transientId(lxmfData: e)
+    store.ingest(container: container([e]))
+    store.remove(transientId: tid)
+    #expect(store.count == 0)
+    #expect(!store.contains(transientId: tid))
+}
+
+@Test func propagationStoreEvictsOldestOverLimit() throws {
+    // Each entry is 16 + 4 = 20 bytes; a 45-byte limit holds at most 2.
+    var store = PropagationStore(storageLimitBytes: 45)
+    let e1 = entry(dest: 0xAA, tail: "aaaa")
+    let e2 = entry(dest: 0xAA, tail: "bbbb")
+    let e3 = entry(dest: 0xAA, tail: "cccc")
+    store.ingest(container: container([e1]))
+    store.ingest(container: container([e2]))
+    store.ingest(container: container([e3]))   // pushes over the limit → evict oldest (e1)
+    #expect(store.sizeBytes <= 45)
+    #expect(store.count == 2)
+    #expect(!store.contains(transientId: LXMFPropagation.transientId(lxmfData: e1)))   // oldest evicted
+    #expect(store.contains(transientId: LXMFPropagation.transientId(lxmfData: e3)))    // newest retained
+}
+
+@Test func propagationStoreSkipsMalformedEntries() throws {
+    var store = PropagationStore()
+    // Short entry (< 16 bytes) is skipped; the well-formed one is stored.
+    let shortEntry = Data([0x01, 0x02, 0x03])
+    let good = entry(dest: 0xAA, tail: "ok")
+    let added = store.ingest(container: container([shortEntry, good]))
+    #expect(added == [LXMFPropagation.transientId(lxmfData: good)])
+    #expect(store.count == 1)
+    // A non-container blob ingests to nothing.
+    #expect(store.ingest(container: Data([0xFF, 0xFF])).isEmpty)
+    #expect(store.count == 1)
+}
