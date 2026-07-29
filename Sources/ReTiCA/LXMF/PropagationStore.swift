@@ -51,6 +51,19 @@ public struct PropagationStore: Equatable {
         stored[transientId] = nil
     }
 
+    /// All stored transient_ids, oldest-first — a propagation node's "offer" set to a peer.
+    public var transientIds: [Data] {
+        stored.values.sorted { $0.sequence < $1.sequence }.map { $0.transientId }
+    }
+
+    /// Of a peer's offered transient_ids, the ones this store is missing (and would pull). Preserves the
+    /// offered order and de-duplicates repeated ids within the offer. Mirrors LXMRouter.offer_request
+    /// wanted_ids — the dedup heart of PN↔PN gossip (convergence rests on transient_id, LXMF-4d-1).
+    public func wanted(fromOffered offered: [Data]) -> [Data] {
+        var seen = Set<Data>()
+        return offered.filter { !contains(transientId: $0) && seen.insert($0).inserted }
+    }
+
     private mutating func evictOverLimit() {
         guard let limit = storageLimitBytes else { return }
         while sizeBytes > limit, let oldest = stored.values.min(by: { $0.sequence < $1.sequence }) {

@@ -76,3 +76,34 @@ private func container(_ entries: [Data]) -> Data {
     #expect(store.ingest(container: Data([0xFF, 0xFF])).isEmpty)
     #expect(store.count == 1)
 }
+
+@Test func propagationStoreOffersAllTransientIdsOldestFirst() throws {
+    var store = PropagationStore()
+    let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2"), e3 = entry(dest: 0xBB, tail: "e3")
+    store.ingest(container: container([e1, e2, e3]))
+    #expect(store.transientIds == [e1, e2, e3].map { LXMFPropagation.transientId(lxmfData: $0) })
+}
+
+@Test func propagationStoreWantedReturnsMissingInOfferedOrder() throws {
+    var store = PropagationStore()
+    let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2")
+    let x = entry(dest: 0xAA, tail: "xx"), y = entry(dest: 0xAA, tail: "yy")
+    store.ingest(container: container([e1, e2]))
+    let offered = [e1, e2, x, y].map { LXMFPropagation.transientId(lxmfData: $0) }
+    #expect(store.wanted(fromOffered: offered) == [x, y].map { LXMFPropagation.transientId(lxmfData: $0) })
+}
+
+@Test func propagationStoreWantedDedupsWithinOffer() throws {
+    let store = PropagationStore()   // empty
+    let x = entry(dest: 0xAA, tail: "xx"), y = entry(dest: 0xAA, tail: "yy")
+    let tx = LXMFPropagation.transientId(lxmfData: x), ty = LXMFPropagation.transientId(lxmfData: y)
+    #expect(store.wanted(fromOffered: [tx, tx, ty]) == [tx, ty])
+}
+
+@Test func propagationStoreWantedEmptyWhenAllPresent() throws {
+    var store = PropagationStore()
+    let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2")
+    store.ingest(container: container([e1, e2]))
+    let offered = [e1, e2].map { LXMFPropagation.transientId(lxmfData: $0) }
+    #expect(store.wanted(fromOffered: offered).isEmpty)
+}
