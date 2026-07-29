@@ -39,7 +39,7 @@ func idleTimer(_ dest: Data) -> Effect<Action> {
 }
 ```
 
-- **Restart on activity.** `idleTimer(dest)` is merged into every effect that emits a `.sendDirect` for `dest` — the three sites: `.send` direct-active, the `.linkEstablished` drain (per drained message), and the `.retryDue` direct active-link resend. `cancelInFlight: true` means each send restarts the idle clock.
+- **Restart on activity.** `idleTimer(dest)` is merged into the two effects that emit a `.sendDirect` for a *newly submitted* message to `dest`: `.send` direct-active and the `.linkEstablished` drain. `cancelInFlight: true` means each such send restarts the idle clock. The `.retryDue` active-link *resend* deliberately does **not** re-arm the idle timer: a retry saga is bounded to ~`maxAttempts × retryWaitSeconds` ≈ 50s ≪ 600s, so the original send's idle arm already spans the entire saga — re-arming on each resend would be redundant and would add an untested code path. New sends (the only activity that meaningfully extends a link's useful life beyond one saga) are covered by the two sites above.
 
 - **`.idleDeadline(dest)`:**
 
@@ -57,8 +57,8 @@ The `guard case .active` makes a stale timer (link already closed or re-establis
 ## Data flow
 
 ```
-.linkEstablished / .send direct-active / .retryDue direct-active  ──▶  .sendDirect(dest) ⊕ idleTimer(dest)   (restart)
-… linkMaxInactivitySeconds with no further sendDirect to dest …
+.linkEstablished drain / .send direct-active  ──▶  .sendDirect(dest) ⊕ idleTimer(dest)   (restart)
+… linkMaxInactivitySeconds with no further new send to dest …
 .idleDeadline(dest) ──▶ directLinks[dest]=nil ; .delegate(.closeLink(dest))   → app tears down real link → .linkClosed(dest) (nothing pending → clears)
 ```
 
