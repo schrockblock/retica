@@ -16,6 +16,7 @@ public struct LXMessage: Equatable {
     public let hash: Data                         // 32 — message ID
     public let signature: Data                    // 64
     public let fields: [MsgPackValue.IntPair]     // ordered integer-keyed fields (empty = none)
+    public let stamp: Data?                       // optional PoW delivery stamp (payload 5th element)
 
     /// LXMF app name and delivery aspect. A message's source/destination hashes are the hashes of the
     /// parties' `<identity>.lxmf.delivery` destinations — NOT raw identity hashes. A receiver recalls
@@ -30,9 +31,11 @@ public struct LXMessage: Equatable {
     }
 
     private static func payloadBytes(timestamp: Double, title: Data, content: Data,
-                                     fields: [MsgPackValue.IntPair]) -> Data {
+                                     fields: [MsgPackValue.IntPair], stamp: Data? = nil) -> Data {
         let fieldsValue: MsgPackValue = fields.isEmpty ? .map([]) : .intMap(fields)
-        return MsgPack.encode(.array([.double(timestamp), .bin(title), .bin(content), fieldsValue]))
+        var items: [MsgPackValue] = [.double(timestamp), .bin(title), .bin(content), fieldsValue]
+        if let stamp { items.append(.bin(stamp)) }
+        return MsgPack.encode(.array(items))
     }
 
     /// Build and sign a message from the source identity. `sourceHash` is derived as the source's
@@ -48,18 +51,34 @@ public struct LXMessage: Equatable {
         let signature = source.sign(hashedPart + hash)
         return LXMessage(destinationHash: destinationHash, sourceHash: sourceHash,
                          timestamp: timestamp, title: title, content: content,
-                         hash: hash, signature: signature, fields: fields)
+                         hash: hash, signature: signature, fields: fields, stamp: nil)
     }
 
     /// The on-wire bytes: destinationHash ‖ sourceHash ‖ signature ‖ msgpack(payload).
     public var packed: Data {
         destinationHash + sourceHash + signature
-            + LXMessage.payloadBytes(timestamp: timestamp, title: title, content: content, fields: fields)
+            + LXMessage.payloadBytes(timestamp: timestamp, title: title, content: content,
+                                     fields: fields, stamp: stamp)
     }
 
-    /// Parse wire bytes back into a message (structure + recomputed hash). Returns nil for malformed
-    /// input or a payload that is not exactly [float64, bin, bin, empty-map] (this rejects rich
-    /// integer-keyed `fields`, which LXMF-1 does not yet support). Signature validation is separate.
+    /// A copy of this message with a delivery stamp attached (hash/signature unchanged — the stamp is
+    /// not part of the signed payload). The stamp is produced by `LXStamper.generateStamp(messageId: hash, …)`.
+    public func withStamp(_ stamp: Data) -> LXMessage {
+        LXMessage(destinationHash: destinationHash, sourceHash: sourceHash, timestamp: timestamp,
+                  title: title, content: content, hash: hash, signature: signature, fields: fields, stamp: stamp)
+    }
+
+    /// Validate the attached stamp against `targetCost` (workblock derived from this message's hash).
+    public func validateStamp(targetCost: Int) -> Bool {
+        guard let stamp else { return false }
+        return LXStamper.stampValid(stamp: stamp, targetCost: targetCost,
+                                    workblock: LXStamper.stampWorkblock(material: hash))
+    }
+
+    /// Parse wire bytes back into a message (structure + recomputed hash). The payload is a 4-element
+    /// array [float64, bin, bin, fields] — where `fields` is an empty map or an integer-keyed map — with
+    /// an optional 5th `bin` stamp element. The hash is recomputed over the 4-element payload (the stamp
+    /// is excluded, matching the reference). Returns nil for malformed input. Signature validation is separate.
     public static func unpack(_ data: Data) -> LXMessage? {
         let headerLen = 2 * destinationLength + signatureLength
         guard data.count >= headerLen else { return nil }
@@ -68,7 +87,7 @@ public struct LXMessage: Equatable {
         let signature = Data(data.dropFirst(2 * destinationLength).prefix(signatureLength))
         let packedPayload = Data(data.dropFirst(headerLen))
         guard let value = MsgPack.decodeValue(packedPayload),
-              case let .array(items) = value, items.count == 4,
+              case let .array(items) = value, items.count == 4 || items.count == 5,
               case let .double(timestamp) = items[0],
               case let .bin(title) = items[1],
               case let .bin(content) = items[2]
@@ -79,10 +98,19 @@ public struct LXMessage: Equatable {
         case let .intMap(pairs): fields = pairs
         default: return nil
         }
-        let hash = Crypto.fullHash(destinationHash + sourceHash + packedPayload)
+        let stamp: Data?
+        if items.count == 5 {
+            guard case let .bin(s) = items[4] else { return nil }
+            stamp = s
+        } else { stamp = nil }
+        // Hash is over the 4-element payload only (stamp excluded); re-pack payload[:4] when a stamp is present.
+        let hashPayload = items.count == 5
+            ? payloadBytes(timestamp: timestamp, title: title, content: content, fields: fields)
+            : packedPayload
+        let hash = Crypto.fullHash(destinationHash + sourceHash + hashPayload)
         return LXMessage(destinationHash: destinationHash, sourceHash: sourceHash,
                          timestamp: timestamp, title: title, content: content,
-                         hash: hash, signature: signature, fields: fields)
+                         hash: hash, signature: signature, fields: fields, stamp: stamp)
     }
 
     /// Recompute the hashed/signed parts from this message's fields and validate the signature
