@@ -1,0 +1,11 @@
+{
+  "timebase": 1700000000,
+  "node_state": true,
+  "per_transfer_limit": 256,
+  "per_sync_limit": 10240,
+  "target_stamp_cost": 16,
+  "stamp_cost_flexibility": 3,
+  "peering_cost": 18,
+  "packed": "97c2ce6553f100c3cd0100cd28009310031280",
+  "invalid_packed": "96c2ce6553f100c3cd0100cd28009110"
+}

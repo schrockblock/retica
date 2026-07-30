@@ -31,6 +31,7 @@ public enum MsgPack {
         case let .map(pairs): return encodeMap(pairs)
         case let .array(items): return encodeArray(items)
         case let .intMap(pairs): return encodeIntMap(pairs)
+        case let .bool(b):    return Data([b ? 0xC3 : 0xC2])
         }
     }
 
@@ -94,6 +95,8 @@ public enum MsgPack {
         switch tag {
         case 0x00...0x7F: return (.uint(UInt64(tag)), i + 1)
         case 0xC0: return (.null, i + 1)
+        case 0xC2: return (.bool(false), i + 1)
+        case 0xC3: return (.bool(true), i + 1)
         case 0xCC: guard i + 1 < b.count else { return nil }; return (.uint(UInt64(b[i + 1])), i + 2)
         case 0xCD: guard i + 2 < b.count else { return nil }; return (.uint(UInt64(be(b, i + 1, 2))), i + 3)
         case 0xCE: guard i + 4 < b.count else { return nil }; return (.uint(be(b, i + 1, 4)), i + 5)
@@ -160,8 +163,8 @@ public enum MsgPack {
     }
 }
 
-/// A MessagePack value covering the subset Reticulum resource advertisements use:
-/// unsigned ints, byte strings, UTF-8 strings, nil, float64, and ordered string-keyed maps.
+/// A MessagePack value covering the subset Reticulum uses: unsigned ints, byte strings, UTF-8 strings,
+/// booleans, nil, float64, arrays, ordered string-keyed maps, and ordered integer-keyed maps (`intMap`).
 public indirect enum MsgPackValue: Equatable {
     case uint(UInt64)
     case bin(Data)
@@ -171,6 +174,7 @@ public indirect enum MsgPackValue: Equatable {
     case map([Pair])
     case array([MsgPackValue])
     case intMap([IntPair])
+    case bool(Bool)
 
     public struct Pair: Equatable {
         public let key: String
