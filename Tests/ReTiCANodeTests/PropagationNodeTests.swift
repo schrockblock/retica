@@ -85,3 +85,60 @@ private func container(_ entries: [Data]) -> Data {
         return false
     }
 }
+
+// MARK: - LXMF-4d-5b peer sync (mesh)
+
+@Test @MainActor func propagationNodePeerOfferedRequestsOnlyMissing() async {
+    let x = entry(dest: 0xAA, tail: "x"), y = entry(dest: 0xAA, tail: "y")
+    let z = entry(dest: 0xAA, tail: "z"), w = entry(dest: 0xAA, tail: "w")
+    let tid: (Data) -> Data = { LXMFPropagation.transientId(lxmfData: $0) }
+    let store = TestStore(initialState: PropagationNode.State()) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([x, y])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+    let peer = Data(repeating: 0x11, count: 16)
+    await store.send(.peerOffered(peerHash: peer, transientIds: [tid(x), tid(y), tid(z), tid(w)]))
+    await store.receive { action in
+        if case let .delegate(.requestFromPeer(p, ids)) = action {
+            #expect(p == peer); #expect(ids == [tid(z), tid(w)]); return true   // only the ids we lack
+        }
+        return false
+    }
+}
+
+@Test @MainActor func propagationNodeOffersOurTransientIds() async {
+    let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xBB, tail: "e2")
+    let tid: (Data) -> Data = { LXMFPropagation.transientId(lxmfData: $0) }
+    let store = TestStore(initialState: PropagationNode.State()) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([e1, e2])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+    let peer = Data(repeating: 0x11, count: 16)
+    await store.send(.offerToPeer(peerHash: peer))
+    await store.receive { action in
+        if case let .delegate(.offerTransientIds(p, ids)) = action {
+            #expect(p == peer); #expect(ids == [tid(e1), tid(e2)]); return true   // oldest-first
+        }
+        return false
+    }
+}
+
+@Test @MainActor func propagationNodeValidatesPeeringKey() async {
+    let peer = Data(repeating: 0x11, count: 16)
+    let peeringId = Data(repeating: 0x22, count: 32)
+    let key = Data(repeating: 0x33, count: LXStamper.stampSize)
+    let store = TestStore(initialState: PropagationNode.State()) { PropagationNode() }
+    store.exhaustivity = .off
+    // cost 0 → any key validates (leading-zero-bits >= 0 always true)
+    await store.send(.validatePeeringKey(peerHash: peer, peeringId: peeringId, peeringKey: key, targetCost: 0))
+    await store.receive { action in
+        if case let .delegate(.peerValidated(p, valid)) = action { #expect(p == peer); #expect(valid == true); return true }
+        return false
+    }
+    // an arbitrary key cannot meet a high cost → rejected
+    await store.send(.validatePeeringKey(peerHash: peer, peeringId: peeringId, peeringKey: key, targetCost: 250))
+    await store.receive { action in
+        if case let .delegate(.peerValidated(_, valid)) = action { #expect(valid == false); return true }
+        return false
+    }
+}

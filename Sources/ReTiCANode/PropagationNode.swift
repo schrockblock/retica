@@ -7,7 +7,8 @@ import ReTiCA
 /// container, a client's message request, a client's delivery confirmation) and wires the delegates back
 /// out to the transport. The literal Endpoint registration, resource framing, and IDENTIFY resolution are
 /// app glue. Mirrors lxmf 1.1.0 LXMRouter (propagation_resource_concluded / message_get_request /
-/// save_locally_delivered_transient_ids); peering, stamps, and the PN↔PN mesh are separate.
+/// save_locally_delivered_transient_ids). Also does PN↔PN peer sync (offer/wanted exchange + peering-key
+/// validation); stamps enforcement and the peer link/transfer networking + peer registry are app/mesh glue.
 @Reducer
 public struct PropagationNode {
     @ObservableState
@@ -22,11 +23,17 @@ public struct PropagationNode {
         case ingestContainer(Data)
         case messagesRequested(destinationHash: Data)
         case messagesDelivered(transientIds: [Data])
+        case peerOffered(peerHash: Data, transientIds: [Data])
+        case offerToPeer(peerHash: Data)
+        case validatePeeringKey(peerHash: Data, peeringId: Data, peeringKey: Data, targetCost: Int)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
             case stored(transientIds: [Data])
             case deliverMessages(destinationHash: Data, entries: [Data])
+            case requestFromPeer(peerHash: Data, transientIds: [Data])
+            case offerTransientIds(peerHash: Data, transientIds: [Data])
+            case peerValidated(peerHash: Data, valid: Bool)
         }
     }
 
@@ -46,6 +53,17 @@ public struct PropagationNode {
             case let .messagesDelivered(transientIds):
                 for tid in transientIds { state.store.remove(transientId: tid) }
                 return .none
+
+            case let .peerOffered(peerHash, offered):
+                return .send(.delegate(.requestFromPeer(peerHash: peerHash,
+                                                        transientIds: state.store.wanted(fromOffered: offered))))
+
+            case let .offerToPeer(peerHash):
+                return .send(.delegate(.offerTransientIds(peerHash: peerHash, transientIds: state.store.transientIds)))
+
+            case let .validatePeeringKey(peerHash, peeringId, peeringKey, targetCost):
+                let valid = LXStamper.validatePeeringKey(peeringId: peeringId, peeringKey: peeringKey, targetCost: targetCost)
+                return .send(.delegate(.peerValidated(peerHash: peerHash, valid: valid)))
 
             case .delegate:
                 return .none
