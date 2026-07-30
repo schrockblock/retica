@@ -44,4 +44,29 @@ public enum LXStamper {
             if stampValid(stamp: s, targetCost: targetCost, workblock: wb) { return s }
         }
     }
+
+    public static let workblockExpandRoundsPeering = 25     // RNS WORKBLOCK_EXPAND_ROUNDS_PEERING
+    public static let workblockExpandRoundsPN = 1000        // RNS WORKBLOCK_EXPAND_ROUNDS_PN
+
+    /// Validate a peering key: a stamp over `peeringId` with the short (25-round) workblock
+    /// (RNS LXStamper.validate_peering_key).
+    public static func validatePeeringKey(peeringId: Data, peeringKey: Data, targetCost: Int) -> Bool {
+        stampValid(stamp: peeringKey, targetCost: targetCost,
+                   workblock: stampWorkblock(material: peeringId, expandRounds: workblockExpandRoundsPeering))
+    }
+
+    /// Validate a propagation-node stamp appended to lxmf_data (`transientData = lxmf_data ‖ stamp[32]`):
+    /// strip the trailing 32-byte stamp, recompute `transient_id = full_hash(lxm_data)`, and validate over
+    /// the medium (1000-round) workblock. Returns (transientId, lxmfData, value, stamp) or nil
+    /// (RNS LXStamper.validate_pn_stamp).
+    public static func validatePnStamp(transientData: Data, targetCost: Int)
+        -> (transientId: Data, lxmfData: Data, value: Int, stamp: Data)? {
+        guard transientData.count > stampSize else { return nil }
+        let lxmfData = Data(transientData.dropLast(stampSize))
+        let stamp = Data(transientData.suffix(stampSize))
+        let transientId = Crypto.fullHash(lxmfData)
+        let wb = stampWorkblock(material: transientId, expandRounds: workblockExpandRoundsPN)
+        guard stampValid(stamp: stamp, targetCost: targetCost, workblock: wb) else { return nil }
+        return (transientId, lxmfData, stampValue(workblock: wb, stamp: stamp), stamp)
+    }
 }

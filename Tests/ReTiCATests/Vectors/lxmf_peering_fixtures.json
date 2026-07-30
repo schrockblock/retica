@@ -1,0 +1,15 @@
+{
+  "workblock_expand_rounds_peering": 25,
+  "workblock_expand_rounds_pn": 1000,
+  "peering_id": "00112233445566778899aabbccddeeff",
+  "peering_cost": 4,
+  "peering_key": "dbbd72ee01fc4fb6d7de313a981d8ea45c666f5dad84c25c3fee60e2495bc3ea",
+  "peering_workblock_hash": "088f46200e979a4228e673336d55170ad92d9352860c4f70b107f2c5ec89d7bb",
+  "lxmf_data": "aabbccddeeff00112233445566778899656e637279707465642d6c786d662d7061796c6f61642d706c616365686f6c646572",
+  "pn_cost": 4,
+  "pn_stamp": "d994481cd4c82799f77fa184aa0447ee2f8e83defa24f8901d2832c172677fd9",
+  "transient_data": "aabbccddeeff00112233445566778899656e637279707465642d6c786d662d7061796c6f61642d706c616365686f6c646572d994481cd4c82799f77fa184aa0447ee2f8e83defa24f8901d2832c172677fd9",
+  "transient_id": "d0821ff5febc5c812b38da48afe600a4888e83148cccd8c0f93f2ba46f6b6097",
+  "pn_value": 4,
+  "pn_workblock_hash": "4d60e63242bf46b1af3250cc7ea1b831f5b0e2ff67f80743452b8907bf102e89"
+}

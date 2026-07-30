@@ -1,9 +1,9 @@
 import Foundation
 
 /// A Lightweight Extensible Message Format (LXMF) message — the RNS application message envelope.
-/// Pure value type, byte-compatible with reference lxmf 1.1.0 (LXMessage.py). LXMF-1 scope: the
-/// message core with an empty `fields` map (plain title+content messages); rich integer-keyed
-/// fields and stamps are deferred to later slices.
+/// Pure value type, byte-compatible with reference lxmf 1.1.0 (LXMessage.py). Carries the message core
+/// plus optional rich integer-keyed `fields` (LXMF-5a) and an optional proof-of-work `stamp` (LXMF-5b,
+/// the payload's 5th element).
 public struct LXMessage: Equatable {
     public static let destinationLength = 16      // RNS TRUNCATED_HASHLENGTH/8
     public static let signatureLength = 64        // RNS SIGLENGTH/8
