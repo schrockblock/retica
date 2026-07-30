@@ -48,14 +48,16 @@ import Foundation
     #expect(a.hash != c.hash)              // content-sensitive message ID
 }
 
-@Test func lxMessageUnpackRejectsMalformedAndRichFields() {
+@Test func lxMessageUnpackRejectsMalformed() {
     // Too short (< 16+16+64).
     #expect(LXMessage.unpack(Data(count: 50)) == nil)
-    // 4th payload element is a non-empty (integer-keyed) map → not LXMF-1 → rejected.
+    // 4th payload element is a non-empty integer-keyed map → now accepted as rich fields (LXMF-5a).
     // payload = fixarray4 [ float64(0), bin(0), bin(0), fixmap1{ uint(1): uint(1) } ]
     let payload = Data([0x94, 0xCB]) + Data(count: 8) + Data([0xC4, 0x00, 0xC4, 0x00, 0x81, 0x01, 0x01])
-    let bogus = Data(count: 16) + Data(count: 16) + Data(count: 64) + payload
-    #expect(LXMessage.unpack(bogus) == nil)
+    let richMessage = Data(count: 16) + Data(count: 16) + Data(count: 64) + payload
+    let unpacked = LXMessage.unpack(richMessage)
+    #expect(unpacked != nil)
+    #expect(unpacked?.fields == [MsgPackValue.IntPair(1, .uint(1))])
 }
 
 @Test func opportunisticPayloadStripsLeadingDestinationHash() {

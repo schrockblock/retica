@@ -30,6 +30,7 @@ public enum MsgPack {
         case .null:           return Data([0xC0])
         case let .map(pairs): return encodeMap(pairs)
         case let .array(items): return encodeArray(items)
+        case let .intMap(pairs): return encodeIntMap(pairs)
         }
     }
 
@@ -61,6 +62,12 @@ public enum MsgPack {
         let n = pairs.count
         var d = n <= 15 ? Data([0x80 | UInt8(n)]) : Data([0xDE]) + beBytes(UInt16(n))
         for p in pairs { d.append(encodeStr(p.key)); d.append(encode(p.value)) }
+        return d
+    }
+    private static func encodeIntMap(_ pairs: [MsgPackValue.IntPair]) -> Data {
+        let n = pairs.count
+        var d = n <= 15 ? Data([0x80 | UInt8(n)]) : Data([0xDE]) + beBytes(UInt16(n))
+        for p in pairs { d.append(encodeUInt(UInt64(p.key))); d.append(encode(p.value)) }
         return d
     }
     private static func encodeArray(_ items: [MsgPackValue]) -> Data {
@@ -116,13 +123,29 @@ public enum MsgPack {
         return (.string(s), start + n)
     }
     private static func parseMap(_ b: [UInt8], _ start: Int, _ count: Int) -> (MsgPackValue, Int)? {
-        var i = start; var pairs: [MsgPackValue.Pair] = []
-        for _ in 0..<count {
-            guard let (kv, ni) = parse(b, i), case let .string(key) = kv,
-                  let (vv, ni2) = parse(b, ni) else { return nil }
-            pairs.append(.init(key, vv)); i = ni2
+        if count == 0 { return (.map([]), start) }
+        guard let (firstKey, _) = parse(b, start) else { return nil }   // peek to pick key type
+        var i = start
+        switch firstKey {
+        case .string:
+            var pairs: [MsgPackValue.Pair] = []
+            for _ in 0..<count {
+                guard let (kv, ni) = parse(b, i), case let .string(key) = kv,
+                      let (vv, ni2) = parse(b, ni) else { return nil }
+                pairs.append(.init(key, vv)); i = ni2
+            }
+            return (.map(pairs), i)
+        case .uint:
+            var pairs: [MsgPackValue.IntPair] = []
+            for _ in 0..<count {
+                guard let (kv, ni) = parse(b, i), case let .uint(key) = kv,
+                      let (vv, ni2) = parse(b, ni) else { return nil }
+                pairs.append(.init(Int(key), vv)); i = ni2
+            }
+            return (.intMap(pairs), i)
+        default:
+            return nil
         }
-        return (.map(pairs), i)
     }
     private static func parseArray(_ b: [UInt8], _ start: Int, _ count: Int) -> (MsgPackValue, Int)? {
         var i = start; var items: [MsgPackValue] = []
@@ -147,10 +170,16 @@ public indirect enum MsgPackValue: Equatable {
     case null
     case map([Pair])
     case array([MsgPackValue])
+    case intMap([IntPair])
 
     public struct Pair: Equatable {
         public let key: String
         public let value: MsgPackValue
         public init(_ key: String, _ value: MsgPackValue) { self.key = key; self.value = value }
+    }
+    public struct IntPair: Equatable {
+        public let key: Int
+        public let value: MsgPackValue
+        public init(_ key: Int, _ value: MsgPackValue) { self.key = key; self.value = value }
     }
 }

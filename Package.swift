@@ -32,7 +32,7 @@ let package = Package(
         .testTarget(
             name: "ReTiCATests",
             dependencies: ["ReTiCA"],
-            resources: [.process("Vectors/fixtures.json"), .process("Vectors/lxmf_fixtures.json"), .process("Vectors/lxmf_propagation_fixtures.json")]
+            resources: [.process("Vectors/fixtures.json"), .process("Vectors/lxmf_fixtures.json"), .process("Vectors/lxmf_propagation_fixtures.json"), .process("Vectors/lxmf_rich_fixtures.json")]
         ),
         .testTarget(
             name: "ReTiCAInterfacesTests",

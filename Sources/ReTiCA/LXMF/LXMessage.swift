@@ -15,6 +15,7 @@ public struct LXMessage: Equatable {
     public let content: Data                      // utf-8 bytes (may be empty)
     public let hash: Data                         // 32 — message ID
     public let signature: Data                    // 64
+    public let fields: [MsgPackValue.IntPair]     // ordered integer-keyed fields (empty = none)
 
     /// LXMF app name and delivery aspect. A message's source/destination hashes are the hashes of the
     /// parties' `<identity>.lxmf.delivery` destinations — NOT raw identity hashes. A receiver recalls
@@ -28,31 +29,32 @@ public struct LXMessage: Equatable {
         Destination.hash(identityHash: identityHash, appName: appName, aspects: deliveryAspects)
     }
 
-    /// The msgpack of the 4-element payload [timestamp, title, content, {}] — the exact bytes the
-    /// reference packs (empty fields map as the 4th element).
-    private static func payloadBytes(timestamp: Double, title: Data, content: Data) -> Data {
-        MsgPack.encode(.array([.double(timestamp), .bin(title), .bin(content), .map([])]))
+    private static func payloadBytes(timestamp: Double, title: Data, content: Data,
+                                     fields: [MsgPackValue.IntPair]) -> Data {
+        let fieldsValue: MsgPackValue = fields.isEmpty ? .map([]) : .intMap(fields)
+        return MsgPack.encode(.array([.double(timestamp), .bin(title), .bin(content), fieldsValue]))
     }
 
     /// Build and sign a message from the source identity. `sourceHash` is derived as the source's
     /// `lxmf.delivery` destination hash; `destinationHash` is the recipient's `lxmf.delivery`
     /// destination hash. `title`/`content` are raw utf-8 bytes.
     public static func create(source: Identity, destinationHash: Data,
-                              timestamp: Double, title: Data, content: Data) -> LXMessage {
+                              timestamp: Double, title: Data, content: Data,
+                              fields: [MsgPackValue.IntPair] = []) -> LXMessage {
         let sourceHash = deliveryHash(identityHash: source.hash)
-        let payload = payloadBytes(timestamp: timestamp, title: title, content: content)
+        let payload = payloadBytes(timestamp: timestamp, title: title, content: content, fields: fields)
         let hashedPart = destinationHash + sourceHash + payload
         let hash = Crypto.fullHash(hashedPart)
         let signature = source.sign(hashedPart + hash)
         return LXMessage(destinationHash: destinationHash, sourceHash: sourceHash,
                          timestamp: timestamp, title: title, content: content,
-                         hash: hash, signature: signature)
+                         hash: hash, signature: signature, fields: fields)
     }
 
     /// The on-wire bytes: destinationHash ‖ sourceHash ‖ signature ‖ msgpack(payload).
     public var packed: Data {
         destinationHash + sourceHash + signature
-            + LXMessage.payloadBytes(timestamp: timestamp, title: title, content: content)
+            + LXMessage.payloadBytes(timestamp: timestamp, title: title, content: content, fields: fields)
     }
 
     /// Parse wire bytes back into a message (structure + recomputed hash). Returns nil for malformed
@@ -69,22 +71,24 @@ public struct LXMessage: Equatable {
               case let .array(items) = value, items.count == 4,
               case let .double(timestamp) = items[0],
               case let .bin(title) = items[1],
-              case let .bin(content) = items[2],
-              case let .map(pairs) = items[3], pairs.isEmpty
+              case let .bin(content) = items[2]
         else { return nil }
-        // Hash is recomputed from the received payload bytes (== msgpack(payload) for LXMF-1). The
-        // reference re-packs payload[:4] when stripping a stamp (5th element); we reject stamped/rich
-        // messages above, so packedPayload is always the exact hashed bytes here (LXMF-5 will revisit).
+        let fields: [MsgPackValue.IntPair]
+        switch items[3] {
+        case let .map(pairs) where pairs.isEmpty: fields = []
+        case let .intMap(pairs): fields = pairs
+        default: return nil
+        }
         let hash = Crypto.fullHash(destinationHash + sourceHash + packedPayload)
         return LXMessage(destinationHash: destinationHash, sourceHash: sourceHash,
                          timestamp: timestamp, title: title, content: content,
-                         hash: hash, signature: signature)
+                         hash: hash, signature: signature, fields: fields)
     }
 
     /// Recompute the hashed/signed parts from this message's fields and validate the signature
     /// against the resolved source identity (the caller resolves it by `sourceHash`).
     public func validateSignature(source: Identity) -> Bool {
-        let payload = LXMessage.payloadBytes(timestamp: timestamp, title: title, content: content)
+        let payload = LXMessage.payloadBytes(timestamp: timestamp, title: title, content: content, fields: fields)
         let hashedPart = destinationHash + sourceHash + payload
         let hash = Crypto.fullHash(hashedPart)
         return source.validate(signature: signature, message: hashedPart + hash)
