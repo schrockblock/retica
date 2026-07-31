@@ -53,7 +53,7 @@ import ComposableArchitecture
     await b.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
 
     // A sends opportunistically to B; bridge the DATA packet to B.
-    await a.send(.send(destinationHash: bDeliveryHash, title: Data("hi".utf8), content: Data("hello node".utf8)))
+    await a.send(.send(destinationHash: bDeliveryHash, title: Data("hi".utf8), content: Data("hello node".utf8), method: .opportunistic))
     await a.receive { if case .endpoint(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
 
