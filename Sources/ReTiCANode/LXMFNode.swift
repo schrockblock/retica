@@ -32,6 +32,7 @@ public struct LXMFNode {
         public enum Delegate: Equatable {
             case messageReceived(message: LXMessage, signatureValidated: Bool)
             case deliveryFailed(messageHash: Data)
+            case deliveryConfirmed(messageHash: Data)
         }
     }
 
@@ -74,6 +75,9 @@ public struct LXMFNode {
             case let .router(.delegate(.deliveryFailed(hash))):
                 return .send(.delegate(.deliveryFailed(messageHash: hash)))
 
+            case let .router(.delegate(.deliveryConfirmed(hash))):
+                return .send(.delegate(.deliveryConfirmed(messageHash: hash)))
+
             // --- Direct-over-link: router delegates → endpoint actions ---
             case let .router(.delegate(.requestLink(dest))):
                 return .send(.endpoint(.openLink(destinationHash: dest)))
@@ -109,6 +113,9 @@ public struct LXMFNode {
 
             case let .endpoint(.delegate(.resourceReceived(_, data))):
                 return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
+
+            case let .endpoint(.delegate(.resourceConcluded(linkID, _))):
+                return .send(.router(.resourceDeliveredOnLink(linkID: linkID)))
 
             case .endpoint, .router, .delegate:
                 return .none

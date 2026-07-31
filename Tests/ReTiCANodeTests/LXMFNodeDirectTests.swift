@@ -7,16 +7,16 @@ import ComposableArchitecture
 @testable import ReTiCATransport
 
 /// End-to-end through the LXMFNode composition: node A delivers a large LXMF message to node B directly
-/// over a Link (as a Resource), and B's LXMFNode surfaces the reconstructed, signature-validated message —
-/// with no hand-wiring of LXMessage/Endpoint/Link (the router + composition do it). Delivery confirmation
-/// is out of scope for this slice.
+/// over a Link (as a Resource), and B's LXMFNode surfaces the reconstructed, signature-validated message.
+/// Then B's RESOURCE_PRF is bridged back to A so A's resourceConcluded fires, which LXMFNode maps through
+/// to deliveryConfirmed — proving the full round-trip.
 ///
 /// Key sequencing note (vs. the brief's skeleton): TCA processes the entire chain
 /// LRRTT-transmit → link.established → LXMFNode.linkEstablished → router.drain → sendDirect →
 /// endpoint.sendResourceOverLink → RESOURCE_ADV within a single `await a.receive(isInterfaceSend)`
 /// call for LRRTT. So both sentA[lrrttIdx] and sentA[lrrttIdx+1] are written before that receive
 /// returns. Byte bridging uses explicit index arithmetic rather than `sentA.value.last!`.
-@Test @MainActor func lxmfNodeDirectDeliversResourceEndToEnd() async {
+@Test @MainActor func lxmfNodeDirectDeliversResourceAndConfirms() async {
     let clock = TestClock()
     let aIdentity = Identity()
     let bIdentity = Identity()
@@ -67,6 +67,10 @@ import ComposableArchitecture
     // A sends a LARGE message to B via .direct → router establishes a link (path already known),
     // then sends the message as a Resource. First: the LINKREQUEST goes out.
     let bigContent = Data((0..<800).map { UInt8($0 & 0xff) })
+    // Recover the deterministic message hash by rebuilding with the same params (timestamp from the fixed date).
+    let sentMessageHash = LXMessage.create(
+        source: aIdentity, destinationHash: bDeliveryHash,
+        timestamp: 1700000000.5, title: Data("big".utf8), content: bigContent).hash
     await a.send(.send(destinationHash: bDeliveryHash, title: Data("big".utf8), content: bigContent, method: .direct))
     await a.receive(isInterfaceSend)                        // LINKREQUEST out
 
@@ -109,10 +113,12 @@ import ComposableArchitecture
     let gotTitle = LockIsolated<Data?>(nil)
     let gotSrcHash = LockIsolated<Data?>(nil)
     let gotValidated = LockIsolated<Bool>(false)
+    let resourcePrfBytes = LockIsolated<Data?>(nil)
     for (i, frame) in parts.enumerated() {
         eventsB.yield(.data(frame))
         if i == partCount - 1 {
             await b.receive(isInterfaceSend)               // RESOURCE_PRF out
+            resourcePrfBytes.setValue(sentB.value.last!)   // capture RESOURCE_PRF before messageReceived
             await b.receive { action in
                 if case let .delegate(.messageReceived(m, v)) = action {
                     gotContent.setValue(m.content)
@@ -130,6 +136,16 @@ import ComposableArchitecture
     #expect(gotTitle.value == Data("big".utf8))
     #expect(gotSrcHash.value == LXMessage.deliveryHash(identityHash: aIdentity.hash))
     #expect(gotValidated.value == true)                    // B learned A's identity → signature validates
+
+    // B's RESOURCE_PRF → A: A concludes the resource, which LXMFNode maps
+    // resourceConcluded → router.resourceDeliveredOnLink → deliveryConfirmed.
+    let gotConfirmed = LockIsolated<Data?>(nil)
+    eventsA.yield(.data(resourcePrfBytes.value!))
+    await a.receive { action in
+        if case let .delegate(.deliveryConfirmed(hash)) = action { gotConfirmed.setValue(hash); return true }
+        return false
+    }
+    #expect(gotConfirmed.value == sentMessageHash)         // the hash of the message A sent
 
     await a.send(.endpoint(.disconnect)); await b.send(.endpoint(.disconnect))
 }
