@@ -27,6 +27,8 @@ public struct LXMFNode {
         case router(LXMFRouter.Action)
         case registerDelivery
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
+        case setPropagationNode(destinationHash: Data)
+        case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -55,6 +57,18 @@ public struct LXMFNode {
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
                 return .send(.router(.send(message: msg, desiredMethod: method)))
+
+            case let .setPropagationNode(destinationHash):
+                return .send(.router(.setOutboundPropagationNode(destinationHash)))
+
+            case let .sendViaPropagation(destinationHash, title, content):
+                guard let recipient = state.endpoint.transport.learned[destinationHash]?.identity
+                else { return .none }
+                let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
+                                           timestamp: date.now.timeIntervalSince1970, title: title, content: content)
+                let (packed, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient,
+                                                       timestamp: date.now.timeIntervalSince1970)
+                return .send(.router(.sendViaPropagation(message: msg, propagationPacked: packed)))
 
             case let .router(.delegate(.sendOpportunistic(dest, payload))):
                 return .send(.endpoint(.send(destinationHash: dest, plaintext: payload)))
@@ -89,6 +103,9 @@ public struct LXMFNode {
                 return asResource
                     ? .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: data)))
                     : .send(.endpoint(.sendOverLink(linkID: linkID, data: data)))
+
+            case let .router(.delegate(.sendPropagated(linkID, propagationPacked))):
+                return .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: propagationPacked)))
 
             case let .router(.delegate(.closeLink(dest))):
                 guard let linkID = state.directLinks[dest] else { return .none }
