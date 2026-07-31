@@ -38,6 +38,9 @@ public struct LXMFRouter {
         var propagationQueue: [Data: [PropagationItem]] = [:]
         /// Set when a sync was requested but the PN link is not yet active; drained on `.linkEstablished`.
         var pendingDownloadFromPN: Bool = false
+        /// Client "have" set: transient_ids already downloaded from a PN. Drives the wants/haves split on
+        /// the next offer (wants = offered we lack; haves = offered we have → PN purges). Unbounded for now.
+        public var downloadedTransientIds: Set<Data> = []
         public init() {}
     }
 
@@ -59,6 +62,8 @@ public struct LXMFRouter {
         case setOutboundPropagationNode(Data?)
         case sendViaPropagation(message: LXMessage, propagationPacked: Data)
         case syncFromPropagationNode
+        case offeredMessageList(transientIds: [Data])
+        case messagesDownloaded(transientIds: [Data])
         case linkEstablished(destinationHash: Data, linkID: Data)
         case linkClosed(destinationHash: Data)
         case learnedPath(destinationHash: Data)
@@ -76,7 +81,8 @@ public struct LXMFRouter {
             case requestPath(destinationHash: Data)
             case sendDirect(linkID: Data, data: Data, asResource: Bool)
             case sendPropagated(linkID: Data, propagationPacked: Data)
-            case requestMessageDownload(linkID: Data)
+            case requestMessageList(linkID: Data)
+            case requestMessages(linkID: Data, wants: [Data], haves: [Data])
             case closeLink(destinationHash: Data)
             case deliveryConfirmed(messageHash: Data)
             case deliveryFailed(messageHash: Data)
@@ -184,12 +190,24 @@ public struct LXMFRouter {
             case .syncFromPropagationNode:
                 guard let pn = state.outboundPropagationNode else { return .none }
                 if case let .active(linkID) = state.directLinks[pn] {
-                    return .send(.delegate(.requestMessageDownload(linkID: linkID)))
+                    return .send(.delegate(.requestMessageList(linkID: linkID)))
                 }
                 state.pendingDownloadFromPN = true
                 if state.directLinks[pn] == nil {
                     return establish(&state, pn)
                 }
+                return .none
+
+            case let .offeredMessageList(offered):
+                guard !offered.isEmpty else { return .none }            // empty offer → nothing to fetch
+                let wants = offered.filter { !state.downloadedTransientIds.contains($0) }
+                let haves = offered.filter { state.downloadedTransientIds.contains($0) }
+                guard let pn = state.outboundPropagationNode,
+                      case let .active(linkID) = state.directLinks[pn] else { return .none }  // link gone → abort
+                return .send(.delegate(.requestMessages(linkID: linkID, wants: wants, haves: haves)))
+
+            case let .messagesDownloaded(transientIds):
+                state.downloadedTransientIds.formUnion(transientIds)
                 return .none
 
             case let .linkEstablished(dest, linkID):
@@ -214,7 +232,7 @@ public struct LXMFRouter {
                 if !queued.isEmpty || !propQueued.isEmpty { effects.append(idleTimer(dest)) }
                 if dest == state.outboundPropagationNode, state.pendingDownloadFromPN {
                     state.pendingDownloadFromPN = false
-                    effects.append(.send(.delegate(.requestMessageDownload(linkID: linkID))))
+                    effects.append(.send(.delegate(.requestMessageList(linkID: linkID))))
                 }
                 return effects.isEmpty ? .none : .merge(effects)
 

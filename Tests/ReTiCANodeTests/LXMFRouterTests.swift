@@ -812,7 +812,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.syncFromPropagationNode)
     await store.receive { action in
-        if case let .delegate(.requestMessageDownload(lid)) = action { #expect(lid == linkID); return true }
+        if case let .delegate(.requestMessageList(lid)) = action { #expect(lid == linkID); return true }
         return false
     }
     #expect(store.state.pendingDownloadFromPN == false)
@@ -823,7 +823,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.syncFromPropagationNode)
     #expect(store.state.pendingDownloadFromPN == false)
-    store.exhaustivity = .on   // no PN → no requestLink / requestMessageDownload; a stray fails teardown
+    store.exhaustivity = .on   // no PN → no requestLink / requestMessageList; a stray fails teardown
 }
 
 @Test @MainActor func routerSyncEstablishesThenRequestsOnLinkEstablished() async {
@@ -842,7 +842,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.pendingDownloadFromPN == true)
     await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
     await store.receive { action in
-        if case let .delegate(.requestMessageDownload(lid)) = action { #expect(lid == linkID); return true }
+        if case let .delegate(.requestMessageList(lid)) = action { #expect(lid == linkID); return true }
         return false
     }
     #expect(store.state.pendingDownloadFromPN == false)
@@ -859,11 +859,11 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.send(.syncFromPropagationNode)
     await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
     await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
-    await store.receive { if case .delegate(.requestMessageDownload) = $0 { return true }; return false }
+    await store.receive { if case .delegate(.requestMessageList) = $0 { return true }; return false }
     // A second establish (e.g. link re-open) must NOT re-request the download — the flag was cleared.
     await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
     #expect(store.state.pendingDownloadFromPN == false)
-    store.exhaustivity = .on   // a stray requestMessageDownload would fail teardown
+    store.exhaustivity = .on   // a stray requestMessageList would fail teardown
 }
 
 // MARK: - Resource-direct delivery confirmation
@@ -899,4 +899,71 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     #expect(store.state.pendingDeliveries[bigMsg.hash] == nil)           // resolved → retry can't resend
     #expect(store.state.linkResourceInFlight[linkID] == nil)            // in-flight entry cleared
+}
+
+// MARK: - Propagation download two-phase offer/get (P2a)
+
+/// Phase-2: an offered list with nothing yet downloaded → request all of them as `wants`, no `haves`.
+@Test @MainActor func routerOfferedListRequestsAllWantsWhenNoneHeld() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    let id1 = Data(repeating: 0x11, count: 32); let id2 = Data(repeating: 0x22, count: 32)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.offeredMessageList(transientIds: [id1, id2]))
+    await store.receive { action in
+        if case let .delegate(.requestMessages(lid, wants, haves)) = action {
+            #expect(lid == linkID); #expect(wants == [id1, id2]); #expect(haves == []); return true
+        }
+        return false
+    }
+}
+
+/// Phase-2 with a have-set: a previously downloaded id moves from `wants` to `haves` (for PN purge).
+@Test @MainActor func routerOfferedListSplitsWantsAndHaves() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    let id1 = Data(repeating: 0x11, count: 32); let id2 = Data(repeating: 0x22, count: 32)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.messagesDownloaded(transientIds: [id1]))
+    #expect(store.state.downloadedTransientIds.contains(id1))
+    await store.send(.offeredMessageList(transientIds: [id1, id2]))
+    await store.receive { action in
+        if case let .delegate(.requestMessages(_, wants, haves)) = action {
+            #expect(wants == [id2]); #expect(haves == [id1]); return true
+        }
+        return false
+    }
+}
+
+/// An empty offer → sync done, no phase-2 request.
+@Test @MainActor func routerEmptyOfferedListRequestsNothing() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.offeredMessageList(transientIds: []))
+    store.exhaustivity = .on   // a stray requestMessages would fail teardown
+}
+
+/// No active PN link (offer arrived after the link dropped) → abort, no phase-2 request.
+@Test @MainActor func routerOfferedListWithoutActiveLinkAborts() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let id1 = Data(repeating: 0x11, count: 32)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn                 // configured, but no active link
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.offeredMessageList(transientIds: [id1]))
+    store.exhaustivity = .on   // a stray requestMessages would fail teardown
 }
