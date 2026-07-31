@@ -16,12 +16,20 @@ extension LXMFPropagation {
         return (container(timestamp: timestamp, entries: [entry]), transientId(lxmfData: entry))
     }
 
-    /// Recover the LXMessage from one container entry by decrypting its tail with `recipientIdentity`.
-    /// Returns nil if the entry is malformed or decryption/unpack fails.
-    public static func open(lxmfData: Data, recipientIdentity: Identity) -> LXMessage? {
+    /// Recover the packed LXMF wire bytes (destinationHash ‖ decrypted tail) from one container/download
+    /// entry, decrypting the tail with `recipientIdentity`. Nil if malformed or decryption fails. The
+    /// symmetric inverse of `pack`'s encryption step; `open` is `unpack(recoverPacked(...))`.
+    public static func recoverPacked(lxmfData: Data, recipientIdentity: Identity) -> Data? {
         guard let destHash = destinationHash(lxmfData: lxmfData) else { return nil }
         let encrypted = Data(lxmfData.dropFirst(LXMessage.destinationLength))
         guard let tail = recipientIdentity.decrypt(encrypted) else { return nil }
-        return LXMessage.unpack(destHash + tail)
+        return destHash + tail
+    }
+
+    /// Recover the LXMessage from one container entry by decrypting its tail with `recipientIdentity`.
+    /// Returns nil if the entry is malformed or decryption/unpack fails.
+    public static func open(lxmfData: Data, recipientIdentity: Identity) -> LXMessage? {
+        guard let packed = recoverPacked(lxmfData: lxmfData, recipientIdentity: recipientIdentity) else { return nil }
+        return LXMessage.unpack(packed)
     }
 }
