@@ -865,3 +865,38 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.pendingDownloadFromPN == false)
     store.exhaustivity = .on   // a stray requestMessageDownload would fail teardown
 }
+
+// MARK: - Resource-direct delivery confirmation
+
+/// Resource-direct confirmation: a resource-sized message sent over an active link records its hash in
+/// linkResourceInFlight; resourceDeliveredOnLink(linkID) resolves it to deliveryConfirmed and clears both
+/// the pending delivery and the in-flight entry. (This is what stops the direct retry-storm on success.)
+@Test @MainActor func routerConfirmsResourceDirectOnResourceDelivered() async {
+    let bigMsg = makeMessage(source: Identity(), content: String(repeating: "y", count: 2000))
+    #expect(bigMsg.directRepresentation == .resource)
+    let linkID = Data(repeating: 0xEF, count: 16)
+    var initial = LXMFRouter.State()
+    initial.directLinks[bigMsg.destinationHash] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+
+    await store.send(.send(message: bigMsg, desiredMethod: .direct))
+    await store.receive { action in
+        if case let .delegate(.sendDirect(lid, _, asResource)) = action {
+            #expect(lid == linkID); #expect(asResource == true); return true
+        }
+        return false
+    }
+    #expect(store.state.linkResourceInFlight[linkID] == bigMsg.hash)     // recorded on send
+    #expect(store.state.pendingDeliveries[bigMsg.hash] != nil)           // awaiting outcome
+
+    await store.send(.resourceDeliveredOnLink(linkID: linkID))
+    await store.receive { action in
+        if case let .delegate(.deliveryConfirmed(hash)) = action { #expect(hash == bigMsg.hash); return true }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[bigMsg.hash] == nil)           // resolved → retry can't resend
+    #expect(store.state.linkResourceInFlight[linkID] == nil)            // in-flight entry cleared
+}

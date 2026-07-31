@@ -29,6 +29,9 @@ public struct LXMFRouter {
         var outboundQueue: [Data: [LXMessage]] = [:]
         /// message.hash → in-flight send awaiting a delivery outcome (with its resend info + attempts).
         public var pendingDeliveries: [Data: PendingDelivery] = [:]
+        /// linkID → message.hash of the Resource-direct send currently in flight on that link.
+        /// Single-in-flight per link (last write wins); resolves resourceDeliveredOnLink → deliveryConfirmed.
+        public var linkResourceInFlight: [Data: Data] = [:]
         /// The configured store-and-forward propagation node (all PROPAGATED sends link to it).
         public var outboundPropagationNode: Data? = nil
         /// PN hash → propagated messages queued until a link to the PN becomes active.
@@ -60,6 +63,7 @@ public struct LXMFRouter {
         case linkClosed(destinationHash: Data)
         case learnedPath(destinationHash: Data)
         case delivered(messageHash: Data)
+        case resourceDeliveredOnLink(linkID: Data)
         case retryDue(messageHash: Data)
         case idleDeadline(destinationHash: Data)
         case delegate(Delegate)
@@ -143,6 +147,7 @@ public struct LXMFRouter {
                     if case let .active(linkID) = state.directLinks[dest] {
                         let asResource = message.directRepresentation == .resource
                         arm(&state, message.hash, .direct(destinationHash: dest, data: message.packed, asResource: asResource))
+                        if asResource { state.linkResourceInFlight[linkID] = message.hash }
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: message.packed,
                                                                   asResource: asResource))),
                                       retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
@@ -197,6 +202,7 @@ public struct LXMFRouter {
                 for m in queued {
                     let asResource = m.directRepresentation == .resource
                     arm(&state, m.hash, .direct(destinationHash: dest, data: m.packed, asResource: asResource))
+                    if asResource { state.linkResourceInFlight[linkID] = m.hash }
                     effects.append(.send(.delegate(.sendDirect(linkID: linkID, data: m.packed, asResource: asResource))))
                     effects.append(retryTimer(m.hash, LXMFDelivery.retryWaitSeconds))
                 }
@@ -213,6 +219,9 @@ public struct LXMFRouter {
                 return effects.isEmpty ? .none : .merge(effects)
 
             case let .linkClosed(dest):
+                if case let .active(linkID) = state.directLinks[dest] {
+                    state.linkResourceInFlight[linkID] = nil
+                }
                 state.directLinks[dest] = nil
                 let hasPending = state.pendingDeliveries.values.contains {
                     switch $0.resend {
@@ -242,6 +251,11 @@ public struct LXMFRouter {
                 return .merge(.cancel(id: CancelID.retry(hash)),
                               .send(.delegate(.deliveryConfirmed(messageHash: hash))))
 
+            case let .resourceDeliveredOnLink(linkID):
+                guard let hash = state.linkResourceInFlight[linkID] else { return .none }
+                state.linkResourceInFlight[linkID] = nil
+                return .send(.delivered(messageHash: hash))
+
             case let .retryDue(hash):
                 guard var pending = state.pendingDeliveries[hash] else { return .none }
                 pending.attempts += 1
@@ -261,6 +275,7 @@ public struct LXMFRouter {
                                   retryTimer(hash, LXMFDelivery.retryWaitSeconds))
                 case let .direct(destinationHash, data, asResource):
                     if case let .active(linkID) = state.directLinks[destinationHash] {
+                        if asResource { state.linkResourceInFlight[linkID] = hash }
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: asResource))),
                                       retryTimer(hash, LXMFDelivery.retryWaitSeconds))
                     }
