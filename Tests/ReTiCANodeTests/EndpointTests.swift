@@ -1663,3 +1663,31 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     events.yield(.disconnected(reason: nil))              // → interfaceDisconnected + stopMaintenance
     await store.receive(\.transport.stopMaintenance)
 }
+
+@Test @MainActor func endpointRequestPathForwardsToTransport() async {
+    let clock = TestClock()
+    let events = AsyncStream<TCPEvent>.makeStream()
+    let sent = LockIsolated<[Data]>([])
+    let store = TestStore(initialState: Endpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
+        Endpoint()
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                         send: { d in sent.withValue { $0.append(d) } },
+                                         close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    await store.send(.connect); events.continuation.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+
+    let dest = Data((0..<16).map { UInt8($0) })
+    await store.send(.requestPath(destinationHash: dest))
+    await store.receive(\.transport.requestPath)                 // forwarder reaches Transport
+    await store.receive { if case .interface(.send) = $0 { return true }; return false }
+    #expect(!sent.value.isEmpty)                                 // a path-request packet went out
+
+    await store.send(.disconnect)
+}

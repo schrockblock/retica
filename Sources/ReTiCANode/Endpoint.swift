@@ -37,6 +37,7 @@ public struct Endpoint {
         case send(destinationHash: Data, plaintext: Data)
         case enableRelay(Identity)
         case openLink(destinationHash: Data)
+        case requestPath(destinationHash: Data)
         case sendOverLink(linkID: Data, data: Data)
         case sendResourceOverLink(linkID: Data, data: Data)
         case closeLink(linkID: Data)
@@ -52,7 +53,7 @@ public struct Endpoint {
             case messageReceived(destinationHash: Data, plaintext: Data)
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: Transport.SendFailure)
-            case linkEstablished(linkID: Data)
+            case linkEstablished(linkID: Data, destinationHash: Data)
             case linkDataReceived(linkID: Data, data: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
             case linkFailed(destinationHash: Data)
@@ -133,6 +134,9 @@ public struct Endpoint {
                                                      relayNextHop: relayNextHop))
                 return .send(.link(.element(id: newID, action: .establish)))
 
+            case let .requestPath(destinationHash):
+                return .send(.transport(.requestPath(destinationHash: destinationHash)))
+
             case let .sendOverLink(linkID, data):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .send(data))))
@@ -162,8 +166,9 @@ public struct Endpoint {
                 state.registrations[Crypto.truncatedHash(Data(path.utf8))] = nil
                 return .none
 
-            case let .link(.element(_, .delegate(.established(linkID, _)))):
-                return .send(.delegate(.linkEstablished(linkID: linkID)))
+            case let .link(.element(elementID, .delegate(.established(linkID, _)))):
+                guard let destHash = state.links[id: elementID]?.destinationHash else { return .none }
+                return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))
 
             case let .link(.element(elementID, .delegate(.dataReceived(data)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
