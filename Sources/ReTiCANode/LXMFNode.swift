@@ -9,12 +9,15 @@ import ReTiCATransport
 /// over-link, path requests, delivery confirmation, and propagation wiring are follow-ons.
 @Reducer
 public struct LXMFNode {
+    public enum SyncPhase: Equatable { case awaitingList, awaitingMessages }
+
     @ObservableState
     public struct State: Equatable {
         public var endpoint: Endpoint.State
         public var router: LXMFRouter.State
         public var identity: Identity
         public var directLinks: [Data: Data] = [:]   // destinationHash → linkID (close/linkClosed correlation)
+        public var syncPhase: [Data: SyncPhase] = [:]   // linkID → current download phase (one sync/link)
         public init(identity: Identity, endpoint: Endpoint.State) {
             self.identity = identity
             self.endpoint = endpoint
@@ -29,6 +32,7 @@ public struct LXMFNode {
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
         case setPropagationNode(destinationHash: Data)
         case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
+        case syncFromPropagationNode
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -69,6 +73,53 @@ public struct LXMFNode {
                 let (packed, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient,
                                                        timestamp: date.now.timeIntervalSince1970)
                 return .send(.router(.sendViaPropagation(message: msg, propagationPacked: packed)))
+
+            case .syncFromPropagationNode:
+                return .send(.router(.syncFromPropagationNode))
+
+            // --- Propagation sync: phase-1 (IDENTIFY + list request) ---
+            case let .router(.delegate(.requestMessageList(linkID))):
+                state.syncPhase[linkID] = .awaitingList
+                return .merge(
+                    .send(.endpoint(.identifyOverLink(linkID: linkID, identity: state.identity))),
+                    .send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/get",
+                                                         data: MsgPack.encode(.array([.null, .null]))))))
+
+            // --- Propagation sync: phase-2 (wanted messages request) ---
+            case let .router(.delegate(.requestMessages(linkID, wants, haves))):
+                state.syncPhase[linkID] = .awaitingMessages
+                let payload = MsgPack.encode(.array([.array(wants.map { .bin($0) }),
+                                                     .array(haves.map { .bin($0) })]))
+                return .send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/get", data: payload)))
+
+            // --- Propagation sync: dispatch on responseReceived based on phase ---
+            case let .endpoint(.delegate(.responseReceived(linkID, _, data))):
+                switch state.syncPhase[linkID] {
+                case .awaitingList:
+                    guard case let .array(items)? = MsgPack.decodeValue(data) else { return .none }
+                    let ids = items.compactMap { item -> Data? in
+                        if case let .bin(d) = item { return d } else { return nil }
+                    }
+                    return .send(.router(.offeredMessageList(transientIds: ids)))
+                case .awaitingMessages:
+                    state.syncPhase[linkID] = nil
+                    guard case let .array(items)? = MsgPack.decodeValue(data) else { return .none }
+                    let blobs = items.compactMap { item -> Data? in
+                        if case let .bin(d) = item { return d } else { return nil }
+                    }
+                    var effects: [Effect<Action>] = []
+                    var tids: [Data] = []
+                    for blob in blobs {
+                        tids.append(LXMFPropagation.transientId(lxmfData: blob))
+                        if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity) {
+                            effects.append(.send(.router(.received(method: .direct, destinationHash: Data(), data: packed))))
+                        }
+                    }
+                    effects.append(.send(.router(.messagesDownloaded(transientIds: tids))))
+                    return .merge(effects)
+                case .none:
+                    return .none
+                }
 
             case let .router(.delegate(.sendOpportunistic(dest, payload))):
                 return .send(.endpoint(.send(destinationHash: dest, plaintext: payload)))

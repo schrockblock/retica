@@ -1,0 +1,171 @@
+import Testing
+import Foundation
+import ComposableArchitecture
+@testable import ReTiCANode
+@testable import ReTiCA
+@testable import ReTiCAInterfaces
+@testable import ReTiCATransport
+
+/// End-to-end through LXMFNode: client A syncs from a propagation node. A establishes a link to the PN's
+/// lxmf.propagation destination, IDENTIFYs, and runs the two-phase /get exchange (list → wanted → blobs).
+/// The PN is a bare Endpoint stub whose two responses the test supplies. A opens the returned blob with its
+/// own identity and surfaces the sender's signature-valid message. (PN server logic is P3.)
+@Test @MainActor func lxmfNodeSyncsMessagesFromPropagationNode() async {
+    let clock = TestClock()
+    let aIdentity = Identity()      // client / recipient
+    let sIdentity = Identity()      // the original sender of the stored message
+    let pnIdentity = Identity()
+    let aDeliveryHash = LXMessage.deliveryHash(identityHash: aIdentity.hash)
+    let sDelivery = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                                aspects: LXMessage.deliveryAspects, identity: sIdentity)!
+    let pnDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                             aspects: ["propagation"], identity: pnIdentity)!
+
+    // The stored message (from S to A) and its propagation entry + transient id.
+    let storedMsg = LXMessage.create(source: sIdentity, destinationHash: aDeliveryHash,
+                                     timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi A".utf8))
+    let (container, _) = LXMFPropagation.pack(message: storedMsg, recipientIdentity: aIdentity, timestamp: 1700000000.5)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
+    let tid = LXMFPropagation.transientId(lxmfData: entry)
+
+    func makeNode(_ host: String, _ identity: Identity, _ sent: LockIsolated<[Data]>)
+        -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: LXMFNode.State(
+            identity: identity, endpoint: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false))
+        ) { LXMFNode() } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } }, close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    func makeEndpoint(_ host: String, _ sent: LockIsolated<[Data]>)
+        -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            Endpoint()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } }, close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
+    func epSend(_ act: Endpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+
+    let sentA = LockIsolated<[Data]>([]); let sentS = LockIsolated<[Data]>([]); let sentPN = LockIsolated<[Data]>([])
+    let (a, eventsA) = makeNode("a", aIdentity, sentA)
+    let (s, eventsS) = makeEndpoint("s", sentS)
+    let (pn, eventsPN) = makeEndpoint("pn", sentPN)
+
+    await a.send(.endpoint(.connect)); eventsA.yield(.connected)
+    await s.send(.connect); eventsS.yield(.connected)
+    await pn.send(.connect); eventsPN.yield(.connected)
+
+    // S announces its delivery destination → A learns S's path + identity (for signature validation).
+    await s.send(.registerLocalDestination(sDelivery))
+    await s.send(.announce(destinationHash: sDelivery.hash, appData: nil))
+    await s.receive(epSend)
+    eventsA.yield(.data(sentS.value.last!))
+    await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
+
+    // PN announces its lxmf.propagation destination → A learns PN's path + identity.
+    await pn.send(.registerLocalDestination(pnDest))
+    await pn.send(.announce(destinationHash: pnDest.hash, appData: nil))
+    await pn.receive(epSend)
+    eventsA.yield(.data(sentPN.value.last!))
+    await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
+
+    // Configure A with the PN and trigger sync → router sets pendingDownloadFromPN + fires requestLink(pn).
+    await a.send(.setPropagationNode(destinationHash: pnDest.hash))
+    await a.send(.syncFromPropagationNode)
+    await a.receive(aSend)                                   // LINKREQUEST out to PN
+
+    // LINKREQUEST → PN; PN sends LRPROOF.
+    eventsPN.yield(.data(sentA.value.last!))
+    await pn.receive(epSend)                                 // LRPROOF out
+
+    // LRPROOF → A: A becomes active. Within this single chain A also fires:
+    //   LRRTT, then (linkEstablished → router.linkEstablished → pendingDownloadFromPN →
+    //   requestMessageList → IDENTIFY + phase-1 /get).
+    // All three sends (LRRTT, IDENTIFY, phase-1 /get) are emitted before the receive returns.
+    let preLRPROOFIdx = sentA.value.count
+    eventsA.yield(.data(sentPN.value.last!))
+    await a.receive(aSend)                                   // LRRTT out
+    await a.receive(aSend)                                   // IDENTIFY out
+    await a.receive(aSend)                                   // phase-1 /get out
+    let lrrttBytes = sentA.value[preLRPROOFIdx]
+    let identifyBytes = sentA.value[preLRPROOFIdx + 1]
+    let phase1ReqBytes = sentA.value[preLRPROOFIdx + 2]
+
+    // LRRTT → PN; PN becomes active (linkEstablished on PN side).
+    eventsPN.yield(.data(lrrttBytes))
+    await pn.receive { if case .delegate(.linkEstablished) = $0 { return true }; return false }
+
+    // Bridge IDENTIFY to PN.
+    eventsPN.yield(.data(identifyBytes))
+    await pn.receive { if case .delegate(.linkIdentified) = $0 { return true }; return false }
+
+    // Bridge phase-1 /get to PN; PN surfaces requestReceived.
+    let reqID1 = LockIsolated<Data?>(nil)
+    eventsPN.yield(.data(phase1ReqBytes))
+    await pn.receive { action in
+        if case let .delegate(.requestReceived(_, rid, _, _)) = action { reqID1.setValue(rid); return true }
+        return false
+    }
+
+    // PN responds with the transient id list.
+    let phase1Resp = MsgPack.encode(.array([.bin(tid)]))
+    let pnLinkID = pn.state.links[0].linkID
+    await pn.send(.sendResponseOverLink(linkID: pnLinkID, requestID: reqID1.value!, data: phase1Resp))
+    await pn.receive(epSend)                                 // response frame out
+
+    // Bridge response to A → responseReceived (awaitingList) → offeredMessageList → requestMessages → phase-2 /get.
+    eventsA.yield(.data(sentPN.value.last!))
+    await a.receive { if case .endpoint(.delegate(.responseReceived)) = $0 { return true }; return false }
+    await a.receive(aSend)                                   // phase-2 /get out
+    let phase2ReqBytes = sentA.value.last!
+
+    // Bridge phase-2 /get to PN; PN surfaces requestReceived.
+    let reqID2 = LockIsolated<Data?>(nil)
+    eventsPN.yield(.data(phase2ReqBytes))
+    await pn.receive { action in
+        if case let .delegate(.requestReceived(_, rid, _, _)) = action { reqID2.setValue(rid); return true }
+        return false
+    }
+
+    // PN responds with the blob list (the single lxmfData entry).
+    let phase2Resp = MsgPack.encode(.array([.bin(entry)]))
+    await pn.send(.sendResponseOverLink(linkID: pnLinkID, requestID: reqID2.value!, data: phase2Resp))
+    await pn.receive(epSend)                                 // response frame out
+
+    // Bridge response to A → responseReceived (awaitingMessages) → recoverPacked → received → messageDelivered.
+    let gotContent = LockIsolated<Data?>(nil)
+    let gotValidated = LockIsolated<Bool>(false)
+    eventsA.yield(.data(sentPN.value.last!))
+    await a.receive { if case .endpoint(.delegate(.responseReceived)) = $0 { return true }; return false }
+    await a.receive { action in
+        if case let .delegate(.messageReceived(m, v)) = action {
+            gotContent.setValue(m.content)
+            gotValidated.setValue(v)
+            return true
+        }
+        return false
+    }
+
+    #expect(gotContent.value == Data("hi A".utf8))
+    #expect(gotValidated.value == true)                        // A learned S → signature validates
+    #expect(a.state.router.downloadedTransientIds.contains(tid))
+
+    await a.send(.endpoint(.disconnect)); await s.send(.disconnect); await pn.send(.disconnect)
+}
