@@ -39,7 +39,8 @@ let package = Package(
             dependencies: [
                 "ReTiCAInterfaces",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
-            ]
+            ],
+            resources: [.process("Vectors/ble_fixtures.json")]
         ),
         .target(
             name: "ReTiCATransport",
