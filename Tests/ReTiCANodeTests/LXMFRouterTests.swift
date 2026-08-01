@@ -967,3 +967,37 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.send(.offeredMessageList(transientIds: [id1]))
     store.exhaustivity = .on   // a stray requestMessages would fail teardown
 }
+
+// MARK: - Propagation-accept confirmation (P3c)
+
+/// Propagation-accept: a propagation send over an active PN link records linkResourceInFlight; when the PN
+/// concludes the resource, resourceDeliveredOnLink resolves it to propagationAccepted (NOT deliveryConfirmed)
+/// and clears the pending delivery — closing the propagation retry-storm on PN accept.
+@Test @MainActor func routerConfirmsPropagationAcceptOnResourceDelivered() async {
+    let msg = makeMessage(source: Identity(), content: "via pn")
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: Data("container".utf8)))
+    await store.receive { action in
+        if case let .delegate(.sendPropagated(lid, _)) = action { #expect(lid == linkID); return true }
+        return false
+    }
+    #expect(store.state.linkResourceInFlight[linkID] == msg.hash)      // recorded on propagation send
+    #expect(store.state.pendingDeliveries[msg.hash] != nil)
+
+    await store.send(.resourceDeliveredOnLink(linkID: linkID))
+    await store.receive { action in
+        if case let .delegate(.propagationAccepted(hash)) = action { #expect(hash == msg.hash); return true }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash] == nil)           // resolved → retry cancelled
+    #expect(store.state.linkResourceInFlight[linkID] == nil)
+}
