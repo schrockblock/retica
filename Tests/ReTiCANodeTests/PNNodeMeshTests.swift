@@ -73,7 +73,7 @@ import ComposableArchitecture
     await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
 
     // --- A.syncToPeer(bPropDest.hash) → A opens link to B. ---
-    await a.send(.syncToPeer(destinationHash: bPropDest.hash))
+    await a.send(.syncToPeer(destinationHash: bPropDest.hash, peeringCost: 0))
     await a.receive { if case .endpoint(.openLink) = $0 { return true }; return false }
     await a.receive(aSend)   // LINKREQUEST out
 

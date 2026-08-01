@@ -6,9 +6,10 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
-private func makeStore(_ pnIdentity: Identity) -> TestStore<PNNode.State, PNNode.Action> {
+private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStore<PNNode.State, PNNode.Action> {
     let store = TestStore(initialState: PNNode.State(
-        identity: pnIdentity, endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+        identity: pnIdentity, endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false),
+        peeringCost: peeringCost)
     ) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
@@ -159,36 +160,38 @@ private func makeStore(_ pnIdentity: Identity) -> TestStore<PNNode.State, PNNode
 
 // MARK: - P4b-2 mesh initiator
 
-/// syncToPeer opens a link and, on establishment to a pending peer, IDENTIFYs and offers store.transientIds.
-@Test @MainActor func pnNodeSyncToPeerOffersOnLinkEstablished() async {
-    let sender = Identity(); let recipient = Identity()
-    let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
-                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("m".utf8))
-    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5)
-    let tid = LXMFPropagation.transientId(lxmfData: LXMFPropagation.parseContainer(container)!.entries[0])
-    let peerDest = Data(repeating: 0xD0, count: 16)
-    let linkID = Data(repeating: 0xD1, count: 16)
-    let store = makeStore(Identity())
+/// Initiator generates a peering key valid at the peer's cost and puts it in the /offer.
+@Test @MainActor func pnNodeInitiatorGeneratesValidPeeringKey() async {
+    let aIdentity = Identity(); let peerIdentity = Identity()
+    let cost = 8
+    let peerDest = Data(repeating: 0xD0, count: 16); let linkID = Data(repeating: 0xD1, count: 16)
+    var initial = PNNode.State(identity: aIdentity, endpoint: Endpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
+    initial.endpoint.transport.learned[peerDest] = LearnedDestination(
+        identity: peerIdentity, appData: nil, ratchet: nil, interfaceID: initial.endpoint.interfaceID,
+        hops: 1, nextHop: nil, announceEmitted: 0)
+    let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+        $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
 
-    await store.send(.endpoint(.delegate(.resourceReceived(linkID: Data([9]), data: container))))  // PN-A now holds `tid`
-    await store.receive { if case .delegate(.messagesStored) = $0 { return true }; return false }
-
-    await store.send(.syncToPeer(destinationHash: peerDest))
+    await store.send(.syncToPeer(destinationHash: peerDest, peeringCost: cost))
     await store.receive { if case .endpoint(.openLink(peerDest)) = $0 { return true }; return false }
-    #expect(store.state.pendingSyncPeers.contains(peerDest))
+    #expect(store.state.pendingSyncPeers[peerDest] == cost)
 
     await store.send(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: peerDest))))
     await store.receive { if case let .endpoint(.identifyOverLink(lid, _)) = $0 { return lid == linkID }; return false }
-    await store.receive { action in
-        if case let .endpoint(.sendRequestOverLink(lid, path, data)) = action {
-            #expect(lid == linkID); #expect(path == "/offer")
-            #expect(MsgPack.decodeValue(data) == .array([.bin(Data([0x01])), .array([.bin(tid)])]))
+    let gotKey = LockIsolated<Data?>(nil)
+    await store.receive { action in                              // driven by the async offerKeyReady effect
+        if case let .endpoint(.sendRequestOverLink(lid, path, data)) = action, lid == linkID, path == "/offer" {
+            if case let .array(items)? = MsgPack.decodeValue(data), case let .bin(k) = items[0] { gotKey.setValue(k) }
             return true
         }
         return false
     }
-    #expect(store.state.offerLinks[linkID] == [tid])
-    #expect(!store.state.pendingSyncPeers.contains(peerDest))
+    // The generated key validates at the peer's cost over the same responder-first peeringId.
+    #expect(LXStamper.validatePeeringKey(peeringId: peerIdentity.hash + aIdentity.hash,
+                                         peeringKey: gotKey.value!, targetCost: cost))
 }
 
 /// Offer response (list): transfer the wanted subset as a container Resource.
@@ -267,4 +270,42 @@ private func makeStore(_ pnIdentity: Identity) -> TestStore<PNNode.State, PNNode
     let linkID = Data(repeating: 0xD1, count: 16)
     await store.send(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: Data(repeating: 0xEE, count: 16)))))
     store.exhaustivity = .on   // a stray identify/sendRequest would fail teardown
+}
+
+// MARK: - P4c-2 peering-cost enforcement
+
+/// Responder validates the offer's peering key at the configured cost: a valid key is accepted (wanted response).
+@Test @MainActor func pnNodeOfferAcceptedWithValidPeeringKey() async {
+    let pnIdentity = Identity(); let peer = Identity()
+    let cost = 8
+    let peeringId = pnIdentity.hash + peer.hash                       // responder-first: responder + initiator
+    let key = LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: cost)
+    let offerPath = Crypto.truncatedHash(Data("/offer".utf8))
+    let id1 = Data(repeating: 0x11, count: 32)
+    let store = makeStore(pnIdentity, peeringCost: cost)
+    let linkID = Data(repeating: 0xB0, count: 16)
+    await store.send(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: peer))))
+    await store.send(.endpoint(.delegate(.requestReceived(linkID: linkID, requestID: Data([1]),
+        pathHash: offerPath, data: MsgPack.encode(.array([.bin(key), .array([.bin(id1)])]))))))
+    await store.receive { action in
+        if case let .endpoint(.sendResponseOverLink(_, _, data)) = action {
+            #expect(MsgPack.decodeValue(data) == .array([.bin(id1)])); return true
+        }
+        return false
+    }
+}
+
+/// Responder rejects an invalid peering key at cost > 0: no response.
+@Test @MainActor func pnNodeOfferRejectedWithInvalidPeeringKey() async {
+    let peer = Identity()
+    let offerPath = Crypto.truncatedHash(Data("/offer".utf8))
+    let store = makeStore(Identity(), peeringCost: 8)
+    let linkID = Data(repeating: 0xB0, count: 16)
+    await store.send(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: peer))))
+    await store.send(.endpoint(.delegate(.requestReceived(linkID: linkID, requestID: Data([1]),
+        pathHash: offerPath, data: MsgPack.encode(.array([.bin(Data([0])), .array([.bin(Data(repeating: 0x11, count: 32))])]))))))
+    // Drain the internal validatePeeringKey → peerValidated chain (both return .none → no sendResponseOverLink).
+    await store.receive { if case .node(.validatePeeringKey) = $0 { return true }; return false }
+    await store.receive { if case .node(.delegate(.peerValidated)) = $0 { return true }; return false }
+    store.exhaustivity = .on   // an invalid key must NOT produce a sendResponseOverLink
 }

@@ -14,14 +14,16 @@ public struct PNNode {
         public var endpoint: Endpoint.State
         public var node: PropagationNode.State
         public var identity: Identity
+        public var peeringCost: Int = 0                        // required cost for inbound /offer peering keys
         public var clientIdentities: [Data: Identity] = [:]   // linkID → IDENTIFY'd client
         public var pendingGet: [Data: PendingGet] = [:]        // client delivery hash → (linkID, requestID)
         public var pendingOffer: [Data: PendingOffer] = [:]   // peerHash → (linkID, requestID, offeredIds)
-        public var pendingSyncPeers: Set<Data> = []        // peer dests openLink'd, awaiting linkEstablished
+        public var pendingSyncPeers: [Data: Int] = [:]     // peer dest → the peer's peering cost, awaiting linkEstablished
         public var offerLinks: [Data: [Data]] = [:]        // outbound offer linkID → offeredIds we sent
-        public init(identity: Identity, endpoint: Endpoint.State, storageLimitBytes: Int? = nil) {
+        public init(identity: Identity, endpoint: Endpoint.State, storageLimitBytes: Int? = nil, peeringCost: Int = 0) {
             self.identity = identity
             self.endpoint = endpoint
+            self.peeringCost = peeringCost
             self.node = PropagationNode.State(storageLimitBytes: storageLimitBytes)
         }
     }
@@ -41,7 +43,8 @@ public struct PNNode {
         case endpoint(Endpoint.Action)
         case node(PropagationNode.Action)
         case registerPropagation
-        case syncToPeer(destinationHash: Data)
+        case syncToPeer(destinationHash: Data, peeringCost: Int)
+        case offerKeyReady(linkID: Data, key: Data)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -67,12 +70,12 @@ public struct PNNode {
                                           aspects: ["propagation"], identity: state.identity) else { return .none }
                 let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: true,
                                          perTransferLimit: 0, perSyncLimit: 0, targetStampCost: 0,
-                                         stampCostFlexibility: 0, peeringCost: 0).packed
+                                         stampCostFlexibility: 0, peeringCost: state.peeringCost).packed
                 return .merge(.send(.endpoint(.registerLocalDestination(d))),
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
 
-            case let .syncToPeer(destinationHash):
-                state.pendingSyncPeers.insert(destinationHash)
+            case let .syncToPeer(destinationHash, peeringCost):
+                state.pendingSyncPeers[destinationHash] = peeringCost
                 return .send(.endpoint(.openLink(destinationHash: destinationHash)))
 
             case let .endpoint(.delegate(.resourceReceived(_, data))):
@@ -107,7 +110,7 @@ public struct PNNode {
                     let peeringId = state.identity.hash + clientIdentity.hash
                     state.pendingOffer[peerHash] = PendingOffer(linkID: linkID, requestID: requestID, offeredIds: offeredIds)
                     return .send(.node(.validatePeeringKey(peerHash: peerHash, peeringId: peeringId,
-                                                           peeringKey: peeringKey, targetCost: 0)))   // cost 0 = open mesh (P4c enforces)
+                                                           peeringKey: peeringKey, targetCost: state.peeringCost)))   // configured cost
                 }
                 return .none
 
@@ -136,14 +139,23 @@ public struct PNNode {
                                                              data: MsgPack.encode(.array(wanted.map { .bin($0) })))))
 
             case let .endpoint(.delegate(.linkEstablished(linkID, dest))):
-                guard state.pendingSyncPeers.contains(dest) else { return .none }   // inbound responder link → ignore
-                state.pendingSyncPeers.remove(dest)
-                let offeredIds = state.node.store.transientIds
-                state.offerLinks[linkID] = offeredIds
-                let offer = MsgPack.encode(.array([.bin(Data([0x01])),             // trivial cost-0 peering key (P4c: PoW)
-                                                   .array(offeredIds.map { .bin($0) })]))
-                return .merge(.send(.endpoint(.identifyOverLink(linkID: linkID, identity: state.identity))),
-                              .send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/offer", data: offer))))
+                guard let cost = state.pendingSyncPeers[dest] else { return .none }   // inbound responder link → ignore
+                state.pendingSyncPeers[dest] = nil
+                guard let peerIdentity = state.endpoint.transport.learned[dest]?.identity else { return .none }
+                state.offerLinks[linkID] = state.node.store.transientIds
+                let peeringId = peerIdentity.hash + state.identity.hash              // responder-first (matches P4a)
+                let selfIdentity = state.identity
+                return .merge(
+                    .send(.endpoint(.identifyOverLink(linkID: linkID, identity: selfIdentity))),
+                    .run { send in
+                        let key = LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: cost)
+                        await send(.offerKeyReady(linkID: linkID, key: key))
+                    })
+
+            case let .offerKeyReady(linkID, key):
+                guard let offeredIds = state.offerLinks[linkID] else { return .none }
+                let offer = MsgPack.encode(.array([.bin(key), .array(offeredIds.map { .bin($0) })]))
+                return .send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/offer", data: offer)))
 
             case let .endpoint(.delegate(.responseReceived(linkID, _, data))):
                 guard let offeredIds = state.offerLinks[linkID] else { return .none }   // not an outbound offer link
