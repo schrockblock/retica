@@ -47,6 +47,13 @@ public struct PropagationStore: Equatable {
         stored.values.filter { $0.destinationHash == destinationHash }.sorted { $0.sequence < $1.sequence }
     }
 
+    /// The entries this store holds for a set of transient_ids — used to build a peer-sync transfer of the
+    /// messages a peer requested (`/offer` wanted list). Preserves the requested order; silently skips ids
+    /// not present (a peer may want an id we have since evicted).
+    public func entries(forTransientIds ids: [Data]) -> [Entry] {
+        ids.compactMap { stored[$0] }
+    }
+
     public mutating func remove(transientId: Data) {
         stored[transientId] = nil
     }

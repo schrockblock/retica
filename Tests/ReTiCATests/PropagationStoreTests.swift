@@ -107,3 +107,25 @@ private func container(_ entries: [Data]) -> Data {
     let offered = [e1, e2].map { LXMFPropagation.transientId(lxmfData: $0) }
     #expect(store.wanted(fromOffered: offered).isEmpty)
 }
+
+@Test func propagationStoreGathersEntriesByTransientIdInOrder() {
+    // Three distinct entries addressed to any destinations.
+    let d1 = LXMFPropagation.lxmfData(destinationHash: Data(repeating: 0xA1, count: LXMessage.destinationLength),
+                                      encryptedData: Data("one".utf8))
+    let d2 = LXMFPropagation.lxmfData(destinationHash: Data(repeating: 0xA2, count: LXMessage.destinationLength),
+                                      encryptedData: Data("two".utf8))
+    let d3 = LXMFPropagation.lxmfData(destinationHash: Data(repeating: 0xA3, count: LXMessage.destinationLength),
+                                      encryptedData: Data("three".utf8))
+    let tid1 = LXMFPropagation.transientId(lxmfData: d1)
+    _ = LXMFPropagation.transientId(lxmfData: d2)   // d2 intentionally excluded from the query
+    let tid3 = LXMFPropagation.transientId(lxmfData: d3)
+    let absent = Data(repeating: 0xFF, count: 32)
+
+    var store = PropagationStore()
+    _ = store.ingest(container: LXMFPropagation.container(timestamp: 1700000000.5, entries: [d1, d2, d3]))
+
+    // Requested order [tid3, absent, tid1] → [d3, d1]: order preserved, absent skipped, tid2 excluded.
+    let got = store.entries(forTransientIds: [tid3, absent, tid1]).map(\.lxmfData)
+    #expect(got == [d3, d1])
+    #expect(store.entries(forTransientIds: []).isEmpty)
+}
