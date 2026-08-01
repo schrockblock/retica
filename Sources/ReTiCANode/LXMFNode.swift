@@ -39,6 +39,7 @@ public struct LXMFNode {
             case messageReceived(message: LXMessage, signatureValidated: Bool)
             case deliveryFailed(messageHash: Data)
             case deliveryConfirmed(messageHash: Data)
+            case propagationAccepted(messageHash: Data)
         }
     }
 
@@ -142,6 +143,9 @@ public struct LXMFNode {
 
             case let .router(.delegate(.deliveryConfirmed(hash))):
                 return .send(.delegate(.deliveryConfirmed(messageHash: hash)))
+
+            case let .router(.delegate(.propagationAccepted(hash))):
+                return .send(.delegate(.propagationAccepted(messageHash: hash)))
 
             // --- Direct-over-link: router delegates → endpoint actions ---
             case let .router(.delegate(.requestLink(dest))):

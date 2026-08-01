@@ -10,8 +10,8 @@ import ComposableArchitecture
 /// node PN. A builds the propagation container (encrypted to R), establishes a link to PN's lxmf.propagation
 /// destination, and ships the container as a Resource. PN (a bare Endpoint stub — ingest is P3) receives it;
 /// we verify the container is addressed to R and that opening it recovers A's signature-valid message.
-/// Propagation-accept confirmation is out of scope (P1 is client-send only).
-@Test @MainActor func lxmfNodeSendsViaPropagationNode() async {
+/// Then PN's RESOURCE_PRF is bridged back to A, triggering resourceConcluded → propagationAccepted.
+@Test @MainActor func lxmfNodeSendsViaPropagationNodeAndConfirmsAccept() async {
     let clock = TestClock()
     let aIdentity = Identity()
     let rIdentity = Identity()
@@ -107,12 +107,15 @@ import ComposableArchitecture
     for _ in 0..<partCount { await a.receive(aSend) }
 
     // Deliver all part frames to PN; capture the concluded container from resourceReceived.
+    // Also capture the RESOURCE_PRF emitted by PN so we can bridge it back to A.
     let parts = Array(sentA.value.suffix(partCount))
     let gotContainer = LockIsolated<Data?>(nil)
+    let resourcePrfBytes = LockIsolated<Data?>(nil)
     for (i, frame) in parts.enumerated() {
         eventsPN.yield(.data(frame))
         if i == partCount - 1 {
             await pn.receive(epSend)                         // RESOURCE_PRF out
+            resourcePrfBytes.setValue(sentPN.value.last!)    // capture RESOURCE_PRF before resourceReceived
             await pn.receive { action in
                 if case let .delegate(.resourceReceived(_, d)) = action { gotContainer.setValue(d); return true }
                 return false
@@ -134,6 +137,19 @@ import ComposableArchitecture
     #expect(recovered?.title == Data("t".utf8))
     #expect(recovered?.sourceHash == LXMessage.deliveryHash(identityHash: aIdentity.hash))
     #expect(recovered?.validateSignature(source: aIdentity) == true)             // real Ed25519 validation
+
+    // PN's RESOURCE_PRF → A: A concludes the resource → router.resourceDeliveredOnLink → propagationAccepted.
+    // Recover the deterministic message hash by rebuilding with the same fixed params.
+    let sentHash = LXMessage.create(source: aIdentity, destinationHash: rDeliveryHash,
+                                    timestamp: 1700000000.5, title: Data("t".utf8),
+                                    content: Data("hello via PN".utf8)).hash
+    let gotAccepted = LockIsolated<Data?>(nil)
+    eventsA.yield(.data(resourcePrfBytes.value!))            // PN's RESOURCE_PRF → A concludes the resource
+    await a.receive { action in
+        if case let .delegate(.propagationAccepted(hash)) = action { gotAccepted.setValue(hash); return true }
+        return false
+    }
+    #expect(gotAccepted.value == sentHash)
 
     await a.send(.endpoint(.disconnect)); await r.send(.disconnect); await pn.send(.disconnect)
 }
