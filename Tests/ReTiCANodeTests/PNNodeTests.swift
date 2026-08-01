@@ -156,3 +156,115 @@ private func makeStore(_ pnIdentity: Identity) -> TestStore<PNNode.State, PNNode
         pathHash: offerPath, data: MsgPack.encode(.array([.bin(Data([0x01])), .array([.bin(Data(repeating: 0x11, count: 32))])]))))))
     store.exhaustivity = .on   // a stray sendResponseOverLink / node action would fail teardown
 }
+
+// MARK: - P4b-2 mesh initiator
+
+/// syncToPeer opens a link and, on establishment to a pending peer, IDENTIFYs and offers store.transientIds.
+@Test @MainActor func pnNodeSyncToPeerOffersOnLinkEstablished() async {
+    let sender = Identity(); let recipient = Identity()
+    let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
+                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("m".utf8))
+    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5)
+    let tid = LXMFPropagation.transientId(lxmfData: LXMFPropagation.parseContainer(container)!.entries[0])
+    let peerDest = Data(repeating: 0xD0, count: 16)
+    let linkID = Data(repeating: 0xD1, count: 16)
+    let store = makeStore(Identity())
+
+    await store.send(.endpoint(.delegate(.resourceReceived(linkID: Data([9]), data: container))))  // PN-A now holds `tid`
+    await store.receive { if case .delegate(.messagesStored) = $0 { return true }; return false }
+
+    await store.send(.syncToPeer(destinationHash: peerDest))
+    await store.receive { if case .endpoint(.openLink(peerDest)) = $0 { return true }; return false }
+    #expect(store.state.pendingSyncPeers.contains(peerDest))
+
+    await store.send(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: peerDest))))
+    await store.receive { if case let .endpoint(.identifyOverLink(lid, _)) = $0 { return lid == linkID }; return false }
+    await store.receive { action in
+        if case let .endpoint(.sendRequestOverLink(lid, path, data)) = action {
+            #expect(lid == linkID); #expect(path == "/offer")
+            #expect(MsgPack.decodeValue(data) == .array([.bin(Data([0x01])), .array([.bin(tid)])]))
+            return true
+        }
+        return false
+    }
+    #expect(store.state.offerLinks[linkID] == [tid])
+    #expect(!store.state.pendingSyncPeers.contains(peerDest))
+}
+
+/// Offer response (list): transfer the wanted subset as a container Resource.
+@Test @MainActor func pnNodeTransfersWantedListOnOfferResponse() async {
+    let sender = Identity(); let recipient = Identity()
+    let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
+                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("m".utf8))
+    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
+    let tid = LXMFPropagation.transientId(lxmfData: entry)
+    let linkID = Data(repeating: 0xD1, count: 16)
+    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    _ = initial.node.store.ingest(container: container)
+    initial.offerLinks[linkID] = [tid]
+    let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
+        $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    await store.send(.endpoint(.delegate(.responseReceived(linkID: linkID, requestID: Data([1]),
+        data: MsgPack.encode(.array([.bin(tid)]))))))
+    await store.receive { action in
+        if case let .endpoint(.sendResourceOverLink(lid, data)) = action {
+            #expect(lid == linkID)
+            #expect(LXMFPropagation.parseContainer(data)?.entries == [entry]); return true
+        }
+        return false
+    }
+    #expect(store.state.offerLinks[linkID] == nil)   // consumed
+}
+
+/// Offer response `true` (wants all): transfer all offered entries.
+@Test @MainActor func pnNodeTransfersAllOnTrueResponse() async {
+    let sender = Identity(); let recipient = Identity()
+    let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
+                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("m".utf8))
+    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
+    let tid = LXMFPropagation.transientId(lxmfData: entry)
+    let linkID = Data(repeating: 0xD1, count: 16)
+    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    _ = initial.node.store.ingest(container: container)
+    initial.offerLinks[linkID] = [tid]
+    let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
+        $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    await store.send(.endpoint(.delegate(.responseReceived(linkID: linkID, requestID: Data([1]),
+        data: MsgPack.encode(.bool(true))))))
+    await store.receive { action in
+        if case let .endpoint(.sendResourceOverLink(_, data)) = action {
+            #expect(LXMFPropagation.parseContainer(data)?.entries == [entry]); return true
+        }
+        return false
+    }
+}
+
+/// Offer response `false` (has all): no transfer.
+@Test @MainActor func pnNodeTransfersNothingOnFalseResponse() async {
+    let linkID = Data(repeating: 0xD1, count: 16)
+    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    initial.offerLinks[linkID] = [Data(repeating: 0x11, count: 32)]
+    let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
+        $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.endpoint(.delegate(.responseReceived(linkID: linkID, requestID: Data([1]),
+        data: MsgPack.encode(.bool(false))))))
+    store.exhaustivity = .on   // a stray sendResourceOverLink would fail teardown
+}
+
+/// linkEstablished for a dest NOT in pendingSyncPeers (an inbound responder link) is ignored — no offer.
+@Test @MainActor func pnNodeInboundLinkEstablishedIgnored() async {
+    let store = makeStore(Identity())
+    let linkID = Data(repeating: 0xD1, count: 16)
+    await store.send(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: Data(repeating: 0xEE, count: 16)))))
+    store.exhaustivity = .on   // a stray identify/sendRequest would fail teardown
+}
