@@ -73,3 +73,84 @@ import Foundation
     #expect(BLEHello.parse(Data(repeating: 0, count: 21)) == nil)  // long
     #expect(BLEHello.parse(Data()) == nil)
 }
+
+// MARK: - Greylist
+
+@Test func greylistBackoffGrowsExponentiallyAndIsInclusive() {
+    var greylist = BLEPeerGreylist<String>()
+    let t0 = Date(timeIntervalSince1970: 0)
+    greylist.recordFailure("peer", now: t0)
+    // Strike 1: 5 s delay; boundary is inclusive.
+    #expect(greylist.isBlocked("peer", now: t0.addingTimeInterval(5.0)))
+    #expect(!greylist.isBlocked("peer", now: t0.addingTimeInterval(5.01)))
+    // Strike 2 at t=10: 10 s delay -> blocked through t=20.
+    greylist.recordFailure("peer", now: t0.addingTimeInterval(10))
+    #expect(greylist.isBlocked("peer", now: t0.addingTimeInterval(20.0)))
+    #expect(!greylist.isBlocked("peer", now: t0.addingTimeInterval(20.01)))
+}
+
+@Test func greylistCapsAtMaxDelay() {
+    var greylist = BLEPeerGreylist<String>()
+    var t = Date(timeIntervalSince1970: 0)
+    for _ in 0..<8 {  // strikes 1..8; 5*2^7 = 640 would exceed the 300 s cap
+        greylist.recordFailure("peer", now: t)
+        t = t.addingTimeInterval(10)
+    }
+    let last = t.addingTimeInterval(-10)  // time of the 8th strike
+    #expect(greylist.isBlocked("peer", now: last.addingTimeInterval(300)))
+    #expect(!greylist.isBlocked("peer", now: last.addingTimeInterval(300.01)))
+}
+
+@Test func greylistForgetsStrikesAfterQuietPeriod() {
+    var greylist = BLEPeerGreylist<String>()
+    let t0 = Date(timeIntervalSince1970: 0)
+    greylist.recordFailure("peer", now: t0)
+    greylist.recordFailure("peer", now: t0.addingTimeInterval(10))  // strike 2
+    // 601 s after the last failure: strikes reset, next failure is strike 1 (5 s).
+    let late = t0.addingTimeInterval(10 + 601)
+    greylist.recordFailure("peer", now: late)
+    #expect(greylist.isBlocked("peer", now: late.addingTimeInterval(5.0)))
+    #expect(!greylist.isBlocked("peer", now: late.addingTimeInterval(5.01)))
+}
+
+@Test func greylistUnknownPeerIsNotBlockedAndClearWorks() {
+    var greylist = BLEPeerGreylist<String>()
+    let t0 = Date(timeIntervalSince1970: 0)
+    #expect(!greylist.isBlocked("stranger", now: t0))
+    greylist.recordFailure("peer", now: t0)
+    greylist.clear("peer")
+    #expect(!greylist.isBlocked("peer", now: t0))
+}
+
+// MARK: - Duplicate resolution
+
+@Test func tokenComparisonIsUnsignedLexicographic() {
+    #expect(bleTokenIsLower(Data([0x01, 0xFF]), Data([0x02, 0x00])))
+    #expect(!bleTokenIsLower(Data([0x80]), Data([0x7F])))  // unsigned, not signed
+    #expect(!bleTokenIsLower(Data([0x01]), Data([0x01])))  // equal is not lower
+}
+
+@Test func crossConnectBothEndpointsKeepTheLowerInitiatorsChannel() {
+    let low = Data(repeating: 0x01, count: 16)
+    let high = Data(repeating: 0x02, count: 16)
+    // Endpoint LOW: its outbound channel exists, HIGH's inbound arrives second.
+    #expect(bleResolveDuplicate(localToken: low, peerToken: high,
+                                existingDirection: .outbound, newDirection: .inbound) == .keepExisting)
+    // Endpoint HIGH: its outbound channel exists, LOW's inbound arrives second.
+    #expect(bleResolveDuplicate(localToken: high, peerToken: low,
+                                existingDirection: .outbound, newDirection: .inbound) == .keepNew)
+    // Arrival order flipped on both endpoints — conclusions must still agree (keep LOW's channel).
+    #expect(bleResolveDuplicate(localToken: low, peerToken: high,
+                                existingDirection: .inbound, newDirection: .outbound) == .keepNew)
+    #expect(bleResolveDuplicate(localToken: high, peerToken: low,
+                                existingDirection: .inbound, newDirection: .outbound) == .keepExisting)
+}
+
+@Test func sameDirectionDuplicateIsAReconnectKeepNew() {
+    let a = Data(repeating: 0x01, count: 16)
+    let b = Data(repeating: 0x02, count: 16)
+    #expect(bleResolveDuplicate(localToken: a, peerToken: b,
+                                existingDirection: .outbound, newDirection: .outbound) == .keepNew)
+    #expect(bleResolveDuplicate(localToken: a, peerToken: b,
+                                existingDirection: .inbound, newDirection: .inbound) == .keepNew)
+}

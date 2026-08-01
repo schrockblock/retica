@@ -73,3 +73,75 @@ public enum BLEHello {
         return (version: rebased[magic.count], token: Data(rebased.suffix(tokenLength)))
     }
 }
+
+/// Per-peer reconnection rate limiter with exponential backoff. Port of
+/// ble_support.PeerGreylist: delay = min(base * 2^(strikes-1), max); strikes are
+/// forgotten when more than strikeForget elapses since the last failure; the
+/// blocking boundary is INCLUSIVE (blocked while now <= unblock time).
+public struct BLEPeerGreylist<Key: Hashable & Sendable>: Equatable, Sendable {
+    struct Entry: Equatable, Sendable {
+        var strikes: Int
+        var lastFailure: Date
+        var blockedUntil: Date
+    }
+
+    public let baseDelay: TimeInterval
+    public let maxDelay: TimeInterval
+    public let strikeForget: TimeInterval
+    var entries: [Key: Entry] = [:]
+
+    public init(baseDelay: TimeInterval = 5, maxDelay: TimeInterval = 300,
+                strikeForget: TimeInterval = 600) {
+        self.baseDelay = baseDelay
+        self.maxDelay = maxDelay
+        self.strikeForget = strikeForget
+    }
+
+    public mutating func recordFailure(_ peer: Key, now: Date) {
+        var strikes = 0
+        if let entry = entries[peer], now.timeIntervalSince(entry.lastFailure) <= strikeForget {
+            strikes = entry.strikes
+        }
+        strikes += 1
+        let delay = min(baseDelay * pow(2, Double(strikes - 1)), maxDelay)
+        entries[peer] = Entry(strikes: strikes, lastFailure: now,
+                              blockedUntil: now.addingTimeInterval(delay))
+    }
+
+    public func isBlocked(_ peer: Key, now: Date) -> Bool {
+        guard let entry = entries[peer] else { return false }
+        return now <= entry.blockedUntil
+    }
+
+    public mutating func clear(_ peer: Key) {
+        entries[peer] = nil
+    }
+}
+
+public enum BLEChannelDirection: Equatable, Sendable {
+    case outbound, inbound
+}
+
+public enum BLEDuplicateResolution: Equatable, Sendable {
+    case keepExisting, keepNew
+}
+
+/// Unsigned byte-wise lexicographic comparison.
+public func bleTokenIsLower(_ a: Data, _ b: Data) -> Bool {
+    for (x, y) in zip(a, b) where x != y { return x < y }
+    return a.count < b.count
+}
+
+/// Symmetric duplicate-channel resolution. Same direction = reconnect (new wins).
+/// Opposite directions = simultaneous cross-connect: the channel initiated by the
+/// owner of the LOWER token survives; both endpoints reach complementary
+/// conclusions from their own (localToken, direction) view.
+public func bleResolveDuplicate(
+    localToken: Data, peerToken: Data,
+    existingDirection: BLEChannelDirection, newDirection: BLEChannelDirection
+) -> BLEDuplicateResolution {
+    guard existingDirection != newDirection else { return .keepNew }
+    let localInitiatorWins = bleTokenIsLower(localToken, peerToken)
+    let existingInitiatedLocally = existingDirection == .outbound
+    return existingInitiatedLocally == localInitiatorWins ? .keepExisting : .keepNew
+}
