@@ -151,6 +151,8 @@ func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int 
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
     #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 2)
+    // The re-discoveries above re-armed establish timers; .stop's per-pending
+    // cancel loop (CancelID.establish per handle) drains them here.
     await store.send(.stop) { $0.status = .stopped }
 }
 
@@ -174,7 +176,7 @@ func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int 
 }
 
 @Test @MainActor func establishDeadlineAbandonsAndStrikes() async {
-    let (store, events, _, clock, _) = await makeOnlineStore()
+    let (store, events, calls, clock, _) = await makeOnlineStore()
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
     await clock.advance(by: BLEInterface.establishTimeout)
@@ -182,6 +184,7 @@ func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int 
     // Late directoryRead for a no-longer-pending peer is ignored (no openChannel).
     events[0].yield(.directoryRead(peerHandleA, version: 2, psm: 0x0081))
     await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 2, psm: 0x0081)))
+    #expect(!calls.value.contains(.openChannel(peerHandleA, 0x0081)))
     await store.send(.stop) { $0.status = .stopped }
 }
 
