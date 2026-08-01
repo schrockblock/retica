@@ -109,10 +109,6 @@ public struct BLEInterface {
                 state.adapterRetryDelay = Self.adapterRetryMin
                 return .none
 
-            // Stubs — implemented in Tasks 5–7.
-            case .driverEvent(.unavailable):
-                return .none
-
             case let .driverEvent(.peerDiscovered(handle)):
                 guard state.status == .online,
                       !state.pendingPeers.contains(handle),
@@ -257,10 +253,45 @@ public struct BLEInterface {
                 else { return .none }
                 return tearDown(&state, channelID: channelID, strike: true)
 
-            case .driverEvent(.channelClosed):
-                return .none
+            case let .driverEvent(.channelClosed(channelID, _)):
+                guard let channel = state.channels.removeValue(forKey: channelID) else { return .none }
+                var effects: [Effect<Action>] = [.cancel(id: CancelID.hello(channelID))]
+                if let token = channel.peerToken, state.peers[token] == channelID {
+                    state.peers[token] = nil
+                    effects.append(.send(.delegate(.peerOffline(token))))
+                }
+                let now = date()
+                if now.timeIntervalSince(channel.openedAt) < Self.churnMinLifetime {
+                    state.greylist.recordFailure(channel.peer, now: now)
+                }
+                return .merge(effects)
+
+            case .driverEvent(.unavailable):
+                guard state.status != .stopped else { return .none }
+                let established = Array(state.peers.keys)
+                let channelIDs = Array(state.channels.keys)
+                let pending = Array(state.pendingPeers)
+                state.channels = [:]
+                state.peers = [:]
+                state.pendingPeers = []
+                state.status = .waitingForAdapter
+                let delay = state.adapterRetryDelay
+                state.adapterRetryDelay = min(delay * 2, Self.adapterRetryMax)
+                var effects: [Effect<Action>] = [.cancel(id: CancelID.driver)]
+                effects += channelIDs.map { .cancel(id: CancelID.hello($0)) }
+                effects += pending.map { .cancel(id: CancelID.establish($0)) }
+                effects += established.map { .send(.delegate(.peerOffline($0))) }
+                effects.append(.run { [clock] send in
+                    try await clock.sleep(for: delay)
+                    await send(.adapterRetry)
+                }
+                .cancellable(id: CancelID.retry, cancelInFlight: true))
+                return .merge(effects)
+
             case .adapterRetry:
-                return .none
+                guard state.status == .waitingForAdapter else { return .none }
+                state.status = .starting
+                return startDriver(state: &state)
 
             case .delegate:
                 return .none

@@ -383,3 +383,97 @@ func establishPeer(
     #expect(calls.value.contains(.send(channel2, try! BLEFraming.frame(packet))))
     await store.send(.stop) { $0.status = .stopped }
 }
+
+// MARK: - Close policy / churn / adapter loss
+
+@Test @MainActor func channelClosedTakesPeerOfflineWithoutChurnStrike() async {
+    let (store, events, calls, _, now) = await makeOnlineStore()
+    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
+    // Lives >= 10 s: no strike.
+    now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime))
+    events[0].yield(.channelClosed(channel1, reason: "supervision timeout"))
+    await store.receive(.driverEvent(.channelClosed(channel1, reason: "supervision timeout")))
+    await store.receive(.delegate(.peerOffline(tokenHigh)))
+    // No strike: rediscovery proceeds straight to a directory read.
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 2)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func shortLivedChannelEarnsChurnStrike() async {
+    let (store, events, calls, _, now) = await makeOnlineStore()
+    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
+    // Lives < 10 s: strike.
+    now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime - 0.5))
+    events[0].yield(.channelClosed(channel1, reason: nil))
+    await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
+    await store.receive(.delegate(.peerOffline(tokenHigh)))
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 1)  // blocked
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func closedChannelUnknownToStateIsIgnored() async {
+    let (store, events, _, _, _) = await makeOnlineStore()
+    events[0].yield(.channelClosed(channel2, reason: nil))
+    await store.receive(.driverEvent(.channelClosed(channel2, reason: nil)))  // no crash, no delegate
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func adapterLossTakesPeersOfflineThenRecoversWithBackoff() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore(streams: 2)
+    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
+    events[0].yield(.unavailable(reason: "poweredOff"))
+    await store.receive(.driverEvent(.unavailable(reason: "poweredOff"))) {
+        $0.status = .waitingForAdapter
+        $0.channels = [:]
+        $0.peers = [:]
+        $0.pendingPeers = []
+    }
+    await store.receive(.delegate(.peerOffline(tokenHigh)))
+    // First retry after 5 s.
+    await clock.advance(by: BLEInterface.adapterRetryMin)
+    await store.receive(.adapterRetry) { $0.status = .starting }
+    #expect(calls.value.filter { $0 == .start }.count == 2)
+    // Recovery: second stream reports ready; backoff delay resets.
+    events[1].yield(.ready)
+    await store.receive(.driverEvent(.ready)) {
+        $0.status = .online
+        $0.adapterRetryDelay = BLEInterface.adapterRetryMin
+    }
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func adapterRetryDelayDoublesUpToCap() async {
+    let (store, events, _, clock, _) = await makeOnlineStore(streams: 2)
+    events[0].yield(.unavailable(reason: nil))
+    await store.receive(.driverEvent(.unavailable(reason: nil))) {
+        $0.status = .waitingForAdapter
+        $0.adapterRetryDelay = .seconds(10)  // doubled after scheduling the 5 s retry
+    }
+    await clock.advance(by: BLEInterface.adapterRetryMin)
+    await store.receive(.adapterRetry) { $0.status = .starting }
+    // Second loss: the scheduled retry now uses 10 s, and the stored delay doubles to 20 s.
+    events[1].yield(.unavailable(reason: nil))
+    await store.receive(.driverEvent(.unavailable(reason: nil))) {
+        $0.status = .waitingForAdapter
+        $0.adapterRetryDelay = .seconds(20)
+    }
+    await clock.advance(by: .seconds(5))
+    // 5 s is no longer enough — no retry yet.
+    await clock.advance(by: .seconds(5))
+    await store.receive(.adapterRetry) { $0.status = .starting }
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func stopWhileWaitingForAdapterCancelsRetry() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore()
+    events[0].yield(.unavailable(reason: nil))
+    await store.receive(.driverEvent(.unavailable(reason: nil))) { $0.status = .waitingForAdapter }
+    await store.send(.stop) { $0.status = .stopped }
+    let startsBefore = calls.value.filter { $0 == .start }.count
+    await clock.advance(by: BLEInterface.adapterRetryMax)
+    #expect(calls.value.filter { $0 == .start }.count == startsBefore)  // no retry fired
+}
