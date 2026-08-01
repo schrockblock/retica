@@ -309,3 +309,50 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStor
     await store.receive { if case .node(.delegate(.peerValidated)) = $0 { return true }; return false }
     store.exhaustivity = .on   // an invalid key must NOT produce a sendResponseOverLink
 }
+
+// MARK: - P4c-3 link cleanup
+
+/// linkClosed clears all per-link state (clientIdentities, offerLinks, and any pendingGet/pendingOffer on it).
+@Test @MainActor func pnNodeLinkClosedClearsPerLinkState() async {
+    let linkID = Data(repeating: 0xC0, count: 16)
+    let pHash = Data(repeating: 0xAB, count: 16)               // any 16-byte peer hash
+    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    initial.clientIdentities[linkID] = Identity()
+    initial.offerLinks[linkID] = [Data(repeating: 0x11, count: 32)]
+    initial.pendingGet[Data(repeating: 0xCC, count: 16)] = PNNode.PendingGet(linkID: linkID, requestID: Data([1]))
+    initial.pendingOffer[pHash] = PNNode.PendingOffer(linkID: linkID, requestID: Data([2]), offeredIds: [])
+    let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
+        $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    await store.send(.endpoint(.delegate(.linkClosed(linkID: linkID, reason: .initiatorClosed))))
+    #expect(store.state.clientIdentities[linkID] == nil)
+    #expect(store.state.offerLinks[linkID] == nil)
+    #expect(!store.state.pendingGet.values.contains { $0.linkID == linkID })
+    #expect(!store.state.pendingOffer.values.contains { $0.linkID == linkID })
+}
+
+/// requestFailed clears the outbound offer link entry.
+@Test @MainActor func pnNodeRequestFailedClearsOfferLink() async {
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    initial.offerLinks[linkID] = [Data(repeating: 0x11, count: 32)]
+    let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
+        $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.endpoint(.delegate(.requestFailed(linkID: linkID, requestID: Data([1])))))
+    #expect(store.state.offerLinks[linkID] == nil)
+}
+
+/// linkFailed clears the pending sync peer (outbound openLink failed).
+@Test @MainActor func pnNodeLinkFailedClearsPendingSyncPeer() async {
+    let peerDest = Data(repeating: 0xD0, count: 16)
+    let store = makeStore(Identity())
+    await store.send(.syncToPeer(destinationHash: peerDest, peeringCost: 0))
+    await store.receive { if case .endpoint(.openLink(peerDest)) = $0 { return true }; return false }
+    #expect(store.state.pendingSyncPeers[peerDest] == 0)
+    await store.send(.endpoint(.delegate(.linkFailed(destinationHash: peerDest))))
+    #expect(store.state.pendingSyncPeers[peerDest] == nil)
+}

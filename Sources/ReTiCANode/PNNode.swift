@@ -64,6 +64,12 @@ public struct PNNode {
         Scope(state: \.endpoint, action: \.endpoint) { Endpoint() }
         Scope(state: \.node, action: \.node) { PropagationNode() }
         Reduce { [date] state, action in
+            func clearLink(_ state: inout State, _ linkID: Data) {
+                state.offerLinks[linkID] = nil
+                state.clientIdentities[linkID] = nil
+                state.pendingGet = state.pendingGet.filter { $0.value.linkID != linkID }
+                state.pendingOffer = state.pendingOffer.filter { $0.value.linkID != linkID }
+            }
             switch action {
             case .registerPropagation:
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
@@ -129,7 +135,7 @@ public struct PNNode {
             case let .node(.delegate(.peerValidated(peerHash, valid))):
                 guard let pending = state.pendingOffer[peerHash] else { return .none }
                 if valid { return .send(.node(.peerOffered(peerHash: peerHash, transientIds: pending.offeredIds))) }
-                state.pendingOffer[peerHash] = nil                     // invalid key → drop (dead path at cost 0)
+                state.pendingOffer[peerHash] = nil                     // invalid key → drop
                 return .none
 
             case let .node(.delegate(.requestFromPeer(peerHash, wanted))):
@@ -171,6 +177,18 @@ public struct PNNode {
                 let entries = state.node.store.entries(forTransientIds: wanted).map(\.lxmfData)
                 let container = LXMFPropagation.container(timestamp: date.now.timeIntervalSince1970, entries: entries)
                 return .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: container)))
+
+            case let .endpoint(.delegate(.linkClosed(linkID, _))):
+                clearLink(&state, linkID)
+                return .none
+
+            case let .endpoint(.delegate(.requestFailed(linkID, _))):
+                clearLink(&state, linkID)
+                return .none
+
+            case let .endpoint(.delegate(.linkFailed(dest))):
+                state.pendingSyncPeers[dest] = nil          // outbound openLink failed before a link existed
+                return .none
 
             case .endpoint, .node, .delegate:
                 return .none
