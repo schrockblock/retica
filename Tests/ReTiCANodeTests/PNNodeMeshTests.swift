@@ -6,10 +6,10 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
-/// Full bidirectional PN↔PN mesh over a real link: PN-A (holding a message) syncs to PN-B — A offers its
-/// transient_ids, B (P4a responder) returns the ones it wants, A transfers them as a Resource, and B ingests.
-/// Proves initiator (P4b) + responder (P4a) compose end-to-end.
-@Test @MainActor func pnNodeMeshSyncTransfersStoredMessage() async {
+/// Full bidirectional PN↔PN mesh over a real link with non-zero peering cost: PN-A syncs to PN-B (cost 8).
+/// A generates a real cost-8 peering key via the async offerKeyReady effect; B validates and accepts it;
+/// A transfers its stored message; B ingests. Proves peering-cost enforcement end-to-end.
+@Test @MainActor func pnNodeMeshSyncEnforcesPeeringCost() async {
     let clock = TestClock()
     let aIdentity = Identity()
     let bIdentity = Identity()
@@ -32,7 +32,8 @@ import ComposableArchitecture
         -> (TestStore<PNNode.State, PNNode.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: PNNode.State(
-            identity: identity, endpoint: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false))
+            identity: identity, endpoint: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false),
+            peeringCost: host == "b" ? 8 : 0)
         ) { PNNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -73,7 +74,7 @@ import ComposableArchitecture
     await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
 
     // --- A.syncToPeer(bPropDest.hash) → A opens link to B. ---
-    await a.send(.syncToPeer(destinationHash: bPropDest.hash, peeringCost: 0))
+    await a.send(.syncToPeer(destinationHash: bPropDest.hash, peeringCost: 8))
     await a.receive { if case .endpoint(.openLink) = $0 { return true }; return false }
     await a.receive(aSend)   // LINKREQUEST out
 
@@ -90,6 +91,7 @@ import ComposableArchitecture
     await a.receive(aSend)   // LRRTT out
     await a.receive { if case .endpoint(.delegate(.linkEstablished)) = $0 { return true }; return false }
     await a.receive(aSend)   // IDENTIFY out
+    await a.receive { if case .offerKeyReady = $0 { return true }; return false }  // async cost-8 key-gen completes
     await a.receive(aSend)   // /offer REQUEST out
 
     let lrrttBytes    = sentA.value[afterLrproof]
@@ -107,7 +109,7 @@ import ComposableArchitecture
     // --- Bridge /offer REQUEST to B → B validates peering key → sends wanted list. ---
     eventsB.yield(.data(offerBytes))
     await b.receive { if case .endpoint(.delegate(.requestReceived)) = $0 { return true }; return false }
-    // B validates (cost 0 → always valid) → requestFromPeer → sendResponseOverLink.
+    // B validates (cost 8 → A's generated cost-8 key passes) → requestFromPeer → sendResponseOverLink.
     await b.receive(bSend)   // /offer response (wanted list) out
 
     // --- Bridge B's response back to A → A builds container and sends as Resource. ---
