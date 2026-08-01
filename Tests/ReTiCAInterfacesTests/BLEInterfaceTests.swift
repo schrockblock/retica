@@ -79,7 +79,10 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
 
 @Test @MainActor func startWhileRunningIsIgnored() async {
     let (store, events, calls, _, _) = makeStore()
-    await store.send(.start) { $0.status = .starting }
+    await store.send(.start) {
+        $0.status = .starting
+        $0.sessionToken = localToken
+    }
     events[0].yield(.ready)
     await store.receive(.driverEvent(.ready)) { $0.status = .online }
     await store.send(.start)  // no state change, no second driver start
