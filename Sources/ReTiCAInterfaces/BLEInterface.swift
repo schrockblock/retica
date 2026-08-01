@@ -152,15 +152,112 @@ public struct BLEInterface {
                 state.greylist.recordFailure(handle, now: date())
                 return .none
 
-            case .driverEvent(.channelOpened):
-                return .none
-            case .driverEvent(.channelData):
-                return .none
+            case let .driverEvent(.channelOpened(channelID, handle, direction)):
+                var effects: [Effect<Action>] = []
+                if direction == .outbound {
+                    state.pendingPeers.remove(handle)
+                    effects.append(.cancel(id: CancelID.establish(handle)))
+                }
+                let now = date()
+                guard state.status == .online,
+                      let token = state.sessionToken,
+                      state.peers.count < state.maxPeers,
+                      !state.greylist.isBlocked(handle, now: now)
+                else {
+                    effects.append(.run { [bleDriver] _ in await bleDriver.closeChannel(channelID) })
+                    return .merge(effects)
+                }
+                state.channels[channelID] = ChannelState(
+                    peer: handle, direction: direction,
+                    frameBuffer: BLEFrameBuffer(), peerToken: nil, openedAt: now)
+                // 20-byte HELLO framed by hand — cannot exceed frame bounds, no throw.
+                var hello = Data([0x00, UInt8(BLEHello.length)])
+                hello.append(BLEHello.pack(version: Self.protocolVersion, token: token))
+                let framedHello = hello
+                effects.append(.run { [bleDriver] _ in await bleDriver.send(channelID, framedHello) })
+                effects.append(.run { [clock] send in
+                    try await clock.sleep(for: Self.helloTimeout)
+                    await send(.helloDeadline(channelID))
+                }
+                .cancellable(id: CancelID.hello(channelID), cancelInFlight: true))
+                return .merge(effects)
+
+            case let .driverEvent(.channelData(channelID, bytes)):
+                guard var channel = state.channels[channelID] else { return .none }
+                let frames: [Data]
+                do {
+                    frames = try channel.frameBuffer.append(bytes)
+                    state.channels[channelID] = channel
+                } catch {
+                    state.channels[channelID] = channel
+                    return tearDown(&state, channelID: channelID, strike: true)
+                }
+                var effects: [Effect<Action>] = []
+                for frame in frames {
+                    guard let current = state.channels[channelID] else { break }
+                    if let token = current.peerToken {
+                        effects.append(.send(.delegate(.packetReceived(peer: token, packet: frame))))
+                        continue
+                    }
+                    // First frame must be a valid v2 HELLO that is not our own echo.
+                    guard let hello = BLEHello.parse(frame),
+                          hello.version == Self.protocolVersion,
+                          hello.token != state.sessionToken
+                    else {
+                        effects.append(tearDown(&state, channelID: channelID, strike: true))
+                        continue  // channel gone; loop guard drops remaining frames
+                    }
+                    effects.append(.cancel(id: CancelID.hello(channelID)))
+                    let token = hello.token
+                    if let existingID = state.peers[token],
+                       let existing = state.channels[existingID],
+                       existingID != channelID {
+                        let resolution = bleResolveDuplicate(
+                            localToken: state.sessionToken ?? Data(),
+                            peerToken: token,
+                            existingDirection: existing.direction,
+                            newDirection: current.direction)
+                        switch resolution {
+                        case .keepExisting:
+                            // Close the new channel quietly: never online, no strike.
+                            state.channels[channelID] = nil
+                            effects.append(.run { [bleDriver] _ in
+                                await bleDriver.closeChannel(channelID)
+                            })
+                        case .keepNew:
+                            // Swap channels under the peer without an offline blip.
+                            state.channels[existingID] = nil
+                            effects.append(.cancel(id: CancelID.hello(existingID)))
+                            effects.append(.run { [bleDriver] _ in
+                                await bleDriver.closeChannel(existingID)
+                            })
+                            var updated = current
+                            updated.peerToken = token
+                            state.channels[channelID] = updated
+                            state.peers[token] = channelID
+                        }
+                    } else {
+                        var updated = current
+                        updated.peerToken = token
+                        state.channels[channelID] = updated
+                        state.peers[token] = channelID
+                        effects.append(.send(.delegate(.peerOnline(token))))
+                    }
+                }
+                return .merge(effects)
+
+            case let .send(peer, packet):
+                guard let channelID = state.peers[peer],
+                      let framed = try? BLEFraming.frame(packet)
+                else { return .none }
+                return .run { [bleDriver] _ in await bleDriver.send(channelID, framed) }
+
+            case let .helloDeadline(channelID):
+                guard let channel = state.channels[channelID], channel.peerToken == nil
+                else { return .none }
+                return tearDown(&state, channelID: channelID, strike: true)
+
             case .driverEvent(.channelClosed):
-                return .none
-            case .send:
-                return .none
-            case .helloDeadline:
                 return .none
             case .adapterRetry:
                 return .none
@@ -180,5 +277,23 @@ public struct BLEInterface {
             }
         }
         .cancellable(id: CancelID.driver, cancelInFlight: true)
+    }
+
+    /// Removes a channel, closes it at the driver, emits peerOffline if it was the
+    /// established channel for a peer, and optionally records a greylist strike.
+    private func tearDown(_ state: inout State, channelID: BLEChannelID, strike: Bool) -> Effect<Action> {
+        guard let channel = state.channels.removeValue(forKey: channelID) else { return .none }
+        var effects: [Effect<Action>] = [
+            .cancel(id: CancelID.hello(channelID)),
+            .run { [bleDriver] _ in await bleDriver.closeChannel(channelID) },
+        ]
+        if let token = channel.peerToken, state.peers[token] == channelID {
+            state.peers[token] = nil
+            effects.append(.send(.delegate(.peerOffline(token))))
+        }
+        if strike {
+            state.greylist.recordFailure(channel.peer, now: date())
+        }
+        return .merge(effects)
     }
 }
