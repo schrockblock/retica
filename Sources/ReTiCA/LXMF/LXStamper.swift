@@ -55,6 +55,18 @@ public enum LXStamper {
                    workblock: stampWorkblock(material: peeringId, expandRounds: workblockExpandRoundsPeering))
     }
 
+    /// Generate a peering key: search random 32-byte stamps until one is valid for `targetCost` over
+    /// `peeringId`'s short (25-round) peering workblock — the initiator's counterpart to
+    /// `validatePeeringKey` (RNS LXMPeer.generate_peering_key). Mirrors `generateStamp`. Cost averages
+    /// ~2^targetCost hash iterations.
+    public static func generatePeeringKey(peeringId: Data, targetCost: Int) -> Data {
+        let wb = stampWorkblock(material: peeringId, expandRounds: workblockExpandRoundsPeering)
+        while true {
+            let s = SecureRandom.bytes(stampSize)
+            if stampValid(stamp: s, targetCost: targetCost, workblock: wb) { return s }
+        }
+    }
+
     /// Validate a propagation-node stamp appended to lxmf_data (`transientData = lxmf_data ‖ stamp[32]`):
     /// strip the trailing 32-byte stamp, recompute `transient_id = full_hash(lxm_data)`, and validate over
     /// the medium (1000-round) workblock. Returns (transientId, lxmfData, value, stamp) or nil
