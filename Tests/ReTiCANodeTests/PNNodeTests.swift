@@ -100,3 +100,59 @@ private func makeStore(_ pnIdentity: Identity) -> TestStore<PNNode.State, PNNode
         pathHash: getPath, data: MsgPack.encode(.array([.null, .null]))))))
     store.exhaustivity = .on   // a stray sendResponseOverLink / node action would fail teardown
 }
+
+// MARK: - P4a PN↔PN mesh responder (/offer)
+
+/// /offer with a peer identity: the store lacks both offered ids → responds wanting both.
+@Test @MainActor func pnNodeOfferWantsAllWhenStoreEmpty() async {
+    let peer = Identity()
+    let offerPath = Crypto.truncatedHash(Data("/offer".utf8))
+    let id1 = Data(repeating: 0x11, count: 32); let id2 = Data(repeating: 0x22, count: 32)
+    let store = makeStore(Identity())
+    let linkID = Data(repeating: 0xB0, count: 16)
+    await store.send(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: peer))))
+    await store.send(.endpoint(.delegate(.requestReceived(linkID: linkID, requestID: Data([1]),
+        pathHash: offerPath, data: MsgPack.encode(.array([.bin(Data([0x01])), .array([.bin(id1), .bin(id2)])]))))))
+    await store.receive { action in
+        if case let .endpoint(.sendResponseOverLink(lid, rid, data)) = action {
+            #expect(lid == linkID); #expect(rid == Data([1]))
+            #expect(MsgPack.decodeValue(data) == .array([.bin(id1), .bin(id2)])); return true
+        }
+        return false
+    }
+}
+
+/// /offer where the store already holds one offered id → responds wanting only the other.
+@Test @MainActor func pnNodeOfferWantsOnlyMissing() async {
+    let peer = Identity(); let sender = Identity(); let recipient = Identity()
+    let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
+                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("x".utf8))
+    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5)
+    let held = LXMFPropagation.transientId(lxmfData: LXMFPropagation.parseContainer(container)!.entries[0])
+    let want = Data(repeating: 0x22, count: 32)
+    let offerPath = Crypto.truncatedHash(Data("/offer".utf8))
+    let store = makeStore(Identity())
+    let linkID = Data(repeating: 0xB0, count: 16)
+
+    await store.send(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container))))   // PN now holds `held`
+    await store.receive { if case .delegate(.messagesStored) = $0 { return true }; return false }
+    await store.send(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: peer))))
+    await store.send(.endpoint(.delegate(.requestReceived(linkID: linkID, requestID: Data([2]),
+        pathHash: offerPath, data: MsgPack.encode(.array([.bin(Data([0x01])), .array([.bin(held), .bin(want)])]))))))
+    await store.receive { action in
+        if case let .endpoint(.sendResponseOverLink(_, _, data)) = action {
+            #expect(MsgPack.decodeValue(data) == .array([.bin(want)])); return true   // held excluded, only `want`
+        }
+        return false
+    }
+}
+
+/// /offer without a prior IDENTIFY on the link is dropped (no response).
+@Test @MainActor func pnNodeOfferWithoutIdentifyDrops() async {
+    let offerPath = Crypto.truncatedHash(Data("/offer".utf8))
+    let store = makeStore(Identity())
+    let linkID = Data(repeating: 0xB0, count: 16)
+    await store.send(.endpoint(.delegate(.requestReceived(linkID: linkID, requestID: Data([1]),
+        pathHash: offerPath, data: MsgPack.encode(.array([.bin(Data([0x01])), .array([.bin(Data(repeating: 0x11, count: 32))])]))))))
+    store.exhaustivity = .on   // a stray sendResponseOverLink / node action would fail teardown
+}

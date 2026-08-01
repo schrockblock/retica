@@ -16,6 +16,7 @@ public struct PNNode {
         public var identity: Identity
         public var clientIdentities: [Data: Identity] = [:]   // linkID → IDENTIFY'd client
         public var pendingGet: [Data: PendingGet] = [:]        // client delivery hash → (linkID, requestID)
+        public var pendingOffer: [Data: PendingOffer] = [:]   // peerHash → (linkID, requestID, offeredIds)
         public init(identity: Identity, endpoint: Endpoint.State, storageLimitBytes: Int? = nil) {
             self.identity = identity
             self.endpoint = endpoint
@@ -26,6 +27,12 @@ public struct PNNode {
     public struct PendingGet: Equatable {
         public var linkID: Data
         public var requestID: Data
+    }
+
+    public struct PendingOffer: Equatable {
+        public var linkID: Data
+        public var requestID: Data
+        public var offeredIds: [Data]
     }
 
     public enum Action: Equatable {
@@ -72,17 +79,30 @@ public struct PNNode {
                 return .none
 
             case let .endpoint(.delegate(.requestReceived(linkID, requestID, pathHash, data))):
-                guard pathHash == Crypto.truncatedHash(Data("/get".utf8)) else { return .none }
-                guard let clientIdentity = state.clientIdentities[linkID] else { return .none }   // no IDENTIFY → drop
-                let clientHash = LXMessage.deliveryHash(identityHash: clientIdentity.hash)
-                state.pendingGet[clientHash] = PendingGet(linkID: linkID, requestID: requestID)
-                guard case let .array(items)? = MsgPack.decodeValue(data), items.count >= 2 else { return .none }
-                if case .null = items[0], case .null = items[1] {
-                    return .send(.node(.messageListRequested(destinationHash: clientHash)))
+                guard let clientIdentity = state.clientIdentities[linkID] else { return .none }   // no IDENTIFY → drop (both paths)
+                if pathHash == Crypto.truncatedHash(Data("/get".utf8)) {
+                    let clientHash = LXMessage.deliveryHash(identityHash: clientIdentity.hash)
+                    state.pendingGet[clientHash] = PendingGet(linkID: linkID, requestID: requestID)
+                    guard case let .array(items)? = MsgPack.decodeValue(data), items.count >= 2 else { return .none }
+                    if case .null = items[0], case .null = items[1] {
+                        return .send(.node(.messageListRequested(destinationHash: clientHash)))
+                    }
+                    return .send(.node(.messagesRequested(destinationHash: clientHash,
+                                                          wants: PNNode.arrayOfBin(items[0]),
+                                                          haves: PNNode.arrayOfBin(items[1]))))
                 }
-                return .send(.node(.messagesRequested(destinationHash: clientHash,
-                                                      wants: PNNode.arrayOfBin(items[0]),
-                                                      haves: PNNode.arrayOfBin(items[1]))))
+                if pathHash == Crypto.truncatedHash(Data("/offer".utf8)) {
+                    guard case let .array(items)? = MsgPack.decodeValue(data), items.count >= 2,
+                          case let .bin(peeringKey) = items[0] else { return .none }
+                    let offeredIds = PNNode.arrayOfBin(items[1])
+                    let peerHash = Destination.hash(identityHash: clientIdentity.hash,
+                                                    appName: LXMessage.appName, aspects: ["propagation"])
+                    let peeringId = state.identity.hash + clientIdentity.hash
+                    state.pendingOffer[peerHash] = PendingOffer(linkID: linkID, requestID: requestID, offeredIds: offeredIds)
+                    return .send(.node(.validatePeeringKey(peerHash: peerHash, peeringId: peeringId,
+                                                           peeringKey: peeringKey, targetCost: 0)))   // cost 0 = open mesh (P4c enforces)
+                }
+                return .none
 
             case let .node(.delegate(.deliverMessageList(dest, ids))):
                 guard let p = state.pendingGet[dest] else { return .none }
@@ -95,6 +115,18 @@ public struct PNNode {
                 state.pendingGet[dest] = nil
                 return .send(.endpoint(.sendResponseOverLink(linkID: p.linkID, requestID: p.requestID,
                                                              data: MsgPack.encode(.array(entries.map { .bin($0) })))))
+
+            case let .node(.delegate(.peerValidated(peerHash, valid))):
+                guard let pending = state.pendingOffer[peerHash] else { return .none }
+                if valid { return .send(.node(.peerOffered(peerHash: peerHash, transientIds: pending.offeredIds))) }
+                state.pendingOffer[peerHash] = nil                     // invalid key → drop (dead path at cost 0)
+                return .none
+
+            case let .node(.delegate(.requestFromPeer(peerHash, wanted))):
+                guard let pending = state.pendingOffer[peerHash] else { return .none }
+                state.pendingOffer[peerHash] = nil
+                return .send(.endpoint(.sendResponseOverLink(linkID: pending.linkID, requestID: pending.requestID,
+                                                             data: MsgPack.encode(.array(wanted.map { .bin($0) })))))
 
             case .endpoint, .node, .delegate:
                 return .none
