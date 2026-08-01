@@ -79,7 +79,7 @@ public enum BLEHello {
 /// forgotten when more than strikeForget elapses since the last failure; the
 /// blocking boundary is INCLUSIVE (blocked while now <= unblock time).
 public struct BLEPeerGreylist<Key: Hashable & Sendable>: Equatable, Sendable {
-    struct Entry: Equatable, Sendable {
+    private struct Entry: Equatable, Sendable {
         var strikes: Int
         var lastFailure: Date
         var blockedUntil: Date
@@ -88,7 +88,7 @@ public struct BLEPeerGreylist<Key: Hashable & Sendable>: Equatable, Sendable {
     public let baseDelay: TimeInterval
     public let maxDelay: TimeInterval
     public let strikeForget: TimeInterval
-    var entries: [Key: Entry] = [:]
+    private var entries: [Key: Entry] = [:]
 
     public init(baseDelay: TimeInterval = 5, maxDelay: TimeInterval = 300,
                 strikeForget: TimeInterval = 600) {

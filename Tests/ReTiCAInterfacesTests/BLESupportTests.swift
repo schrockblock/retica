@@ -120,6 +120,11 @@ import Foundation
     greylist.recordFailure("peer", now: t0)
     greylist.clear("peer")
     #expect(!greylist.isBlocked("peer", now: t0))
+    // A failure after clear starts over at strike 1 (5 s), not a stale escalated count.
+    let t = t0.addingTimeInterval(60)
+    greylist.recordFailure("peer", now: t)
+    #expect(greylist.isBlocked("peer", now: t.addingTimeInterval(5.0)))
+    #expect(!greylist.isBlocked("peer", now: t.addingTimeInterval(5.01)))
 }
 
 // MARK: - Duplicate resolution
