@@ -47,7 +47,9 @@ private func container(_ entries: [Data]) -> Data {
     await store.send(.ingestContainer(container([a1, b1, a2])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
     let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
-    await store.send(.messagesRequested(destinationHash: destA))
+    let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
+    let tidA2 = LXMFPropagation.transientId(lxmfData: a2)
+    await store.send(.messagesRequested(destinationHash: destA, wants: [tidA1, tidA2], haves: []))
     await store.receive { action in
         if case let .delegate(.deliverMessages(dest, entries)) = action {
             #expect(dest == destA); #expect(entries == [a1, a2]); return true   // only A's, oldest-first
@@ -60,7 +62,7 @@ private func container(_ entries: [Data]) -> Data {
     let store = TestStore(initialState: PropagationNode.State()) { PropagationNode() }
     store.exhaustivity = .off
     let dest = Data(repeating: 0xCC, count: LXMessage.destinationLength)
-    await store.send(.messagesRequested(destinationHash: dest))
+    await store.send(.messagesRequested(destinationHash: dest, wants: [], haves: []))
     await store.receive { action in
         if case let .delegate(.deliverMessages(d, entries)) = action {
             #expect(d == dest); #expect(entries.isEmpty); return true
@@ -79,7 +81,7 @@ private func container(_ entries: [Data]) -> Data {
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
     await store.send(.messagesDelivered(transientIds: [tid]))
     #expect(store.state.store.count == 0)
-    await store.send(.messagesRequested(destinationHash: destA))
+    await store.send(.messagesRequested(destinationHash: destA, wants: [tid], haves: []))
     await store.receive { action in
         if case let .delegate(.deliverMessages(_, entries)) = action { #expect(entries.isEmpty); return true }
         return false
@@ -139,6 +141,82 @@ private func container(_ entries: [Data]) -> Data {
     await store.send(.validatePeeringKey(peerHash: peer, peeringId: peeringId, peeringKey: key, targetCost: 250))
     await store.receive { action in
         if case let .delegate(.peerValidated(_, valid)) = action { #expect(valid == false); return true }
+        return false
+    }
+}
+
+// MARK: - P3a two-phase serve (/get)
+
+/// Phase-1: messageListRequested returns only the destination's transient_ids, oldest-first.
+@Test @MainActor func propagationNodeListsTransientIdsByDestination() async {
+    let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
+    let b1 = entry(dest: 0xBB, tail: "b1")
+    let store = TestStore(initialState: PropagationNode.State()) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([a1, b1, a2])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    await store.send(.messageListRequested(destinationHash: destA))
+    await store.receive { action in
+        if case let .delegate(.deliverMessageList(dest, ids)) = action {
+            #expect(dest == destA)
+            #expect(ids == [LXMFPropagation.transientId(lxmfData: a1),
+                            LXMFPropagation.transientId(lxmfData: a2)])   // A's only, oldest-first
+            return true
+        }
+        return false
+    }
+}
+
+/// Phase-2: only the WANTED subset is served; an unwanted entry for the same destination is withheld.
+@Test @MainActor func propagationNodeServesOnlyWantedSubset() async {
+    let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
+    let store = TestStore(initialState: PropagationNode.State()) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([a1, a2])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    await store.send(.messagesRequested(destinationHash: destA,
+                                        wants: [LXMFPropagation.transientId(lxmfData: a1)], haves: []))
+    await store.receive { action in
+        if case let .delegate(.deliverMessages(_, entries)) = action { #expect(entries == [a1]); return true }
+        return false
+    }
+}
+
+/// Phase-2: haves are purged from the store (client already has them).
+@Test @MainActor func propagationNodePurgesHaves() async {
+    let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
+    let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
+    let tidA2 = LXMFPropagation.transientId(lxmfData: a2)
+    let store = TestStore(initialState: PropagationNode.State()) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([a1, a2])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    await store.send(.messagesRequested(destinationHash: destA, wants: [tidA2], haves: [tidA1]))
+    await store.receive { action in
+        if case let .delegate(.deliverMessages(_, entries)) = action { #expect(entries == [a2]); return true }
+        return false
+    }
+    #expect(store.state.store.contains(transientId: tidA1) == false)   // have purged
+    #expect(store.state.store.contains(transientId: tidA2) == true)    // still stored (served, not delivered-acked)
+}
+
+/// Phase-2: a want for a foreign-destination or absent id is silently skipped.
+@Test @MainActor func propagationNodeSkipsForeignOrAbsentWants() async {
+    let a1 = entry(dest: 0xAA, tail: "a1")
+    let b1 = entry(dest: 0xBB, tail: "b1")
+    let store = TestStore(initialState: PropagationNode.State()) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([a1, b1])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    await store.send(.messagesRequested(destinationHash: destA,
+                                        wants: [LXMFPropagation.transientId(lxmfData: b1),      // wrong dest
+                                                Data(repeating: 0x99, count: 32)], haves: []))   // absent
+    await store.receive { action in
+        if case let .delegate(.deliverMessages(_, entries)) = action { #expect(entries.isEmpty); return true }
         return false
     }
 }

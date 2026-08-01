@@ -21,7 +21,8 @@ public struct PropagationNode {
 
     public enum Action: Equatable {
         case ingestContainer(Data)
-        case messagesRequested(destinationHash: Data)
+        case messagesRequested(destinationHash: Data, wants: [Data], haves: [Data])
+        case messageListRequested(destinationHash: Data)
         case messagesDelivered(transientIds: [Data])
         case peerOffered(peerHash: Data, transientIds: [Data])
         case offerToPeer(peerHash: Data)
@@ -31,6 +32,7 @@ public struct PropagationNode {
         public enum Delegate: Equatable {
             case stored(transientIds: [Data])
             case deliverMessages(destinationHash: Data, entries: [Data])
+            case deliverMessageList(destinationHash: Data, transientIds: [Data])
             case requestFromPeer(peerHash: Data, transientIds: [Data])
             case offerTransientIds(peerHash: Data, transientIds: [Data])
             case peerValidated(peerHash: Data, valid: Bool)
@@ -46,9 +48,17 @@ public struct PropagationNode {
                 let added = state.store.ingest(container: data)
                 return .send(.delegate(.stored(transientIds: added)))
 
-            case let .messagesRequested(destinationHash):
-                let entries = state.store.entries(forDestination: destinationHash).map(\.lxmfData)
+            case let .messagesRequested(destinationHash, wants, haves):
+                for tid in haves { state.store.remove(transientId: tid) }          // purge what the client already has
+                let wantSet = Set(wants)
+                let entries = state.store.entries(forDestination: destinationHash)
+                    .filter { wantSet.contains($0.transientId) }
+                    .map(\.lxmfData)
                 return .send(.delegate(.deliverMessages(destinationHash: destinationHash, entries: entries)))
+
+            case let .messageListRequested(destinationHash):
+                let ids = state.store.entries(forDestination: destinationHash).map(\.transientId)
+                return .send(.delegate(.deliverMessageList(destinationHash: destinationHash, transientIds: ids)))
 
             case let .messagesDelivered(transientIds):
                 for tid in transientIds { state.store.remove(transientId: tid) }
