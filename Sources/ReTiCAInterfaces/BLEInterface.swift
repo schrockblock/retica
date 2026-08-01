@@ -112,12 +112,46 @@ public struct BLEInterface {
             // Stubs — implemented in Tasks 5–7.
             case .driverEvent(.unavailable):
                 return .none
-            case .driverEvent(.peerDiscovered):
+
+            case let .driverEvent(.peerDiscovered(handle)):
+                guard state.status == .online,
+                      !state.pendingPeers.contains(handle),
+                      !state.channels.values.contains(where: { $0.peer == handle }),
+                      state.peers.count + state.pendingPeers.count < state.maxPeers,
+                      !state.greylist.isBlocked(handle, now: date())
+                else { return .none }
+                state.pendingPeers.insert(handle)
+                return .merge(
+                    .run { [bleDriver] _ in await bleDriver.readDirectory(handle) },
+                    .run { [clock] send in
+                        try await clock.sleep(for: Self.establishTimeout)
+                        await send(.establishDeadline(handle))
+                    }
+                    .cancellable(id: CancelID.establish(handle), cancelInFlight: true)
+                )
+
+            case let .driverEvent(.directoryRead(handle, version, psm)):
+                guard state.pendingPeers.contains(handle) else { return .none }
+                guard version == Self.protocolVersion else {
+                    state.pendingPeers.remove(handle)
+                    state.greylist.recordFailure(handle, now: date())
+                    return .cancel(id: CancelID.establish(handle))
+                }
+                return .run { [bleDriver] _ in await bleDriver.openChannel(handle, psm) }
+
+            case let .driverEvent(.directoryFailed(handle, _)),
+                 let .driverEvent(.channelFailed(handle, _)):
+                guard state.pendingPeers.contains(handle) else { return .none }
+                state.pendingPeers.remove(handle)
+                state.greylist.recordFailure(handle, now: date())
+                return .cancel(id: CancelID.establish(handle))
+
+            case let .establishDeadline(handle):
+                guard state.pendingPeers.contains(handle) else { return .none }
+                state.pendingPeers.remove(handle)
+                state.greylist.recordFailure(handle, now: date())
                 return .none
-            case .driverEvent(.directoryRead):
-                return .none
-            case .driverEvent(.directoryFailed), .driverEvent(.channelFailed):
-                return .none
+
             case .driverEvent(.channelOpened):
                 return .none
             case .driverEvent(.channelData):
@@ -127,8 +161,6 @@ public struct BLEInterface {
             case .send:
                 return .none
             case .helloDeadline:
-                return .none
-            case .establishDeadline:
                 return .none
             case .adapterRetry:
                 return .none

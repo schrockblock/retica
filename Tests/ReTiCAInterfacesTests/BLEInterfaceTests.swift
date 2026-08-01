@@ -101,3 +101,99 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
     }
     #expect(calls.value.contains(.stop))
 }
+
+// MARK: - Discovery / establishment
+
+/// Brings a store online and returns it ready for discovery events.
+@MainActor
+func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
+    async -> (store: TestStore<BLEInterface.State, BLEInterface.Action>,
+              events: [AsyncStream<BLEDriverEvent>.Continuation],
+              calls: LockIsolated<[MockDriverCall]>,
+              clock: TestClock<Duration>,
+              now: LockIsolated<Date>)
+{
+    let (store, events, calls, clock, now) = makeStore(maxPeers: maxPeers, streams: streams)
+    await store.send(.start) { $0.status = .starting }
+    events[0].yield(.ready)
+    await store.receive(.driverEvent(.ready)) { $0.status = .online }
+    return (store, events, calls, clock, now)
+}
+
+@Test @MainActor func discoveryReadsDirectoryThenOpensChannel() async {
+    let (store, events, calls, _, _) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA))) {
+        $0.pendingPeers = [peerHandleA]
+    }
+    #expect(calls.value.contains(.readDirectory(peerHandleA)))
+    events[0].yield(.directoryRead(peerHandleA, version: 2, psm: 0x0081))
+    await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 2, psm: 0x0081)))
+    #expect(calls.value.contains(.openChannel(peerHandleA, 0x0081)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func versionMismatchRefusesAndGreylists() async {
+    let (store, events, calls, _, now) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.directoryRead(peerHandleA, version: 1, psm: 0x0081))
+    await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 1, psm: 0x0081))) {
+        $0.pendingPeers = []
+    }
+    #expect(!calls.value.contains(.openChannel(peerHandleA, 0x0081)))
+    // Greylisted: an immediate rediscovery is ignored (no second readDirectory).
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 1)
+    // After the 5 s backoff expires (strictly after — inclusive boundary), retry is allowed.
+    now.setValue(now.value.addingTimeInterval(5.01))
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 2)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func directoryFailureStrikesAndPendingPeerIsNotRediscovered() async {
+    let (store, events, calls, _, _) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    // While pending, duplicate discovery is ignored.
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 1)
+    events[0].yield(.directoryFailed(peerHandleA, reason: "gatt error"))
+    await store.receive(.driverEvent(.directoryFailed(peerHandleA, reason: "gatt error"))) {
+        $0.pendingPeers = []
+    }
+    // Strike recorded: immediate rediscovery ignored.
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 1)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func establishDeadlineAbandonsAndStrikes() async {
+    let (store, events, _, clock, _) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    await clock.advance(by: BLEInterface.establishTimeout)
+    await store.receive(.establishDeadline(peerHandleA)) { $0.pendingPeers = [] }
+    // Late directoryRead for a no-longer-pending peer is ignored (no openChannel).
+    events[0].yield(.directoryRead(peerHandleA, version: 2, psm: 0x0081))
+    await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 2, psm: 0x0081)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func discoveryIsIgnoredAtPeerCap() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(maxPeers: 1)
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    // A pending establishment counts against the cap (Python: spawned + pending >= max).
+    events[0].yield(.peerDiscovered(peerHandleB))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleB)))
+    #expect(calls.value.filter {
+        if case .readDirectory = $0 { return true } else { return false }
+    }.count == 1)
+    await store.send(.stop) { $0.status = .stopped }
+}
