@@ -157,9 +157,24 @@ Unchanged at the contract level: every FCB-level throw or stream termination bec
 
 The user's global mutation-verification discipline applies to every test-bearing task.
 
+## Known limitation: macOS central L2CAP (accepted)
+
+CoreBluetoothMock's `CBMPeripheral` protocol gates `openL2CAPChannel` under
+`#if !os(macOS)`, and FCB's central role routes through CBM, so on macOS the central
+cannot *initiate* an outbound L2CAP channel (FCB throws `BluetoothError.l2capNotSupported`).
+The peripheral role's inbound L2CAP works on macOS (real CoreBluetooth). Under RBTP v2's
+both-initiate model this means: iPhone↔iPhone and Mac↔iPhone form links (a Mac accepts the
+iPhone-initiated channel), but **Mac↔Mac cannot form a link** (neither side can dial). The
+adapter surfaces this naturally — an outbound `openChannel` on macOS produces a
+`.channelFailed`, which the reducer greylists like any other failure; nothing crashes.
+Decision (approved): accept and document rather than add a native-`CBPeripheral` escape
+hatch in FCB. Real CoreBluetooth supports macOS `openL2CAPChannel`, so a future FCB escape
+hatch remains feasible if Mac↔Mac is ever required.
+
 ## Out of scope
 
 - Reducer, protocol, or `BLEDriverEvent` contract changes (none; RBTP v2 byte-identical).
 - Endpoint/Transport wiring (unchanged follow-up).
 - Write-buffer cap (tracked in both repos' specs as future work).
 - tvOS/watchOS support (returns if/when FCB adds those platforms).
+- Mac↔Mac L2CAP (blocked by the CBM macOS gate above; accepted limitation).
