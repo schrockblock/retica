@@ -182,7 +182,6 @@ public struct LXMFRouter {
                                   retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
                                   idleTimer(pn))
                 }
-                arm(&state, message.hash, .propagated(destinationHash: pn, data: propagationPacked))
                 state.propagationQueue[pn, default: []].append(
                     PropagationItem(messageHash: message.hash, propagationPacked: propagationPacked))
                 if state.directLinks[pn] == nil {

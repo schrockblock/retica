@@ -6,6 +6,8 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
+private let pnHash = Data(repeating: 0xC0, count: 16)
+
 @MainActor
 private func makeNode(identity: Identity, seedLearned: Identity?, dest: Data,
                       pn: Data?) -> TestStore<LXMFNode.State, LXMFNode.Action> {
@@ -31,44 +33,39 @@ private func makeNode(identity: Identity, seedLearned: Identity?, dest: Data,
     return store
 }
 
-private func isPropagated(_ resend: LXMFRouter.ResendInfo?) -> Bool {
-    if case .propagated = resend { return true }; return false
-}
-private func isOpportunistic(_ resend: LXMFRouter.ResendInfo?) -> Bool {
-    if case .opportunistic = resend { return true }; return false
-}
-
 @MainActor @Test func sendMessageFlagFalseSendsOpportunisticOnly() async {
     let me = Identity(); let recipient = Identity()
     let dest = Data(repeating: 0xA1, count: 16)
-    let store = makeNode(identity: me, seedLearned: recipient, dest: dest, pn: Data(repeating: 0xC0, count: 16))
+    let store = makeNode(identity: me, seedLearned: recipient, dest: dest, pn: pnHash)
     let msg = LXMessage.create(source: me, destinationHash: dest, timestamp: 1700000000,
                                title: Data(), content: Data("x".utf8))
     await store.send(.sendMessage(message: msg, alsoViaPropagation: false))
     await store.receive { if case let .router(.send(m, method)) = $0 { return m == msg && method == .opportunistic }; return false }
-    #expect(isOpportunistic(store.state.router.pendingDeliveries[msg.hash]?.resend))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.router.propagationQueue.isEmpty)
 }
 
 @MainActor @Test func sendMessageFlagTrueKnownIdentitySendsBoth() async {
     let me = Identity(); let recipient = Identity()
     let dest = Data(repeating: 0xA2, count: 16)
-    let store = makeNode(identity: me, seedLearned: recipient, dest: dest, pn: Data(repeating: 0xC0, count: 16))
+    let store = makeNode(identity: me, seedLearned: recipient, dest: dest, pn: pnHash)
     let msg = LXMessage.create(source: me, destinationHash: dest, timestamp: 1700000000,
                                title: Data(), content: Data("x".utf8))
     await store.send(.sendMessage(message: msg, alsoViaPropagation: true))
     await store.receive { if case let .router(.send(m, method)) = $0 { return m == msg && method == .opportunistic }; return false }
     await store.receive { if case let .router(.sendViaPropagation(m, _)) = $0 { return m == msg }; return false }
-    #expect(isPropagated(store.state.router.pendingDeliveries[msg.hash]?.resend))
+    #expect(store.state.router.propagationQueue[pnHash]?.count == 1)
 }
 
 @MainActor @Test func sendMessageFlagTrueUnknownIdentitySkipsPropagation() async {
     let me = Identity()
     let dest = Data(repeating: 0xA3, count: 16)
     // NOTE: seedLearned nil → transport.learned has no identity for dest → propagation must be skipped.
-    let store = makeNode(identity: me, seedLearned: nil, dest: dest, pn: Data(repeating: 0xC0, count: 16))
+    let store = makeNode(identity: me, seedLearned: nil, dest: dest, pn: pnHash)
     let msg = LXMessage.create(source: me, destinationHash: dest, timestamp: 1700000000,
                                title: Data(), content: Data("x".utf8))
     await store.send(.sendMessage(message: msg, alsoViaPropagation: true))
     await store.receive { if case let .router(.send(m, method)) = $0 { return m == msg && method == .opportunistic }; return false }
-    #expect(isOpportunistic(store.state.router.pendingDeliveries[msg.hash]?.resend))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.router.propagationQueue.isEmpty)
 }
