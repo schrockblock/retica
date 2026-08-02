@@ -150,10 +150,8 @@ public struct BLEInterface {
 
             case let .driverEvent(.channelOpened(channelID, handle, direction)):
                 var effects: [Effect<Action>] = []
-                if direction == .outbound {
-                    state.pendingPeers.remove(handle)
-                    effects.append(.cancel(id: CancelID.establish(handle)))
-                }
+                state.pendingPeers.remove(handle)
+                effects.append(.cancel(id: CancelID.establish(handle)))
                 let now = date()
                 guard state.status == .online,
                       let token = state.sessionToken,

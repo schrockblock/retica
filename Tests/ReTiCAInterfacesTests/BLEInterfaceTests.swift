@@ -329,6 +329,44 @@ func establishPeer(
     await store.send(.stop) { $0.status = .stopped }
 }
 
+@Test @MainActor func inboundOpenClearsPendingOutboundEstablishment() async {
+    // Regression: if an inbound channel arrives while we have a pending outbound establishment
+    // to the same handle, a later outbound failure (directoryFailed, channelFailed, or
+    // establishDeadline) must NOT record a greylist strike against an already-online peer.
+    let (store, events, calls, _, now) = await makeOnlineStore()
+    // Kick off outbound establishment.
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA))) {
+        $0.pendingPeers = [peerHandleA]
+    }
+    // Inbound channel arrives (cross-connect) before the outbound leg completes.
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound))) {
+        $0.pendingPeers = []   // must be cleared for BOTH directions
+    }
+    // Complete the HELLO so the peer is fully online.
+    events[0].yield(.channelData(channel1, framedHello(token: tokenHigh)))
+    await store.receive(.driverEvent(.channelData(channel1, framedHello(token: tokenHigh))))
+    await store.receive(.delegate(.peerOnline(tokenHigh)))
+    // The outbound leg reports a late failure — this must NOT strike since pendingPeers is empty.
+    events[0].yield(.directoryFailed(peerHandleA, reason: "late failure"))
+    await store.receive(.driverEvent(.directoryFailed(peerHandleA, reason: "late failure"))) {
+        $0.pendingPeers = []   // still empty — guard fires, no strike
+    }
+    // Advance time past the churn threshold so the subsequent channel close is NOT a strike.
+    now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime + 1))
+    // Close the inbound channel.
+    events[0].yield(.channelClosed(channel1, reason: nil))
+    await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
+    await store.receive(.delegate(.peerOffline(tokenHigh)))
+    // Re-discover: if no strike was recorded the handle passes the greylist gate,
+    // producing a second readDirectory call.
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 2)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
 // MARK: - Dedup
 
 @Test @MainActor func crossConnectKeepsLowerInitiatorsChannelFromBothPerspectives() async {
@@ -361,6 +399,9 @@ func establishPeer(
     events[0].yield(.channelData(channel1, framedHello(token: tokenLow)))
     await store.receive(.driverEvent(.channelData(channel1, framedHello(token: tokenLow))))
     #expect(calls.value.contains(.closeChannel(channel1)))   // ours still loses
+    // Traffic flows on the surviving inbound channel.
+    await store.send(.send(peer: tokenLow, packet: Data([0x0D])))
+    #expect(calls.value.contains(.send(channel2, try! BLEFraming.frame(Data([0x0D])))))
     await store.send(.stop) { $0.status = .stopped }
 }
 

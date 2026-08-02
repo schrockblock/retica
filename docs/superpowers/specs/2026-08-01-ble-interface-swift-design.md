@@ -386,3 +386,10 @@ pass), with `.off` TestStores asserting outcomes per project preference.
   apps), state restoration, and app-level permission UX.
 - `ifac_netname`/`ifac_netkey` derivation (ReTiCA's Transport does not implement IFAC yet;
   passthrough note retained in the spec deltas only).
+- **Greylist/seen-peer map eviction:** `BLEPeerGreylist` entries and the `peers`/`channels`
+  maps have no bounded-size eviction policy; very long sessions accumulate entries for every
+  peer ever seen. Eviction is deferred to the Endpoint composition slice.
+- **Outbound write-buffer cap:** when a peer's L2CAP channel stalls (stream
+  `hasSpaceAvailable == false`), the CoreBluetooth driver queues writes without a size cap.
+  This is a driver-level concern; the maximum practical backlog depends on hardware
+  throughput and is flagged for verification during live-device testing.
