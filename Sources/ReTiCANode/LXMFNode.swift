@@ -32,6 +32,7 @@ public struct LXMFNode {
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
         case setPropagationNode(destinationHash: Data)
         case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
+        case sendMessage(message: LXMessage, alsoViaPropagation: Bool)
         case syncFromPropagationNode
         case delegate(Delegate)
 
@@ -74,6 +75,19 @@ public struct LXMFNode {
                 let (packed, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient,
                                                        timestamp: date.now.timeIntervalSince1970)
                 return .send(.router(.sendViaPropagation(message: msg, propagationPacked: packed)))
+
+            case let .sendMessage(message, alsoViaPropagation):
+                var effects: [Effect<Action>] = [
+                    .send(.router(.send(message: message, desiredMethod: .opportunistic)))
+                ]
+                if alsoViaPropagation,
+                   let recipient = state.endpoint.transport.learned[message.destinationHash]?.identity {
+                    let (packed, _) = LXMFPropagation.pack(
+                        message: message, recipientIdentity: recipient,
+                        timestamp: date.now.timeIntervalSince1970)
+                    effects.append(.send(.router(.sendViaPropagation(message: message, propagationPacked: packed))))
+                }
+                return .merge(effects)
 
             case .syncFromPropagationNode:
                 return .send(.router(.syncFromPropagationNode))
