@@ -70,15 +70,7 @@ public struct BLEDriver: Sendable {
 extension BLEDriver: DependencyKey {
     public static var liveValue: BLEDriver {
         #if canImport(CoreBluetooth) && (os(iOS) || os(macOS))
-        let driver = CoreBluetoothDriver()
-        return BLEDriver(
-            start: { config in driver.start(config) },
-            readDirectory: { peer in driver.readDirectory(peer) },
-            openChannel: { peer, psm in driver.openChannel(peer, psm: psm) },
-            send: { channel, data in driver.send(channel, data: data) },
-            closeChannel: { channel in driver.closeChannel(channel) },
-            stop: { driver.stop() }
-        )
+        return .fcb(central: .liveValue, peripheral: .liveValue)
         #else
         return BLEDriver(start: { _ in .finished }, readDirectory: { _ in },
                          openChannel: { _, _ in }, send: { _, _ in },
