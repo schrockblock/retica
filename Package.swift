@@ -4,11 +4,9 @@ import PackageDescription
 let package = Package(
     name: "ReTiCA",
     platforms: [
-        .iOS(.v16),
+        .iOS(.v17),
         .macOS(.v13),
-        .tvOS(.v16),
-        .watchOS(.v9),
-        .macCatalyst(.v16),
+        .macCatalyst(.v17),
     ],
     products: [
         .library(name: "ReTiCA", targets: ["ReTiCA"]),
@@ -18,6 +16,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/pointfreeco/swift-composable-architecture", from: "1.15.0"),
+        .package(path: "../FCB"),
+        .package(url: "https://github.com/NordicSemiconductor/IOS-CoreBluetooth-Mock.git", from: "1.0.0"),
     ],
     targets: [
         .target(name: "ReTiCA"),
@@ -27,6 +27,7 @@ let package = Package(
             dependencies: [
                 "ReTiCA",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
+                .product(name: "FCBComposable", package: "FCB"),
             ]
         ),
         .testTarget(
@@ -39,6 +40,8 @@ let package = Package(
             dependencies: [
                 "ReTiCAInterfaces",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
+                .product(name: "FCBComposable", package: "FCB"),
+                .product(name: "CoreBluetoothMock", package: "IOS-CoreBluetooth-Mock"),
             ],
             resources: [.process("Vectors/ble_fixtures.json")]
         ),
