@@ -79,14 +79,16 @@ struct FCBDriverAdapterCBMTests {
         // openChannel on the mocked central → CBM can't open L2CAP → .channelFailed.
         await driver.openChannel(handle, 0x0081)
         let failed = await waitFor { if case .channelFailed = $0 { return true }; return false }
-        #expect(failed != nil)
+        guard case let .channelFailed(failedHandle, _)? = failed else {
+            Issue.record("expected channelFailed, got \(String(describing: failed))"); await driver.stop(); return
+        }
+        #expect(failedHandle == handle)
         await driver.stop()
     }
 }
 
-/// A peripheral client that never powers on (peripheral role unused in this test),
-/// so the adapter's `.ready` waits only on the central side is irrelevant here —
-/// we drive directory flow directly via readDirectory without needing .ready.
+// Peripheral role is unused in this test — the peripheral client never powers on, so the
+// adapter never advertises; we drive the central directory flow directly via readDirectory.
 @MainActor
 func noopPeripheralClient() -> BluetoothPeripheralClient {
     var client = BluetoothPeripheralClient.testValue
