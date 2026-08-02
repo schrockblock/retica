@@ -38,9 +38,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStor
     let client = Identity(); let sender = Identity()
     let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: client.hash),
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi".utf8))
-    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: client, timestamp: 1700000000.5)
-    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
-    let tid = LXMFPropagation.transientId(lxmfData: entry)
+    let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: client, timestamp: 1700000000.5, stampCost: 4)
     let store = makeStore(Identity())
     let linkID = Data(repeating: 0xA0, count: 16)
     await store.send(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container))))
@@ -58,9 +56,8 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStor
     let clientHash = LXMessage.deliveryHash(identityHash: client.hash)
     let msg = LXMessage.create(source: sender, destinationHash: clientHash,
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi".utf8))
-    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: client, timestamp: 1700000000.5)
-    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
-    let tid = LXMFPropagation.transientId(lxmfData: entry)
+    let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: client, timestamp: 1700000000.5, stampCost: 4)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let getPath = Crypto.truncatedHash(Data("/get".utf8))
     let store = makeStore(Identity())
     let linkID = Data(repeating: 0xA0, count: 16)
@@ -128,8 +125,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStor
     let peer = Identity(); let sender = Identity(); let recipient = Identity()
     let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("x".utf8))
-    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5)
-    let held = LXMFPropagation.transientId(lxmfData: LXMFPropagation.parseContainer(container)!.entries[0])
+    let (container, held) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
     let want = Data(repeating: 0x22, count: 32)
     let offerPath = Crypto.truncatedHash(Data("/offer".utf8))
     let store = makeStore(Identity())
@@ -199,9 +195,8 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStor
     let sender = Identity(); let recipient = Identity()
     let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("m".utf8))
-    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5)
-    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
-    let tid = LXMFPropagation.transientId(lxmfData: entry)
+    let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
     var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
     _ = initial.node.store.ingest(container: container)
@@ -228,9 +223,8 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStor
     let sender = Identity(); let recipient = Identity()
     let msg = LXMessage.create(source: sender, destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("m".utf8))
-    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5)
-    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
-    let tid = LXMFPropagation.transientId(lxmfData: entry)
+    let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
     var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
     _ = initial.node.store.ingest(container: container)

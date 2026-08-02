@@ -20,9 +20,8 @@ import ComposableArchitecture
     // The message C will retrieve, packed as a container for C.
     let msg = LXMessage.create(source: sIdentity, destinationHash: cDeliveryHash,
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi C".utf8))
-    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: cIdentity, timestamp: 1700000000.5)
-    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
-    let tid = LXMFPropagation.transientId(lxmfData: entry)
+    let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: cIdentity, timestamp: 1700000000.5, stampCost: 4)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
 
     // makePN: builds a PNNode TestStore with isolated TCP (sends captured in sentPN).
     func makePN(_ host: String, _ identity: Identity, _ sent: LockIsolated<[Data]>)

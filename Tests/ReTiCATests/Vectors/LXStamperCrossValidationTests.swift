@@ -23,3 +23,13 @@ import Foundation
     let wb = LXStamper.stampWorkblock(material: messageId)
     #expect(LXStamper.stampValid(stamp: stamp, targetCost: cost, workblock: wb) == true)
 }
+
+@Test func generatePnStampRoundTripsValidatePnStamp() {
+    let lxmData = Data("pn-stamp-gen-material".utf8)
+    let transientId = Crypto.fullHash(lxmData)
+    let stamp = LXStamper.generatePnStamp(transientId: transientId, targetCost: 4)
+    #expect(stamp.count == LXStamper.stampSize)
+    let result = LXStamper.validatePnStamp(transientData: lxmData + stamp, targetCost: 4)
+    #expect(result != nil)
+    #expect(result?.transientId == transientId)
+}

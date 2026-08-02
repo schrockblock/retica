@@ -57,10 +57,11 @@ import Foundation
     let msg = LXMessage.create(source: source, destinationHash: Data(hexString: f.destinationHash)!,
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("round trip".utf8))
     let (packed, transientId) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient,
-                                                     timestamp: 1700000000.5)
+                                                     timestamp: 1700000000.5, stampCost: 4)
     let parsed = LXMFPropagation.parseContainer(packed)!
     #expect(parsed.entries.count == 1)
-    #expect(transientId == LXMFPropagation.transientId(lxmfData: parsed.entries[0]))   // returned id self-consistent
+    let stamplessEntry = Data(parsed.entries[0].dropLast(LXStamper.stampSize))
+    #expect(transientId == LXMFPropagation.transientId(lxmfData: stamplessEntry))   // returned id over stampless entry
     let recovered = LXMFPropagation.open(lxmfData: parsed.entries[0], recipientIdentity: recipient)
     #expect(recovered?.hash == msg.hash)
     #expect(recovered?.content == Data("round trip".utf8))

@@ -29,6 +29,9 @@ public enum LXMFPropagation {
         MsgPack.encode(.array([.double(timestamp), .array(entries.map { .bin($0) })]))
     }
 
+    /// Default propagation stamp cost for client→PN offers (RNS PROPAGATION_COST = 16).
+    public static let defaultPropagationStampCost = 16
+
     /// Parse a propagation-node container back into its timestamp and entries; nil if malformed.
     public static func parseContainer(_ data: Data) -> (timestamp: Double, entries: [Data])? {
         guard case let .array(top)? = MsgPack.decodeValue(data), top.count == 2,

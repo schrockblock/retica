@@ -72,9 +72,13 @@ public struct LXMFNode {
                 else { return .none }
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
-                let (packed, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient,
-                                                       timestamp: date.now.timeIntervalSince1970)
-                return .send(.router(.sendViaPropagation(message: msg, propagationPacked: packed)))
+                let ts = date.now.timeIntervalSince1970
+                let cost = propagationStampCost(state)
+                return .run { send in
+                    let (packed, _) = LXMFPropagation.pack(
+                        message: msg, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                    await send(.router(.sendViaPropagation(message: msg, propagationPacked: packed)))
+                }
 
             case let .sendMessage(message, alsoViaPropagation):
                 var effects: [Effect<Action>] = [
@@ -82,10 +86,13 @@ public struct LXMFNode {
                 ]
                 if alsoViaPropagation,
                    let recipient = state.endpoint.transport.learned[message.destinationHash]?.identity {
-                    let (packed, _) = LXMFPropagation.pack(
-                        message: message, recipientIdentity: recipient,
-                        timestamp: date.now.timeIntervalSince1970)
-                    effects.append(.send(.router(.sendViaPropagation(message: message, propagationPacked: packed))))
+                    let ts = date.now.timeIntervalSince1970
+                    let cost = propagationStampCost(state)
+                    effects.append(.run { send in
+                        let (packed, _) = LXMFPropagation.pack(
+                            message: message, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                        await send(.router(.sendViaPropagation(message: message, propagationPacked: packed)))
+                    })
                 }
                 return .merge(effects)
 
@@ -125,7 +132,12 @@ public struct LXMFNode {
                     var effects: [Effect<Action>] = []
                     var tids: [Data] = []
                     for blob in blobs {
-                        tids.append(LXMFPropagation.transientId(lxmfData: blob))
+                        // Strip the trailing stamp (32 bytes) if present to recover the canonical transient_id
+                        // (full_hash of the stampless lxmf_data), matching how PropagationStore deduplicates.
+                        let blobCore = blob.count > LXMessage.destinationLength + LXStamper.stampSize
+                            ? Data(blob.dropLast(LXStamper.stampSize))
+                            : blob
+                        tids.append(LXMFPropagation.transientId(lxmfData: blobCore))
                         if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity) {
                             effects.append(.send(.router(.received(method: .direct, destinationHash: Data(), data: packed))))
                         }
@@ -207,5 +219,13 @@ public struct LXMFNode {
                 return .none
             }
         }
+    }
+
+    private func propagationStampCost(_ state: State) -> Int {
+        guard let pn = state.router.outboundPropagationNode,
+              let appData = state.endpoint.transport.learned[pn]?.appData,
+              let ann = PNAnnounce.parse(appData)
+        else { return LXMFPropagation.defaultPropagationStampCost }
+        return ann.targetStampCost
     }
 }

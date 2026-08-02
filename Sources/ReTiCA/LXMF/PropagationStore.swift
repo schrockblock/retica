@@ -33,7 +33,15 @@ public struct PropagationStore: Equatable {
         var added: [Data] = []
         for lxmfData in lxmfDatas {
             guard let dest = LXMFPropagation.destinationHash(lxmfData: lxmfData) else { continue }
-            let tid = LXMFPropagation.transientId(lxmfData: lxmfData)
+            // Strip the trailing propagation stamp (32 bytes) to compute the canonical transient_id over the
+            // pure lxmf_data. Real entries always have an encrypted tail of ≥ 60 bytes, so stamped entries are
+            // always > destHash(16) + stamp(32) = 48 bytes; test-only short helpers are ≤ 48 → no strip.
+            // The original lxmfData (possibly stamped) is stored so that PN→PN sync re-delivers stamped
+            // entries, letting the receiving PN strip identically and arrive at the same transient_id.
+            let lxmfCore = lxmfData.count > LXMessage.destinationLength + LXStamper.stampSize
+                ? Data(lxmfData.dropLast(LXStamper.stampSize))
+                : lxmfData
+            let tid = LXMFPropagation.transientId(lxmfData: lxmfCore)
             if stored[tid] != nil { continue }   // dedup by transient_id
             stored[tid] = Entry(transientId: tid, destinationHash: dest, lxmfData: lxmfData, sequence: nextSequence)
             nextSequence += 1

@@ -165,7 +165,7 @@ public enum MsgPack {
 
 /// A MessagePack value covering the subset Reticulum uses: unsigned ints, byte strings, UTF-8 strings,
 /// booleans, nil, float64, arrays, ordered string-keyed maps, and ordered integer-keyed maps (`intMap`).
-public indirect enum MsgPackValue: Equatable {
+public indirect enum MsgPackValue: Equatable, Sendable {
     case uint(UInt64)
     case bin(Data)
     case string(String)
@@ -176,12 +176,12 @@ public indirect enum MsgPackValue: Equatable {
     case intMap([IntPair])
     case bool(Bool)
 
-    public struct Pair: Equatable {
+    public struct Pair: Equatable, Sendable {
         public let key: String
         public let value: MsgPackValue
         public init(_ key: String, _ value: MsgPackValue) { self.key = key; self.value = value }
     }
-    public struct IntPair: Equatable {
+    public struct IntPair: Equatable, Sendable {
         public let key: Int
         public let value: MsgPackValue
         public init(_ key: Int, _ value: MsgPackValue) { self.key = key; self.value = value }

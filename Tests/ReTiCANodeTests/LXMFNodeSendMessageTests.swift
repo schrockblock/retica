@@ -17,6 +17,14 @@ private func makeNode(identity: Identity, seedLearned: Identity?, dest: Data,
             identity: r, appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),
             hops: 1, nextHop: nil, announceEmitted: 0)
     }
+    // Seed the PN with targetStampCost:4 so the async PoW in sendMessage(alsoViaPropagation:true) is fast.
+    if let pn {
+        ep.transport.learned[pn] = LearnedDestination(
+            identity: Identity(),
+            appData: PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
+                                targetStampCost: 4, stampCostFlexibility: 0, peeringCost: 0).packed,
+            ratchet: nil, interfaceID: InterfaceID("tcp"), hops: 1, nextHop: nil, announceEmitted: 0)
+    }
     var node = LXMFNode.State(identity: identity, endpoint: ep)
     // Seed the router so the opportunistic send can arm, and (when set) propagation can arm.
     node.router.knownIdentities[dest] = seedLearned ?? Identity()

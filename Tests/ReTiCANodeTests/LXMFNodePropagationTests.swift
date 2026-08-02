@@ -74,8 +74,11 @@ import ComposableArchitecture
     await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
 
     // PN announces its lxmf.propagation destination → A learns PN's path + identity (to establish the link).
+    // Use targetStampCost:4 so the async PoW in sendViaPropagation is fast.
+    let pnAppData = PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
+                               targetStampCost: 4, stampCostFlexibility: 0, peeringCost: 0).packed
     await pn.send(.registerLocalDestination(pnDest))
-    await pn.send(.announce(destinationHash: pnDest.hash, appData: nil))
+    await pn.send(.announce(destinationHash: pnDest.hash, appData: pnAppData))
     await pn.receive(epSend)
     eventsA.yield(.data(sentPN.value.last!))
     await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }

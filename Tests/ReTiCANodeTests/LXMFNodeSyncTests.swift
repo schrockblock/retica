@@ -24,9 +24,8 @@ import ComposableArchitecture
     // The stored message (from S to A) and its propagation entry + transient id.
     let storedMsg = LXMessage.create(source: sIdentity, destinationHash: aDeliveryHash,
                                      timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi A".utf8))
-    let (container, _) = LXMFPropagation.pack(message: storedMsg, recipientIdentity: aIdentity, timestamp: 1700000000.5)
-    let entry = LXMFPropagation.parseContainer(container)!.entries[0]
-    let tid = LXMFPropagation.transientId(lxmfData: entry)
+    let (container, tid) = LXMFPropagation.pack(message: storedMsg, recipientIdentity: aIdentity, timestamp: 1700000000.5, stampCost: 4)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped entry — what PN stores and serves
 
     func makeNode(_ host: String, _ identity: Identity, _ sent: LockIsolated<[Data]>)
         -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
