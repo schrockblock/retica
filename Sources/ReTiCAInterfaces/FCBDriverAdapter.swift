@@ -248,10 +248,28 @@ actor FCBDriverAdapter {
         }
     }
 
-    // Command stubs — Task 4 implements.
-    private func subscribeInboundL2CAP() {}
-    func send(_ channel: BLEChannelID, data: Data) async {}
-    func closeChannel(_ channel: BLEChannelID) async {}
+    private func subscribeInboundL2CAP() {
+        tasks.append(Task { [peripheral] in
+            for await conn in peripheral.l2capConnections() {
+                await self.registerInbound(conn)
+            }
+        })
+    }
+
+    private func registerInbound(_ conn: L2CAPConnection) {
+        register(conn, direction: .inbound)
+    }
+
+    func send(_ channel: BLEChannelID, data: Data) async {
+        guard let conn = connections[channel] else { return }
+        try? await conn.send(data)
+    }
+
+    func closeChannel(_ channel: BLEChannelID) async {
+        guard let conn = connections[channel] else { return }
+        reducerClosed.insert(channel)   // suppress the channelClosed echo
+        await conn.close()
+    }
 
     func stop() async {
         teardown()

@@ -334,6 +334,68 @@ func fakeConnection(peerID: UUID, psm: UInt16, inbound: [Data] = [],
     await adapter.stop()
 }
 
+@Test @MainActor func inboundConnectionEmitsChannelOpenedInboundAndData() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(7)
+    let conn = fakeConnection(peerID: p.id, psm: 0x0081, inbound: [Data([0x42])])
+    stubs.inboundL2CAP.yield(conn)
+    let collected = await collect(events, count: 3)  // opened, data, closed
+    guard collected.count >= 2,
+          case let .channelOpened(_, hp, dir) = collected[0],
+          case let .channelData(_, data) = collected[1]
+    else { Issue.record("unexpected: \(collected)"); await adapter.stop(); return }
+    #expect(hp == p)
+    #expect(dir == .inbound)
+    #expect(data == Data([0x42]))
+    await adapter.stop()
+}
+
+@Test @MainActor func sendForwardsToTheChannelConnection() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(8)
+    let sent = LockIsolated<[Data]>([])
+    // Keep the connection open (don't finish incoming) so the channel stays registered.
+    let conn = fakeConnection(peerID: p.id, psm: 0x0081, inbound: [], sent: sent, finishAfterInbound: false)
+    stubs.openResult.setValue(conn)
+    await adapter.openChannel(p, psm: 0x0081)
+    let opened = await collect(events, count: 1)
+    guard case let .channelOpened(cid, _, _)? = opened.first else {
+        Issue.record("no channelOpened"); await adapter.stop(); return
+    }
+    await adapter.send(cid, data: Data([0x01, 0x02]))
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    #expect(sent.value == [Data([0x01, 0x02])])
+    await adapter.stop()
+}
+
+@Test @MainActor func closeChannelIsSilentNoChannelClosedEcho() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(9)
+    let closed = LockIsolated<Bool>(false)
+    let conn = fakeConnection(peerID: p.id, psm: 0x0081, inbound: [], closed: closed, finishAfterInbound: false)
+    stubs.openResult.setValue(conn)
+    await adapter.openChannel(p, psm: 0x0081)
+    let opened = await collect(events, count: 1)
+    guard case let .channelOpened(cid, _, _)? = opened.first else {
+        Issue.record("no channelOpened"); await adapter.stop(); return
+    }
+    await adapter.closeChannel(cid)
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    #expect(closed.value == true)  // underlying connection closed
+    // No channelClosed event should have been emitted for a reducer-initiated close.
+    // Drain briefly: the only remaining event before stop() must NOT be channelClosed(cid).
+    await adapter.stop()
+    let tail = await collect(events, count: 5)
+    #expect(!tail.contains { if case .channelClosed(cid, _) = $0 { return true }; return false })
+}
+
+@Test @MainActor func sendToUnknownChannelIsDropped() async {
+    let (adapter, _, _) = await onlineAdapter()
+    // No such channel — must not crash.
+    await adapter.send(BLEChannelID(id: UUID()), data: Data([0x01]))
+    await adapter.stop()
+}
+
 @Test @MainActor func readyWaitsForAdvertisingNotJustScanning() async {
     let stubs = makeStubs()
     let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
