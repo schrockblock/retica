@@ -201,3 +201,26 @@ func collect(_ stream: AsyncStream<BLEDriverEvent>, count: Int) async -> [BLEDri
     #expect(collected == [.unavailable(reason: "central poweredOff")])
     await adapter.stop()
 }
+
+@Test @MainActor func readyWaitsForAdvertisingNotJustScanning() async {
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
+    let events = adapter.start(BLEDriverConfig(version: 2, pairingMode: .open))
+    // Drain the whole session with ONE iterator (the stream is single-consumer),
+    // recording every event with the order it arrived.
+    let recorded = LockIsolated<[BLEDriverEvent]>([])
+    let drain = Task {
+        for await e in events { recorded.withValue { $0.append(e) } }
+    }
+    // Only the central powers on: scanning goes up, advertising stays down.
+    // .ready MUST NOT fire yet (the GATT directory isn't published).
+    stubs.centralState.yield(.poweredOn)
+    try? await Task.sleep(nanoseconds: 400_000_000)
+    #expect(recorded.value == [])           // correct: nothing; mutation 2: [.ready]
+    // Now the peripheral powers on → advertising up → .ready fires exactly once.
+    stubs.peripheralState.yield(.poweredOn)
+    try? await Task.sleep(nanoseconds: 400_000_000)
+    #expect(recorded.value == [.ready])
+    await adapter.stop()
+    drain.cancel()
+}
