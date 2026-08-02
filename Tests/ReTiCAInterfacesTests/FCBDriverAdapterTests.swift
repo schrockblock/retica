@@ -202,6 +202,138 @@ func collect(_ stream: AsyncStream<BLEDriverEvent>, count: Int) async -> [BLEDri
     await adapter.stop()
 }
 
+/// Brings the adapter online, drains the .ready event, and returns (adapter, stubs, events).
+@MainActor
+func onlineAdapter() async -> (FCBDriverAdapter, AdapterStubs, AsyncStream<BLEDriverEvent>) {
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
+    let events = adapter.start(BLEDriverConfig(version: 2, pairingMode: .open))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    _ = await collect(events, count: 1)  // consume .ready so tests see only their events
+    return (adapter, stubs, events)
+}
+
+func peer(_ b: UInt8) -> BLEPeerHandle { BLEPeerHandle(id: UUID(uuidString: "0000000\(b)-0000-0000-0000-000000000000")!) }
+
+/// A minimal in-memory L2CAPConnection for tests: `incoming` replays scripted
+/// chunks then finishes; `send`/`close` record.
+@MainActor
+func fakeConnection(peerID: UUID, psm: UInt16, inbound: [Data] = [],
+                    sent: LockIsolated<[Data]>? = nil, closed: LockIsolated<Bool>? = nil,
+                    finishAfterInbound: Bool = true) -> L2CAPConnection {
+    L2CAPConnection(
+        id: UUID(), peerID: peerID, psm: psm,
+        incoming: {
+            AsyncStream { cont in
+                for c in inbound { cont.yield(c) }
+                if finishAfterInbound { cont.finish() }
+            }
+        },
+        send: { d in sent?.withValue { $0.append(d) } },
+        close: { closed?.setValue(true) }
+    )
+}
+
+@Test @MainActor func discoveryDedupsAndEmitsPeerDiscovered() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p1 = peer(1)
+    let p2 = peer(7)
+    stubs.scanCont.yield(DiscoveredPeripheral(
+        peripheral: Peripheral(id: p1.id, name: nil, state: .disconnected),
+        advertisementData: AdvertisementData(serviceUUIDs: [serviceUUID]), rssi: -50))
+    stubs.scanCont.yield(DiscoveredPeripheral(  // duplicate — must be ignored
+        peripheral: Peripheral(id: p1.id, name: nil, state: .disconnected),
+        advertisementData: AdvertisementData(serviceUUIDs: [serviceUUID]), rssi: -51))
+    stubs.scanCont.yield(DiscoveredPeripheral(  // distinct peer as sentinel
+        peripheral: Peripheral(id: p2.id, name: nil, state: .disconnected),
+        advertisementData: AdvertisementData(serviceUUIDs: [serviceUUID]), rssi: -52))
+    // With dedup: [p1, p2]. Without dedup: [p1, p1] (p2 never reached in count: 2).
+    let collected = await collect(events, count: 2)
+    #expect(collected == [.peerDiscovered(p1), .peerDiscovered(p2)])
+    await adapter.stop()
+}
+
+@Test @MainActor func readDirectoryHappyPathEmitsDirectoryRead() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(2)
+    stubs.directoryResult.setValue((version: 2, psm: 0x0192))
+    await adapter.readDirectory(p)
+    let collected = await collect(events, count: 1)
+    #expect(collected == [.directoryRead(p, version: 2, psm: 0x0192)])
+    #expect(await stubs.calls.connected == [p.id])
+    #expect(await stubs.calls.readValues.map(\.1) == [versionCharUUID, psmCharUUID])
+    await adapter.stop()
+}
+
+@Test @MainActor func readDirectoryFailureEmitsDirectoryFailedAndForgets() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(3)
+    stubs.directoryResult.setValue(nil)  // readValue throws
+    await adapter.readDirectory(p)
+    let collected = await collect(events, count: 1)
+    guard case .directoryFailed(p, _)? = collected.first else {
+        Issue.record("expected directoryFailed, got \(collected)"); await adapter.stop(); return
+    }
+    // Forgotten: a re-discovery re-emits peerDiscovered.
+    stubs.scanCont.yield(DiscoveredPeripheral(
+        peripheral: Peripheral(id: p.id, name: nil, state: .disconnected),
+        advertisementData: AdvertisementData(serviceUUIDs: [serviceUUID]), rssi: -50))
+    let after = await collect(events, count: 1)
+    #expect(after == [.peerDiscovered(p)])
+    await adapter.stop()
+}
+
+@Test @MainActor func openChannelSuccessEmitsChannelOpenedOutboundThenDataAndClose() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(4)
+    let conn = fakeConnection(peerID: p.id, psm: 0x0081, inbound: [Data([0xAB, 0xCD])])
+    stubs.openResult.setValue(conn)
+    await adapter.openChannel(p, psm: 0x0081)
+    // Expect: channelOpened(.outbound), channelData, channelClosed (stream finished).
+    let collected = await collect(events, count: 3)
+    guard collected.count == 3,
+          case let .channelOpened(cid, hp, dir) = collected[0],
+          case let .channelData(cid2, data) = collected[1],
+          case let .channelClosed(cid3, _) = collected[2]
+    else { Issue.record("unexpected: \(collected)"); await adapter.stop(); return }
+    #expect(hp == p)
+    #expect(dir == .outbound)
+    #expect(data == Data([0xAB, 0xCD]))
+    #expect(cid == cid2 && cid2 == cid3)
+    await adapter.stop()
+}
+
+@Test @MainActor func openChannelFailureEmitsChannelFailedAndForgets() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(5)
+    stubs.openResult.setValue(nil)  // throws l2capNotSupported
+    await adapter.openChannel(p, psm: 0x0081)
+    let collected = await collect(events, count: 1)
+    guard case .channelFailed(p, _)? = collected.first else {
+        Issue.record("expected channelFailed, got \(collected)"); await adapter.stop(); return
+    }
+    await adapter.stop()
+}
+
+@Test @MainActor func disconnectEventForgetsPeer() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(6)
+    stubs.scanCont.yield(DiscoveredPeripheral(
+        peripheral: Peripheral(id: p.id, name: nil, state: .disconnected),
+        advertisementData: AdvertisementData(serviceUUIDs: [serviceUUID]), rssi: -50))
+    _ = await collect(events, count: 1)  // consume the first peerDiscovered
+    stubs.centralEvents.yield(.didDisconnect(Peripheral(id: p.id, name: nil, state: .disconnected), nil))
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    // Re-discovery now re-emits (forgotten on disconnect).
+    stubs.scanCont.yield(DiscoveredPeripheral(
+        peripheral: Peripheral(id: p.id, name: nil, state: .disconnected),
+        advertisementData: AdvertisementData(serviceUUIDs: [serviceUUID]), rssi: -50))
+    let after = await collect(events, count: 1)
+    #expect(after == [.peerDiscovered(p)])
+    await adapter.stop()
+}
+
 @Test @MainActor func readyWaitsForAdvertisingNotJustScanning() async {
     let stubs = makeStubs()
     let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)

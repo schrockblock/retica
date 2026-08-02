@@ -165,14 +165,91 @@ actor FCBDriverAdapter {
         })
     }
 
-    // Filled in Tasks 3–4 (bodies empty here so startup compiles & tests).
-    private func subscribeCentralEvents() {}
-    private func subscribeInboundL2CAP() {}
-    private func handleDiscovered(_ discovered: DiscoveredPeripheral) async {}
+    private func subscribeCentralEvents() {
+        tasks.append(Task { [central] in
+            for await event in central.events() {
+                await self.handleCentralEvent(event)
+            }
+        })
+    }
 
-    // Command stubs — Tasks 3–4 implement.
-    func readDirectory(_ peer: BLEPeerHandle) async {}
-    func openChannel(_ peer: BLEPeerHandle, psm: UInt16) async {}
+    private func handleCentralEvent(_ event: CentralEvent) async {
+        if case let .didDisconnect(peripheral, _) = event {
+            forget(peripheral.id)
+        }
+    }
+
+    private func handleDiscovered(_ discovered: DiscoveredPeripheral) async {
+        let id = discovered.peripheral.id
+        guard !seenPeers.contains(id) else { return }
+        seenPeers.insert(id)
+        continuation?.yield(.peerDiscovered(BLEPeerHandle(id: id)))
+    }
+
+    private func forget(_ id: UUID) { seenPeers.remove(id) }
+
+    /// Wraps a live L2CAPConnection: mints a channel ID, emits channelOpened,
+    /// and pumps incoming() → channelData, with channelClosed on stream end
+    /// unless the reducer closed it (silent close, no echo).
+    private func register(_ conn: L2CAPConnection, direction: BLEChannelDirection) {
+        let channelID = BLEChannelID(id: UUID())
+        connections[channelID] = conn
+        continuation?.yield(.channelOpened(channelID, BLEPeerHandle(id: conn.peerID), direction: direction))
+        tasks.append(Task { [conn] in
+            for await chunk in conn.incoming() {
+                await self.emitChannelData(channelID, chunk)
+            }
+            await self.channelDidClose(channelID)
+        })
+    }
+
+    private func emitChannelData(_ id: BLEChannelID, _ data: Data) {
+        guard connections[id] != nil else { return }
+        continuation?.yield(.channelData(id, data))
+    }
+
+    private func channelDidClose(_ id: BLEChannelID) {
+        guard connections.removeValue(forKey: id) != nil else { return }
+        let reducerInitiated = reducerClosed.remove(id) != nil
+        if !reducerInitiated {
+            continuation?.yield(.channelClosed(id, reason: nil))
+        }
+    }
+
+    func readDirectory(_ peer: BLEPeerHandle) async {
+        do {
+            _ = try await central.connect(peer.id, nil)
+            _ = try await central.discoverServices(peer.id, [rbtpServiceUUID])
+            _ = try await central.discoverCharacteristics(peer.id, rbtpServiceUUID, [rbtpVersionCharUUID, rbtpPSMCharUUID])
+            let versionData = try await central.readValue(peer.id, rbtpVersionCharUUID)
+            let psmData = try await central.readValue(peer.id, rbtpPSMCharUUID)
+            guard versionData.count >= 1, psmData.count >= 2 else {
+                forget(peer.id)
+                continuation?.yield(.directoryFailed(peer, reason: "short directory read"))
+                return
+            }
+            let version = versionData[versionData.startIndex]
+            let lo = UInt16(psmData[psmData.startIndex])
+            let hi = UInt16(psmData[psmData.startIndex + 1])
+            continuation?.yield(.directoryRead(peer, version: version, psm: lo | (hi << 8)))
+        } catch {
+            forget(peer.id)
+            continuation?.yield(.directoryFailed(peer, reason: "\(error)"))
+        }
+    }
+
+    func openChannel(_ peer: BLEPeerHandle, psm: UInt16) async {
+        do {
+            let conn = try await central.openL2CAPChannel(peer.id, psm)
+            register(conn, direction: .outbound)
+        } catch {
+            forget(peer.id)
+            continuation?.yield(.channelFailed(peer, reason: "\(error)"))
+        }
+    }
+
+    // Command stubs — Task 4 implements.
+    private func subscribeInboundL2CAP() {}
     func send(_ channel: BLEChannelID, data: Data) async {}
     func closeChannel(_ channel: BLEChannelID) async {}
 
