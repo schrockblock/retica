@@ -15,15 +15,17 @@ public func bleInterfaceID(_ token: Data) -> InterfaceID {
     return InterfaceID("ble:" + hex)
 }
 
-/// Composes the FCB-backed `BLEInterface` with `Transport`, mapping each connected BLE peer
-/// (16-byte session token) to its own Transport `InterfaceID`. Packet plane only: announces,
-/// path learning, opportunistic send/receive. Links/resources/requests are follow-ons.
+/// Composes the FCB-backed `BLEInterface` with `Transport` and the interface-agnostic
+/// `LinkPlane`, mapping each connected BLE peer (16-byte session token) to its own Transport
+/// `InterfaceID`. Provides packet plane (announces, path learning, opportunistic send/receive)
+/// and link plane (links/resources/requests) with per-peer transmit routing.
 @Reducer
 public struct BLEEndpoint {
     @ObservableState
     public struct State: Equatable {
         public var ble: BLEInterface.State
         public var transport: Transport.State
+        public var linkPlane: LinkPlane.State = LinkPlane.State()
         var peerInterfaces: [InterfaceID: Data] = [:]   // InterfaceID → 16-byte peer token
 
         public init(maxPeers: Int = BLEInterface.defaultMaxPeers,
@@ -36,6 +38,7 @@ public struct BLEEndpoint {
     public enum Action: Equatable {
         case ble(BLEInterface.Action)
         case transport(Transport.Action)
+        case linkPlane(LinkPlane.Action)
 
         case start
         case stop
@@ -43,6 +46,17 @@ public struct BLEEndpoint {
         case announce(destinationHash: Data, appData: Data?)
         case send(destinationHash: Data, plaintext: Data)
         case enableRelay(Identity)
+        case requestPath(destinationHash: Data)
+        case openLink(destinationHash: Data)
+        case sendOverLink(linkID: Data, data: Data)
+        case sendResourceOverLink(linkID: Data, data: Data)
+        case identifyOverLink(linkID: Data, identity: Identity)
+        case sendRequestOverLink(linkID: Data, path: String, data: Data)
+        case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
+        case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
+        case closeLink(linkID: Data)
+        case registerRequestHandler(path: String, policy: RequestPolicy)
+        case deregisterRequestHandler(path: String)
 
         case delegate(Delegate)
         @CasePathable
@@ -52,6 +66,19 @@ public struct BLEEndpoint {
             case sendFailed(destinationHash: Data, reason: Transport.SendFailure)
             case peerOnline(Data)
             case peerOffline(Data)
+            case linkEstablished(linkID: Data, destinationHash: Data)
+            case linkDataReceived(linkID: Data, data: Data)
+            case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
+            case linkFailed(destinationHash: Data)
+            case resourceReceived(linkID: Data, data: Data)
+            case resourceConcluded(linkID: Data, resourceHash: Data)
+            case resourceFailed(linkID: Data, resourceHash: Data)
+            case linkIdentified(linkID: Data, remoteIdentity: Identity)
+            case requestReceived(linkID: Data, requestID: Data, pathHash: Data, data: Data)
+            case responseReceived(linkID: Data, requestID: Data, data: Data)
+            case requestFailed(linkID: Data, requestID: Data)
+            case packetDelivered(token: Data)
+            case packetDeliveryFailed(token: Data)
         }
     }
 
@@ -60,6 +87,7 @@ public struct BLEEndpoint {
     public var body: some ReducerOf<Self> {
         Scope(state: \.ble, action: \.ble) { BLEInterface() }
         Scope(state: \.transport, action: \.transport) { Transport() }
+        Scope(state: \.linkPlane, action: \.linkPlane) { LinkPlane() }
         Reduce { state, action in
             switch action {
             case .start:                            return .send(.ble(.start))
@@ -68,6 +96,9 @@ public struct BLEEndpoint {
             case let .announce(h, a):               return .send(.transport(.announce(destinationHash: h, appData: a)))
             case let .send(h, p):                   return .send(.transport(.send(destinationHash: h, plaintext: p)))
             case let .enableRelay(identity):        return .send(.transport(.setTransportIdentity(identity)))
+
+            case let .requestPath(destinationHash):
+                return .send(.transport(.requestPath(destinationHash: destinationHash)))
 
             // --- BLE peer lifecycle → Transport interface set (+ maintenance) ---
             case let .ble(.delegate(.peerOnline(token))):
@@ -106,7 +137,82 @@ public struct BLEEndpoint {
             case let .transport(.delegate(.sendFailed(h, r))):
                 return .send(.delegate(.sendFailed(destinationHash: h, reason: r)))
 
-            case .ble, .transport, .delegate:
+            // --- Transport → LinkPlane (per-peer interface) ---
+            case let .transport(.delegate(.linkPacket(linkID, data))):
+                return .send(.linkPlane(.routeLinkPacket(linkID: linkID, data: data)))
+
+            case let .transport(.delegate(.linkRequest(destHash, arrivalInterface, data))):
+                guard let owner = state.transport.localDestinations[destHash]?.identity,
+                      owner.privateKey != nil
+                else { return .none }
+                // Reply on the peer the request arrived from.
+                return .send(.linkPlane(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                                           interfaceID: arrivalInterface, data: data)))
+
+            // --- Public link actions → LinkPlane ---
+            case let .openLink(destinationHash):
+                guard let learned = state.transport.learned[destinationHash] else {
+                    return .send(.delegate(.linkFailed(destinationHash: destinationHash)))
+                }
+                let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
+                // The learned entry records which BLE peer's interface the destination was heard on.
+                return .send(.linkPlane(.openLink(initiatorTo: learned.identity,
+                                                  destinationHash: destinationHash,
+                                                  interfaceID: learned.interfaceID,
+                                                  relayNextHop: relayNextHop)))
+
+            case let .sendOverLink(linkID, data):
+                return .send(.linkPlane(.sendOverLink(linkID: linkID, data: data)))
+            case let .sendResourceOverLink(linkID, data):
+                return .send(.linkPlane(.sendResourceOverLink(linkID: linkID, data: data)))
+            case let .identifyOverLink(linkID, identity):
+                return .send(.linkPlane(.identifyOverLink(linkID: linkID, identity: identity)))
+            case let .sendRequestOverLink(linkID, path, data):
+                return .send(.linkPlane(.sendRequestOverLink(linkID: linkID, path: path, data: data)))
+            case let .sendResponseOverLink(linkID, requestID, data):
+                return .send(.linkPlane(.sendResponseOverLink(linkID: linkID, requestID: requestID, data: data)))
+            case let .sendWithReceiptOverLink(linkID, data, token):
+                return .send(.linkPlane(.sendWithReceiptOverLink(linkID: linkID, data: data, token: token)))
+            case let .closeLink(linkID):
+                return .send(.linkPlane(.closeLink(linkID: linkID)))
+            case let .registerRequestHandler(path, policy):
+                return .send(.linkPlane(.registerRequestHandler(path: path, policy: policy)))
+            case let .deregisterRequestHandler(path):
+                return .send(.linkPlane(.deregisterRequestHandler(path: path)))
+
+            // --- LinkPlane delegates: route transmit per-peer, forward the rest ---
+            case let .linkPlane(.delegate(.transmit(txID, raw))):
+                guard let peer = state.peerInterfaces[txID] else { return .none }
+                return .send(.ble(.send(peer: peer, packet: raw)))
+
+            case let .linkPlane(.delegate(.linkEstablished(linkID, destHash))):
+                return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))
+            case let .linkPlane(.delegate(.linkDataReceived(linkID, data))):
+                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data)))
+            case let .linkPlane(.delegate(.linkClosed(linkID, reason))):
+                return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
+            case let .linkPlane(.delegate(.linkFailed(destHash))):
+                return .send(.delegate(.linkFailed(destinationHash: destHash)))
+            case let .linkPlane(.delegate(.resourceReceived(linkID, data))):
+                return .send(.delegate(.resourceReceived(linkID: linkID, data: data)))
+            case let .linkPlane(.delegate(.resourceConcluded(linkID, hash))):
+                return .send(.delegate(.resourceConcluded(linkID: linkID, resourceHash: hash)))
+            case let .linkPlane(.delegate(.resourceFailed(linkID, hash))):
+                return .send(.delegate(.resourceFailed(linkID: linkID, resourceHash: hash)))
+            case let .linkPlane(.delegate(.linkIdentified(linkID, identity))):
+                return .send(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: identity)))
+            case let .linkPlane(.delegate(.requestReceived(linkID, rid, ph, data))):
+                return .send(.delegate(.requestReceived(linkID: linkID, requestID: rid, pathHash: ph, data: data)))
+            case let .linkPlane(.delegate(.responseReceived(linkID, rid, data))):
+                return .send(.delegate(.responseReceived(linkID: linkID, requestID: rid, data: data)))
+            case let .linkPlane(.delegate(.requestFailed(linkID, rid))):
+                return .send(.delegate(.requestFailed(linkID: linkID, requestID: rid)))
+            case let .linkPlane(.delegate(.packetDelivered(token))):
+                return .send(.delegate(.packetDelivered(token: token)))
+            case let .linkPlane(.delegate(.packetDeliveryFailed(token))):
+                return .send(.delegate(.packetDeliveryFailed(token: token)))
+
+            case .ble, .transport, .delegate, .linkPlane:
                 return .none
             }
         }
