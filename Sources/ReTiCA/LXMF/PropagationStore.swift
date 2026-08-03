@@ -53,9 +53,7 @@ public struct PropagationStore: Equatable {
                 // minStampCost == 0: accept without stamp validation (backward-compat / test helper path).
                 // Strip the trailing stamp if present (> destHash(16) + stamp(32) bytes), otherwise use as-is.
                 guard let dest = LXMFPropagation.destinationHash(lxmfData: lxmfData) else { continue }
-                let lxmfCore = lxmfData.count > LXMessage.destinationLength + LXStamper.stampSize
-                    ? Data(lxmfData.dropLast(LXStamper.stampSize))
-                    : lxmfData
+                let lxmfCore = LXMFPropagation.strippedCore(lxmfData: lxmfData)
                 tid = LXMFPropagation.transientId(lxmfData: lxmfCore)
                 destData = dest
             }

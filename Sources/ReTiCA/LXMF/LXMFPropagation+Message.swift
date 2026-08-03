@@ -31,7 +31,7 @@ extension LXMFPropagation {
         let raw = Data(lxmfData.dropFirst(LXMessage.destinationLength))
         // Try stripping the trailing stamp first (stamped entries, new format).
         if raw.count > LXStamper.stampSize {
-            let stripped = Data(raw.dropLast(LXStamper.stampSize))
+            let stripped = Data(strippedCore(lxmfData: lxmfData).dropFirst(LXMessage.destinationLength))
             if let tail = recipientIdentity.decrypt(stripped) {
                 return destHash + tail
             }

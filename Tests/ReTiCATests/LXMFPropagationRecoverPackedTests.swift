@@ -26,6 +26,15 @@ import Foundation
     #expect(LXMFPropagation.recoverPacked(lxmfData: entry, recipientIdentity: Identity()) == nil)  // wrong key
 }
 
+@Test func strippedCoreDropsStampWhenPresent() {
+    let core = Data(repeating: 0xAB, count: 200)          // a plausible stampless entry
+    let stamped = core + Data(repeating: 0xCD, count: 32)  // + 32-byte stamp
+    #expect(LXMFPropagation.strippedCore(lxmfData: stamped) == core)
+    // A stampless entry recovered via the authenticated path is unchanged by callers; the helper's
+    // contract is "drop the trailing 32 bytes if length > destLen+stampSize", matching current sites.
+    #expect(LXMFPropagation.strippedCore(lxmfData: core).count == core.count - 32)  // size-based drop
+}
+
 @Test func packAttachesValidPnStamp() {
     let sender = Identity()
     let recipient = Identity()

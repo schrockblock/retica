@@ -32,6 +32,18 @@ public enum LXMFPropagation {
     /// Default propagation stamp cost for client→PN offers (RNS PROPAGATION_COST = 16).
     public static let defaultPropagationStampCost = 16
 
+    /// Strip the trailing 32-byte PN stamp from a raw `lxmf_data` entry when the entry is long enough
+    /// to contain one (i.e. `count > destinationLength + stampSize`), and return the stampless core.
+    /// When the entry is at or below the threshold the bytes are returned unchanged.
+    ///
+    /// This is a pure size-based heuristic (matching the three existing call sites) used to recover the
+    /// canonical stampless entry before computing `transient_id` or decrypting the tail. It does **not**
+    /// validate the stamp — use `LXStamper.validatePnStamp` when cryptographic validation is required.
+    public static func strippedCore(lxmfData: Data) -> Data {
+        guard lxmfData.count > LXMessage.destinationLength + LXStamper.stampSize else { return lxmfData }
+        return Data(lxmfData.dropLast(LXStamper.stampSize))
+    }
+
     /// Parse a propagation-node container back into its timestamp and entries; nil if malformed.
     public static func parseContainer(_ data: Data) -> (timestamp: Double, entries: [Data])? {
         guard case let .array(top)? = MsgPack.decodeValue(data), top.count == 2,

@@ -143,9 +143,7 @@ public struct LXMFNode {
                     for blob in blobs {
                         // Strip the trailing stamp (32 bytes) if present to recover the canonical transient_id
                         // (full_hash of the stampless lxmf_data), matching how PropagationStore deduplicates.
-                        let blobCore = blob.count > LXMessage.destinationLength + LXStamper.stampSize
-                            ? Data(blob.dropLast(LXStamper.stampSize))
-                            : blob
+                        let blobCore = LXMFPropagation.strippedCore(lxmfData: blob)
                         tids.append(LXMFPropagation.transientId(lxmfData: blobCore))
                         if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity) {
                             effects.append(.send(.router(.received(method: .direct, destinationHash: Data(), data: packed))))
