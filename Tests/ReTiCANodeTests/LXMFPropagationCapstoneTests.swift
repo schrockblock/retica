@@ -124,14 +124,14 @@ import ComposableArchitecture
     eventsPN.yield(.data(sentS.value.last!))
     await pn.receive(pnSend)                                  // LRPROOF out
 
-    // Step 2: LRPROOF → S; S sends LRRTT. The propagation container is SMALL (<= Link.mdu = 431 bytes)
-    // so S uses the packet route (sendWithReceiptOverLink) rather than Resource. The data packet fires
-    // in the same chain as LRRTT; capture both by index.
+    // Step 2: LRPROOF → S; S goes active and the router immediately drains the propagation queue. The SMALL
+    // container (<= Link.mdu = 431) takes the packet route (sendWithReceiptOverLink) rather than Resource,
+    // so the link data packet co-fires with LRRTT in this chain; capture both by index.
     let afterLrproofS = sentS.value.count
     eventsS.yield(.data(sentPN.value.last!))
     await s.receive(sSend)                                    // LRRTT out
     let lrrttBytesS = sentS.value[afterLrproofS]
-    let propPacketBytes = sentS.value[afterLrproofS + 1]     // link data packet (propagation container)
+    let propPacketBytes = sentS.value[afterLrproofS + 1]     // link data packet (receipt-tracked container)
 
     // LRRTT → PN; PN becomes active (linkEstablished both sides).
     eventsPN.yield(.data(lrrttBytesS))
@@ -139,12 +139,11 @@ import ComposableArchitecture
     await pn.receive { if case .endpoint(.delegate(.linkEstablished)) = $0 { return true }; return false }
     await s.receive(sSend)                                    // link data packet (already queued in S's store)
 
-    // PN receives the link data packet → linkDataReceived → ingestContainer → messagesStored.
-    // PN also emits a DATA_PROOF (receipt) which S needs to receive for propagationAccepted.
+    // PN genuinely receives the link data packet → linkDataReceived → ingestContainer → messagesStored.
+    // (ReTiCA is a non-proving client and the PN does NOT auto-prove inbound link packets — matching RNS's
+    // default prove-none strategy — so no DATA_PROOF is emitted by the PN here.)
     let gotTid = LockIsolated<Data?>(nil)
     eventsPN.yield(.data(propPacketBytes))
-    await pn.receive(pnSend)                                  // DATA_PROOF out (receipt for the packet)
-    let dataPrfBytes = sentPN.value.last!                     // capture DATA_PROOF before messagesStored
     await pn.receive { action in
         if case let .delegate(.messagesStored(tids)) = action {
             gotTid.setValue(tids.first)
@@ -154,8 +153,20 @@ import ComposableArchitecture
     }
     #expect(gotTid.value != nil)                              // PN has ingested the container
 
-    // Bridge DATA_PROOF back to S → packetDelivered(token=message.hash) → delivered → propagationAccepted.
-    eventsS.yield(.data(dataPrfBytes))
+    // Drive the genuine ack by injecting a synthetic signed DATA_PROOF into S's LinkSession (stands in for
+    // a proving PN). Non-circular: the proof carries a REAL Ed25519 signature by pnIdentity (S's link peer)
+    // over the REAL hash of the packet S actually sent. Mirrors LinkSessionReceiptTests.
+    // propPacketBytes is HDLC-framed at the interface level; deframe to recover the raw packet, then hash it.
+    let sLinkID = s.state.endpoint.links[0].linkID
+    var deframer = HDLCDeframer()
+    let rawPropPacket = deframer.ingest(propPacketBytes).first!
+    let sentPacketHash = Packet(raw: rawPropPacket)!.packetHash
+    let proofSig = pnIdentity.sign(sentPacketHash)
+    let proofPacket = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                             destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                             destinationHash: sLinkID, transportId: nil, payload: sentPacketHash + proofSig)
+    // Inbound bytes are HDLC-framed at the interface; frame the synthetic proof before feeding it in.
+    eventsS.yield(.data(HDLC.frame(try! proofPacket.packed())))  // DATA_PROOF → S: packetDelivered → delivered → propagationAccepted
     await s.receive { if case .delegate(.propagationAccepted) = $0 { return true }; return false }
 
     // ─────────────────────────────────────────────────────────────────────────────
