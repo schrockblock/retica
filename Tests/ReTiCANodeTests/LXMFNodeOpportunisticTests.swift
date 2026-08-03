@@ -38,15 +38,15 @@ import ComposableArchitecture
     let (a, eventsA) = make("a", aIdentity, sentA)
     let (b, eventsB) = make("b", bIdentity, sentB)
 
-    await a.send(.endpoint(.connect)); eventsA.yield(.connected)
-    await b.send(.endpoint(.connect)); eventsB.yield(.connected)
+    await a.send(.endpoint(.start)); eventsA.yield(.connected)
+    await b.send(.endpoint(.start)); eventsB.yield(.connected)
 
     // Both register + announce their lxmf.delivery destination; bridge announces so each learns the other
     // (path + identity — B needs A's identity to validate A's signature).
     await a.send(.registerDelivery)
-    await a.receive { if case .endpoint(.interface(.send)) = $0 { return true }; return false }
+    await a.receive { if case .endpoint(.tcp(.interface(.send))) = $0 { return true }; return false }
     await b.send(.registerDelivery)
-    await b.receive { if case .endpoint(.interface(.send)) = $0 { return true }; return false }
+    await b.receive { if case .endpoint(.tcp(.interface(.send))) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!))                 // B's announce → A learns B
     await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))                 // A's announce → B learns A
@@ -54,7 +54,7 @@ import ComposableArchitecture
 
     // A sends opportunistically to B; bridge the DATA packet to B.
     await a.send(.send(destinationHash: bDeliveryHash, title: Data("hi".utf8), content: Data("hello node".utf8), method: .opportunistic))
-    await a.receive { if case .endpoint(.interface(.send)) = $0 { return true }; return false }
+    await a.receive { if case .endpoint(.tcp(.interface(.send))) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
 
     // B's LXMFNode surfaces the reconstructed + validated message.
@@ -80,5 +80,5 @@ import ComposableArchitecture
     #expect(gotSrcHash.value == LXMessage.deliveryHash(identityHash: aIdentity.hash))
     #expect(gotValidated.value == true)                     // B learned A's identity → signature validates
 
-    await a.send(.endpoint(.disconnect)); await b.send(.endpoint(.disconnect))
+    await a.send(.endpoint(.stop)); await b.send(.endpoint(.stop))
 }

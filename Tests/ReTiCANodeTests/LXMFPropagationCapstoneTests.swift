@@ -58,8 +58,8 @@ import ComposableArchitecture
     }
 
     // Send-frame predicates.
-    func sSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
-    func rSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
+    func sSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcp(.interface(.send))) = act { return true }; return false }
+    func rSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcp(.interface(.send))) = act { return true }; return false }
     func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
 
     let sentS  = LockIsolated<[Data]>([])
@@ -71,8 +71,8 @@ import ComposableArchitecture
     let (pn, eventsPN) = makePN("pn", pnIdentity, sentPN)
 
     // Connect all three.
-    await s.send(.endpoint(.connect));  eventsS.yield(.connected)
-    await r.send(.endpoint(.connect));  eventsR.yield(.connected)
+    await s.send(.endpoint(.start));  eventsS.yield(.connected)
+    await r.send(.endpoint(.start));  eventsR.yield(.connected)
     await pn.send(.endpoint(.connect)); eventsPN.yield(.connected)
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -244,7 +244,7 @@ import ComposableArchitecture
     #expect(gotValidated.value == true)                          // R learned S → signature validates
 
     // Disconnect all.
-    await s.send(.endpoint(.disconnect))
-    await r.send(.endpoint(.disconnect))
+    await s.send(.endpoint(.stop))
+    await r.send(.endpoint(.stop))
     await pn.send(.endpoint(.disconnect))
 }

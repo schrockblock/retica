@@ -54,7 +54,7 @@ import ComposableArchitecture
         return (store, events.continuation)
     }
 
-    func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
+    func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcp(.interface(.send))) = act { return true }; return false }
     func epSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
 
     let sentA = LockIsolated<[Data]>([]); let sentR = LockIsolated<[Data]>([]); let sentPN = LockIsolated<[Data]>([])
@@ -62,7 +62,7 @@ import ComposableArchitecture
     let (r, eventsR) = makeEndpoint("r", sentR)
     let (pn, eventsPN) = makeEndpoint("pn", sentPN)
 
-    await a.send(.endpoint(.connect)); eventsA.yield(.connected)
+    await a.send(.endpoint(.start)); eventsA.yield(.connected)
     await r.send(.connect); eventsR.yield(.connected)
     await pn.send(.connect); eventsPN.yield(.connected)
 
@@ -157,5 +157,5 @@ import ComposableArchitecture
     }
     #expect(gotAccepted.value == sentHash)
 
-    await a.send(.endpoint(.disconnect)); await r.send(.disconnect); await pn.send(.disconnect)
+    await a.send(.endpoint(.stop)); await r.send(.disconnect); await pn.send(.disconnect)
 }

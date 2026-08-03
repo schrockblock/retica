@@ -4,29 +4,41 @@ import ReTiCA
 import ReTiCATransport
 
 /// The first production composition connecting the decoupled `LXMFRouter` to real transport (LXMF-Node,
-/// opportunistic 1:1). Composes `TCPEndpoint` + `LXMFRouter` and translates their delegates/actions: the app
-/// calls `.registerDelivery` then `.send(...)`, and receives `.delegate(.messageReceived(...))`. Direct-
-/// over-link, path requests, delivery confirmation, and propagation wiring are follow-ons.
+/// opportunistic 1:1). Composes `TransportEndpoint` (TCP or BLE) + `LXMFRouter` and translates their
+/// delegates/actions: the app calls `.registerDelivery` then `.send(...)`, and receives
+/// `.delegate(.messageReceived(...))`. Direct-over-link, path requests, delivery confirmation, and
+/// propagation wiring are follow-ons.
 @Reducer
 public struct LXMFNode {
     public enum SyncPhase: Equatable { case awaitingList, awaitingMessages }
 
     @ObservableState
     public struct State: Equatable {
-        public var endpoint: TCPEndpoint.State
+        public var endpoint: TransportEndpoint.State
         public var router: LXMFRouter.State
         public var identity: Identity
         public var directLinks: [Data: Data] = [:]   // destinationHash → linkID (close/linkClosed correlation)
         public var syncPhase: [Data: SyncPhase] = [:]   // linkID → current download phase (one sync/link)
-        public init(identity: Identity, endpoint: TCPEndpoint.State) {
+
+        public init(identity: Identity, endpoint: TransportEndpoint.State) {
             self.identity = identity
             self.endpoint = endpoint
             self.router = LXMFRouter.State()
         }
+
+        /// Convenience: run this node over TCP.
+        public init(identity: Identity, endpoint: TCPEndpoint.State) {
+            self.init(identity: identity, endpoint: .tcp(endpoint))
+        }
+
+        /// Convenience: run this node over BLE.
+        public init(identity: Identity, endpoint: BLEEndpoint.State) {
+            self.init(identity: identity, endpoint: .ble(endpoint))
+        }
     }
 
     public enum Action: Equatable {
-        case endpoint(TCPEndpoint.Action)
+        case endpoint(TransportEndpoint.Action)
         case router(LXMFRouter.Action)
         case registerDelivery
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
@@ -54,7 +66,7 @@ public struct LXMFNode {
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Scope(state: \.endpoint, action: \.endpoint) { TCPEndpoint() }
+        Scope(state: \.endpoint, action: \.endpoint) { TransportEndpoint() }
         Scope(state: \.router, action: \.router) { LXMFRouter() }
         Reduce { [date] state, action in
             switch action {
@@ -74,7 +86,7 @@ public struct LXMFNode {
                 return .send(.router(.setOutboundPropagationNode(destinationHash)))
 
             case let .sendViaPropagation(destinationHash, title, content):
-                guard let recipient = state.endpoint.transport.learned[destinationHash]?.identity
+                guard let recipient = state.endpoint.learned[destinationHash]?.identity
                 else { return .none }
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
@@ -91,7 +103,7 @@ public struct LXMFNode {
                     .send(.router(.send(message: message, desiredMethod: .opportunistic)))
                 ]
                 if alsoViaPropagation,
-                   let recipient = state.endpoint.transport.learned[message.destinationHash]?.identity {
+                   let recipient = state.endpoint.learned[message.destinationHash]?.identity {
                     let ts = date.now.timeIntervalSince1970
                     let cost = propagationStampCost(state)
                     effects.append(.run { send in
@@ -168,7 +180,7 @@ public struct LXMFNode {
 
             case let .endpoint(.delegate(.pathLearned(h, _))):
                 var effects: [Effect<Action>] = [.send(.router(.learnedPath(destinationHash: h)))]
-                if let identity = state.endpoint.transport.learned[h]?.identity {
+                if let identity = state.endpoint.learned[h]?.identity {
                     effects.append(.send(.router(.learnedIdentity(destinationHash: h, identity: identity))))
                 }
                 return .merge(effects)
@@ -247,7 +259,7 @@ public struct LXMFNode {
 
     private func propagationStampCost(_ state: State) -> Int {
         guard let pn = state.router.outboundPropagationNode,
-              let appData = state.endpoint.transport.learned[pn]?.appData,
+              let appData = state.endpoint.learned[pn]?.appData,
               let ann = PNAnnounce.parse(appData)
         else { return LXMFPropagation.defaultPropagationStampCost }
         return ann.targetStampCost

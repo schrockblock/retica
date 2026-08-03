@@ -43,15 +43,15 @@ import ComposableArchitecture
 
     // Predicate helpers for the .off store (everything is wrapped under .endpoint(...)).
     func isInterfaceSend(_ a: LXMFNode.Action) -> Bool {
-        if case .endpoint(.interface(.send)) = a { return true }; return false
+        if case .endpoint(.tcp(.interface(.send))) = a { return true }; return false
     }
 
     let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
     let (a, eventsA) = make("a", aIdentity, sentA)
     let (b, eventsB) = make("b", bIdentity, sentB)
 
-    await a.send(.endpoint(.connect)); eventsA.yield(.connected)
-    await b.send(.endpoint(.connect)); eventsB.yield(.connected)
+    await a.send(.endpoint(.start)); eventsA.yield(.connected)
+    await b.send(.endpoint(.start)); eventsB.yield(.connected)
 
     // Both register + announce; bridge announces so A learns B (path + identity for signing/validation)
     // and B learns A (identity — B validates A's signature).
@@ -147,5 +147,5 @@ import ComposableArchitecture
     }
     #expect(gotConfirmed.value == sentMessageHash)         // the hash of the message A sent
 
-    await a.send(.endpoint(.disconnect)); await b.send(.endpoint(.disconnect))
+    await a.send(.endpoint(.stop)); await b.send(.endpoint(.stop))
 }
