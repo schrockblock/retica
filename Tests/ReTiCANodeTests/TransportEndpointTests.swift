@@ -96,6 +96,10 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
 
 @Test @MainActor func bleOnlyDelegatesDoNotSurfaceOnTheUnifiedSurface() async {
     let ble = makeBLE()
+    // Must be EXHAUSTIVE: under `.off` the store swallows unasserted actions, so a spuriously
+    // surfaced `.delegate(...)` would go unnoticed and this test could never fail. With `.on`,
+    // `finish()` asserts no action went unreceived.
+    ble.exhaustivity = .on
     let token = Data(repeating: 0xC7, count: 16)
     // peerOnline/peerOffline are BLE-specific; they must NOT map to a unified delegate.
     await ble.send(.ble(.delegate(.peerOnline(token))))
