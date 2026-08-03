@@ -274,3 +274,43 @@ import ComposableArchitecture
     }
     #expect(gotPurge, "Phase-3 purge /get must be sent after messagesDownloaded")
 }
+
+/// The phase-2 fetch (`requestMessages`) must carry a POSITIVE per-transfer limit as data[2].
+/// lxmd (LXMRouter.py:1528/1547) reads `float(data[2])*1000` as a byte cap and skips every message
+/// larger than it — a 0 there means "serve nothing", so the recipient would download an empty set.
+@MainActor @Test func syncPhase2FetchCarriesPositiveTransferLimit() async {
+    let identity = Identity()
+    let linkID = Data(repeating: 0xCD, count: 16)
+    let want = Data(repeating: 0x11, count: 16)
+    let have = Data(repeating: 0x22, count: 16)
+
+    let store = TestStore(initialState: LXMFNode.State(
+        identity: identity,
+        endpoint: Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    ) { LXMFNode() } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } },
+                                         send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+
+    await store.send(.router(.delegate(.requestMessages(linkID: linkID, wants: [want], haves: [have]))))
+
+    // The emitted phase-2 /get payload must be [[want], [have], .uint(positive)] — never .uint(0).
+    let expected = MsgPack.encode(.array([.array([.bin(want)]),
+                                          .array([.bin(have)]),
+                                          .uint(LXMFNode.propagationTransferLimitKB)]))
+    var gotFetch = false
+    await store.receive { action in
+        if case let .endpoint(.sendRequestOverLink(lid, path, data)) = action,
+           lid == linkID, path == "/get", data == expected {
+            gotFetch = true
+            return true
+        }
+        return false
+    }
+    #expect(gotFetch, "phase-2 /get must carry [wants, haves, .uint(limit)]")
+    #expect(LXMFNode.propagationTransferLimitKB > 0, "transfer limit must be positive (0 = lxmd serves nothing)")
+}

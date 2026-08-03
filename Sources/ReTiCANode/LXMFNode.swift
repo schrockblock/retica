@@ -44,8 +44,11 @@ public struct LXMFNode {
         }
     }
 
-    /// Transfer-limit value sent as the third element of the phase-2 /get payload (0 = no limit).
-    public static let propagationTransferLimitKB: UInt64 = 0
+    /// Per-transfer accept limit (KB) sent as the third element of the phase-2 /get payload. lxmd
+    /// (LXMRouter.py:1528) reads `float(data[2])*1000` as a byte cap and SKIPS every message larger
+    /// than it — so 0 means "serve nothing". A generous positive value (1000 KB ≈ 1 MB) defers to the
+    /// PN, which caps at min(client, its own limit). Never send 0.
+    public static let propagationTransferLimitKB: UInt64 = 1000
 
     @Dependency(\.date) var date
     public init() {}
