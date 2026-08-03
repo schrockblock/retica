@@ -24,6 +24,7 @@ actor AdapterCalls {
     var readValues: [(UUID, CBUUID)] = []
     var openedL2CAP: [(UUID, UInt16)] = []
     var unpublished: [UInt16] = []
+    var disconnected: [UUID] = []
 
     func addService(_ s: MutableService) { addedServices.append(s) }
     func advertise(_ d: AdvertisementData?) { advertised.append(d) }
@@ -33,6 +34,7 @@ actor AdapterCalls {
     func stopAdvertising() { stoppedAdvertising += 1 }
     func removeAll() { removedAll += 1 }
     func connect(_ id: UUID) { connected.append(id) }
+    func disconnect(_ id: UUID) { disconnected.append(id) }
     func discoverServices(_ id: UUID) { discoveredServices.append(id) }
     func discoverChars(_ id: UUID, _ s: CBUUID) { discoveredChars.append((id, s)) }
     func read(_ id: UUID, _ c: CBUUID) { readValues.append((id, c)) }
@@ -76,7 +78,7 @@ func makeStubs() -> AdapterStubs {
         scan: { _, _ in Task { await calls.scan() }; return scan.stream },
         stopScan: { await calls.stopScan() },
         connect: { id, _ in await calls.connect(id); return Peripheral(id: id, name: nil, state: .connected) },
-        disconnect: { _ in },
+        disconnect: { id in await calls.disconnect(id) },
         retrievePeripherals: { _ in [] },
         retrieveConnected: { _ in [] },
         discoverServices: { id, _ in await calls.discoverServices(id); return [Service(id: serviceUUID, peripheralID: id, isPrimary: true)] },
@@ -266,6 +268,19 @@ func fakeConnection(peerID: UUID, psm: UInt16, inbound: [Data] = [],
     await adapter.stop()
 }
 
+@Test @MainActor func readDirectoryFailureDisconnectsBestEffort() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    // Use a fresh peer ID that doesn't collide with other tests.
+    let p = BLEPeerHandle(id: UUID())
+    stubs.directoryResult.setValue(nil)  // readValue throws
+    await adapter.readDirectory(p)
+    _ = await collect(events, count: 1)  // consume directoryFailed
+    // The adapter must have called disconnect on the peer after the failure.
+    let disconnected = await stubs.calls.disconnected
+    #expect(disconnected.contains(p.id), "adapter must best-effort disconnect on directory failure")
+    await adapter.stop()
+}
+
 @Test @MainActor func readDirectoryFailureEmitsDirectoryFailedAndForgets() async {
     let (adapter, stubs, events) = await onlineAdapter()
     let p = peer(3)
@@ -393,6 +408,43 @@ func fakeConnection(peerID: UUID, psm: UInt16, inbound: [Data] = [],
     let (adapter, _, _) = await onlineAdapter()
     // No such channel — must not crash.
     await adapter.send(BLEChannelID(id: UUID()), data: Data([0x01]))
+    await adapter.stop()
+}
+
+/// Verifies that calling start() a second time without stop() in between (the
+/// reducer's adapter-retry path) fully resets the prior session: the old event
+/// stream is finished and the old PSM is unpublished before the new session begins.
+///
+/// The "session-2 reaches .ready" property is covered by the startup test;
+/// here we focus on the two invariants that the prior teardown() didn't satisfy:
+/// continuation.finish() and unpublishL2CAPChannel(psm).
+@Test @MainActor func adapterRetryStartWithoutStopResetsPriorSession() async {
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
+
+    // --- Session 1: bring the adapter fully online ---
+    let events1 = adapter.start(BLEDriverConfig(version: 2, pairingMode: .open))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    // Wait for .ready so we know a PSM was published and the session is live.
+    let session1Ready = await collect(events1, count: 1)
+    #expect(session1Ready == [.ready])
+    let psm1 = stubs.publishPSM.value
+
+    // --- Session 2 (retry — no stop() between) ---
+    // Use a different PSM value so publish counts are distinguishable.
+    stubs.publishPSM.setValue(psm1 &+ 1)
+    _ = adapter.start(BLEDriverConfig(version: 2, pairingMode: .open))
+
+    // resetSession() must have called continuation.finish() on the session-1 stream.
+    // collect() will return immediately (stream ended) rather than timing out.
+    let session1Tail = await collect(events1, count: 1)
+    #expect(session1Tail == [], "session-1 stream must be finished after retry start()")
+
+    // resetSession() must have unpublished the session-1 PSM.
+    let unpublishedList = await stubs.calls.unpublished
+    #expect(unpublishedList.contains(psm1), "prior-session PSM must be unpublished on retry start()")
+
     await adapter.stop()
 }
 

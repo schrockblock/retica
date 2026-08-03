@@ -52,8 +52,8 @@ actor FCBDriverAdapter {
         }
     }
 
-    private func begin(config: BLEDriverConfig, continuation: AsyncStream<BLEDriverEvent>.Continuation) {
-        self.teardown()
+    private func begin(config: BLEDriverConfig, continuation: AsyncStream<BLEDriverEvent>.Continuation) async {
+        await resetSession()
         self.config = config
         self.continuation = continuation
         self.announcedReady = false
@@ -149,11 +149,23 @@ actor FCBDriverAdapter {
         }
     }
 
-    private func teardown() {
+    /// Cancels tasks, closes+clears connections, unpublishes our PSM, and finishes
+    /// the previous event stream — so a start() that was NOT preceded by stop()
+    /// (the reducer's adapter-retry path) still begins from a clean slate.
+    private func resetSession() async {
         for t in tasks { t.cancel() }
         tasks = []
         advertising = false
         scanning = false
+        for (_, conn) in connections { await conn.close() }
+        connections = [:]
+        reducerClosed = []
+        if let psm = publishedPSM {
+            await peripheral.unpublishL2CAPChannel(psm)
+            publishedPSM = nil
+        }
+        continuation?.finish()
+        continuation = nil
     }
 
     // Issues central.scan() and pumps discoveries to handleDiscovered.
@@ -225,6 +237,7 @@ actor FCBDriverAdapter {
             let psmData = try await central.readValue(peer.id, rbtpPSMCharUUID)
             guard versionData.count >= 1, psmData.count >= 2 else {
                 forget(peer.id)
+                try? await central.disconnect(peer.id)
                 continuation?.yield(.directoryFailed(peer, reason: "short directory read"))
                 return
             }
@@ -234,6 +247,7 @@ actor FCBDriverAdapter {
             continuation?.yield(.directoryRead(peer, version: version, psm: lo | (hi << 8)))
         } catch {
             forget(peer.id)
+            try? await central.disconnect(peer.id)
             continuation?.yield(.directoryFailed(peer, reason: "\(error)"))
         }
     }
@@ -272,15 +286,10 @@ actor FCBDriverAdapter {
     }
 
     func stop() async {
-        teardown()
+        await resetSession()
         await central.stopScan()
         await peripheral.stopAdvertising()
         await peripheral.removeAll()
-        if let psm = publishedPSM { await peripheral.unpublishL2CAPChannel(psm) }
-        for (_, conn) in connections { await conn.close() }
-        connections = [:]
-        continuation?.finish()
-        continuation = nil
     }
 }
 
