@@ -132,7 +132,11 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     let before = sent.value.count
     await store.send(.send(destinationHash: bDest.hash, title: Data("hi".utf8),
                            content: Data("ping".utf8), method: .opportunistic))
-    await store.receive { if case .endpoint(.ble(.send)) = $0 { return true }; return false }
+    // Synchronize on the DEEPEST hop — the BLEInterface-level send that actually calls the
+    // driver — not `.ble(.send)`, which is the first of four-plus hops and leaves `sent`
+    // written only by a later effect. Unambiguous here: this node never calls
+    // `.registerDelivery`, so the DATA packet is the only BLEInterface send after `.send`.
+    await store.receive { if case .endpoint(.ble(.ble(.send))) = $0 { return true }; return false }
     #expect(sent.value.count > before)
     // The driver receives FRAMED bytes; drop the 2-byte framing header to get the raw packet.
     // Non-trapping: #expect does not abort, so an empty `sent` must record an issue and return
