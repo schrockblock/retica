@@ -337,9 +337,10 @@ public struct LinkSession {
                 case (_, .active, .data, .response):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
                           case let .array(items)? = MsgPack.decodeValue(Data(plain)), items.count == 2,
-                          case let .bin(requestID) = items[0], case let .bin(data) = items[1],
+                          case let .bin(requestID) = items[0],
                           state.pendingRequests.contains(requestID)
                     else { return .none }
+                    let data = MsgPack.encode(items[1])
                     state.pendingRequests.remove(requestID)
                     return .merge(.cancel(id: CancelID.request(requestID)),
                                   .send(.delegate(.responseReceived(requestID: requestID, data: data))))
@@ -361,8 +362,9 @@ public struct LinkSession {
                     let requestID = packet.truncatedHash
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
                           case let .array(items)? = MsgPack.decodeValue(Data(plain)), items.count == 3,
-                          case let .bin(pathHash) = items[1], case let .bin(data) = items[2]
+                          case let .bin(pathHash) = items[1]
                     else { return .none }
+                    let data = MsgPack.encode(items[2])
                     return .send(.delegate(.requestReceived(requestID: requestID, pathHash: pathHash, data: data)))
 
                 default:
@@ -416,7 +418,7 @@ public struct LinkSession {
                 guard state.status == .active else { return .none }
                 let pathHash = Crypto.truncatedHash(Data(path.utf8))
                 let packed = MsgPack.encode(.array([.double(date.now.timeIntervalSince1970),
-                                                    .bin(pathHash), .bin(data)]))
+                                                    .bin(pathHash), MsgPack.decodeValue(data) ?? .null]))
                 let ifID = state.interfaceID
                 let timeout = (state.rtt ?? 0.5) * 6 + 11.25
                 if packed.count <= Self.requestMDU {
@@ -454,7 +456,7 @@ public struct LinkSession {
 
             case let .sendResponse(requestID, data):
                 guard state.status == .active else { return .none }
-                let packed = MsgPack.encode(.array([.bin(requestID), .bin(data)]))
+                let packed = MsgPack.encode(.array([.bin(requestID), MsgPack.decodeValue(data) ?? .null]))
                 if packed.count <= Self.requestMDU {
                     guard let raw = linkPacket(state.linkID, .response,
                                                Link.encrypt(packed, sessionKey: state.sessionKey))
@@ -529,13 +531,15 @@ public struct LinkSession {
                 state.transfers.remove(id: elementID)          // GC the completed receiver
                 if adv?.isRequest == true {
                     guard case let .array(items)? = MsgPack.decodeValue(payload), items.count == 3,
-                          case let .bin(pathHash) = items[1], case let .bin(data) = items[2] else { return .none }
+                          case let .bin(pathHash) = items[1] else { return .none }
+                    let data = MsgPack.encode(items[2])
                     return .send(.delegate(.requestReceived(requestID: Crypto.truncatedHash(payload),
                                                             pathHash: pathHash, data: data)))
                 } else if adv?.isResponse == true {
                     guard case let .array(items)? = MsgPack.decodeValue(payload), items.count == 2,
-                          case let .bin(rid) = items[0], case let .bin(data) = items[1],
+                          case let .bin(rid) = items[0],
                           state.pendingRequests.contains(rid) else { return .none }
+                    let data = MsgPack.encode(items[1])
                     state.pendingRequests.remove(rid)
                     return .merge(.cancel(id: CancelID.request(rid)),
                                   .send(.delegate(.responseReceived(requestID: rid, data: data))))

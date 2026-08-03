@@ -576,10 +576,11 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     #expect(a.state.links[0].status == .active && b.state.links[0].status == .active)
 
     // --- A sends a large (>431 packed) request; it rides a Resource. ---
-    // reqData: 450 bytes. Packed as [timestamp(0.0), pathHash(16), data(450)] ≈ 478 bytes → > 431 MDU.
-    // respData: 450 bytes. Packed as [requestID(16), data(450)] ≈ 474 bytes → > 431 MDU.
-    let reqData = Data(repeating: 0xAB, count: 450)
-    let respData = Data(repeating: 0xCD, count: 450)
+    // reqData/respData: msgpack-encoded binary blobs of sequential bytes. When embedded inline in the
+    // wire array the decoded .bin value re-encodes to ~453 bytes, pushing payload > 431 MDU. Using
+    // sequential bytes keeps the data moderately incompressible so Bzip2 doesn't reduce stream < SDU.
+    let reqData = MsgPack.encode(.bin(Data((0..<450).map { UInt8($0 & 0xff) })))
+    let respData = MsgPack.encode(.bin(Data((0..<450).map { UInt8($0 & 0xff) })))
 
     await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: reqData))
     await a.receive { if case .interface(.send) = $0 { return true }; return false }   // REQ_RESOURCE_ADV out
@@ -718,15 +719,18 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     #expect(idHash.value == aIdentity.hash)
 
     // A requests → B surfaces requestReceived → B responds → A surfaces responseReceived.
-    await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: Data("ping".utf8)))
+    // data must be valid msgpack so it can be embedded inline on the wire.
+    let pingData = MsgPack.encode(.string("ping"))
+    let pongData = MsgPack.encode(.string("pong"))
+    await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: pingData))
     await a.receive { if case .interface(.send) = $0 { return true }; return false }
     let reqID = LockIsolated<Data?>(nil)
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received)
     await b.receive { action in
-        if case let .delegate(.requestReceived(_, rid, _, d)) = action, d == Data("ping".utf8) { reqID.setValue(rid); return true }
+        if case let .delegate(.requestReceived(_, rid, _, d)) = action, d == pingData { reqID.setValue(rid); return true }
         return false
     }
-    await b.send(.sendResponseOverLink(linkID: linkID, requestID: reqID.value!, data: Data("pong".utf8)))
+    await b.send(.sendResponseOverLink(linkID: linkID, requestID: reqID.value!, data: pongData))
     await b.receive { if case .interface(.send) = $0 { return true }; return false }
     let respData = LockIsolated<Data?>(nil)
     eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
@@ -734,7 +738,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         if case let .delegate(.responseReceived(_, rid, d)) = action, rid == reqID.value! { respData.setValue(d); return true }
         return false
     }
-    #expect(respData.value == Data("pong".utf8))
+    #expect(respData.value == pongData)
 
     await a.send(.disconnect); await b.send(.disconnect)
 }
@@ -915,8 +919,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     // Track whether B ever surfaces delegate.requestReceived.
     let bSurfaced = LockIsolated(false)
 
-    // A sends a small inline request.
-    let reqPayload = Data("ping".utf8)
+    // A sends a small inline request. Must be valid msgpack to survive the wire round-trip.
+    let reqPayload = MsgPack.encode(.string("ping"))
     await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: reqPayload))
     await a.receive { if case .interface(.send) = $0 { return true }; return false }
 
@@ -961,7 +965,10 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
 
     // B's responder returns a >431-byte payload so the response rides a Resource.
-    let largeResponse = Data((0..<600).map { UInt8($0 & 0xff) })
+    // Must be valid msgpack so it embeds inline on the wire and still exceeds the MDU.
+    // A bin(600B) of sequential bytes is moderately incompressible; 603 bytes inline keeps
+    // the encrypted stream large enough for 2+ ResourceTransfer parts.
+    let largeResponse = MsgPack.encode(.bin(Data((0..<600).map { UInt8($0 & 0xff) })))
 
     // Build A (initiator).
     let eventsA_stream = AsyncStream<TCPEvent>.makeStream()
@@ -1012,8 +1019,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     // Register the handler on B.
     await b.send(.registerRequestHandler(path: "svc/echo", policy: .all))
 
-    // A sends a small inline request (only the RESPONSE is large).
-    await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: Data("ping".utf8)))
+    // A sends a small inline request (only the RESPONSE is large). Must be valid msgpack.
+    await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: MsgPack.encode(.string("ping"))))
     await a.receive { if case .interface(.send) = $0 { return true }; return false }
 
     // Request frame → B: B auto-answers with the large response, which rides a Resource.

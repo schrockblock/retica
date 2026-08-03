@@ -100,7 +100,7 @@ private func captureTransmitReq(_ store: TestStore<LinkSession.State, LinkSessio
 
 // Build an inbound RESPONSE packet echoing `requestID`.
 private func responsePacket(_ requestID: Data, _ data: Data) -> Data {
-    let packed = MsgPack.encode(.array([.bin(requestID), .bin(data)]))
+    let packed = MsgPack.encode(.array([.bin(requestID), MsgPack.decodeValue(data) ?? .null]))
     let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                    destinationType: .link, context: .response, contextFlag: false, hops: 0,
                    destinationHash: reqLinkID, transportId: nil, payload: Link.encrypt(packed, sessionKey: reqKey))
@@ -110,15 +110,18 @@ private func responsePacket(_ requestID: Data, _ data: Data) -> Data {
 @Test @MainActor func sendRequestEmitsRequestPacketWithPathHash() async {
     let clock = TestClock<Duration>()
     let store = activeStore(role: .initiator, clock)
-    await store.send(.sendRequest(path: "svc/echo", data: Data("hello".utf8)))
+    // data must be valid msgpack so decodeValue can embed it inline on the wire
+    let helloData = MsgPack.encode(.string("hello"))
+    await store.send(.sendRequest(path: "svc/echo", data: helloData))
     let raw = await captureTransmitReq(store)
     let packet = Packet(raw: raw)!
     #expect(packet.context == .request)
     let plain = Data(Link.decrypt(packet.payload, sessionKey: reqKey)!)
     guard case let .array(items)? = MsgPack.decodeValue(plain), items.count == 3,
-          case let .bin(pathHash) = items[1], case let .bin(data) = items[2] else { Issue.record("bad req"); return }
+          case let .bin(pathHash) = items[1] else { Issue.record("bad req"); return }
+    let data = MsgPack.encode(items[2])
     #expect(pathHash == Crypto.truncatedHash(Data("svc/echo".utf8)))
-    #expect(data == Data("hello".utf8))
+    #expect(data == helloData)
     #expect(store.state.pendingRequests.contains(packet.truncatedHash))
     // cleanup: fire the deadline to drain the timer
     await store.send(.requestDeadline(packet.truncatedHash))
@@ -127,23 +130,26 @@ private func responsePacket(_ requestID: Data, _ data: Data) -> Data {
 @Test @MainActor func inboundResponseMatchesPendingRequestAndClearsIt() async {
     let clock = TestClock<Duration>()
     let store = activeStore(role: .initiator, clock)
-    await store.send(.sendRequest(path: "svc/echo", data: Data("hi".utf8)))
+    // data must be valid msgpack; use msgpack str so the round-trip is stable
+    let hiData = MsgPack.encode(.string("hi"))
+    await store.send(.sendRequest(path: "svc/echo", data: hiData))
     let raw = await captureTransmitReq(store)
     let requestID = Packet(raw: raw)!.truncatedHash
+    let worldData = MsgPack.encode(.string("world"))
     let got = LockIsolated<Data?>(nil)
-    await store.send(.received(responsePacket(requestID, Data("world".utf8))))
+    await store.send(.received(responsePacket(requestID, worldData)))
     await store.receive { action in
         if case let .delegate(.responseReceived(rid, d)) = action, rid == requestID { got.setValue(d); return true }
         return false
     }
-    #expect(got.value == Data("world".utf8))
+    #expect(got.value == worldData)
     #expect(!store.state.pendingRequests.contains(requestID))   // cleared (+ timeout cancelled)
 }
 
 @Test @MainActor func requestDeadlineFiresRequestFailed() async {
     let clock = TestClock<Duration>()
     let store = activeStore(role: .initiator, clock)
-    await store.send(.sendRequest(path: "svc/slow", data: Data()))
+    await store.send(.sendRequest(path: "svc/slow", data: MsgPack.encode(.null)))
     let raw = await captureTransmitReq(store)
     let requestID = Packet(raw: raw)!.truncatedHash
     // Advance past the timeout (rtt 1.0 → 1*6 + 11.25 = 17.25 s).
@@ -155,8 +161,10 @@ private func responsePacket(_ requestID: Data, _ data: Data) -> Data {
     #expect(!store.state.pendingRequests.contains(requestID))
 }
 
-// A large request/response payload (> ~431 packed → Resource path). 500 raw bytes packs to ~530.
-private func bigData() -> Data { Data((0..<500).map { UInt8($0 & 0xff) }) }
+// A large request/response payload (> ~431 packed → Resource path).
+// Must be valid msgpack so decodeValue can embed it inline on the wire.
+// A 450-element array of nulls encodes to ~452 bytes inline, pushing the response payload > 431 MDU.
+private func bigData() -> Data { MsgPack.encode(.array(Array(repeating: .null, count: 450))) }
 
 @Test @MainActor func largeSendRequestSpawnsRequestResource() async {
     let clock = TestClock<Duration>()
@@ -166,7 +174,7 @@ private func bigData() -> Data { Data((0..<500).map { UInt8($0 & 0xff) }) }
     let adv = store.state.transfers[0].advertisement!
     #expect(adv.isRequest == true)
     // request_id = truncatedHash(packed) where packed uses the deterministic epoch timestamp (0.0).
-    let expectedPacked = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data("svc/big".utf8))), .bin(bigData())]))
+    let expectedPacked = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data("svc/big".utf8))), MsgPack.decodeValue(bigData()) ?? .null]))
     #expect(adv.requestID == Crypto.truncatedHash(expectedPacked))
     #expect(store.state.pendingRequests.contains(Crypto.truncatedHash(expectedPacked)))
     // Cleanup: cancel the spawned transfer and fire the request timeout so no effects dangle.
@@ -192,7 +200,7 @@ private func bigData() -> Data { Data((0..<500).map { UInt8($0 & 0xff) }) }
 @Test @MainActor func inlineSendRequestStillUsesAPacket() async {
     let clock = TestClock<Duration>()
     let store = activeStore(role: .initiator, clock)
-    await store.send(.sendRequest(path: "svc/small", data: Data("hi".utf8)))
+    await store.send(.sendRequest(path: "svc/small", data: MsgPack.encode(.string("hi"))))
     #expect(store.state.transfers.isEmpty)                 // inline → no Resource spawned
     let raw = await captureTransmitReq(store)
     #expect(Packet(raw: raw)?.context == .request)
@@ -225,7 +233,9 @@ private func responderStoreWith(_ transfer: ResourceTransfer.State, _ pending: S
 
 @Test @MainActor func completedRequestResourceRoutesToRequestReceived() async {
     let clock = TestClock<Duration>()
-    let packed = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data("svc/x".utf8))), .bin(Data("body".utf8))]))
+    // bodyData must be valid msgpack so it can be embedded inline in the wire payload
+    let bodyData = MsgPack.encode(.string("body"))
+    let packed = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data("svc/x".utf8))), MsgPack.decodeValue(bodyData) ?? .null]))
     let t = hostedTransfer(packed, requestID: Crypto.truncatedHash(packed), isResponse: false)
     let store = responderStoreWith(t, [], clock)
     let got = LockIsolated<(Data, Data)?>(nil)
@@ -235,14 +245,16 @@ private func responderStoreWith(_ transfer: ResourceTransfer.State, _ pending: S
         return false
     }
     #expect(got.value?.0 == Crypto.truncatedHash(Data("svc/x".utf8)))
-    #expect(got.value?.1 == Data("body".utf8))
+    #expect(got.value?.1 == bodyData)
     #expect(store.state.transfers[id: t.id] == nil)          // receiver GC'd on .received
 }
 
 @Test @MainActor func completedResponseResourceRoutesToResponseReceivedAndClearsPending() async {
     let clock = TestClock<Duration>()
     let rid = Data(repeating: 0xCD, count: 16)
-    let packed = MsgPack.encode(.array([.bin(rid), .bin(Data("answer".utf8))]))
+    // answerData must be valid msgpack so it can be embedded inline in the wire payload
+    let answerData = MsgPack.encode(.string("answer"))
+    let packed = MsgPack.encode(.array([.bin(rid), MsgPack.decodeValue(answerData) ?? .null]))
     let t = hostedTransfer(packed, requestID: rid, isResponse: true)
     let store = responderStoreWith(t, [rid], clock)
     let got = LockIsolated<Data?>(nil)
@@ -251,7 +263,7 @@ private func responderStoreWith(_ transfer: ResourceTransfer.State, _ pending: S
         if case let .delegate(.responseReceived(r, d)) = action, r == rid { got.setValue(d); return true }
         return false
     }
-    #expect(got.value == Data("answer".utf8))
+    #expect(got.value == answerData)
     #expect(!store.state.pendingRequests.contains(rid))
     #expect(store.state.transfers[id: t.id] == nil)          // receiver GC'd on .received
 }
@@ -261,7 +273,7 @@ private func responderStoreWith(_ transfer: ResourceTransfer.State, _ pending: S
     let store = activeStore(role: .initiator, clock)
     // Build a response-Resource advertisement packet whose request_id is NOT pending.
     let rid = Data(repeating: 0xEE, count: 16)
-    let sender = hostedTransfer(MsgPack.encode(.array([.bin(rid), .bin(bigData())])), requestID: rid, isResponse: true)
+    let sender = hostedTransfer(MsgPack.encode(.array([.bin(rid), MsgPack.decodeValue(bigData()) ?? .null])), requestID: rid, isResponse: true)
     let advPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                            destinationType: .link, context: .resourceAdvertisement, contextFlag: false, hops: 0,
                            destinationHash: reqLinkID, transportId: nil,
@@ -272,7 +284,7 @@ private func responderStoreWith(_ transfer: ResourceTransfer.State, _ pending: S
 
 // Build an inbound REQUEST packet for a path+data.
 private func requestPacket(_ path: String, _ data: Data) -> Data {
-    let packed = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data(path.utf8))), .bin(data)]))
+    let packed = MsgPack.encode(.array([.double(0), .bin(Crypto.truncatedHash(Data(path.utf8))), MsgPack.decodeValue(data) ?? .null]))
     let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                    destinationType: .link, context: .request, contextFlag: false, hops: 0,
                    destinationHash: reqLinkID, transportId: nil, payload: Link.encrypt(packed, sessionKey: reqKey))
@@ -282,7 +294,8 @@ private func requestPacket(_ path: String, _ data: Data) -> Data {
 @Test @MainActor func inboundRequestSurfacesRequestReceivedWithPacketID() async {
     let clock = TestClock<Duration>()
     let store = activeStore(role: .responder, clock)
-    let raw = requestPacket("svc/echo", Data("ping".utf8))
+    let pingData = MsgPack.encode(.string("ping"))
+    let raw = requestPacket("svc/echo", pingData)
     let expectedID = Packet(raw: raw)!.truncatedHash
     let got = LockIsolated<(Data, Data, Data)?>(nil)
     await store.send(.received(raw))
@@ -292,20 +305,44 @@ private func requestPacket(_ path: String, _ data: Data) -> Data {
     }
     #expect(got.value?.0 == expectedID)
     #expect(got.value?.1 == Crypto.truncatedHash(Data("svc/echo".utf8)))
-    #expect(got.value?.2 == Data("ping".utf8))
+    #expect(got.value?.2 == pingData)
 }
 
 @Test @MainActor func sendResponseEmitsResponsePacketEchoingRequestID() async {
     let clock = TestClock<Duration>()
     let store = activeStore(role: .responder, clock)
     let requestID = Data(repeating: 0xCD, count: 16)
-    await store.send(.sendResponse(requestID: requestID, data: Data("pong".utf8)))
+    let pongData = MsgPack.encode(.string("pong"))
+    await store.send(.sendResponse(requestID: requestID, data: pongData))
     let raw = await captureTransmitReq(store)
     let packet = Packet(raw: raw)!
     #expect(packet.context == .response)
     let plain = Data(Link.decrypt(packet.payload, sessionKey: reqKey)!)
     guard case let .array(items)? = MsgPack.decodeValue(plain), items.count == 2,
-          case let .bin(rid) = items[0], case let .bin(d) = items[1] else { Issue.record("bad resp"); return }
+          case let .bin(rid) = items[0] else { Issue.record("bad resp"); return }
+    let d = MsgPack.encode(items[1])
     #expect(rid == requestID)
-    #expect(d == Data("pong".utf8))
+    #expect(d == pongData)
+}
+
+// Locks the wire shape: the data field of a request must be a NESTED msgpack value,
+// not a binary blob wrapping already-encoded bytes (the old double-encoding bug).
+// Mutation: revert element [2] to .bin(data) in sendRequest → this test fails.
+@Test @MainActor func sendRequestDataEmbeddedAsNestedValueNotBinBlob() async {
+    let clock = TestClock<Duration>()
+    let store = activeStore(role: .initiator, clock)
+    // Encode [None, None] as the data payload, matching the LXMF sync /get argument shape.
+    let data = MsgPack.encode(.array([.null, .null]))
+    await store.send(.sendRequest(path: "/get", data: data))
+    let raw = await captureTransmitReq(store)
+    let packet = Packet(raw: raw)!
+    let plain = Data(Link.decrypt(packet.payload, sessionKey: reqKey)!)
+    guard case let .array(items)? = MsgPack.decodeValue(plain), items.count == 3,
+          case let .bin(pathHash) = items[1] else { Issue.record("outer array malformed"); return }
+    // Element [2] MUST be the decoded value .array([.null, .null]), NOT .bin(...).
+    // If sendRequest uses .bin(data) instead, items[2] would be .bin(data) and this would fail.
+    #expect(items[2] == .array([.null, .null]))
+    #expect(pathHash == Crypto.truncatedHash(Data("/get".utf8)))
+    // Cleanup: fire the deadline to drain the timer
+    await store.send(.requestDeadline(packet.truncatedHash))
 }
