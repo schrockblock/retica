@@ -56,6 +56,7 @@ public struct LinkSession {
             public var parts: [UInt64: Data]     // segmentIndex (1-based) -> segment data
         }
         public var incomingSegments: [Data: SegmentAccumulator] = [:]   // keyed by originalHash
+        public var pendingDataReceipts: [Data: Data] = [:]              // sentPacketHash(32) → caller token
         public var establishmentTimeout: TimeInterval
         public var keepaliveInterval: TimeInterval
         var staleTime: TimeInterval { keepaliveInterval * 2 }
@@ -127,6 +128,8 @@ public struct LinkSession {
         case sendRequest(path: String, data: Data)
         case sendResponse(requestID: Data, data: Data)
         case requestDeadline(Data)
+        case sendWithReceipt(data: Data, token: Data)
+        case dataProofDeadline(packetHash: Data)
         case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
 
@@ -143,6 +146,8 @@ public struct LinkSession {
             case responseReceived(requestID: Data, data: Data)
             case requestFailed(requestID: Data)
             case requestReceived(requestID: Data, pathHash: Data, data: Data)
+            case packetDelivered(token: Data)
+            case packetDeliveryFailed(token: Data)
         }
     }
 
@@ -151,7 +156,7 @@ public struct LinkSession {
     @Dependency(\.uuid) var uuid
     @Dependency(\.randomBytes) var randomBytes
 
-    private enum CancelID: Hashable { case establishment, keepalive, inactivity, request(Data) }
+    private enum CancelID: Hashable { case establishment, keepalive, inactivity, request(Data), receipt(Data) }
 
     public init() {}
 
@@ -367,6 +372,18 @@ public struct LinkSession {
                     let data = MsgPack.encode(items[2])
                     return .send(.delegate(.requestReceived(requestID: requestID, pathHash: pathHash, data: data)))
 
+                case (_, .active, .proof, .none):
+                    guard packet.payload.count == 96 else { return .none }
+                    let proofHash = Data(packet.payload.prefix(32))
+                    let signature = Data(packet.payload.suffix(64))
+                    guard let token = state.pendingDataReceipts[proofHash],
+                          let peer = state.destinationIdentity,
+                          peer.validate(signature: signature, message: proofHash)
+                    else { return .none }
+                    state.pendingDataReceipts[proofHash] = nil
+                    return .merge(.cancel(id: CancelID.receipt(proofHash)),
+                                  .send(.delegate(.packetDelivered(token: token))))
+
                 default:
                     return .none
                 }
@@ -523,6 +540,28 @@ public struct LinkSession {
                 guard state.pendingRequests.contains(requestID) else { return .none }
                 state.pendingRequests.remove(requestID)
                 return .send(.delegate(.requestFailed(requestID: requestID)))
+
+            case let .sendWithReceipt(data, token):
+                guard state.status == .active else { return .none }
+                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                    destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: state.linkID, transportId: nil,
+                                    payload: Link.encrypt(data, sessionKey: state.sessionKey))
+                let packetHash = packet.packetHash
+                guard let raw = try? packet.packed() else { return .none }
+                state.pendingDataReceipts[packetHash] = token
+                let timeout = (state.rtt ?? 0.5) * 6 + 11.25
+                return .merge(
+                    .send(.delegate(.transmit(state.interfaceID, raw))),
+                    .run { [timeout] send in
+                        try await clock.sleep(for: .seconds(timeout))
+                        await send(.dataProofDeadline(packetHash: packetHash))
+                    }.cancellable(id: CancelID.receipt(packetHash), cancelInFlight: true))
+
+            case let .dataProofDeadline(packetHash):
+                guard let token = state.pendingDataReceipts[packetHash] else { return .none }
+                state.pendingDataReceipts[packetHash] = nil
+                return .send(.delegate(.packetDeliveryFailed(token: token)))
 
             case let .transfer(.element(_, .delegate(.transmit(ifID, raw)))):
                 return .send(.delegate(.transmit(ifID, raw)))
