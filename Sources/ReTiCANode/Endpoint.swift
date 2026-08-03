@@ -197,6 +197,29 @@ public struct Endpoint {
 extension Endpoint.Action.AllCasePaths {
     /// The case path `Endpoint` scopes `LinkPlane` through.
     ///
+    /// **TCP-legacy alias — new hosts should use a plain `Scope` instead.**
+    ///
+    /// This alias exists solely to preserve `Endpoint`'s pre-existing public action names
+    /// so the large existing `EndpointTests` suite stays unedited.  New transport hosts
+    /// (e.g. `BLEEndpoint`) should use a plain `Scope(state: \.linkPlane, action: \.linkPlane)`
+    /// instead, which is simpler and avoids the subtleties below.
+    ///
+    /// **Alias vs. plain `Scope` — one action hop difference.**
+    /// A plain `Scope` host receives a `LinkPlane.Action` directly via the `.linkPlane(...)`
+    /// case; the host sees it one `.send` hop after the child reducer runs.
+    /// Through this alias the same action is *also* consumed immediately by the `Scope`
+    /// (synchronously within the same `Reducer.body` pass), so the host's `Reduce` sees it
+    /// zero additional hops later — the alias is already spent.  That is why actions like
+    /// `.sendOverLink`, `.closeLink`, etc. appear in `Endpoint.Action` at the top level rather
+    /// than nested under `.linkPlane(...)`.
+    ///
+    /// **Matching alias-aliased actions from the outside.**
+    /// Because the `Scope` embeds child effects through this path, plane-originated actions
+    /// surface under their aliased names in the parent (e.g. `.link(.element(id:action:))`,
+    /// `.sendResponseOverLink(...)`) rather than under `.linkPlane(...)`.  If you write
+    /// `.linkPlane(<an aliased case>)` it also compiles, but the action will re-surface under
+    /// the alias name — prefer the alias spelling on `Endpoint` to avoid confusion.
+    ///
     /// It is a *bijection*, not a forward-plus-mirror pair: every `LinkPlane.Action` that already
     /// had an identically-shaped `Endpoint.Action` case (`.link`, `.sendOverLink`, `.closeLink`,
     /// `.registerRequestHandler`, …) is aliased onto that case, and the plane-only actions

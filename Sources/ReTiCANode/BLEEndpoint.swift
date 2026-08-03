@@ -28,6 +28,17 @@ public struct BLEEndpoint {
         public var linkPlane: LinkPlane.State = LinkPlane.State()
         var peerInterfaces: [InterfaceID: Data] = [:]   // InterfaceID → 16-byte peer token
 
+        /// Live links (owned by the embedded LinkPlane).
+        public var links: IdentifiedArrayOf<LinkSession.State> {
+            get { linkPlane.links }
+            set { linkPlane.links = newValue }
+        }
+        /// Request-handler registrations (owned by the embedded LinkPlane).
+        public var registrations: [Data: RequestRegistration] {
+            get { linkPlane.registrations }
+            set { linkPlane.registrations = newValue }
+        }
+
         public init(maxPeers: Int = BLEInterface.defaultMaxPeers,
                     pairingMode: BLEPairingMode = .open) {
             self.ble = BLEInterface.State(maxPeers: maxPeers, pairingMode: pairingMode)

@@ -56,6 +56,21 @@ private func teardown(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.Action>)
     await store.receive { if case .transport(.stopMaintenance) = $0 { return true }; return false }
 }
 
+// Build a raw HEADER_1 ANNOUNCE packet for a synthetic identity.
+// (Mirrors makeAnnouncePacket in BLEEndpointIntegrationTests; private helpers cannot cross files.)
+private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [String],
+                                hops: UInt8, emitted: UInt64, appData: Data? = nil) -> (Data, Data) {
+    let nameHash = Destination.nameHash(appName: appName, aspects: aspects)
+    let destHash = Destination.hash(identityHash: identity.hash, appName: appName, aspects: aspects)
+    let randomHash = Announce.randomHash(now: emitted, randomPrefix: Data(repeating: 0xA5, count: 5))
+    let payload = Announce.buildPayload(identity: identity, destinationHash: destHash,
+                                        nameHash: nameHash, randomHash: randomHash, appData: appData)
+    let packet = Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: hops,
+                        destinationHash: destHash, transportId: nil, payload: payload)
+    return (try! packet.packed(), destHash)
+}
+
 @Test @MainActor func inboundLinkRequestOverBLERepliesToThatPeer() async {
     let (store, events, sent) = makeNode()
     await bringPeerOnline(store, events)
@@ -74,13 +89,56 @@ private func teardown(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.Action>)
 
     // A responder link is created on the arrival peer's interface, and the LRPROOF goes back to that peer.
     await store.receive { if case .ble(.send) = $0 { return true }; return false }
-    #expect(store.state.linkPlane.links.count == 1)
-    #expect(store.state.linkPlane.links[0].interfaceID == bleInterfaceID(peerToken))
+    #expect(store.state.links.count == 1)
+    #expect(store.state.links[0].interfaceID == bleInterfaceID(peerToken))
     let last = sent.value.last
     #expect(last?.0 == peerToken)
     // BLEInterface.send frames packets (2-byte big-endian length prefix); unframe before parsing.
     let unframed = last.map { Data($0.1.dropFirst(BLEFraming.headerLength)) }
     #expect(Packet(raw: unframed!)?.packetType == .proof)
+
+    await teardown(store)
+}
+
+@Test @MainActor func outboundOpenLinkRidesTheLearnedPeersInterface() async {
+    let (store, events, sent) = makeNode()
+    await bringPeerOnline(store, events)
+
+    // Learn a destination via a crafted announce delivered on the peer's channel.
+    let remote = Identity()
+    let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
+                                                     aspects: ["svc"], hops: 0, emitted: 1000)
+    events.yield(.channelData(channel, try! BLEFraming.frame(announceRaw)))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+
+    // openLink must pick the peer's BLE interface from the learned entry.
+    await store.send(.openLink(destinationHash: destHash))
+    // A LINKREQUEST is emitted as the link begins establishing; wait for the transmit so we
+    // know LinkPlane has processed .openLink and state is settled.
+    await store.receive { if case .ble(.send) = $0 { return true }; return false }
+
+    // (a) link shim: state.links forwards to linkPlane.links
+    #expect(store.state.links.count == 1)
+    // (b) the link rides the BLE interface for this peer
+    #expect(store.state.links[0].interfaceID == bleInterfaceID(peerToken))
+    // (c) the driver received a LINKREQUEST for this peer
+    let lastSent = sent.value.last
+    #expect(lastSent?.0 == peerToken)
+    let unframed = lastSent.map { Data($0.1.dropFirst(BLEFraming.headerLength)) }
+    #expect(Packet(raw: unframed!)?.packetType == .linkRequest)
+
+    await store.send(.closeLink(linkID: store.state.links[0].linkID))
+    await teardown(store)
+}
+
+@Test @MainActor func openLinkToUnlearnedDestinationFailsOverBLE() async {
+    let (store, events, _) = makeNode()
+    await bringPeerOnline(store, events)
+
+    let unknownDest = Data(repeating: 0x42, count: 16)
+    await store.send(.openLink(destinationHash: unknownDest))
+    await store.receive { if case .delegate(.linkFailed(let hash)) = $0 { return hash == unknownDest }; return false }
+    #expect(store.state.links.isEmpty)
 
     await teardown(store)
 }
