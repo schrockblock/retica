@@ -112,7 +112,7 @@ public struct Endpoint {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .received(data))))
 
-            case let .transport(.delegate(.linkRequest(destHash, data))):
+            case let .transport(.delegate(.linkRequest(destHash, _, data))):
                 guard let owner = state.transport.localDestinations[destHash]?.identity,
                       owner.privateKey != nil
                 else { return .none }

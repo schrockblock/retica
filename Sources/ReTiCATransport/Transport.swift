@@ -109,7 +109,7 @@ public struct Transport {
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: SendFailure)
             case linkPacket(linkID: Data, data: Data)
-            case linkRequest(destinationHash: Data, data: Data)
+            case linkRequest(destinationHash: Data, arrivalInterface: InterfaceID, data: Data)
         }
     }
 
@@ -193,7 +193,8 @@ public struct Transport {
                     return .send(.delegate(.linkPacket(linkID: packet.destinationHash, data: data)))
                 }
                 if packet.packetType == .linkRequest, state.localDestinations[packet.destinationHash] != nil {
-                    return .send(.delegate(.linkRequest(destinationHash: packet.destinationHash, data: data)))
+                    return .send(.delegate(.linkRequest(destinationHash: packet.destinationHash,
+                                                        arrivalInterface: interfaceID, data: data)))
                 }
                 // Announces are deduped by per-destination random-blob (in the `.announce` case
                 // below), NOT by packetHash: keying on the unforgeable-per-announce random_hash

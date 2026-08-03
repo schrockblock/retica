@@ -322,12 +322,16 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
                         payload: Identity().publicKey + Link.signallingBytes)
     let raw = try! packet.packed()
     let captured = LockIsolated<Data?>(nil)
+    let capturedArrival = LockIsolated<InterfaceID?>(nil)
     await store.send(.received(InterfaceID("i"), raw))
     await store.receive { action in
-        if case let .delegate(.linkRequest(h, _)) = action { captured.setValue(h); return true }
+        if case let .delegate(.linkRequest(h, arrival, _)) = action {
+            captured.setValue(h); capturedArrival.setValue(arrival); return true
+        }
         return false
     }
     #expect(captured.value == dest.hash)
+    #expect(capturedArrival.value == InterfaceID("i"))
 }
 
 @Test @MainActor func linkRequestToUnknownDestinationIsNotSurfaced() async {
