@@ -150,22 +150,26 @@ pass); `.off` TestStores asserting behavior.
    - `transport.delegate(.transmit(id, raw))` for a live peer → `.ble(.send(peer: token, packet: raw))`;
      `.transmit` for an unknown `txID` → dropped (no `.ble(.send)`).
    - `.pathLearned` / `.messageReceived` / `.sendFailed` forwarding surfaces the right delegate.
-2. **2-node in-memory integration test** (`BLEEndpointIntegrationTests`), following the
-   `LXMFNodeOpportunisticTests` pattern: two `BLEEndpoint` `TestStore`s, each with a mock
-   `BLEDriver` whose `send` records framed bytes into a `LockIsolated` buffer and whose
-   `start` returns a controllable event stream. Drive both endpoints to `peerOnline` through
-   the discovery→directoryRead→channelOpened→HELLO handshake (the adapter/interface machinery
-   is already unit-tested; the integration test drives it through the driver events). Then
-   MANUALLY BRIDGE: take the framed packet node A's adapter "sent" (from its buffer) and yield
-   it as `.channelData` into node B's driver event stream, and vice-versa. Assert:
-   - A registers + announces a destination; bridging A's announce to B makes B emit
-     `.delegate(.pathLearned)` for A's destination.
-   - A `.send`s an opportunistic packet to B's destination; bridging it to B surfaces
-     `.delegate(.messageReceived)` at B with the exact plaintext.
+2. **Integration coverage** (`BLEEndpointIntegrationTests`) — two single-store directional
+   tests with crafted packets, mirroring the proven single-store `EndpointTests` style. This
+   targets exactly what is NEW here — the BLE seam (framing + per-peer `InterfaceID` routing);
+   cross-node crypto interop is interface-agnostic and already proven by the TCP 2-node tests.
+   Each test brings one peer online via the driver handshake (`.start` →
+   `channelOpened(.inbound)` → `channelData(HELLO)` → `peerOnline`), then:
+   - **Inbound:** register a local `Destination`; inject a crafted `.data` packet
+     (`payload = dest.encrypt(plaintext)`, `destinationHash = dest.hash`) as
+     `channelData(BLEFraming.frame(packetRaw))` on the peer's channel → assert
+     `.delegate(.messageReceived)` surfaces with the exact plaintext. Proves
+     channelData → deframe → `packetReceived` → `transport.received` → decrypt → delegate.
+   - **Outbound:** inject a crafted announce as `channelData` so the node learns a destination
+     (assert `.delegate(.pathLearned)`), then `.send(destHash, plaintext)` → assert the
+     resulting `.ble(.send(peer:, packet: raw))` carries a valid `.data` packet addressed to
+     `destHash`. Proves `.send` → `transport` → `transmit` → per-peer routing → `ble.send`.
 
-   (Signature validation / identity nuances are the reducer's concern and already tested at
-   the interface/transport layer; this test proves the composition routes packets end-to-end
-   over the BLE seam.)
+   Teardown per test: `.stop` (cancels the driver stream and emits `peerOffline`, whose
+   cascade stops maintenance). (The originally-sketched 2-node bridged test was dropped in
+   favor of these two: it re-proved interface-agnostic crypto interop and was fragile to
+   author; the directional tests cover the seam deterministically.)
 
 ## Deliverables
 
