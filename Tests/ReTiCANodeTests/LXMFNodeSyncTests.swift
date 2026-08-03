@@ -8,7 +8,7 @@ import ComposableArchitecture
 
 /// End-to-end through LXMFNode: client A syncs from a propagation node. A establishes a link to the PN's
 /// lxmf.propagation destination, IDENTIFYs, and runs the two-phase /get exchange (list → wanted → blobs).
-/// The PN is a bare Endpoint stub whose two responses the test supplies. A opens the returned blob with its
+/// The PN is a bare TCPEndpoint stub whose two responses the test supplies. A opens the returned blob with its
 /// own identity and surfaces the sender's signature-valid message. (PN server logic is P3.)
 @Test @MainActor func lxmfNodeSyncsMessagesFromPropagationNode() async {
     let clock = TestClock()
@@ -31,7 +31,7 @@ import ComposableArchitecture
         -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: LXMFNode.State(
-            identity: identity, endpoint: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false))
+            identity: identity, endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false))
         ) { LXMFNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -44,10 +44,10 @@ import ComposableArchitecture
     }
 
     func makeEndpoint(_ host: String, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -60,7 +60,7 @@ import ComposableArchitecture
     }
 
     func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
-    func epSend(_ act: Endpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+    func epSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
 
     let sentA = LockIsolated<[Data]>([]); let sentS = LockIsolated<[Data]>([]); let sentPN = LockIsolated<[Data]>([])
     let (a, eventsA) = makeNode("a", aIdentity, sentA)
@@ -179,7 +179,7 @@ import ComposableArchitecture
 
     var initialState = LXMFNode.State(
         identity: identity,
-        endpoint: Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     initialState.syncPhase = [:]   // nothing pre-set
 
     let store = TestStore(initialState: initialState) { LXMFNode() } withDependencies: {
@@ -238,7 +238,7 @@ import ComposableArchitecture
 
     var initialState = LXMFNode.State(
         identity: aIdentity,
-        endpoint: Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     // Put the link into awaitingMessages phase so responseReceived dispatches that branch.
     initialState.syncPhase[linkID] = .awaitingMessages
 
@@ -286,7 +286,7 @@ import ComposableArchitecture
 
     let store = TestStore(initialState: LXMFNode.State(
         identity: identity,
-        endpoint: Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     ) { LXMFNode() } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000))

@@ -8,7 +8,7 @@ import ComposableArchitecture
 
 private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCost: Int = 4) -> TestStore<PNNode.State, PNNode.Action> {
     let store = TestStore(initialState: PNNode.State(
-        identity: pnIdentity, endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false),
+        identity: pnIdentity, endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false),
         minStampCost: minStampCost, peeringCost: peeringCost)
     ) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock()
@@ -161,7 +161,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     let aIdentity = Identity(); let peerIdentity = Identity()
     let cost = 8
     let peerDest = Data(repeating: 0xD0, count: 16); let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: aIdentity, endpoint: Endpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
+    var initial = PNNode.State(identity: aIdentity, endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
         identity: peerIdentity, appData: nil, ratchet: nil, interfaceID: initial.endpoint.interfaceID,
         hops: 1, nextHop: nil, announceEmitted: 0)
@@ -198,7 +198,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), minStampCost: 4)
+    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), minStampCost: 4)
     _ = initial.node.store.ingest(container: container)
     initial.offerLinks[linkID] = [tid]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
@@ -226,7 +226,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), minStampCost: 4)
+    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), minStampCost: 4)
     _ = initial.node.store.ingest(container: container)
     initial.offerLinks[linkID] = [tid]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
@@ -247,7 +247,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
 /// Offer response `false` (has all): no transfer.
 @Test @MainActor func pnNodeTransfersNothingOnFalseResponse() async {
     let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
     initial.offerLinks[linkID] = [Data(repeating: 0x11, count: 32)]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
@@ -310,7 +310,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
 @Test @MainActor func pnNodeLinkClosedClearsPerLinkState() async {
     let linkID = Data(repeating: 0xC0, count: 16)
     let pHash = Data(repeating: 0xAB, count: 16)               // any 16-byte peer hash
-    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
     initial.clientIdentities[linkID] = Identity()
     initial.offerLinks[linkID] = [Data(repeating: 0x11, count: 32)]
     initial.pendingGet[Data(repeating: 0xCC, count: 16)] = PNNode.PendingGet(linkID: linkID, requestID: Data([1]))
@@ -330,7 +330,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
 /// requestFailed clears the outbound offer link entry.
 @Test @MainActor func pnNodeRequestFailedClearsOfferLink() async {
     let linkID = Data(repeating: 0xC0, count: 16)
-    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
     initial.offerLinks[linkID] = [Data(repeating: 0x11, count: 32)]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing

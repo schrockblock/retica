@@ -14,8 +14,8 @@ func liveEndpointLearnsAnnouncesFromRealNode() async throws {
     let host = ProcessInfo.processInfo.environment["RETICA_LIVE_HOST"]!
     let port = UInt16(ProcessInfo.processInfo.environment["RETICA_LIVE_PORT"] ?? "4242") ?? 4242
 
-    let store = Store(initialState: Endpoint.State(host: host, port: port, reconnectOnDrop: true)) {
-        Endpoint()
+    let store = Store(initialState: TCPEndpoint.State(host: host, port: port, reconnectOnDrop: true)) {
+        TCPEndpoint()
     }
     store.send(.connect)
 

@@ -59,20 +59,20 @@ private let ifA = InterfaceID("iface-a")
     await store.send(.closeLink(linkID: store.state.links[0].linkID))
 }
 
-/// Verify that every `LinkPlane.Action` case round-trips through `Endpoint`'s `linkPlaneRoute`
+/// Verify that every `LinkPlane.Action` case round-trips through `TCPEndpoint`'s `linkPlaneRoute`
 /// alias: `linkPlaneRoute.extract(from: linkPlaneRoute.embed(a)) == a`.
 ///
 /// This is a structural test: if the bijection ever mis-maps a case (e.g. routes `.openLink`
 /// through the wrong embed branch, or forgets a case in `extract`), at least one assertion
 /// below will fail.  Fourteen cases are checked — one representative value per case.
 @Test func linkPlaneRouteCasePathRoundTripsEveryPlaneAction() {
-    let route = Endpoint.Action.allCasePaths.linkPlaneRoute
+    let route = TCPEndpoint.Action.allCasePaths.linkPlaneRoute
 
     func roundTrips(_ plane: LinkPlane.Action) -> Bool {
         route.extract(from: route.embed(plane)) == plane
     }
 
-    // .link — aliased to Endpoint.Action.link
+    // .link — aliased to TCPEndpoint.Action.link
     let elementID = UUID()
     let linkAction: LinkPlane.Action = .link(.element(id: elementID, action: .establish))
     #expect(roundTrips(linkAction))
@@ -95,7 +95,7 @@ private let ifA = InterfaceID("iface-a")
     #expect(roundTrips(.routeLinkPacket(linkID: Data(repeating: 0x03, count: 16),
                                         data: Data([0x01, 0x02]))))
 
-    // Verb cases — aliased to Endpoint.Action top-level
+    // Verb cases — aliased to TCPEndpoint.Action top-level
     let linkID = Data(repeating: 0x04, count: 16)
     #expect(roundTrips(.sendOverLink(linkID: linkID, data: Data("hello".utf8))))
     #expect(roundTrips(.sendResourceOverLink(linkID: linkID, data: Data("res".utf8))))

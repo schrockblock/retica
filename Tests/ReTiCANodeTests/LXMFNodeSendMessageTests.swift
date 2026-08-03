@@ -11,7 +11,7 @@ private let pnHash = Data(repeating: 0xC0, count: 16)
 @MainActor
 private func makeNode(identity: Identity, seedLearned: Identity?, dest: Data,
                       pn: Data?) -> TestStore<LXMFNode.State, LXMFNode.Action> {
-    var ep = Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+    var ep = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
     if let r = seedLearned {
         ep.transport.learned[dest] = LearnedDestination(
             identity: r, appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),

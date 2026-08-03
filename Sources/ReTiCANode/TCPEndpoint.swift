@@ -8,12 +8,12 @@ import ReTiCATransport
 /// single runnable Reticulum endpoint, wiring their delegates bidirectionally. Single TCP
 /// interface this slice.
 ///
-/// The link/resource/request machinery lives in `LinkPlane`; `Endpoint` is the TCP *host* for it:
+/// The link/resource/request machinery lives in `LinkPlane`; `TCPEndpoint` is the TCP *host* for it:
 /// it decides which links may be created (from `Transport`'s learned paths and local
 /// destinations) and resolves the plane's `.delegate(.transmit(InterfaceID, Data))` routing
 /// delegate to its one TCP interface.
 @Reducer
-public struct Endpoint {
+public struct TCPEndpoint {
     @ObservableState
     public struct State: Equatable {
         public var interface: TCPClientInterface.State
@@ -45,8 +45,8 @@ public struct Endpoint {
         case interface(TCPClientInterface.Action)
         case transport(Transport.Action)
         case link(IdentifiedActionOf<LinkSession>)
-        /// `LinkPlane` actions that have no identically-shaped `Endpoint` case. The rest of the
-        /// plane's surface is aliased onto `Endpoint`'s own cases — see `linkPlaneRoute`.
+        /// `LinkPlane` actions that have no identically-shaped `TCPEndpoint` case. The rest of the
+        /// plane's surface is aliased onto `TCPEndpoint`'s own cases — see `linkPlaneRoute`.
         case linkPlane(LinkPlane.Action)
 
         case connect
@@ -149,7 +149,7 @@ public struct Endpoint {
             case let .requestPath(destinationHash):
                 return .send(.transport(.requestPath(destinationHash: destinationHash)))
 
-            // --- LinkPlane delegates → interface / Endpoint delegates ---
+            // --- LinkPlane delegates → interface / TCPEndpoint delegates ---
 
             case let .linkPlane(.delegate(.transmit(txID, raw))):
                 guard txID == id else { return .none }
@@ -194,13 +194,13 @@ public struct Endpoint {
     }
 }
 
-extension Endpoint.Action.AllCasePaths {
-    /// The case path `Endpoint` scopes `LinkPlane` through.
+extension TCPEndpoint.Action.AllCasePaths {
+    /// The case path `TCPEndpoint` scopes `LinkPlane` through.
     ///
     /// **TCP-legacy alias — new hosts should use a plain `Scope` instead.**
     ///
-    /// This alias exists solely to preserve `Endpoint`'s pre-existing public action names
-    /// so the large existing `EndpointTests` suite stays unedited.  New transport hosts
+    /// This alias exists solely to preserve `TCPEndpoint`'s pre-existing public action names
+    /// so the large existing `TCPEndpointTests` suite stays unedited.  New transport hosts
     /// (e.g. `BLEEndpoint`) should use a plain `Scope(state: \.linkPlane, action: \.linkPlane)`
     /// instead, which is simpler and avoids the subtleties below.
     ///
@@ -210,7 +210,7 @@ extension Endpoint.Action.AllCasePaths {
     /// Through this alias the same action is *also* consumed immediately by the `Scope`
     /// (synchronously within the same `Reducer.body` pass), so the host's `Reduce` sees it
     /// zero additional hops later — the alias is already spent.  That is why actions like
-    /// `.sendOverLink`, `.closeLink`, etc. appear in `Endpoint.Action` at the top level rather
+    /// `.sendOverLink`, `.closeLink`, etc. appear in `TCPEndpoint.Action` at the top level rather
     /// than nested under `.linkPlane(...)`.
     ///
     /// **Matching alias-aliased actions from the outside.**
@@ -218,16 +218,16 @@ extension Endpoint.Action.AllCasePaths {
     /// surface under their aliased names in the parent (e.g. `.link(.element(id:action:))`,
     /// `.sendResponseOverLink(...)`) rather than under `.linkPlane(...)`.  If you write
     /// `.linkPlane(<an aliased case>)` it also compiles, but the action will re-surface under
-    /// the alias name — prefer the alias spelling on `Endpoint` to avoid confusion.
+    /// the alias name — prefer the alias spelling on `TCPEndpoint` to avoid confusion.
     ///
     /// It is a *bijection*, not a forward-plus-mirror pair: every `LinkPlane.Action` that already
-    /// had an identically-shaped `Endpoint.Action` case (`.link`, `.sendOverLink`, `.closeLink`,
+    /// had an identically-shaped `TCPEndpoint.Action` case (`.link`, `.sendOverLink`, `.closeLink`,
     /// `.registerRequestHandler`, …) is aliased onto that case, and the plane-only actions
     /// (`.openLink(initiatorTo:…)`, `.acceptLinkRequest`, `.routeLinkPacket`, `.delegate`) ride
     /// `.linkPlane(...)`.
     ///
     /// Two consequences matter:
-    ///  1. Callers (and the existing `EndpointTests`) can keep sending AND matching
+    ///  1. Callers (and the existing `TCPEndpointTests`) can keep sending AND matching
     ///     `.link(.element(id:action:))`, `.sendResponseOverLink(...)` etc. — plane-originated
     ///     actions surface under exactly those names, because the `Scope` embeds its child
     ///     effects through this path.
@@ -235,9 +235,9 @@ extension Endpoint.Action.AllCasePaths {
     ///     would loop and double-deliver; a bijection delivers each action to the plane exactly
     ///     once, with no re-entry.
     ///
-    /// `Endpoint.Action.openLink(destinationHash:)` is deliberately NOT aliased: it is the
+    /// `TCPEndpoint.Action.openLink(destinationHash:)` is deliberately NOT aliased: it is the
     /// host-level action that resolves a learned path before minting the plane's `.openLink`.
-    public var linkPlaneRoute: AnyCasePath<Endpoint.Action, LinkPlane.Action> {
+    public var linkPlaneRoute: AnyCasePath<TCPEndpoint.Action, LinkPlane.Action> {
         AnyCasePath(
             embed: { plane in
                 switch plane {

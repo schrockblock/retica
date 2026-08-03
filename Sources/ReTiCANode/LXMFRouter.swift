@@ -5,7 +5,7 @@ import ReTiCATransport
 
 /// LXMF inbound router (LXMF-4a): ingests inbound LXMF deliveries from any arrival method, validates
 /// and de-duplicates them by `message.hash`, and surfaces each unique message once. Decoupled from
-/// `Endpoint` — the app forwards Endpoint's delivery/announce events in as `.received`/`.learnedIdentity`.
+/// `TCPEndpoint` — the app forwards TCPEndpoint's delivery/announce events in as `.received`/`.learnedIdentity`.
 /// Mirrors reference LXMRouter.lxmf_delivery (LXMRouter.py:1837-1919): always deliver a well-formed,
 /// non-duplicate message (flagging signature validity), never drop on a bad/unknown signature.
 @Reducer

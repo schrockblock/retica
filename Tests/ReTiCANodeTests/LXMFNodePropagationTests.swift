@@ -8,7 +8,7 @@ import ComposableArchitecture
 
 /// End-to-end through the LXMFNode composition: client A sends a message to recipient R VIA a propagation
 /// node PN. A builds the propagation container (encrypted to R), establishes a link to PN's lxmf.propagation
-/// destination, and ships the container as a Resource. PN (a bare Endpoint stub — ingest is P3) receives it;
+/// destination, and ships the container as a Resource. PN (a bare TCPEndpoint stub — ingest is P3) receives it;
 /// we verify the container is addressed to R and that opening it recovers A's signature-valid message.
 /// Then PN's RESOURCE_PRF is bridged back to A, triggering resourceConcluded → propagationAccepted.
 @Test @MainActor func lxmfNodeSendsViaPropagationNodeAndConfirmsAccept() async {
@@ -26,7 +26,7 @@ import ComposableArchitecture
         -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: LXMFNode.State(
-            identity: identity, endpoint: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false))
+            identity: identity, endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false))
         ) { LXMFNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -39,10 +39,10 @@ import ComposableArchitecture
     }
 
     func makeEndpoint(_ host: String, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -55,7 +55,7 @@ import ComposableArchitecture
     }
 
     func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
-    func epSend(_ act: Endpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+    func epSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
 
     let sentA = LockIsolated<[Data]>([]); let sentR = LockIsolated<[Data]>([]); let sentPN = LockIsolated<[Data]>([])
     let (a, eventsA) = makeNode("a", aIdentity, sentA)
@@ -92,7 +92,7 @@ import ComposableArchitecture
                                      content: largeContent))
     await a.receive(aSend)                                   // LINKREQUEST out to PN
 
-    // Link handshake A ↔ PN (A = LXMFNode, PN = Endpoint), mirroring the direct test.
+    // Link handshake A ↔ PN (A = LXMFNode, PN = TCPEndpoint), mirroring the direct test.
     eventsPN.yield(.data(sentA.value.last!))
     await pn.receive(epSend)                                 // LRPROOF out
     let lrrttIdx = sentA.value.count

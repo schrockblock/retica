@@ -15,10 +15,10 @@ import ComposableArchitecture
     let bIdentity = Identity()
     let bDelivery = Destination(kind: .single, direction: .in, appName: "lxmf", aspects: ["delivery"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -102,10 +102,10 @@ import ComposableArchitecture
     let bIdentity = Identity()
     let bDelivery = Destination(kind: .single, direction: .in, appName: "lxmf", aspects: ["delivery"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },

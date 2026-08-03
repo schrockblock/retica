@@ -26,7 +26,7 @@ import ComposableArchitecture
         -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: LXMFNode.State(
-            identity: identity, endpoint: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false))
+            identity: identity, endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false))
         ) {
             LXMFNode()
         } withDependencies: {

@@ -28,7 +28,7 @@ import ComposableArchitecture
         -> (TestStore<PNNode.State, PNNode.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: PNNode.State(
-            identity: identity, endpoint: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false),
+            identity: identity, endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false),
             minStampCost: 4)
         ) { PNNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
@@ -41,12 +41,12 @@ import ComposableArchitecture
         return (store, events.continuation)
     }
 
-    // makeClient: builds a bare Endpoint TestStore for client C.
+    // makeClient: builds a bare TCPEndpoint TestStore for client C.
     func makeClient(_ host: String, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -60,7 +60,7 @@ import ComposableArchitecture
 
     // Predicate helpers.
     func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
-    func cSend(_ act: Endpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+    func cSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
 
     let sentPN = LockIsolated<[Data]>([])
     let sentC  = LockIsolated<[Data]>([])

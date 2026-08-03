@@ -3,7 +3,7 @@ import ComposableArchitecture
 import ReTiCA
 import ReTiCATransport
 
-/// LXMF propagation-node SERVER composition (P3b): composes `Endpoint` + `PropagationNode` so a node
+/// LXMF propagation-node SERVER composition (P3b): composes `TCPEndpoint` + `PropagationNode` so a node
 /// registers/announces `lxmf.propagation`, ingests clients' concluded containers, and serves the two-phase
 /// `/get` download. `/get` is handled via the unregistered-request surface (registered paths auto-respond
 /// through a static dependency that cannot read the store). Mirrors lxmf 1.1.0 LXMRouter propagation serve.
@@ -11,7 +11,7 @@ import ReTiCATransport
 public struct PNNode {
     @ObservableState
     public struct State: Equatable {
-        public var endpoint: Endpoint.State
+        public var endpoint: TCPEndpoint.State
         public var node: PropagationNode.State
         public var identity: Identity
         public var peeringCost: Int = 0                        // required cost for inbound /offer peering keys
@@ -20,7 +20,7 @@ public struct PNNode {
         public var pendingOffer: [Data: PendingOffer] = [:]   // peerHash → (linkID, requestID, offeredIds)
         public var pendingSyncPeers: [Data: Int] = [:]     // peer dest → the peer's peering cost, awaiting linkEstablished
         public var offerLinks: [Data: [Data]] = [:]        // outbound offer linkID → offeredIds we sent
-        public init(identity: Identity, endpoint: Endpoint.State, storageLimitBytes: Int? = nil,
+        public init(identity: Identity, endpoint: TCPEndpoint.State, storageLimitBytes: Int? = nil,
                     minStampCost: Int = LXMFPropagation.defaultPropagationStampCost, peeringCost: Int = 0) {
             self.identity = identity
             self.endpoint = endpoint
@@ -41,7 +41,7 @@ public struct PNNode {
     }
 
     public enum Action: Equatable {
-        case endpoint(Endpoint.Action)
+        case endpoint(TCPEndpoint.Action)
         case node(PropagationNode.Action)
         case registerPropagation
         case syncToPeer(destinationHash: Data, peeringCost: Int)
@@ -62,7 +62,7 @@ public struct PNNode {
     }
 
     public var body: some ReducerOf<Self> {
-        Scope(state: \.endpoint, action: \.endpoint) { Endpoint() }
+        Scope(state: \.endpoint, action: \.endpoint) { TCPEndpoint() }
         Scope(state: \.node, action: \.node) { PropagationNode() }
         Reduce { [date] state, action in
             func clearLink(_ state: inout State, _ linkID: Data) {

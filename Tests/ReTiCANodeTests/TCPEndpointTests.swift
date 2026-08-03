@@ -24,12 +24,12 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
 // TestStore (which is main-actor-isolated); tests end deterministically via .disconnect.
 @MainActor
 private func makeStore(host: String = "node", port: UInt16 = 4242)
-    -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
     let events = AsyncStream<TCPEvent>.makeStream()
     let store = TestStore(
-        initialState: Endpoint.State(host: host, port: port, reconnectOnDrop: false)
+        initialState: TCPEndpoint.State(host: host, port: port, reconnectOnDrop: false)
     ) {
-        Endpoint()
+        TCPEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in events.stream }, send: { _ in }, close: { })
         $0.continuousClock = TestClock()
@@ -250,15 +250,15 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 }
 
 @Test @MainActor func twoEndpointsEstablishLinkExchangeDataAndClose() async {
-    // Endpoint B owns a destination and announces it; Endpoint A learns it and opens a link.
+    // TCPEndpoint B owns a destination and announces it; TCPEndpoint A learns it and opens a link.
     let clock = TestClock()
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -338,7 +338,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 @Test @MainActor func sendResourceOverLinkDispatchesToTheMatchingLink() async {
     let clock = TestClock()
     let store = TestStore(initialState: {
-        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var s = TCPEndpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
         var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
                                      destinationHash: Data(repeating: 0x02, count: 16),
                                      interfaceID: InterfaceID("tcp"))
@@ -348,7 +348,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         link.rtt = 1.0
         s.links.append(link)
         return s
-    }()) { Endpoint() } withDependencies: {
+    }()) { TCPEndpoint() } withDependencies: {
         $0.continuousClock = clock
         $0.date = .constant(Date(timeIntervalSince1970: 0))
         $0.uuid = .incrementing
@@ -367,14 +367,14 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let clock = TestClock()
     let linkID = Data(repeating: 0xAB, count: 16)
     let store = TestStore(initialState: {
-        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var s = TCPEndpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
         var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
                                      destinationHash: Data(repeating: 0x02, count: 16),
                                      interfaceID: InterfaceID("tcp"))
         link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
         s.links.append(link)
         return s
-    }()) { Endpoint() } withDependencies: {
+    }()) { TCPEndpoint() } withDependencies: {
         $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
     }
     store.exhaustivity = .off
@@ -395,10 +395,10 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -490,13 +490,13 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let clock = TestClock()
     let linkID = Data(repeating: 0xAB, count: 16)
     let store = TestStore(initialState: {
-        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var s = TCPEndpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
         var link = LinkSession.State(id: UUID(0), initiatorTo: Identity(),
                                      destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
         link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
         s.links.append(link)
         return s
-    }()) { Endpoint() } withDependencies: {
+    }()) { TCPEndpoint() } withDependencies: {
         $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
     }
@@ -509,13 +509,13 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let clock = TestClock()
     let linkID = Data(repeating: 0xAB, count: 16)
     let store = TestStore(initialState: {
-        var s = Endpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var s = TCPEndpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
         var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
                                      destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
         link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
         s.links.append(link)
         return s
-    }()) { Endpoint() } withDependencies: {
+    }()) { TCPEndpoint() } withDependencies: {
         $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
     }
     store.exhaustivity = .off
@@ -535,10 +535,10 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -618,7 +618,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     }
     #expect(gotReqData.value == reqData)
 
-    // PRF → A: A validates but does NOT emit resourceConcluded at Endpoint level (req/resp suppressed).
+    // PRF → A: A validates but does NOT emit resourceConcluded at TCPEndpoint level (req/resp suppressed).
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
 
@@ -658,7 +658,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     }
     #expect(gotRespData.value == respData)
 
-    // PRF → B: B validates but does NOT emit resourceConcluded at Endpoint level (req/resp suppressed).
+    // PRF → B: B validates but does NOT emit resourceConcluded at TCPEndpoint level (req/resp suppressed).
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
 
@@ -671,10 +671,10 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -745,7 +745,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
 // MARK: – Request handler registry + allow-gated auto-response tests
 
-// Build an Endpoint store holding one active link (so requestReceived can be routed), with the given
+// Build an TCPEndpoint store holding one active link (so requestReceived can be routed), with the given
 // registrations and responder. `remoteIdentity` is optional (nil = un-identified peer).
 @MainActor
 private func endpointWithActiveLink(
@@ -754,8 +754,8 @@ private func endpointWithActiveLink(
     registrations: [Data: RequestRegistration],
     responder: RequestResponder,
     _ clock: TestClock<Duration>
-) -> (TestStore<Endpoint.State, Endpoint.Action>, UUID) {
-    var s = Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, UUID) {
+    var s = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
     let elementID = UUID(0)
     var link = LinkSession.State(id: elementID, responderFor: Identity(),
                                  destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
@@ -765,7 +765,7 @@ private func endpointWithActiveLink(
     link.remoteIdentity = remoteIdentity
     s.links.append(link)
     s.registrations = registrations
-    let store = TestStore(initialState: s) { Endpoint() } withDependencies: {
+    let store = TestStore(initialState: s) { TCPEndpoint() } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
         $0.continuousClock = clock
         $0.date = .constant(Date(timeIntervalSince1970: 0))
@@ -780,7 +780,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
 @Test @MainActor func registerThenDeregisterMutatesRegistrations() async {
     let clock = TestClock()
-    let store = TestStore(initialState: Endpoint.State(host: "h", port: 1)) { Endpoint() } withDependencies: {
+    let store = TestStore(initialState: TCPEndpoint.State(host: "h", port: 1)) { TCPEndpoint() } withDependencies: {
         $0.continuousClock = clock; $0.uuid = .incrementing
     }
     store.exhaustivity = .off
@@ -858,7 +858,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     #expect(called.value == false)
 }
 
-// MARK: – E2E auto-answer tests (two live Endpoint stores)
+// MARK: – E2E auto-answer tests (two live TCPEndpoint stores)
 
 @Test @MainActor func handlerAutoAnswersInlineRequestWithoutSurfacing() async {
     let clock = TestClock()
@@ -869,8 +869,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // Build A (initiator): standard make.
     let eventsA_stream = AsyncStream<TCPEvent>.makeStream()
-    let a = TestStore(initialState: Endpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
-        Endpoint()
+    let a = TestStore(initialState: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
+        TCPEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in eventsA_stream.stream },
                                          send: { d in sentA.withValue { $0.append(d) } }, close: { })
@@ -883,8 +883,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // Build B (responder): same, plus the echo requestResponder.
     let eventsB_stream = AsyncStream<TCPEvent>.makeStream()
-    let b = TestStore(initialState: Endpoint.State(host: "b", port: 4242, reconnectOnDrop: false)) {
-        Endpoint()
+    let b = TestStore(initialState: TCPEndpoint.State(host: "b", port: 4242, reconnectOnDrop: false)) {
+        TCPEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in eventsB_stream.stream },
                                          send: { d in sentB.withValue { $0.append(d) } }, close: { })
@@ -972,8 +972,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // Build A (initiator).
     let eventsA_stream = AsyncStream<TCPEvent>.makeStream()
-    let a = TestStore(initialState: Endpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
-        Endpoint()
+    let a = TestStore(initialState: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
+        TCPEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in eventsA_stream.stream },
                                          send: { d in sentA.withValue { $0.append(d) } }, close: { })
@@ -986,8 +986,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // Build B (responder) with large-response responder.
     let eventsB_stream = AsyncStream<TCPEvent>.makeStream()
-    let b = TestStore(initialState: Endpoint.State(host: "b", port: 4242, reconnectOnDrop: false)) {
-        Endpoint()
+    let b = TestStore(initialState: TCPEndpoint.State(host: "b", port: 4242, reconnectOnDrop: false)) {
+        TCPEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in eventsB_stream.stream },
                                          send: { d in sentB.withValue { $0.append(d) } }, close: { })
@@ -1108,10 +1108,10 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            Endpoint()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -1328,7 +1328,7 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     #expect(store.state.transport.transportIdentity == id)
 }
 
-// MARK: – HEADER_2 LINKREQUEST (via-relay) Endpoint wiring
+// MARK: – HEADER_2 LINKREQUEST (via-relay) TCPEndpoint wiring
 
 /// Build a raw HEADER_2 ANNOUNCE for `identity`, carrying `transportId` as the relay next hop.
 private func makeRelayAnnouncePacket(identity: Identity, appName: String, aspects: [String],
@@ -1396,7 +1396,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
 }
 
 @Test @MainActor func threeNodeRelayLinkEstablishesAndCarriesData() async {
-    // THE PAYOFF: A (Endpoint/"ar") ↔ R (relay Transport/"ar"+"rb") ↔ B (Endpoint/"rb").
+    // THE PAYOFF: A (TCPEndpoint/"ar") ↔ R (relay Transport/"ar"+"rb") ↔ B (TCPEndpoint/"rb").
     // Proves that a Reticulum Link establishes end-to-end through a relay (HEADER_2→HEADER_1
     // rewrite) and carries bidirectional encrypted data.
     //
@@ -1418,14 +1418,14 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     let destB = Destination(kind: .single, direction: .in, appName: "relay", aspects: ["link3"],
                             identity: bIdentity)!
 
-    // Helper: build an Endpoint store with a given interfaceID (not the default "tcp").
+    // Helper: build an TCPEndpoint store with a given interfaceID (not the default "tcp").
     func makeEndpoint(_ host: String, _ ifID: InterfaceID, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<Endpoint.State, Endpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let evStream = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(
-            initialState: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false,
+            initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false,
                                          interfaceID: ifID)
-        ) { Endpoint() } withDependencies: {
+        ) { TCPEndpoint() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in evStream.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
                                              close: { })
@@ -1629,14 +1629,14 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
 
 // MARK: - 4b-3c-2 maintenance lifecycle
 
-/// Connecting an Endpoint starts the maintenance tick: a learned path is swept once it ages past
-/// pathExpiry and the tick fires. (End-to-end proof the Endpoint auto-started GC.)
+/// Connecting an TCPEndpoint starts the maintenance tick: a learned path is swept once it ages past
+/// pathExpiry and the tick fires. (End-to-end proof the TCPEndpoint auto-started GC.)
 @Test @MainActor func endpointStartsGcOnConnectAndSweepsExpiredPath() async {
     let clock = TestClock()
     let now = LockIsolated(Date(timeIntervalSince1970: 0))
     let events = AsyncStream<TCPEvent>.makeStream()
-    let store = TestStore(initialState: Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false)) {
-        Endpoint()
+    let store = TestStore(initialState: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)) {
+        TCPEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in events.stream }, send: { _ in }, close: { })
         $0.continuousClock = clock
@@ -1661,7 +1661,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     #expect(store.state.transport.learned[destHash] == nil)
 }
 
-/// Disconnecting an Endpoint stops the maintenance tick (the Endpoint forwards .stopMaintenance).
+/// Disconnecting an TCPEndpoint stops the maintenance tick (the TCPEndpoint forwards .stopMaintenance).
 @Test @MainActor func endpointStopsMaintenanceOnDisconnect() async {
     let (store, events) = makeStore()
     await store.send(.connect)
@@ -1675,8 +1675,8 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     let clock = TestClock()
     let events = AsyncStream<TCPEvent>.makeStream()
     let sent = LockIsolated<[Data]>([])
-    let store = TestStore(initialState: Endpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
-        Endpoint()
+    let store = TestStore(initialState: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
+        TCPEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                          send: { d in sent.withValue { $0.append(d) } },

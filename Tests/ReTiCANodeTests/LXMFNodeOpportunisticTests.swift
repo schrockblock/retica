@@ -8,7 +8,7 @@ import ComposableArchitecture
 
 /// End-to-end through the LXMFNode composition: node A opportunistically delivers an LXMF message to
 /// node B, and B's LXMFNode surfaces the reconstructed, signature-validated message — with no hand-wiring
-/// of LXMessage/Endpoint (the router does it).
+/// of LXMessage/TCPEndpoint (the router does it).
 @Test @MainActor func lxmfNodeOpportunisticDeliversEndToEnd() async {
     let clock = TestClock()
     let aIdentity = Identity()
@@ -19,7 +19,7 @@ import ComposableArchitecture
         -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: LXMFNode.State(
-            identity: identity, endpoint: Endpoint.State(host: host, port: 4242, reconnectOnDrop: false))
+            identity: identity, endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false))
         ) {
             LXMFNode()
         } withDependencies: {

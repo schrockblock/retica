@@ -5,7 +5,7 @@ import ReTiCA
 /// LXMF propagation node — the store-and-forward server role (LXMF-4d-3b). A decoupled reducer holding
 /// a `PropagationStore`: the app forwards `lxmf.propagation` events in as actions (a client's concluded
 /// container, a client's message request, a client's delivery confirmation) and wires the delegates back
-/// out to the transport. The literal Endpoint registration, resource framing, and IDENTIFY resolution are
+/// out to the transport. The literal TCPEndpoint registration, resource framing, and IDENTIFY resolution are
 /// app glue. Mirrors lxmf 1.1.0 LXMRouter (propagation_resource_concluded / message_get_request /
 /// save_locally_delivered_transient_ids). Also does PN↔PN peer sync (offer/wanted exchange + peering-key
 /// validation); stamps enforcement and the peer link/transfer networking + peer registry are app/mesh glue.

@@ -4,7 +4,7 @@ import ReTiCA
 import ReTiCATransport
 
 /// The first production composition connecting the decoupled `LXMFRouter` to real transport (LXMF-Node,
-/// opportunistic 1:1). Composes `Endpoint` + `LXMFRouter` and translates their delegates/actions: the app
+/// opportunistic 1:1). Composes `TCPEndpoint` + `LXMFRouter` and translates their delegates/actions: the app
 /// calls `.registerDelivery` then `.send(...)`, and receives `.delegate(.messageReceived(...))`. Direct-
 /// over-link, path requests, delivery confirmation, and propagation wiring are follow-ons.
 @Reducer
@@ -13,12 +13,12 @@ public struct LXMFNode {
 
     @ObservableState
     public struct State: Equatable {
-        public var endpoint: Endpoint.State
+        public var endpoint: TCPEndpoint.State
         public var router: LXMFRouter.State
         public var identity: Identity
         public var directLinks: [Data: Data] = [:]   // destinationHash → linkID (close/linkClosed correlation)
         public var syncPhase: [Data: SyncPhase] = [:]   // linkID → current download phase (one sync/link)
-        public init(identity: Identity, endpoint: Endpoint.State) {
+        public init(identity: Identity, endpoint: TCPEndpoint.State) {
             self.identity = identity
             self.endpoint = endpoint
             self.router = LXMFRouter.State()
@@ -26,7 +26,7 @@ public struct LXMFNode {
     }
 
     public enum Action: Equatable {
-        case endpoint(Endpoint.Action)
+        case endpoint(TCPEndpoint.Action)
         case router(LXMFRouter.Action)
         case registerDelivery
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
@@ -54,7 +54,7 @@ public struct LXMFNode {
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Scope(state: \.endpoint, action: \.endpoint) { Endpoint() }
+        Scope(state: \.endpoint, action: \.endpoint) { TCPEndpoint() }
         Scope(state: \.router, action: \.router) { LXMFRouter() }
         Reduce { [date] state, action in
             switch action {

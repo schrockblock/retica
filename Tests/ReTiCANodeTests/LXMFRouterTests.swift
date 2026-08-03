@@ -839,7 +839,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.linkResourceInFlight[linkID] == nil)
 
     // packetDelivered (token = message.hash) → .delivered(messageHash:) → propagationAccepted.
-    // (In production, LXMFNode maps Endpoint.delegate(.packetDelivered(token)) → router(.delivered(messageHash: token)).)
+    // (In production, LXMFNode maps TCPEndpoint.delegate(.packetDelivered(token)) → router(.delivered(messageHash: token)).)
     await store.send(.delivered(messageHash: msg.hash))
     await store.receive { action in
         if case let .delegate(.propagationAccepted(hash)) = action {
