@@ -6,7 +6,7 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
-// Deviation: `framedHello` is identical to BLEEndpointIntegrationTests.swift — same private helper.
+// A framed HELLO carrying `token` (the wire form the peer sends first on a channel).
 private func framedHello(_ token: Data) -> Data {
     try! BLEFraming.frame(BLEHello.pack(version: BLEInterface.protocolVersion, token: token))
 }
@@ -116,8 +116,6 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     await bringPeerOnline(store, events)
 
     // Learn B's delivery destination from an announce arriving over the peer channel.
-    // Deviation: brief used `direction: .in` for the announce dest; real Destination for
-    // announces uses `direction: .in` (inbound, the recipient registers it as inbound).
     let bDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
                             aspects: LXMessage.deliveryAspects, identity: bIdentity)!
     let nameHash = Destination.nameHash(appName: LXMessage.appName, aspects: LXMessage.deliveryAspects)
@@ -137,7 +135,13 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     await store.receive { if case .endpoint(.ble(.send)) = $0 { return true }; return false }
     #expect(sent.value.count > before)
     // The driver receives FRAMED bytes; drop the 2-byte framing header to get the raw packet.
-    let raw = Data(sent.value.last!.dropFirst(BLEFraming.headerLength))
+    // Non-trapping: #expect does not abort, so an empty `sent` must record an issue and return
+    // rather than force-unwrap nil (Swift Testing has no per-test crash isolation).
+    guard let framed = sent.value.last else {
+        Issue.record("nothing reached the BLE driver")
+        return
+    }
+    let raw = Data(framed.dropFirst(BLEFraming.headerLength))
     let outPacket = Packet(raw: raw)
     #expect(outPacket?.packetType == .data)
     #expect(outPacket?.destinationHash == bDest.hash)
