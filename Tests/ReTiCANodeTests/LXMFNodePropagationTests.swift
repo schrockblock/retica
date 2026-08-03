@@ -84,9 +84,12 @@ import ComposableArchitecture
     await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
 
     // Configure PN and send via propagation.
+    // Use content large enough (> ~252 bytes) to produce a propagation container that exceeds Link.mdu
+    // (431 bytes) so the test exercises the Resource path rather than the small-container packet path.
+    let largeContent = Data(String(repeating: "X", count: 300).utf8)
     await a.send(.setPropagationNode(destinationHash: pnDest.hash))
     await a.send(.sendViaPropagation(destinationHash: rDeliveryHash, title: Data("t".utf8),
-                                     content: Data("hello via PN".utf8)))
+                                     content: largeContent))
     await a.receive(aSend)                                   // LINKREQUEST out to PN
 
     // Link handshake A ↔ PN (A = LXMFNode, PN = Endpoint), mirroring the direct test.
@@ -136,7 +139,7 @@ import ComposableArchitecture
     #expect(LXMFPropagation.destinationHash(lxmfData: entry) == rDeliveryHash)   // addressed to R
     let recovered = LXMFPropagation.open(lxmfData: entry, recipientIdentity: rIdentity)
     #expect(recovered != nil)
-    #expect(recovered?.content == Data("hello via PN".utf8))
+    #expect(recovered?.content == largeContent)
     #expect(recovered?.title == Data("t".utf8))
     #expect(recovered?.sourceHash == LXMessage.deliveryHash(identityHash: aIdentity.hash))
     #expect(recovered?.validateSignature(source: aIdentity) == true)             // real Ed25519 validation
@@ -145,7 +148,7 @@ import ComposableArchitecture
     // Recover the deterministic message hash by rebuilding with the same fixed params.
     let sentHash = LXMessage.create(source: aIdentity, destinationHash: rDeliveryHash,
                                     timestamp: 1700000000.5, title: Data("t".utf8),
-                                    content: Data("hello via PN".utf8)).hash
+                                    content: largeContent).hash
     let gotAccepted = LockIsolated<Data?>(nil)
     eventsA.yield(.data(resourcePrfBytes.value!))            // PN's RESOURCE_PRF → A concludes the resource
     await a.receive { action in

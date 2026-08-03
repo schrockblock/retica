@@ -112,10 +112,11 @@ import ComposableArchitecture
     // S.setPropagationNode + S.sendViaPropagation → S↔PN link handshake + Resource transfer → PN ingests
     // ─────────────────────────────────────────────────────────────────────────────
 
+    let messageContent = Data("store and forward".utf8)
     await s.send(.setPropagationNode(destinationHash: pnPropDest.hash))
     await s.send(.sendViaPropagation(destinationHash: rDeliveryHash,
                                      title: Data("t".utf8),
-                                     content: Data("store and forward".utf8)))
+                                     content: messageContent))
     await s.receive(sSend)                                    // LINKREQUEST out to PN
 
     // Link handshake S ↔ PN (mirrors LXMFNodePropagationTests).
@@ -123,46 +124,38 @@ import ComposableArchitecture
     eventsPN.yield(.data(sentS.value.last!))
     await pn.receive(pnSend)                                  // LRPROOF out
 
-    // Step 2: LRPROOF → S; S sends LRRTT (and RESOURCE_ADV co-fires — capture both by index).
+    // Step 2: LRPROOF → S; S sends LRRTT. The propagation container is SMALL (<= Link.mdu = 431 bytes)
+    // so S uses the packet route (sendWithReceiptOverLink) rather than Resource. The data packet fires
+    // in the same chain as LRRTT; capture both by index.
     let afterLrproofS = sentS.value.count
     eventsS.yield(.data(sentPN.value.last!))
     await s.receive(sSend)                                    // LRRTT out
     let lrrttBytesS = sentS.value[afterLrproofS]
-    let resourceAdvBytesS = sentS.value[afterLrproofS + 1]
+    let propPacketBytes = sentS.value[afterLrproofS + 1]     // link data packet (propagation container)
 
     // LRRTT → PN; PN becomes active (linkEstablished both sides).
     eventsPN.yield(.data(lrrttBytesS))
     await s.receive { if case .endpoint(.delegate(.linkEstablished)) = $0 { return true }; return false }
     await pn.receive { if case .endpoint(.delegate(.linkEstablished)) = $0 { return true }; return false }
-    await s.receive(sSend)                                    // RESOURCE_ADV (already queued in S's store)
+    await s.receive(sSend)                                    // link data packet (already queued in S's store)
 
-    // ADV → PN: PN spawns a receiver, emits RESOURCE_REQ.
-    eventsPN.yield(.data(resourceAdvBytesS))
-    await pn.receive(pnSend)                                  // RESOURCE_REQ out
-    eventsS.yield(.data(sentPN.value.last!))
-    let partCount = s.state.endpoint.links[0].transfers[0].parts.count
-    for _ in 0..<partCount { await s.receive(sSend) }
-
-    // Deliver all part frames to PN; on the last part PN emits PRF + ingests → messagesStored.
-    let parts = Array(sentS.value.suffix(partCount))
+    // PN receives the link data packet → linkDataReceived → ingestContainer → messagesStored.
+    // PN also emits a DATA_PROOF (receipt) which S needs to receive for propagationAccepted.
     let gotTid = LockIsolated<Data?>(nil)
-    for (i, frame) in parts.enumerated() {
-        eventsPN.yield(.data(frame))
-        if i == partCount - 1 {
-            await pn.receive(pnSend)                          // RESOURCE_PRF out
-            await pn.receive { action in
-                if case let .delegate(.messagesStored(tids)) = action {
-                    gotTid.setValue(tids.first)
-                    return true
-                }
-                return false
-            }
+    eventsPN.yield(.data(propPacketBytes))
+    await pn.receive(pnSend)                                  // DATA_PROOF out (receipt for the packet)
+    let dataPrfBytes = sentPN.value.last!                     // capture DATA_PROOF before messagesStored
+    await pn.receive { action in
+        if case let .delegate(.messagesStored(tids)) = action {
+            gotTid.setValue(tids.first)
+            return true
         }
+        return false
     }
     #expect(gotTid.value != nil)                              // PN has ingested the container
 
-    // Bridge RESOURCE_PRF back to S so S gets propagationAccepted.
-    eventsS.yield(.data(sentPN.value.last!))
+    // Bridge DATA_PROOF back to S → packetDelivered(token=message.hash) → delivered → propagationAccepted.
+    eventsS.yield(.data(dataPrfBytes))
     await s.receive { if case .delegate(.propagationAccepted) = $0 { return true }; return false }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -234,7 +227,7 @@ import ComposableArchitecture
     // ─────────────────────────────────────────────────────────────────────────────
     // FINAL ASSERTIONS (load-bearing — do not change)
     // ─────────────────────────────────────────────────────────────────────────────
-    #expect(gotContent.value == Data("store and forward".utf8))  // == what S sent
+    #expect(gotContent.value == messageContent)  // == what S sent
     #expect(gotSrcHash.value == sDeliveryHash)                   // from S
     #expect(gotValidated.value == true)                          // R learned S → signature validates
 

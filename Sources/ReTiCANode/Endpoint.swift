@@ -44,6 +44,7 @@ public struct Endpoint {
         case identifyOverLink(linkID: Data, identity: Identity)
         case sendRequestOverLink(linkID: Data, path: String, data: Data)
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
+        case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
         case registerRequestHandler(path: String, policy: RequestPolicy)
         case deregisterRequestHandler(path: String)
 
@@ -64,6 +65,8 @@ public struct Endpoint {
             case requestReceived(linkID: Data, requestID: Data, pathHash: Data, data: Data)
             case responseReceived(linkID: Data, requestID: Data, data: Data)
             case requestFailed(linkID: Data, requestID: Data)
+            case packetDelivered(token: Data)
+            case packetDeliveryFailed(token: Data)
         }
     }
 
@@ -155,6 +158,10 @@ public struct Endpoint {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .sendResponse(requestID: requestID, data: data))))
 
+            case let .sendWithReceiptOverLink(linkID, data, token):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .sendWithReceipt(data: data, token: token))))
+
             case let .closeLink(linkID):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .close)))
@@ -218,6 +225,11 @@ public struct Endpoint {
             case let .link(.element(elementID, .delegate(.requestFailed(rid)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
                 return .send(.delegate(.requestFailed(linkID: linkID, requestID: rid)))
+
+            case let .link(.element(_, .delegate(.packetDelivered(token)))):
+                return .send(.delegate(.packetDelivered(token: token)))
+            case let .link(.element(_, .delegate(.packetDeliveryFailed(token)))):
+                return .send(.delegate(.packetDeliveryFailed(token: token)))
 
             case .interface, .transport, .delegate, .link:
                 return .none

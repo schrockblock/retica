@@ -87,6 +87,10 @@ public struct PNNode {
             case let .endpoint(.delegate(.resourceReceived(_, data))):
                 return .send(.node(.ingestContainer(data)))
 
+            // Small propagation containers arrive as link data packets (not Resources); ingest them too.
+            case let .endpoint(.delegate(.linkDataReceived(_, data))):
+                return .send(.node(.ingestContainer(data)))
+
             case let .node(.delegate(.stored(tids))):
                 return .send(.delegate(.messagesStored(transientIds: tids)))
 

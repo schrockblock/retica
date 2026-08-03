@@ -731,7 +731,8 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 
 @Test @MainActor func routerPropagationDrainsOnLinkEstablished() async {
     let msg = makeMessage(source: Identity(), content: "prop")
-    let packed = Data("container-bytes".utf8)
+    // Use a large container (> Link.mdu = 431 bytes) so this test stays on the Resource path.
+    let packed = Data(repeating: 0xAA, count: 432)
     let pn = Data(repeating: 0xBB, count: 16)
     let linkID = Data(repeating: 0xC0, count: 16)
     var initial = LXMFRouter.State()
@@ -755,7 +756,8 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 
 @Test @MainActor func routerPropagationSendsImmediatelyWithActiveLink() async {
     let msg = makeMessage(source: Identity(), content: "prop")
-    let packed = Data("container-bytes".utf8)
+    // Use a large container (> Link.mdu = 431 bytes) so this test stays on the Resource path.
+    let packed = Data(repeating: 0xAA, count: 432)
     let pn = Data(repeating: 0xBB, count: 16)
     let linkID = Data(repeating: 0xC0, count: 16)
     var initial = LXMFRouter.State()
@@ -777,7 +779,8 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 
 @Test @MainActor func routerPropagationRetryResendsSameBytes() async {
     let msg = makeMessage(source: Identity(), content: "prop")
-    let packed = Data("container-bytes".utf8)
+    // Use a large container (> Link.mdu = 431 bytes) so this test stays on the Resource path.
+    let packed = Data(repeating: 0xAA, count: 432)
     let pn = Data(repeating: 0xBB, count: 16)
     let linkID = Data(repeating: 0xC0, count: 16)
     let clock = TestClock()
@@ -798,6 +801,54 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         return false
     }
     #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 2)
+}
+
+// MARK: - Task-2: propagation small-packet + genuine propagationAccepted
+
+/// With an active PN link, a small propagation container (<= Link.mdu = 431 bytes) is sent as a
+/// proof-requesting link packet (sendPropagatedPacket), and a matching packetDelivered via
+/// .delivered(messageHash:) resolves to propagationAccepted for that message.hash.
+@Test @MainActor func propagationSmallSendsPacketAndAcceptsOnProof() async {
+    let msg = makeMessage(source: Identity(), content: "small prop")
+    // Small container: <= 431 bytes (Link.mdu) → should take the packet route.
+    let smallPacked = Data("small-container".utf8)
+    #expect(smallPacked.count <= 431)
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+
+    // Small container → sendPropagatedPacket delegate (token = message.hash), NOT sendPropagated.
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: smallPacked))
+    await store.receive { action in
+        if case let .delegate(.sendPropagatedPacket(lid, packed, token)) = action {
+            #expect(lid == linkID)
+            #expect(packed == smallPacked)
+            #expect(token == msg.hash)   // token correlates the proof to this message
+            return true
+        }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    // linkResourceInFlight is NOT set for the packet route (no Resource in flight).
+    #expect(store.state.linkResourceInFlight[linkID] == nil)
+
+    // packetDelivered (token = message.hash) → .delivered(messageHash:) → propagationAccepted.
+    // (In production, LXMFNode maps Endpoint.delegate(.packetDelivered(token)) → router(.delivered(messageHash: token)).)
+    await store.send(.delivered(messageHash: msg.hash))
+    await store.receive { action in
+        if case let .delegate(.propagationAccepted(hash)) = action {
+            #expect(hash == msg.hash)
+            return true
+        }
+        return false
+    }
+    #expect(store.state.pendingDeliveries[msg.hash] == nil)   // pending cleared
 }
 
 // MARK: - LXMF-4d-4 client inbound sync
@@ -970,9 +1021,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 
 // MARK: - Propagation-accept confirmation (P3c)
 
-/// Propagation-accept: a propagation send over an active PN link records linkResourceInFlight; when the PN
-/// concludes the resource, resourceDeliveredOnLink resolves it to propagationAccepted (NOT deliveryConfirmed)
-/// and clears the pending delivery — closing the propagation retry-storm on PN accept.
+/// Propagation-accept via Resource: a LARGE propagation container (> Link.mdu) over an active PN link
+/// records linkResourceInFlight; when the PN concludes the resource, resourceDeliveredOnLink resolves it
+/// to propagationAccepted (NOT deliveryConfirmed) and clears the pending delivery.
 @Test @MainActor func routerConfirmsPropagationAcceptOnResourceDelivered() async {
     let msg = makeMessage(source: Identity(), content: "via pn")
     let pn = Data(repeating: 0xBB, count: 16)
@@ -985,7 +1036,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     store.exhaustivity = .off
 
-    await store.send(.sendViaPropagation(message: msg, propagationPacked: Data("container".utf8)))
+    // Large container (> 431 bytes) → Resource path, linkResourceInFlight is recorded.
+    let largePacked = Data(repeating: 0xAA, count: 432)
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: largePacked))
     await store.receive { action in
         if case let .delegate(.sendPropagated(lid, _)) = action { #expect(lid == linkID); return true }
         return false

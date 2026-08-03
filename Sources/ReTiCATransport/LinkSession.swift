@@ -283,7 +283,23 @@ public struct LinkSession {
                 case (_, .active, .data, .none):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey)
                     else { return .none }   // corrupt/foreign data is ignored, link stays active
-                    return .send(.delegate(.dataReceived(plain)))
+                    // Responder: automatically prove receipt so the initiator's sendWithReceipt resolves.
+                    // payload = packetHash(32) ‖ owningIdentity.sign(packetHash)(64).
+                    var effects: [Effect<Action>] = [.send(.delegate(.dataReceived(plain)))]
+                    if state.role == .responder, let owner = state.owningIdentity {
+                        let proofHash = packet.packetHash
+                        let sig = owner.sign(proofHash)
+                        let proofPayload = proofHash + sig
+                        let proofPacket = Packet(headerType: .header1, packetType: .proof,
+                                                 transportType: .broadcast, destinationType: .link,
+                                                 context: .none, contextFlag: false, hops: 0,
+                                                 destinationHash: state.linkID, transportId: nil,
+                                                 payload: proofPayload)
+                        if let raw = try? proofPacket.packed() {
+                            effects.append(.send(.delegate(.transmit(state.interfaceID, raw))))
+                        }
+                    }
+                    return effects.count == 1 ? effects[0] : .merge(effects)
 
                 case (_, .active, .data, .linkClose):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),

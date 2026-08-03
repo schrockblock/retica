@@ -188,6 +188,18 @@ public struct LXMFNode {
             case let .router(.delegate(.sendPropagated(linkID, propagationPacked))):
                 return .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: propagationPacked)))
 
+            case let .router(.delegate(.sendPropagatedPacket(linkID, propagationPacked, messageHash))):
+                return .send(.endpoint(.sendWithReceiptOverLink(linkID: linkID, data: propagationPacked, token: messageHash)))
+
+            case let .endpoint(.delegate(.packetDelivered(token))):
+                // token == message.hash (set when sendPropagatedPacket was dispatched)
+                // → feeds the router's existing delivered→propagationAccepted path
+                return .send(.router(.delivered(messageHash: token)))
+
+            case let .endpoint(.delegate(.packetDeliveryFailed(token))):
+                // Treat a lost packet the same as a retry-due so the message isn't silently dropped.
+                return .send(.router(.retryDue(messageHash: token)))
+
             case let .router(.delegate(.closeLink(dest))):
                 guard let linkID = state.directLinks[dest] else { return .none }
                 return .send(.endpoint(.closeLink(linkID: linkID)))

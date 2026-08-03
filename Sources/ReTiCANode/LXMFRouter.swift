@@ -81,6 +81,7 @@ public struct LXMFRouter {
             case requestPath(destinationHash: Data)
             case sendDirect(linkID: Data, data: Data, asResource: Bool)
             case sendPropagated(linkID: Data, propagationPacked: Data)
+            case sendPropagatedPacket(linkID: Data, propagationPacked: Data, messageHash: Data)
             case requestMessageList(linkID: Data)
             case requestMessages(linkID: Data, wants: [Data], haves: [Data])
             case closeLink(destinationHash: Data)
@@ -177,10 +178,21 @@ public struct LXMFRouter {
                 }
                 if case let .active(linkID) = state.directLinks[pn] {
                     arm(&state, message.hash, .propagated(destinationHash: pn, data: propagationPacked))
-                    state.linkResourceInFlight[linkID] = message.hash
-                    return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: propagationPacked))),
-                                  retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
-                                  idleTimer(pn))
+                    if propagationPacked.count <= Link.mdu {
+                        // Small container: send as a proof-requesting link packet.
+                        // token = message.hash so packetDelivered maps back to this pending delivery.
+                        return .merge(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
+                                                                            propagationPacked: propagationPacked,
+                                                                            messageHash: message.hash))),
+                                      retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
+                                      idleTimer(pn))
+                    } else {
+                        // Large container: send as Resource; receipt via resourceDeliveredOnLink (unchanged).
+                        state.linkResourceInFlight[linkID] = message.hash
+                        return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: propagationPacked))),
+                                      retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
+                                      idleTimer(pn))
+                    }
                 }
                 state.propagationQueue[pn, default: []].append(
                     PropagationItem(messageHash: message.hash, propagationPacked: propagationPacked))
@@ -228,8 +240,14 @@ public struct LXMFRouter {
                 }
                 for item in propQueued {
                     arm(&state, item.messageHash, .propagated(destinationHash: dest, data: item.propagationPacked))
-                    state.linkResourceInFlight[linkID] = item.messageHash
-                    effects.append(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: item.propagationPacked))))
+                    if item.propagationPacked.count <= Link.mdu {
+                        effects.append(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
+                                                                              propagationPacked: item.propagationPacked,
+                                                                              messageHash: item.messageHash))))
+                    } else {
+                        state.linkResourceInFlight[linkID] = item.messageHash
+                        effects.append(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: item.propagationPacked))))
+                    }
                     effects.append(retryTimer(item.messageHash, LXMFDelivery.retryWaitSeconds))
                 }
                 if !queued.isEmpty || !propQueued.isEmpty { effects.append(idleTimer(dest)) }
@@ -308,9 +326,16 @@ public struct LXMFRouter {
                     return retryTimer(hash, LXMFDelivery.retryWaitSeconds)
                 case let .propagated(destinationHash, data):
                     if case let .active(linkID) = state.directLinks[destinationHash] {
-                        state.linkResourceInFlight[linkID] = hash
-                        return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: data))),
-                                      retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                        if data.count <= Link.mdu {
+                            return .merge(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
+                                                                                propagationPacked: data,
+                                                                                messageHash: hash))),
+                                          retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                        } else {
+                            state.linkResourceInFlight[linkID] = hash
+                            return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: data))),
+                                          retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                        }
                     }
                     // Link down/re-establishing: no live link; wait and re-check (bounded by maxAttempts).
                     return retryTimer(hash, LXMFDelivery.retryWaitSeconds)
