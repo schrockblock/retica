@@ -20,11 +20,12 @@ public struct PNNode {
         public var pendingOffer: [Data: PendingOffer] = [:]   // peerHash → (linkID, requestID, offeredIds)
         public var pendingSyncPeers: [Data: Int] = [:]     // peer dest → the peer's peering cost, awaiting linkEstablished
         public var offerLinks: [Data: [Data]] = [:]        // outbound offer linkID → offeredIds we sent
-        public init(identity: Identity, endpoint: Endpoint.State, storageLimitBytes: Int? = nil, peeringCost: Int = 0) {
+        public init(identity: Identity, endpoint: Endpoint.State, storageLimitBytes: Int? = nil,
+                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost, peeringCost: Int = 0) {
             self.identity = identity
             self.endpoint = endpoint
             self.peeringCost = peeringCost
-            self.node = PropagationNode.State(storageLimitBytes: storageLimitBytes)
+            self.node = PropagationNode.State(storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
         }
     }
 

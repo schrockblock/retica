@@ -14,8 +14,9 @@ public struct PropagationNode {
     @ObservableState
     public struct State: Equatable {
         public var store: PropagationStore
-        public init(storageLimitBytes: Int? = nil) {
-            store = PropagationStore(storageLimitBytes: storageLimitBytes)
+        public init(storageLimitBytes: Int? = nil,
+                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost) {
+            store = PropagationStore(storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
         }
     }
 

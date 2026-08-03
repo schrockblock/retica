@@ -17,9 +17,15 @@ public struct PropagationStore: Equatable {
     private var nextSequence: Int = 0
     /// Total-storage cap in bytes; nil = unbounded (RNS default). Sum of stored lxmf_data sizes.
     public var storageLimitBytes: Int?
+    /// Minimum PoW stamp cost required on each inbound propagation entry (RNS PROPAGATION_COST = 16).
+    /// Entries whose stamp is absent or below this cost are silently rejected. Set to 0 to accept all
+    /// entries regardless of stamp (e.g. in tests using synthetic unstamped entries).
+    public var minStampCost: Int
 
-    public init(storageLimitBytes: Int? = nil) {
+    public init(storageLimitBytes: Int? = nil,
+                minStampCost: Int = LXMFPropagation.defaultPropagationStampCost) {
         self.storageLimitBytes = storageLimitBytes
+        self.minStampCost = minStampCost
     }
 
     public var count: Int { stored.count }
@@ -32,18 +38,31 @@ public struct PropagationStore: Equatable {
         guard let (_, lxmfDatas) = LXMFPropagation.parseContainer(container) else { return [] }
         var added: [Data] = []
         for lxmfData in lxmfDatas {
-            guard let dest = LXMFPropagation.destinationHash(lxmfData: lxmfData) else { continue }
-            // Strip the trailing propagation stamp (32 bytes) to compute the canonical transient_id over the
-            // pure lxmf_data. Real entries always have an encrypted tail of ≥ 60 bytes, so stamped entries are
-            // always > destHash(16) + stamp(32) = 48 bytes; test-only short helpers are ≤ 48 → no strip.
-            // The original lxmfData (possibly stamped) is stored so that PN→PN sync re-delivers stamped
-            // entries, letting the receiving PN strip identically and arrive at the same transient_id.
-            let lxmfCore = lxmfData.count > LXMessage.destinationLength + LXStamper.stampSize
-                ? Data(lxmfData.dropLast(LXStamper.stampSize))
-                : lxmfData
-            let tid = LXMFPropagation.transientId(lxmfData: lxmfCore)
+            let tid: Data
+            let destData: Data
+            if minStampCost > 0 {
+                // Require a valid PN stamp at or above minStampCost. validatePnStamp strips the trailing
+                // 32-byte stamp and returns transient_id = full_hash(stampless_entry) — the canonical dedup
+                // key matching the sender (LXMFPropagation.pack) and peer re-sync. Entries with an absent
+                // or under-cost stamp are silently rejected.
+                guard let validated = LXStamper.validatePnStamp(transientData: lxmfData, targetCost: minStampCost) else { continue }
+                guard let dest = LXMFPropagation.destinationHash(lxmfData: validated.lxmfData) else { continue }
+                tid = validated.transientId
+                destData = dest
+            } else {
+                // minStampCost == 0: accept without stamp validation (backward-compat / test helper path).
+                // Strip the trailing stamp if present (> destHash(16) + stamp(32) bytes), otherwise use as-is.
+                guard let dest = LXMFPropagation.destinationHash(lxmfData: lxmfData) else { continue }
+                let lxmfCore = lxmfData.count > LXMessage.destinationLength + LXStamper.stampSize
+                    ? Data(lxmfData.dropLast(LXStamper.stampSize))
+                    : lxmfData
+                tid = LXMFPropagation.transientId(lxmfData: lxmfCore)
+                destData = dest
+            }
             if stored[tid] != nil { continue }   // dedup by transient_id
-            stored[tid] = Entry(transientId: tid, destinationHash: dest, lxmfData: lxmfData, sequence: nextSequence)
+            // Store the full stamped bytes (lxmfData) so PN→PN sync re-delivers the stamped entry,
+            // letting the receiving PN validate and arrive at the same transient_id.
+            stored[tid] = Entry(transientId: tid, destinationHash: destData, lxmfData: lxmfData, sequence: nextSequence)
             nextSequence += 1
             added.append(tid)
         }

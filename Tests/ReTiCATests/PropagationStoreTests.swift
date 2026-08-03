@@ -12,7 +12,7 @@ private func container(_ entries: [Data]) -> Data {
 }
 
 @Test func propagationStoreIngestsAndDedups() throws {
-    var store = PropagationStore()
+    var store = PropagationStore(minStampCost: 0)
     let e = entry(dest: 0xAA, tail: "one")
     let tid = LXMFPropagation.transientId(lxmfData: e)
     let firstAdded = store.ingest(container: container([e]))
@@ -26,7 +26,7 @@ private func container(_ entries: [Data]) -> Data {
 }
 
 @Test func propagationStoreQueriesByDestination() throws {
-    var store = PropagationStore()
+    var store = PropagationStore(minStampCost: 0)
     let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
     let b1 = entry(dest: 0xBB, tail: "b1")
     store.ingest(container: container([a1, b1, a2]))
@@ -40,7 +40,7 @@ private func container(_ entries: [Data]) -> Data {
 }
 
 @Test func propagationStoreRemoves() throws {
-    var store = PropagationStore()
+    var store = PropagationStore(minStampCost: 0)
     let e = entry(dest: 0xAA, tail: "x")
     let tid = LXMFPropagation.transientId(lxmfData: e)
     store.ingest(container: container([e]))
@@ -51,7 +51,7 @@ private func container(_ entries: [Data]) -> Data {
 
 @Test func propagationStoreEvictsOldestOverLimit() throws {
     // Each entry is 16 + 4 = 20 bytes; a 45-byte limit holds at most 2.
-    var store = PropagationStore(storageLimitBytes: 45)
+    var store = PropagationStore(storageLimitBytes: 45, minStampCost: 0)
     let e1 = entry(dest: 0xAA, tail: "aaaa")
     let e2 = entry(dest: 0xAA, tail: "bbbb")
     let e3 = entry(dest: 0xAA, tail: "cccc")
@@ -65,7 +65,7 @@ private func container(_ entries: [Data]) -> Data {
 }
 
 @Test func propagationStoreSkipsMalformedEntries() throws {
-    var store = PropagationStore()
+    var store = PropagationStore(minStampCost: 0)
     // Short entry (< 16 bytes) is skipped; the well-formed one is stored.
     let shortEntry = Data([0x01, 0x02, 0x03])
     let good = entry(dest: 0xAA, tail: "ok")
@@ -78,14 +78,14 @@ private func container(_ entries: [Data]) -> Data {
 }
 
 @Test func propagationStoreOffersAllTransientIdsOldestFirst() throws {
-    var store = PropagationStore()
+    var store = PropagationStore(minStampCost: 0)
     let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2"), e3 = entry(dest: 0xBB, tail: "e3")
     store.ingest(container: container([e1, e2, e3]))
     #expect(store.transientIds == [e1, e2, e3].map { LXMFPropagation.transientId(lxmfData: $0) })
 }
 
 @Test func propagationStoreWantedReturnsMissingInOfferedOrder() throws {
-    var store = PropagationStore()
+    var store = PropagationStore(minStampCost: 0)
     let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2")
     let x = entry(dest: 0xAA, tail: "xx"), y = entry(dest: 0xAA, tail: "yy")
     store.ingest(container: container([e1, e2]))
@@ -94,14 +94,14 @@ private func container(_ entries: [Data]) -> Data {
 }
 
 @Test func propagationStoreWantedDedupsWithinOffer() throws {
-    let store = PropagationStore()   // empty
+    let store = PropagationStore(minStampCost: 0)   // empty
     let x = entry(dest: 0xAA, tail: "xx"), y = entry(dest: 0xAA, tail: "yy")
     let tx = LXMFPropagation.transientId(lxmfData: x), ty = LXMFPropagation.transientId(lxmfData: y)
     #expect(store.wanted(fromOffered: [tx, tx, ty]) == [tx, ty])
 }
 
 @Test func propagationStoreWantedEmptyWhenAllPresent() throws {
-    var store = PropagationStore()
+    var store = PropagationStore(minStampCost: 0)
     let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2")
     store.ingest(container: container([e1, e2]))
     let offered = [e1, e2].map { LXMFPropagation.transientId(lxmfData: $0) }
@@ -121,11 +121,31 @@ private func container(_ entries: [Data]) -> Data {
     let tid3 = LXMFPropagation.transientId(lxmfData: d3)
     let absent = Data(repeating: 0xFF, count: 32)
 
-    var store = PropagationStore()
+    var store = PropagationStore(minStampCost: 0)
     _ = store.ingest(container: LXMFPropagation.container(timestamp: 1700000000.5, entries: [d1, d2, d3]))
 
     // Requested order [tid3, absent, tid1] → [d3, d1]: order preserved, absent skipped, tid2 excluded.
     let got = store.entries(forTransientIds: [tid3, absent, tid1]).map(\.lxmfData)
     #expect(got == [d3, d1])
     #expect(store.entries(forTransientIds: []).isEmpty)
+}
+
+/// Ingest rejects an entry whose stamp is absent or under the min cost; accepts one with a valid stamp.
+/// Cost 4 keeps the PoW search fast (avg ~16 hash iterations over the 1000-round PN workblock).
+@Test func ingestRejectsUnderCostStamp() {
+    var store = PropagationStore(minStampCost: 4)
+    let dest = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    // Valid entry: destHash ‖ ciphertext ‖ generatePnStamp(transientId, targetCost: 4).
+    // transientId is computed over the stampless core (dest ‖ ciphertext), matching validatePnStamp.
+    let validCore = dest + Data("valid-ciphertext".utf8)
+    let validTid = LXMFPropagation.transientId(lxmfData: validCore)
+    let validStamp = LXStamper.generatePnStamp(transientId: validTid, targetCost: 4)
+    let validEntry = validCore + validStamp
+    // Bad entry: destHash ‖ ciphertext ‖ 32 zero bytes — the zero stamp is not a valid cost-4 PN stamp
+    // (full_hash(workblock ‖ zeros) overwhelmingly lacks 4 leading zero bits), so it must be rejected.
+    let badCore = dest + Data("bad-ciphertext".utf8)
+    let badEntry = badCore + Data(repeating: 0x00, count: LXStamper.stampSize)
+    store.ingest(container: container([validEntry]))
+    store.ingest(container: container([badEntry]))
+    #expect(store.transientIds.count == 1)   // only the validEntry was accepted
 }

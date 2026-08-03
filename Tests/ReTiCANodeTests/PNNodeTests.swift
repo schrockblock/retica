@@ -6,10 +6,10 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
-private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStore<PNNode.State, PNNode.Action> {
+private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCost: Int = 4) -> TestStore<PNNode.State, PNNode.Action> {
     let store = TestStore(initialState: PNNode.State(
         identity: pnIdentity, endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false),
-        peeringCost: peeringCost)
+        minStampCost: minStampCost, peeringCost: peeringCost)
     ) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
@@ -198,7 +198,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStor
     let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), minStampCost: 4)
     _ = initial.node.store.ingest(container: container)
     initial.offerLinks[linkID] = [tid]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
@@ -226,7 +226,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0) -> TestStor
     let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false))
+    var initial = PNNode.State(identity: Identity(), endpoint: Endpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), minStampCost: 4)
     _ = initial.node.store.ingest(container: container)
     initial.offerLinks[linkID] = [tid]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
