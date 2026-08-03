@@ -168,3 +168,109 @@ import ComposableArchitecture
 
     await a.send(.endpoint(.disconnect)); await s.send(.disconnect); await pn.send(.disconnect)
 }
+
+// MARK: - Unit: ordering and purge
+
+/// IDENTIFY must be transmitted before the /get list request. The sequential `.run` in
+/// `requestMessageList` guarantees this; a `.merge` would allow either order.
+@MainActor @Test func syncIdentifiesBeforeRequesting() async {
+    let identity = Identity()
+    let linkID = Data(repeating: 0xAB, count: 16)
+
+    var initialState = LXMFNode.State(
+        identity: identity,
+        endpoint: Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    initialState.syncPhase = [:]   // nothing pre-set
+
+    let store = TestStore(initialState: initialState) { LXMFNode() } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } },
+                                         send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+
+    await store.send(.router(.delegate(.requestMessageList(linkID: linkID))))
+
+    // The sequential .run guarantees IDENTIFY arrives before the /get request.
+    var sawIdentify = false
+    var sawRequest = false
+    var identifyBeforeRequest = false
+
+    await store.receive { action in
+        if case let .endpoint(.identifyOverLink(lid, _)) = action, lid == linkID {
+            sawIdentify = true
+            return true
+        }
+        return false
+    }
+    identifyBeforeRequest = sawIdentify && !sawRequest
+
+    await store.receive { action in
+        if case let .endpoint(.sendRequestOverLink(lid, path, _)) = action, lid == linkID, path == "/get" {
+            sawRequest = true
+            return true
+        }
+        return false
+    }
+
+    #expect(sawIdentify)
+    #expect(sawRequest)
+    #expect(identifyBeforeRequest, "IDENTIFY must be emitted before the /get request")
+}
+
+/// After messagesDownloaded, a phase-3 purge /get [nil, [tid]] is emitted carrying the downloaded
+/// transient_ids so the PN can evict them.
+@MainActor @Test func syncPurgesAfterDownload() async {
+    let aIdentity = Identity()
+    let sIdentity = Identity()
+    let aDeliveryHash = LXMessage.deliveryHash(identityHash: aIdentity.hash)
+    let linkID = Data(repeating: 0xBC, count: 16)
+    let requestID = Data(repeating: 0x01, count: 16)
+
+    // Build a real stored message so recoverPacked succeeds and we get a real transient_id.
+    let storedMsg = LXMessage.create(source: sIdentity, destinationHash: aDeliveryHash,
+                                     timestamp: 1700000000.5, title: Data("t".utf8), content: Data("purge-me".utf8))
+    let (container, tid) = LXMFPropagation.pack(message: storedMsg, recipientIdentity: aIdentity,
+                                                 timestamp: 1700000000.5, stampCost: 4)
+    let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped entry
+
+    var initialState = LXMFNode.State(
+        identity: aIdentity,
+        endpoint: Endpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    // Put the link into awaitingMessages phase so responseReceived dispatches that branch.
+    initialState.syncPhase[linkID] = .awaitingMessages
+
+    let store = TestStore(initialState: initialState) { LXMFNode() } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } },
+                                         send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+
+    // Supply the PN response containing one blob (the stamped entry).
+    let blobResponse = MsgPack.encode(.array([.bin(entry)]))
+    await store.send(.endpoint(.delegate(.responseReceived(linkID: linkID, requestID: requestID, data: blobResponse))))
+
+    // Expect messagesDownloaded carrying the transient_id.
+    await store.receive { action in
+        if case let .router(.messagesDownloaded(tids)) = action { return tids.contains(tid) }
+        return false
+    }
+
+    // Expect the purge /get: [null, [tid]].
+    let expectedPurgeData = MsgPack.encode(.array([.null, .array([.bin(tid)])]))
+    var gotPurge = false
+    await store.receive { action in
+        if case let .endpoint(.sendRequestOverLink(lid, path, data)) = action,
+           lid == linkID, path == "/get", data == expectedPurgeData {
+            gotPurge = true
+            return true
+        }
+        return false
+    }
+    #expect(gotPurge, "Phase-3 purge /get must be sent after messagesDownloaded")
+}

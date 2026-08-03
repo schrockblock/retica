@@ -44,6 +44,9 @@ public struct LXMFNode {
         }
     }
 
+    /// Transfer-limit value sent as the third element of the phase-2 /get payload (0 = no limit).
+    public static let propagationTransferLimitKB: UInt64 = 0
+
     @Dependency(\.date) var date
     public init() {}
 
@@ -102,16 +105,19 @@ public struct LXMFNode {
             // --- Propagation sync: phase-1 (IDENTIFY + list request) ---
             case let .router(.delegate(.requestMessageList(linkID))):
                 state.syncPhase[linkID] = .awaitingList
-                return .merge(
-                    .send(.endpoint(.identifyOverLink(linkID: linkID, identity: state.identity))),
-                    .send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/get",
-                                                         data: MsgPack.encode(.array([.null, .null]))))))
+                let identity = state.identity
+                return .run { send in
+                    await send(.endpoint(.identifyOverLink(linkID: linkID, identity: identity)))
+                    await send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/get",
+                                                              data: MsgPack.encode(.array([.null, .null])))))
+                }
 
             // --- Propagation sync: phase-2 (wanted messages request) ---
             case let .router(.delegate(.requestMessages(linkID, wants, haves))):
                 state.syncPhase[linkID] = .awaitingMessages
                 let payload = MsgPack.encode(.array([.array(wants.map { .bin($0) }),
-                                                     .array(haves.map { .bin($0) })]))
+                                                     .array(haves.map { .bin($0) }),
+                                                     .uint(LXMFNode.propagationTransferLimitKB)]))
                 return .send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/get", data: payload)))
 
             // --- Propagation sync: dispatch on responseReceived based on phase ---
@@ -143,6 +149,10 @@ public struct LXMFNode {
                         }
                     }
                     effects.append(.send(.router(.messagesDownloaded(transientIds: tids))))
+                    if !tids.isEmpty {
+                        effects.append(.send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/get",
+                            data: MsgPack.encode(.array([.null, .array(tids.map { .bin($0) })]))))))
+                    }
                     return .merge(effects)
                 case .none:
                     return .none
