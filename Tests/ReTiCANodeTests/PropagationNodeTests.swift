@@ -58,6 +58,33 @@ private func container(_ entries: [Data]) -> Data {
     }
 }
 
+@Test @MainActor func propagationNodeServesStamplessSoClientTransientIdMatches() async {
+    // A stamped entry (destHash ‖ tail ‖ 32-byte stamp) must be served WITHOUT the stamp — reference
+    // LXMRouter.py:1551 serves lxmf_data[:-STAMP_SIZE]. The client then computes transient_id =
+    // full_hash(served-bytes-as-is), which must equal the node's stored key so the phase-3 purge matches.
+    let dest = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    let core = dest + Data(String(repeating: "x", count: 40).utf8)             // 56-byte stampless core (> 48)
+    let stamped = core + Data(repeating: 0x77, count: LXStamper.stampSize)     // 88-byte stored entry
+    let tid = LXMFPropagation.transientId(lxmfData: core)                      // stored key = full_hash(stampless)
+
+    let store = TestStore(initialState: PropagationNode.State(minStampCost: 0)) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([stamped])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+    #expect(store.state.store.contains(transientId: tid))                      // stored under the stampless key
+
+    await store.send(.messagesRequested(destinationHash: dest, wants: [tid], haves: []))
+    await store.receive { action in
+        if case let .delegate(.deliverMessages(_, entries)) = action {
+            #expect(entries == [core])                                         // stamp stripped on serve
+            #expect(entries != [stamped])
+            #expect(LXMFPropagation.transientId(lxmfData: entries[0]) == tid)  // client's purge id will match
+            return true
+        }
+        return false
+    }
+}
+
 @Test @MainActor func propagationNodeServesEmptyWhenNoneAddressed() async {
     let store = TestStore(initialState: PropagationNode.State(minStampCost: 0)) { PropagationNode() }
     store.exhaustivity = .off

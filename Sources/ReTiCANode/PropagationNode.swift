@@ -54,7 +54,7 @@ public struct PropagationNode {
                 let wantSet = Set(wants)
                 let entries = state.store.entries(forDestination: destinationHash)
                     .filter { wantSet.contains($0.transientId) }
-                    .map(\.lxmfData)
+                    .map { LXMFPropagation.strippedCore(lxmfData: $0.lxmfData) }   // serve stampless (reference LXMRouter.py:1551)
                 return .send(.delegate(.deliverMessages(destinationHash: destinationHash, entries: entries)))
 
             case let .messageListRequested(destinationHash):

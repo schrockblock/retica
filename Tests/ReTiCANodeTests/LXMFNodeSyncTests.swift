@@ -143,8 +143,10 @@ import ComposableArchitecture
         return false
     }
 
-    // PN responds with the blob list (the single lxmfData entry).
-    let phase2Resp = MsgPack.encode(.array([.bin(entry)]))
+    // PN responds with the blob list. Reference LXMRouter serves the STAMPLESS entry (strips the
+    // trailing stamp before serving, LXMRouter.py:1551), so the fixture serves strippedCore(entry);
+    // the client computes transient_id = full_hash of the served bytes as-is, recovering `tid`.
+    let phase2Resp = MsgPack.encode(.array([.bin(LXMFPropagation.strippedCore(lxmfData: entry))]))
     await pn.send(.sendResponseOverLink(linkID: pnLinkID, requestID: reqID2.value!, data: phase2Resp))
     await pn.receive(epSend)                                 // response frame out
 
@@ -251,8 +253,10 @@ import ComposableArchitecture
     }
     store.exhaustivity = .off
 
-    // Supply the PN response containing one blob (the stamped entry).
-    let blobResponse = MsgPack.encode(.array([.bin(entry)]))
+    // Supply the PN response. Reference LXMRouter serves the STAMPLESS entry (LXMRouter.py:1551 strips
+    // the trailing stamp before serving), so the fixture must too — the client's purge transient_id =
+    // full_hash of the served bytes as-is, which equals the node's stored `tid`.
+    let blobResponse = MsgPack.encode(.array([.bin(LXMFPropagation.strippedCore(lxmfData: entry))]))
     await store.send(.endpoint(.delegate(.responseReceived(linkID: linkID, requestID: requestID, data: blobResponse))))
 
     // Expect messagesDownloaded carrying the transient_id.

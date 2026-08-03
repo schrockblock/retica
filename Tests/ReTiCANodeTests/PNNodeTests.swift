@@ -83,7 +83,8 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     await store.receive { action in
         if case let .endpoint(.sendResponseOverLink(_, rid, data)) = action {
             #expect(rid == Data([2]))
-            #expect(MsgPack.decodeValue(data) == .array([.bin(entry)])); return true
+            // Client-download serve is stampless (reference LXMRouter.py:1551 strips the trailing stamp).
+            #expect(MsgPack.decodeValue(data) == .array([.bin(LXMFPropagation.strippedCore(lxmfData: entry))])); return true
         }
         return false
     }

@@ -141,10 +141,11 @@ public struct LXMFNode {
                     var effects: [Effect<Action>] = []
                     var tids: [Data] = []
                     for blob in blobs {
-                        // Strip the trailing stamp (32 bytes) if present to recover the canonical transient_id
-                        // (full_hash of the stampless lxmf_data), matching how PropagationStore deduplicates.
-                        let blobCore = LXMFPropagation.strippedCore(lxmfData: blob)
-                        tids.append(LXMFPropagation.transientId(lxmfData: blobCore))
+                        // The propagation node serves stampless entries (reference LXMRouter strips the
+                        // trailing stamp before serving, LXMRouter.py:1551), so the canonical transient_id
+                        // is full_hash of the served bytes AS-IS — which equals the node's stored key. Do
+                        // NOT strip again here (that double-strip hashed served[:-32] → purge never matched).
+                        tids.append(LXMFPropagation.transientId(lxmfData: blob))
                         if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity) {
                             effects.append(.send(.router(.received(method: .direct, destinationHash: Data(), data: packed))))
                         }

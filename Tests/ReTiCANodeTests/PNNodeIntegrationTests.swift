@@ -188,7 +188,8 @@ import ComposableArchitecture
     // --- Final assertions ---
     #expect(MsgPack.decodeValue(gotList.value!) == .array([.bin(tid)]))
     let served = MsgPack.decodeValue(gotBlob.value!)
-    #expect(served == .array([.bin(entry)]))
+    // Client-download serve is stampless (reference LXMRouter.py:1551 strips the trailing stamp).
+    #expect(served == .array([.bin(LXMFPropagation.strippedCore(lxmfData: entry))]))
     let recovered = LXMFPropagation.open(lxmfData: entry, recipientIdentity: cIdentity)
     #expect(recovered?.content == Data("hi C".utf8))
     #expect(recovered?.validateSignature(source: sIdentity) == true)
