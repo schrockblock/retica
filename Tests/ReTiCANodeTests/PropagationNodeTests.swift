@@ -247,3 +247,52 @@ private func container(_ entries: [Data]) -> Data {
         return false
     }
 }
+
+// MARK: - Persistence delegates
+
+@Test @MainActor func propagationNodeEmitsStoredEntriesForPersistence() async {
+    let e = entry(dest: 0xAA, tail: "persist-me")
+    let tid = LXMFPropagation.transientId(lxmfData: e)
+    let store = TestStore(initialState: PropagationNode.State(minStampCost: 0)) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([e])))
+    await store.receive { action in
+        if case let .delegate(.storedEntries(entries)) = action {
+            #expect(entries.count == 1)
+            #expect(entries[0].transientId == tid)
+            #expect(entries[0].lxmfData == e)            // the bytes the host must write
+            #expect(entries[0].destinationHash == Data(repeating: 0xAA, count: LXMessage.destinationLength))
+            return true
+        }
+        return false
+    }
+}
+
+/// Entries leave the store by two routes — the `haves` purge inside messagesRequested and the
+/// messagesDelivered action. BOTH must signal, or the host's mirror drifts from the store.
+@Test @MainActor func propagationNodeEmitsPurgedOnBothRemovalPaths() async {
+    let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
+    let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
+    let tidA2 = LXMFPropagation.transientId(lxmfData: a2)
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    let store = TestStore(initialState: PropagationNode.State(minStampCost: 0)) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([a1, a2])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+
+    // Route 1: the `haves` purge inside messagesRequested.
+    await store.send(.messagesRequested(destinationHash: destA, wants: [tidA2], haves: [tidA1]))
+    await store.receive { action in
+        if case let .delegate(.purged(ids)) = action { #expect(ids == [tidA1]); return true }
+        return false
+    }
+    #expect(store.state.store.contains(transientId: tidA1) == false)
+
+    // Route 2: messagesDelivered.
+    await store.send(.messagesDelivered(transientIds: [tidA2]))
+    await store.receive { action in
+        if case let .delegate(.purged(ids)) = action { #expect(ids == [tidA2]); return true }
+        return false
+    }
+    #expect(store.state.store.contains(transientId: tidA2) == false)
+}

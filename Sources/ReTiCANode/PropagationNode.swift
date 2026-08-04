@@ -37,6 +37,11 @@ public struct PropagationNode {
             case requestFromPeer(peerHash: Data, transientIds: [Data])
             case offerTransientIds(peerHash: Data, transientIds: [Data])
             case peerValidated(peerHash: Data, valid: Bool)
+            /// The full entries just ingested — the bytes a host persists. Emitted alongside `stored`.
+            case storedEntries(entries: [PropagationStore.Entry])
+            /// Transient ids just removed from the store (client purge or delivery confirmation), so a
+            /// host can delete its mirrored copies.
+            case purged(transientIds: [Data])
         }
     }
 
@@ -47,23 +52,32 @@ public struct PropagationNode {
             switch action {
             case let .ingestContainer(data):
                 let added = state.store.ingest(container: data)
-                return .send(.delegate(.stored(transientIds: added)))
+                let entries = state.store.entries(forTransientIds: added)
+                return .merge(.send(.delegate(.stored(transientIds: added))),
+                              .send(.delegate(.storedEntries(entries: entries))))
 
             case let .messagesRequested(destinationHash, wants, haves):
+                let purged = haves.filter { state.store.contains(transientId: $0) }
                 for tid in haves { state.store.remove(transientId: tid) }          // purge what the client already has
                 let wantSet = Set(wants)
                 let entries = state.store.entries(forDestination: destinationHash)
                     .filter { wantSet.contains($0.transientId) }
                     .map { LXMFPropagation.strippedCore(lxmfData: $0.lxmfData) }   // serve stampless (reference LXMRouter.py:1551)
-                return .send(.delegate(.deliverMessages(destinationHash: destinationHash, entries: entries)))
+                var effects: [Effect<Action>] = [
+                    .send(.delegate(.deliverMessages(destinationHash: destinationHash, entries: entries)))
+                ]
+                if !purged.isEmpty { effects.append(.send(.delegate(.purged(transientIds: purged)))) }
+                return .merge(effects)
 
             case let .messageListRequested(destinationHash):
                 let ids = state.store.entries(forDestination: destinationHash).map(\.transientId)
                 return .send(.delegate(.deliverMessageList(destinationHash: destinationHash, transientIds: ids)))
 
             case let .messagesDelivered(transientIds):
+                let purged = transientIds.filter { state.store.contains(transientId: $0) }
                 for tid in transientIds { state.store.remove(transientId: tid) }
-                return .none
+                guard !purged.isEmpty else { return .none }
+                return .send(.delegate(.purged(transientIds: purged)))
 
             case let .peerOffered(peerHash, offered):
                 return .send(.delegate(.requestFromPeer(peerHash: peerHash,

@@ -11,6 +11,24 @@ public struct PropagationStore: Equatable {
         public var destinationHash: Data
         public var lxmfData: Data
         var sequence: Int
+
+        /// Public construction for hosts mirroring the store (persistence, tests). `sequence` is the
+        /// store's internal ordering and is not part of a host's contract, so it defaults to 0 —
+        /// entries built this way are values to persist/compare, not to insert into a store.
+        public init(transientId: Data, destinationHash: Data, lxmfData: Data) {
+            self.transientId = transientId
+            self.destinationHash = destinationHash
+            self.lxmfData = lxmfData
+            self.sequence = 0
+        }
+
+        /// Internal construction used by the store itself, preserving the insertion-order sequence.
+        init(transientId: Data, destinationHash: Data, lxmfData: Data, sequence: Int) {
+            self.transientId = transientId
+            self.destinationHash = destinationHash
+            self.lxmfData = lxmfData
+            self.sequence = sequence
+        }
     }
 
     private var stored: [Data: Entry] = [:]
