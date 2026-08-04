@@ -42,7 +42,8 @@ import ComposableArchitecture
     // linkDataReceived on the served propagation link must NOT reach the router.
     // A stray .router(.received) from the propagation link would survive as an unhandled effect and
     // fail teardown (or the next send in .on mode).
-    await store.send(.endpoint(.delegate(.linkDataReceived(linkID: servedLink, data: Data("container".utf8)))))
+    await store.send(.endpoint(.delegate(.linkDataReceived(linkID: servedLink, data: Data("container".utf8),
+                                                           packetHash: Data(repeating: 0xE1, count: 32)))))
     // resourceReceived on the served propagation link must ALSO not reach the router (Minor-1).
     // Both guards must block — deleting either one leaves a stray .router(.received) in the queue
     // that causes teardown to fail when exhaustivity is flipped to .on.
@@ -51,7 +52,8 @@ import ComposableArchitecture
 
     // Data on any other link keeps the existing direct-message path.
     // This also proves the guard is not simply disabling everything.
-    await store.send(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: Data("msg".utf8)))))
+    await store.send(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: Data("msg".utf8),
+                                                           packetHash: Data(repeating: 0xE2, count: 32)))))
     await store.receive { if case .router(.received) = $0 { return true }; return false }
 }
 
@@ -176,7 +178,8 @@ import ComposableArchitecture
 
     // Offers on the (otherwise valid) propagation link: both framings must be ignored.
     await store.send(.client(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container)))))
-    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: container)))))
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: container,
+                                                                   packetHash: Data(repeating: 0xE3, count: 32))))))
     // A fresh IDENTIFY must not be recorded either.
     await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: otherLink, remoteIdentity: Identity())))))
     // …and a /get from the already-IDENTIFY'd client must not be answered. Sent LAST so a stray
@@ -253,7 +256,8 @@ import ComposableArchitecture
     #expect(store.state.pn.store.count == 0)
 
     // Framing 2: the same bytes as plain link data on the non-propagation link.
-    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: container)))))
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: container,
+                                                                   packetHash: Data(repeating: 0xE4, count: 32))))))
     await store.skipReceivedActions(strict: false)
     #expect(store.state.pn.store.count == 0)
     #expect(store.state.pn.store.contains(transientId: LXMFPropagation.transientId(lxmfData: e)) == false)
@@ -500,6 +504,99 @@ import ComposableArchitecture
     await node.send(.client(.endpoint(.tcp(.disconnect)))); await c.send(.disconnect)
 }
 
+// MARK: - Inbound packet proving (reference LXMRouter.py:2255 `packet.prove()`)
+
+/// A PACKET-framed offer on the served propagation link is ingested AND proved.
+///
+/// Reference `LXMRouter.propagation_packet` calls `packet.prove()` after ingesting
+/// (LXMRouter.py:2255). Reference clients take that PACKET path whenever the packed propagation
+/// payload fits the link MDU (LXMessage.py:426-444) — the ordinary chat-sized case — and block on
+/// the resulting packet receipt, so without the proof the message is stored but never marked sent.
+@MainActor @Test func serviceNodeProvesPacketOfferOnPropagationLink() async {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)
+    let e = Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("packet-offer".utf8)
+    let tid = LXMFPropagation.transientId(lxmfData: e)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    let packetHash = Data(repeating: 0xF7, count: 32)
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: container,
+                                                                   packetHash: packetHash)))))
+
+    // Proved, on the SAME link, for exactly the packet that carried the offer.
+    // (Asserted before `messagesStored`: in a `.off` store `receive` SKIPS non-matching actions, and
+    // the prove is one hop from `linkDataReceived` while `messagesStored` is three — asserting the
+    // store signal first would silently swallow the prove and make this test vacuous.)
+    await store.receive { action in
+        if case let .client(.endpoint(.provePacketOverLink(lid, h))) = action {
+            #expect(lid == linkID)
+            #expect(h == packetHash)
+            return true
+        }
+        return false
+    }
+    // …and ingested.
+    await store.receive { action in
+        if case let .delegate(.messagesStored(entries)) = action {
+            #expect(entries.map(\.transientId) == [tid]); return true
+        }
+        return false
+    }
+    #expect(store.state.pn.store.contains(transientId: tid))
+}
+
+/// NEGATIVE 1 — a data packet on a NON-propagation link must NOT be proved. RNS does not blanket-prove
+/// inbound data packets (`proof_strategy`, default `PROVE_NONE`); ReTiCA stays an RNS-faithful
+/// non-proving client everywhere except the propagation offers it serves.
+///
+/// The store is armed for serving (node-mode on, propagation registered) so only the
+/// `isPropagationLink` classification stands between this packet and a proof.
+@MainActor @Test func serviceNodeDoesNotProvePacketOnNonPropagationLink() async {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)
+    let otherHash = Data(repeating: 0x5B, count: 16)     // some correspondent, NOT our propagation dest
+    let otherLink = Data(repeating: 0xC2, count: 16)
+
+    await store.send(.registerPropagation)               // we ARE serving — but not on this link
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: otherLink, destinationHash: otherHash)))))
+    await store.skipReceivedActions(strict: false)       // drain setup effects
+
+    // A `.off` store alone would NOT catch a stray provePacketOverLink at teardown, so flip to .on
+    // for the send under test: the stray action then fails teardown.
+    store.exhaustivity = .on
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: Data("msg".utf8),
+                                                                   packetHash: Data(repeating: 0xF8, count: 32))))))
+    await store.receive { if case .client(.router(.received)) = $0 { return true }; return false }
+}
+
+/// NEGATIVE 2 — with node-mode OFF, a packet on the (otherwise fully armed) propagation link must not
+/// be proved either. Deliberately armed so `isPropagationLink` PASSES and `nodeModeEnabled` is the
+/// only thing left standing between the packet and a proof.
+@MainActor @Test func serviceNodeDoesNotProvePacketWhenNodeModeOff() async {
+    let identity = Identity()
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 0)
+    initial.nodeModeEnabled = false
+    initial.client.propagationDestinationHash = propDest.hash   // isPropagationLink would pass…
+    initial.client.linkDestinations[linkID] = propDest.hash     // …for this link
+    let store = makeServiceNodeStore(initial)
+
+    store.exhaustivity = .on   // a stray provePacketOverLink now fails teardown
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: Data("offer".utf8),
+                                                                   packetHash: Data(repeating: 0xF9, count: 32))))))
+}
+
 // MARK: - Important-4: propagationDestinationHash retained on disarm
 
 /// On `setNodeMode(false)`, `propagationDestinationHash` MUST be kept (not cleared) so data arriving
@@ -527,7 +624,8 @@ import ComposableArchitecture
     // And with node-mode off, data on the propagation link IS still suppressed (not misrouted).
     let linkID = Data(repeating: 0xC1, count: 16)
     await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
-    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: Data("offer".utf8))))))
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: Data("offer".utf8),
+                                                                   packetHash: Data(repeating: 0xE5, count: 32))))))
     store.exhaustivity = .on   // no stray .router(.received) from the disabled-but-still-open link
 }
 

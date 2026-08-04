@@ -130,9 +130,22 @@ public struct LXMFServiceNode {
                 guard state.nodeModeEnabled, isPropagationLink(state, linkID) else { return .none }
                 return .send(.pn(.ingestContainer(data)))
 
-            case let .client(.endpoint(.delegate(.linkDataReceived(linkID, data)))):
+            case let .client(.endpoint(.delegate(.linkDataReceived(linkID, data, packetHash)))):
                 guard state.nodeModeEnabled, isPropagationLink(state, linkID) else { return .none }
-                return .send(.pn(.ingestContainer(data)))
+                // Reference LXMRouter.py:2255 — after ingesting a PACKET-framed offer the node calls
+                // `packet.prove()`, which completes the sending client's packet receipt. Without it a
+                // reference client (which picks the PACKET path whenever the packed propagation payload
+                // fits the link MDU — LXMessage.py:426-444, the ordinary chat-sized case) times out,
+                // tears the link down and retries forever, never marking the message sent.
+                //
+                // Deliberately scoped: this is the ONLY place ReTiCA proves an inbound data packet.
+                // RNS proves per-destination (`proof_strategy`, default PROVE_NONE), so a blanket
+                // auto-prove would be wrong; the decision lives here, in the composition that knows
+                // the link terminates on the lxmf.propagation destination we serve AND that node mode
+                // is on. Resource-framed offers already get a resource proof from `ResourceTransfer`.
+                return .merge(
+                    .send(.pn(.ingestContainer(data))),
+                    .send(.client(.endpoint(.provePacketOverLink(linkID: linkID, packetHash: packetHash)))))
 
             case let .client(.endpoint(.delegate(.linkIdentified(linkID, remoteIdentity)))):
                 // Only record identity for links to OUR served propagation destination (Minor-4 / reference

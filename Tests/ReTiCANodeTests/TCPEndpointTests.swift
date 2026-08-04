@@ -317,7 +317,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     await b.receive { action in
-        if case let .delegate(.linkDataReceived(_, d)) = action { gotData.setValue(d); return true }
+        if case let .delegate(.linkDataReceived(_, d, _)) = action { gotData.setValue(d); return true }
         return false
     }
     #expect(gotData.value == payload)
@@ -1585,7 +1585,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     eventsB.yield(.data(HDLC.frame(rToB_Data.value!)))
     await b.receive(\.transport.received)
     await b.receive { action in
-        if case let .delegate(.linkDataReceived(lid, d)) = action, lid == bLinkID {
+        if case let .delegate(.linkDataReceived(lid, d, _)) = action, lid == bLinkID {
             gotAtoBData.setValue(d)
             return true
         }
@@ -1614,7 +1614,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     eventsA.yield(.data(HDLC.frame(rToA_Data.value!)))
     await a.receive(\.transport.received)
     await a.receive { action in
-        if case let .delegate(.linkDataReceived(lid, d)) = action, lid == aLinkID {
+        if case let .delegate(.linkDataReceived(lid, d, _)) = action, lid == aLinkID {
             gotBtoAData.setValue(d)
             return true
         }

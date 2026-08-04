@@ -255,8 +255,10 @@ public struct LXMFNode {
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))
 
-            case let .endpoint(.delegate(.linkDataReceived(linkID, data))):
+            case let .endpoint(.delegate(.linkDataReceived(linkID, data, _))):
                 // On our served lxmf.propagation link this is an offer for the node, not a message for us.
+                // (The packet hash is ignored here: as a plain LXMF CLIENT we prove nothing — RNS's
+                // default proof_strategy is PROVE_NONE. Proving is `LXMFServiceNode`'s decision.)
                 guard !isServedPropagationLink(state, linkID) else { return .none }
                 return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
 

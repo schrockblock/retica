@@ -130,6 +130,12 @@ public struct LinkSession {
         case requestDeadline(Data)
         case sendWithReceipt(data: Data, token: Data)
         case dataProofDeadline(packetHash: Data)
+        /// Prove ONE inbound link data packet, by its `packetHash` (as surfaced with
+        /// `delegate(.dataReceived)`). Mirrors reference `RNS.Packet.prove()` →
+        /// `RNS.Link.prove_packet` (RNS/Link.py:378-388). Deliberately an explicit command, not a
+        /// policy flag: RNS proves per-destination (`proof_strategy`, default `PROVE_NONE`), so the
+        /// decision belongs to whichever composition classified the packet — see `LXMFServiceNode`.
+        case provePacket(packetHash: Data)
         case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
 
@@ -137,7 +143,11 @@ public struct LinkSession {
             case transmit(InterfaceID, Data)
             case established(linkID: Data, sessionKey: Data)
             case establishmentFailed
-            case dataReceived(Data)
+            /// An inbound application data packet. `packetHash` is the 32-byte hash the sender
+            /// records as its pending receipt — pass it back to `.provePacket` to prove the packet.
+            /// (Mirrors the reference callback signature `LXMRouter.propagation_packet(data, packet)`,
+            /// which receives BOTH the decoded payload and the packet it must prove.)
+            case dataReceived(data: Data, packetHash: Data)
             case closed(CloseReason)
             case resourceReceived(Data)
             case resourceConcluded(Data)
@@ -283,7 +293,7 @@ public struct LinkSession {
                 case (_, .active, .data, .none):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey)
                     else { return .none }   // corrupt/foreign data is ignored, link stays active
-                    return .send(.delegate(.dataReceived(plain)))
+                    return .send(.delegate(.dataReceived(data: plain, packetHash: packet.packetHash)))
 
                 case (_, .active, .data, .linkClose):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
@@ -557,6 +567,27 @@ public struct LinkSession {
                         try await clock.sleep(for: .seconds(timeout))
                         await send(.dataProofDeadline(packetHash: packetHash))
                     }.cancellable(id: CancelID.receipt(packetHash), cancelInFlight: true))
+
+            case let .provePacket(packetHash):
+                // Reference RNS/Link.py:378-388 `prove_packet`:
+                //   signature  = self.sign(packet.packet_hash)
+                //   proof_data = packet.packet_hash + signature
+                //   RNS.Packet(self, proof_data, RNS.Packet.PROOF).send()   # context NONE, unencrypted
+                // The signing key is the link's `sig_prv`, which for a RESPONDER link is the owning
+                // destination's long-term identity key (RNS/Link.py:277) — the key the initiator
+                // validates against (`load_peer` with `destination.identity`, RNS/Link.py:407-408).
+                // Requiring `owningIdentity` therefore also structurally restricts proving to the
+                // responder role, matching RNS: an initiator link signs with an ephemeral key the
+                // peer never learns, so an initiator-side packet proof could never validate.
+                guard state.status == .active, let owner = state.owningIdentity else { return .none }
+                let proofData = packetHash + owner.sign(packetHash)
+                let proofPacket = Packet(headerType: .header1, packetType: .proof,
+                                         transportType: .broadcast, destinationType: .link,
+                                         context: .none, contextFlag: false, hops: 0,
+                                         destinationHash: state.linkID, transportId: nil,
+                                         payload: proofData)
+                guard let raw = try? proofPacket.packed() else { return .none }
+                return .send(.delegate(.transmit(state.interfaceID, raw)))
 
             case let .dataProofDeadline(packetHash):
                 guard let token = state.pendingDataReceipts[packetHash] else { return .none }

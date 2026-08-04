@@ -81,7 +81,7 @@ import ComposableArchitecture
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     await b.receive { action in
-        if case let .delegate(.linkDataReceived(lid, d)) = action, lid == linkID { got.setValue(d); return true }
+        if case let .delegate(.linkDataReceived(lid, d, _)) = action, lid == linkID { got.setValue(d); return true }
         return false
     }
 

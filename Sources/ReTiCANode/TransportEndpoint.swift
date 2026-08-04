@@ -62,6 +62,7 @@ public struct TransportEndpoint {
         case sendRequestOverLink(linkID: Data, path: String, data: Data)
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
         case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
+        case provePacketOverLink(linkID: Data, packetHash: Data)
         case closeLink(linkID: Data)
         case registerRequestHandler(path: String, policy: RequestPolicy)
         case deregisterRequestHandler(path: String)
@@ -73,7 +74,7 @@ public struct TransportEndpoint {
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: Transport.SendFailure)
             case linkEstablished(linkID: Data, destinationHash: Data)
-            case linkDataReceived(linkID: Data, data: Data)
+            case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
             case linkFailed(destinationHash: Data)
             case resourceReceived(linkID: Data, data: Data)
@@ -134,6 +135,9 @@ public struct TransportEndpoint {
             case let .sendWithReceiptOverLink(l, d, t):
                 return route(state, tcp: .sendWithReceiptOverLink(linkID: l, data: d, token: t),
                                     ble: .sendWithReceiptOverLink(linkID: l, data: d, token: t))
+            case let .provePacketOverLink(l, h):
+                return route(state, tcp: .provePacketOverLink(linkID: l, packetHash: h),
+                                    ble: .provePacketOverLink(linkID: l, packetHash: h))
             case let .closeLink(l):
                 return route(state, tcp: .closeLink(linkID: l), ble: .closeLink(linkID: l))
             case let .registerRequestHandler(p, pol):
@@ -173,7 +177,7 @@ public struct TransportEndpoint {
         case let .pathLearned(h, hops):         return .pathLearned(destinationHash: h, hops: hops)
         case let .sendFailed(h, r):             return .sendFailed(destinationHash: h, reason: r)
         case let .linkEstablished(l, h):        return .linkEstablished(linkID: l, destinationHash: h)
-        case let .linkDataReceived(l, d):       return .linkDataReceived(linkID: l, data: d)
+        case let .linkDataReceived(l, d, h):    return .linkDataReceived(linkID: l, data: d, packetHash: h)
         case let .linkClosed(l, r):             return .linkClosed(linkID: l, reason: r)
         case let .linkFailed(h):                return .linkFailed(destinationHash: h)
         case let .resourceReceived(l, d):       return .resourceReceived(linkID: l, data: d)
@@ -196,7 +200,7 @@ public struct TransportEndpoint {
         case let .pathLearned(h, hops):         return .pathLearned(destinationHash: h, hops: hops)
         case let .sendFailed(h, r):             return .sendFailed(destinationHash: h, reason: r)
         case let .linkEstablished(l, h):        return .linkEstablished(linkID: l, destinationHash: h)
-        case let .linkDataReceived(l, d):       return .linkDataReceived(linkID: l, data: d)
+        case let .linkDataReceived(l, d, h):    return .linkDataReceived(linkID: l, data: d, packetHash: h)
         case let .linkClosed(l, r):             return .linkClosed(linkID: l, reason: r)
         case let .linkFailed(h):                return .linkFailed(destinationHash: h)
         case let .resourceReceived(l, d):       return .resourceReceived(linkID: l, data: d)

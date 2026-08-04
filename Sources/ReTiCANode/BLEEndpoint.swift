@@ -65,6 +65,7 @@ public struct BLEEndpoint {
         case sendRequestOverLink(linkID: Data, path: String, data: Data)
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
         case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
+        case provePacketOverLink(linkID: Data, packetHash: Data)
         case closeLink(linkID: Data)
         case registerRequestHandler(path: String, policy: RequestPolicy)
         case deregisterRequestHandler(path: String)
@@ -78,7 +79,7 @@ public struct BLEEndpoint {
             case peerOnline(Data)
             case peerOffline(Data)
             case linkEstablished(linkID: Data, destinationHash: Data)
-            case linkDataReceived(linkID: Data, data: Data)
+            case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
             case linkFailed(destinationHash: Data)
             case resourceReceived(linkID: Data, data: Data)
@@ -184,6 +185,8 @@ public struct BLEEndpoint {
                 return .send(.linkPlane(.sendResponseOverLink(linkID: linkID, requestID: requestID, data: data)))
             case let .sendWithReceiptOverLink(linkID, data, token):
                 return .send(.linkPlane(.sendWithReceiptOverLink(linkID: linkID, data: data, token: token)))
+            case let .provePacketOverLink(linkID, packetHash):
+                return .send(.linkPlane(.provePacketOverLink(linkID: linkID, packetHash: packetHash)))
             case let .closeLink(linkID):
                 return .send(.linkPlane(.closeLink(linkID: linkID)))
             case let .registerRequestHandler(path, policy):
@@ -198,8 +201,8 @@ public struct BLEEndpoint {
 
             case let .linkPlane(.delegate(.linkEstablished(linkID, destHash))):
                 return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))
-            case let .linkPlane(.delegate(.linkDataReceived(linkID, data))):
-                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data)))
+            case let .linkPlane(.delegate(.linkDataReceived(linkID, data, packetHash))):
+                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data, packetHash: packetHash)))
             case let .linkPlane(.delegate(.linkClosed(linkID, reason))):
                 return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
             case let .linkPlane(.delegate(.linkFailed(destHash))):

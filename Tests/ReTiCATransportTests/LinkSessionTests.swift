@@ -257,7 +257,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     let captured = LockIsolated<Data?>(nil)
     await store.send(.received(linkPacket(context: .none, payload: cipher)))
     await store.receive { action in
-        if case let .delegate(.dataReceived(p)) = action { captured.setValue(p); return true }
+        if case let .delegate(.dataReceived(p, _)) = action { captured.setValue(p); return true }
         return false
     }
     #expect(captured.value == plaintext)
@@ -360,7 +360,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     let gotUp = LockIsolated<Data?>(nil)
     await responder.send(.received(dataToResp))
     await responder.receive { action in
-        if case let .delegate(.dataReceived(p)) = action { gotUp.setValue(p); return true }
+        if case let .delegate(.dataReceived(p, _)) = action { gotUp.setValue(p); return true }
         return false
     }
     #expect(gotUp.value == up)
@@ -372,7 +372,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     let gotDown = LockIsolated<Data?>(nil)
     await initiator.send(.received(dataToInit))
     await initiator.receive { action in
-        if case let .delegate(.dataReceived(p)) = action { gotDown.setValue(p); return true }
+        if case let .delegate(.dataReceived(p, _)) = action { gotDown.setValue(p); return true }
         return false
     }
     #expect(gotDown.value == down)

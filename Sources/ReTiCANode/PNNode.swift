@@ -89,7 +89,7 @@ public struct PNNode {
                 return .send(.node(.ingestContainer(data)))
 
             // Small propagation containers arrive as link data packets (not Resources); ingest them too.
-            case let .endpoint(.delegate(.linkDataReceived(_, data))):
+            case let .endpoint(.delegate(.linkDataReceived(_, data, _))):
                 return .send(.node(.ingestContainer(data)))
 
             case let .node(.delegate(.stored(tids))):

@@ -41,6 +41,8 @@ public struct LinkPlane {
         case sendRequestOverLink(linkID: Data, path: String, data: Data)
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
         case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
+        /// Prove one inbound data packet on `linkID` (reference `RNS.Packet.prove()`).
+        case provePacketOverLink(linkID: Data, packetHash: Data)
         case closeLink(linkID: Data)
         case registerRequestHandler(path: String, policy: RequestPolicy)
         case deregisterRequestHandler(path: String)
@@ -51,7 +53,7 @@ public struct LinkPlane {
             /// Send `data` on the interface identified by this `InterfaceID`.
             case transmit(InterfaceID, Data)
             case linkEstablished(linkID: Data, destinationHash: Data)
-            case linkDataReceived(linkID: Data, data: Data)
+            case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
             case linkFailed(destinationHash: Data)
             case resourceReceived(linkID: Data, data: Data)
@@ -117,6 +119,10 @@ public struct LinkPlane {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .sendWithReceipt(data: data, token: token))))
 
+            case let .provePacketOverLink(linkID, packetHash):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .provePacket(packetHash: packetHash))))
+
             case let .closeLink(linkID):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .close)))
@@ -138,9 +144,9 @@ public struct LinkPlane {
                 guard let destHash = state.links[id: elementID]?.destinationHash else { return .none }
                 return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))
 
-            case let .link(.element(elementID, .delegate(.dataReceived(data)))):
+            case let .link(.element(elementID, .delegate(.dataReceived(data, packetHash)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
-                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data)))
+                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data, packetHash: packetHash)))
 
             case let .link(.element(elementID, .delegate(.closed(reason)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }

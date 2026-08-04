@@ -64,6 +64,7 @@ public struct TCPEndpoint {
         case sendRequestOverLink(linkID: Data, path: String, data: Data)
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
         case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
+        case provePacketOverLink(linkID: Data, packetHash: Data)
         case registerRequestHandler(path: String, policy: RequestPolicy)
         case deregisterRequestHandler(path: String)
 
@@ -74,7 +75,7 @@ public struct TCPEndpoint {
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: Transport.SendFailure)
             case linkEstablished(linkID: Data, destinationHash: Data)
-            case linkDataReceived(linkID: Data, data: Data)
+            case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
             case linkFailed(destinationHash: Data)
             case resourceReceived(linkID: Data, data: Data)
@@ -157,8 +158,8 @@ public struct TCPEndpoint {
 
             case let .linkPlane(.delegate(.linkEstablished(linkID, destHash))):
                 return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))
-            case let .linkPlane(.delegate(.linkDataReceived(linkID, data))):
-                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data)))
+            case let .linkPlane(.delegate(.linkDataReceived(linkID, data, packetHash))):
+                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data, packetHash: packetHash)))
             case let .linkPlane(.delegate(.linkClosed(linkID, reason))):
                 return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
             case let .linkPlane(.delegate(.linkFailed(destHash))):
@@ -187,7 +188,7 @@ public struct TCPEndpoint {
             case .interface, .transport, .delegate, .linkPlane, .link,
                  .sendOverLink, .sendResourceOverLink, .closeLink, .identifyOverLink,
                  .sendRequestOverLink, .sendResponseOverLink, .sendWithReceiptOverLink,
-                 .registerRequestHandler, .deregisterRequestHandler:
+                 .provePacketOverLink, .registerRequestHandler, .deregisterRequestHandler:
                 return .none
             }
         }
@@ -255,6 +256,8 @@ extension TCPEndpoint.Action.AllCasePaths {
                     return .sendResponseOverLink(linkID: linkID, requestID: requestID, data: data)
                 case let .sendWithReceiptOverLink(linkID, data, token):
                     return .sendWithReceiptOverLink(linkID: linkID, data: data, token: token)
+                case let .provePacketOverLink(linkID, packetHash):
+                    return .provePacketOverLink(linkID: linkID, packetHash: packetHash)
                 case let .closeLink(linkID):
                     return .closeLink(linkID: linkID)
                 case let .registerRequestHandler(path, policy):
@@ -281,6 +284,8 @@ extension TCPEndpoint.Action.AllCasePaths {
                     return .sendResponseOverLink(linkID: linkID, requestID: requestID, data: data)
                 case let .sendWithReceiptOverLink(linkID, data, token):
                     return .sendWithReceiptOverLink(linkID: linkID, data: data, token: token)
+                case let .provePacketOverLink(linkID, packetHash):
+                    return .provePacketOverLink(linkID: linkID, packetHash: packetHash)
                 case let .closeLink(linkID):
                     return .closeLink(linkID: linkID)
                 case let .registerRequestHandler(path, policy):
