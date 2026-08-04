@@ -46,10 +46,6 @@ public struct PropagationNode {
             /// Transient ids just removed from the store (client purge or delivery confirmation), so a
             /// host can delete its mirrored copies.
             case purged(transientIds: [Data])
-            /// Count of entries in the container that failed stamp validation — emitted ONLY when > 0.
-            /// A container with some invalid entries should be rejected rather than proved (reference
-            /// LXMRouter.py:2252-2260). Duplicates (already-stored) are NOT counted here.
-            case stampRejected(count: Int)
         }
     }
 
@@ -59,7 +55,7 @@ public struct PropagationNode {
         Reduce { state, action in
             switch action {
             case let .ingestContainer(data):
-                let (added, evicted, rejected) = state.store.ingest(container: data)
+                let (added, evicted) = state.store.ingest(container: data)
                 let entries = state.store.entries(forTransientIds: added)
                 var effects: [Effect<Action>] = [
                     .send(.delegate(.stored(transientIds: added))),
@@ -67,9 +63,6 @@ public struct PropagationNode {
                 ]
                 // Eviction is a third removal route; surface evicted ids so the host's mirror stays in sync.
                 if !evicted.isEmpty { effects.append(.send(.delegate(.purged(transientIds: evicted)))) }
-                // Surface rejected-stamp count so LXMFServiceNode can withhold the prove and send an error
-                // (reference LXMRouter.py:2252-2260: prove only when ALL entries pass, otherwise ERROR_INVALID_STAMP).
-                if rejected > 0 { effects.append(.send(.delegate(.stampRejected(count: rejected)))) }
                 return .merge(effects)
 
             case let .messagesRequested(destinationHash, wants, haves, transferLimitBytes):

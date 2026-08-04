@@ -15,13 +15,13 @@ private func container(_ entries: [Data]) -> Data {
     var store = PropagationStore(minStampCost: 0)
     let e = entry(dest: 0xAA, tail: "one")
     let tid = LXMFPropagation.transientId(lxmfData: e)
-    let (firstAdded, firstEvicted, _) = store.ingest(container: container([e]))
+    let (firstAdded, firstEvicted) = store.ingest(container: container([e]))
     #expect(firstAdded == [tid])
     #expect(firstEvicted.isEmpty)
     #expect(store.count == 1)
     #expect(store.contains(transientId: tid))
     // Re-ingesting the identical container is a no-op (dedup by transient_id).
-    let (secondAdded, secondEvicted, _) = store.ingest(container: container([e]))
+    let (secondAdded, secondEvicted) = store.ingest(container: container([e]))
     #expect(secondAdded.isEmpty)
     #expect(secondEvicted.isEmpty)
     #expect(store.count == 1)
@@ -78,12 +78,12 @@ private func container(_ entries: [Data]) -> Data {
     let tid1 = LXMFPropagation.transientId(lxmfData: e1)
     let tid2 = LXMFPropagation.transientId(lxmfData: e2)
 
-    let (added1, evicted1, _) = store.ingest(container: container([e1]))
+    let (added1, evicted1) = store.ingest(container: container([e1]))
     #expect(added1 == [tid1])
     #expect(evicted1.isEmpty)   // nothing to evict yet — e1 fits alone
 
     // e2 pushes over the cap → e1 is evicted; added contains only the survivors.
-    let (added2, evicted2, _) = store.ingest(container: container([e2]))
+    let (added2, evicted2) = store.ingest(container: container([e2]))
     #expect(evicted2 == [tid1])   // oldest evicted
     #expect(added2 == [tid2])     // e2 survived (net-new after eviction)
     #expect(!store.contains(transientId: tid1))
@@ -95,7 +95,7 @@ private func container(_ entries: [Data]) -> Data {
     // Short entry (< 16 bytes) is skipped; the well-formed one is stored.
     let shortEntry = Data([0x01, 0x02, 0x03])
     let good = entry(dest: 0xAA, tail: "ok")
-    let (added, evicted, _) = store.ingest(container: container([shortEntry, good]))
+    let (added, evicted) = store.ingest(container: container([shortEntry, good]))
     #expect(added == [LXMFPropagation.transientId(lxmfData: good)])
     #expect(evicted.isEmpty)
     #expect(store.count == 1)
@@ -111,23 +111,15 @@ private func container(_ entries: [Data]) -> Data {
     #expect(store.transientIds == [e1, e2, e3].map { LXMFPropagation.transientId(lxmfData: $0) })
 }
 
-/// Entries that fail stamp validation (absent or below minStampCost) are counted in `rejected`.
-/// A duplicate (already-stored transient_id) is NOT counted as rejected — dedup ≠ stamp failure.
-@Test func propagationStoreIngestCountsStampRejected() throws {
+/// Entries that fail stamp validation (absent or below minStampCost) are silently skipped and
+/// must not be added to the store.
+@Test func propagationStoreSkipsUnderCostStampEntries() throws {
     var store = PropagationStore(minStampCost: 4)
     // An unstamped entry: 16-byte dest + payload, no PN stamp → stamp cost effectively 0 < 4.
     let bad = entry(dest: 0xAA, tail: "no-stamp")
-    let good = entry(dest: 0xBB, tail: "good-stub")   // also unstamped BUT minStampCost==0 path blocked
-    // Use only `bad` to keep the test focused.
-    let (added, _, rejected) = store.ingest(container: container([bad]))
+    let (added, _) = store.ingest(container: container([bad]))
     #expect(added.isEmpty, "unstamped entry must not be added")
-    #expect(rejected == 1, "one entry failed stamp validation")
-    // A duplicate (re-ingest of a previously stored item) is NOT a rejection.
-    var store2 = PropagationStore(minStampCost: 0)
-    let dup = entry(dest: 0xCC, tail: "dup")
-    _ = store2.ingest(container: container([dup]))            // first time: added
-    let (_, _, rejectedDup) = store2.ingest(container: container([dup]))   // second time: dedup
-    #expect(rejectedDup == 0, "duplicate entry must not be counted as stamp-rejected")
+    #expect(store.count == 0, "store must remain empty after rejecting under-cost entry")
 }
 
 @Test func propagationStoreWantedReturnsMissingInOfferedOrder() throws {

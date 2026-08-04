@@ -51,21 +51,19 @@ public struct PropagationStore: Equatable {
 
     public func contains(transientId: Data) -> Bool { stored[transientId] != nil }
 
-    /// Ingest a propagation container. Returns `(added, evicted, rejected)` where:
+    /// Ingest a propagation container. Returns `(added, evicted)` where:
     /// - `added` are transient_ids newly accepted and retained after eviction,
-    /// - `evicted` are transient_ids accepted then immediately evicted to stay under `storageLimitBytes`,
-    /// - `rejected` is the count of entries that failed stamp validation (absent or below `minStampCost`).
+    /// - `evicted` are transient_ids accepted then immediately evicted to stay under `storageLimitBytes`.
     ///
-    /// A **duplicate** entry (already-stored transient_id) is NOT counted as rejected — it simply
-    /// contributes neither to `added` nor to `rejected`. The caller must distinguish "all new entries
-    /// passed policy" (`rejected == 0`) from "nothing was newly stored" (could be all-duplicates).
+    /// Entries whose stamp is absent or below `minStampCost` are silently skipped (not counted).
+    /// A **duplicate** entry (already-stored transient_id) is also silently skipped — it contributes
+    /// nothing to `added`.
     ///
     /// The host must persist `added` AND delete `evicted` so its mirror stays in sync with the in-memory store.
     @discardableResult
-    public mutating func ingest(container: Data) -> (added: [Data], evicted: [Data], rejected: Int) {
-        guard let (_, lxmfDatas) = LXMFPropagation.parseContainer(container) else { return ([], [], 0) }
+    public mutating func ingest(container: Data) -> (added: [Data], evicted: [Data]) {
+        guard let (_, lxmfDatas) = LXMFPropagation.parseContainer(container) else { return ([], []) }
         var added: [Data] = []
-        var rejected = 0
         for lxmfData in lxmfDatas {
             let tid: Data
             let destData: Data
@@ -73,13 +71,11 @@ public struct PropagationStore: Equatable {
                 // Require a valid PN stamp at or above minStampCost. validatePnStamp strips the trailing
                 // 32-byte stamp and returns transient_id = full_hash(stampless_entry) — the canonical dedup
                 // key matching the sender (LXMFPropagation.pack) and peer re-sync. Entries with an absent
-                // or under-cost stamp are policy-rejected (counted for the caller's prove decision).
+                // or under-cost stamp are silently skipped.
                 guard let validated = LXStamper.validatePnStamp(transientData: lxmfData, targetCost: minStampCost) else {
-                    rejected += 1
                     continue
                 }
                 guard let dest = LXMFPropagation.destinationHash(lxmfData: validated.lxmfData) else {
-                    rejected += 1
                     continue
                 }
                 tid = validated.transientId
@@ -92,7 +88,7 @@ public struct PropagationStore: Equatable {
                 tid = LXMFPropagation.transientId(lxmfData: lxmfCore)
                 destData = dest
             }
-            if stored[tid] != nil { continue }   // dedup by transient_id — NOT a rejection
+            if stored[tid] != nil { continue }   // dedup by transient_id
             // Store the full stamped bytes (lxmfData) so PN→PN sync re-delivers the stamped entry,
             // letting the receiving PN validate and arrive at the same transient_id.
             stored[tid] = Entry(transientId: tid, destinationHash: destData, lxmfData: lxmfData, sequence: nextSequence)
@@ -101,7 +97,7 @@ public struct PropagationStore: Equatable {
         }
         let evicted = evictOverLimit()
         let evictedSet = Set(evicted)
-        return (added: added.filter { !evictedSet.contains($0) }, evicted: evicted, rejected: rejected)
+        return (added: added.filter { !evictedSet.contains($0) }, evicted: evicted)
     }
 
     public func entries(forDestination destinationHash: Data) -> [Entry] {
