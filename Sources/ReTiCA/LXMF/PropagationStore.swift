@@ -51,9 +51,13 @@ public struct PropagationStore: Equatable {
 
     public func contains(transientId: Data) -> Bool { stored[transientId] != nil }
 
+    /// Ingest a propagation container. Returns `(added, evicted)` where `added` are transient_ids newly
+    /// accepted and retained after eviction, and `evicted` are transient_ids that were accepted then
+    /// immediately evicted to bring the store under `storageLimitBytes`. The host must persist `added`
+    /// AND delete `evicted` so its mirror stays in sync with the in-memory store.
     @discardableResult
-    public mutating func ingest(container: Data) -> [Data] {
-        guard let (_, lxmfDatas) = LXMFPropagation.parseContainer(container) else { return [] }
+    public mutating func ingest(container: Data) -> (added: [Data], evicted: [Data]) {
+        guard let (_, lxmfDatas) = LXMFPropagation.parseContainer(container) else { return ([], []) }
         var added: [Data] = []
         for lxmfData in lxmfDatas {
             let tid: Data
@@ -82,8 +86,9 @@ public struct PropagationStore: Equatable {
             nextSequence += 1
             added.append(tid)
         }
-        evictOverLimit()
-        return added.filter { stored[$0] != nil }
+        let evicted = evictOverLimit()
+        let evictedSet = Set(evicted)
+        return (added: added.filter { !evictedSet.contains($0) }, evicted: evicted)
     }
 
     public func entries(forDestination destinationHash: Data) -> [Entry] {
@@ -114,10 +119,16 @@ public struct PropagationStore: Equatable {
         return offered.filter { !contains(transientId: $0) && seen.insert($0).inserted }
     }
 
-    private mutating func evictOverLimit() {
-        guard let limit = storageLimitBytes else { return }
+    /// Evicts oldest entries until `sizeBytes <= storageLimitBytes`. Returns the evicted transient_ids
+    /// so the caller can surface them for host-mirror cleanup.
+    @discardableResult
+    private mutating func evictOverLimit() -> [Data] {
+        guard let limit = storageLimitBytes else { return [] }
+        var evicted: [Data] = []
         while sizeBytes > limit, let oldest = stored.values.min(by: { $0.sequence < $1.sequence }) {
             stored[oldest.transientId] = nil
+            evicted.append(oldest.transientId)
         }
+        return evicted
     }
 }

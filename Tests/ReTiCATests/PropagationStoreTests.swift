@@ -15,13 +15,15 @@ private func container(_ entries: [Data]) -> Data {
     var store = PropagationStore(minStampCost: 0)
     let e = entry(dest: 0xAA, tail: "one")
     let tid = LXMFPropagation.transientId(lxmfData: e)
-    let firstAdded = store.ingest(container: container([e]))
+    let (firstAdded, firstEvicted) = store.ingest(container: container([e]))
     #expect(firstAdded == [tid])
+    #expect(firstEvicted.isEmpty)
     #expect(store.count == 1)
     #expect(store.contains(transientId: tid))
     // Re-ingesting the identical container is a no-op (dedup by transient_id).
-    let secondAdded = store.ingest(container: container([e]))
+    let (secondAdded, secondEvicted) = store.ingest(container: container([e]))
     #expect(secondAdded.isEmpty)
+    #expect(secondEvicted.isEmpty)
     #expect(store.count == 1)
 }
 
@@ -64,16 +66,41 @@ private func container(_ entries: [Data]) -> Data {
     #expect(store.contains(transientId: LXMFPropagation.transientId(lxmfData: e3)))    // newest retained
 }
 
+/// When the storage limit is hit, `ingest` reports the evicted transient_ids separately from the
+/// accepted ones so a host's mirror can delete them. Without this signal the mirror grows without
+/// bound across relaunches (Important-1).
+@Test func propagationStoreIngestReturnsEvictedIds() throws {
+    // 16-byte dest + 4-byte tail = 20 bytes per entry; cap at 25 bytes → each ingest of a new entry
+    // evicts the previous one.
+    var store = PropagationStore(storageLimitBytes: 25, minStampCost: 0)
+    let e1 = entry(dest: 0xAA, tail: "aaaa")
+    let e2 = entry(dest: 0xAA, tail: "bbbb")
+    let tid1 = LXMFPropagation.transientId(lxmfData: e1)
+    let tid2 = LXMFPropagation.transientId(lxmfData: e2)
+
+    let (added1, evicted1) = store.ingest(container: container([e1]))
+    #expect(added1 == [tid1])
+    #expect(evicted1.isEmpty)   // nothing to evict yet — e1 fits alone
+
+    // e2 pushes over the cap → e1 is evicted; added contains only the survivors.
+    let (added2, evicted2) = store.ingest(container: container([e2]))
+    #expect(evicted2 == [tid1])   // oldest evicted
+    #expect(added2 == [tid2])     // e2 survived (net-new after eviction)
+    #expect(!store.contains(transientId: tid1))
+    #expect(store.contains(transientId: tid2))
+}
+
 @Test func propagationStoreSkipsMalformedEntries() throws {
     var store = PropagationStore(minStampCost: 0)
     // Short entry (< 16 bytes) is skipped; the well-formed one is stored.
     let shortEntry = Data([0x01, 0x02, 0x03])
     let good = entry(dest: 0xAA, tail: "ok")
-    let added = store.ingest(container: container([shortEntry, good]))
+    let (added, evicted) = store.ingest(container: container([shortEntry, good]))
     #expect(added == [LXMFPropagation.transientId(lxmfData: good)])
+    #expect(evicted.isEmpty)
     #expect(store.count == 1)
     // A non-container blob ingests to nothing.
-    #expect(store.ingest(container: Data([0xFF, 0xFF])).isEmpty)
+    #expect(store.ingest(container: Data([0xFF, 0xFF])).added.isEmpty)
     #expect(store.count == 1)
 }
 

@@ -25,8 +25,11 @@ public struct LXMFServiceNode {
         public var minStampCost: Int
         /// linkID → the IDENTIFY'd remote client on that link. A `/get` without one is dropped.
         public var clientIdentities: [Data: Identity] = [:]
-        /// client delivery hash → the request awaiting a response.
-        public var pendingGet: [Data: PendingGet] = [:]
+        /// client delivery hash → FIFO queue of in-flight /get requests. Clients can tear down and
+        /// retry (reference LXMessage.py:616-621), so concurrent /gets from the same identity are
+        /// possible. Using a queue per key prevents the second request from silently overwriting the
+        /// first (the first's linkID would be lost and its response never sent).
+        public var pendingGet: [Data: [PendingGet]] = [:]
 
         /// 32 MB — a mobile-appropriate cap for the store-and-forward backlog.
         public static let defaultStorageLimitBytes: Int = 32 * 1024 * 1024
@@ -99,7 +102,11 @@ public struct LXMFServiceNode {
             case let .setNodeMode(enabled):
                 state.nodeModeEnabled = enabled
                 if enabled { return .send(.registerPropagation) }
-                state.client.propagationDestinationHash = nil    // client resumes normal handling
+                // Do NOT clear propagationDestinationHash on disable. The lxmf.propagation destination
+                // cannot be unregistered, so links to it are still accepted. Keeping the classification
+                // hint ensures arriving propagation data is recognised and DROPPED (because nodeModeEnabled
+                // is false) rather than misclassified as a direct delivery message. Clearing serve-side
+                // bookkeeping is sufficient — all serve behaviour is independently gated on nodeModeEnabled.
                 state.clientIdentities = [:]
                 state.pendingGet = [:]
                 return .none
@@ -128,36 +135,56 @@ public struct LXMFServiceNode {
                 return .send(.pn(.ingestContainer(data)))
 
             case let .client(.endpoint(.delegate(.linkIdentified(linkID, remoteIdentity)))):
-                guard state.nodeModeEnabled else { return .none }
+                // Only record identity for links to OUR served propagation destination (Minor-4 / reference
+                // LXMRouter.py:670: the /get handler is registered only on the propagation destination).
+                guard state.nodeModeEnabled, isPropagationLink(state, linkID) else { return .none }
                 state.clientIdentities[linkID] = remoteIdentity
                 return .none
 
             // --- Two-phase /get ---
             case let .client(.endpoint(.delegate(.requestReceived(linkID, requestID, pathHash, data)))):
+                // Guard on propagation-link classification (Minor-4): the /get handler is registered only
+                // on the propagation destination (reference LXMRouter.py:670), so a /get on the delivery
+                // link must be silently dropped rather than served.
                 guard state.nodeModeEnabled,
+                      isPropagationLink(state, linkID),
                       pathHash == Crypto.truncatedHash(Data("/get".utf8)),
                       let clientIdentity = state.clientIdentities[linkID]   // no IDENTIFY → drop
                 else { return .none }
                 guard case let .array(items)? = MsgPack.decodeValue(data), items.count >= 2 else { return .none }
                 let clientHash = LXMessage.deliveryHash(identityHash: clientIdentity.hash)
-                state.pendingGet[clientHash] = PendingGet(linkID: linkID, requestID: requestID)
+                let pending = PendingGet(linkID: linkID, requestID: requestID)
+                // Queue the request (Minor-3): a client may have a concurrent in-flight /get (reference
+                // LXMessage.py:616-621 tears down and retries on timeout). Appending preserves FIFO order;
+                // the delegate pops the front when it responds.
+                state.pendingGet[clientHash, default: []].append(pending)
                 if case .null = items[0], case .null = items[1] {
                     return .send(.pn(.messageListRequested(destinationHash: clientHash)))
                 }
+                // Parse the optional third element as the client's per-transfer limit (Important-5).
+                // Reference LXMRouter.py:1526-1529: client_transfer_limit = float(data[2])*1000.
+                // Missing or unparseable → nil (no limit). 0 is a valid 0-byte cap, NOT unlimited.
+                var transferLimitBytes: Int? = nil
+                if items.count >= 3, case let .uint(kb) = items[2], kb > 0 {
+                    transferLimitBytes = Int(kb) * 1000
+                }
                 return .send(.pn(.messagesRequested(destinationHash: clientHash,
                                                     wants: LXMFServiceNode.arrayOfBin(items[0]),
-                                                    haves: LXMFServiceNode.arrayOfBin(items[1]))))
+                                                    haves: LXMFServiceNode.arrayOfBin(items[1]),
+                                                    transferLimitBytes: transferLimitBytes)))
 
             case let .pn(.delegate(.deliverMessageList(dest, ids))):
-                guard let p = state.pendingGet[dest] else { return .none }
-                state.pendingGet[dest] = nil
+                guard var queue = state.pendingGet[dest], !queue.isEmpty else { return .none }
+                let p = queue.removeFirst()
+                state.pendingGet[dest] = queue.isEmpty ? nil : queue
                 return .send(.client(.endpoint(.sendResponseOverLink(
                     linkID: p.linkID, requestID: p.requestID,
                     data: MsgPack.encode(.array(ids.map { .bin($0) }))))))
 
             case let .pn(.delegate(.deliverMessages(dest, entries))):
-                guard let p = state.pendingGet[dest] else { return .none }
-                state.pendingGet[dest] = nil
+                guard var queue = state.pendingGet[dest], !queue.isEmpty else { return .none }
+                let p = queue.removeFirst()
+                state.pendingGet[dest] = queue.isEmpty ? nil : queue
                 return .send(.client(.endpoint(.sendResponseOverLink(
                     linkID: p.linkID, requestID: p.requestID,
                     data: MsgPack.encode(.array(entries.map { .bin($0) }))))))
@@ -174,11 +201,18 @@ public struct LXMFServiceNode {
             // --- Link lifecycle cleanup ---
             case let .client(.endpoint(.delegate(.linkClosed(linkID, _)))):
                 state.clientIdentities[linkID] = nil
-                state.pendingGet = state.pendingGet.filter { $0.value.linkID != linkID }
+                // Drop all queued requests for this link; responses can never be delivered.
+                state.pendingGet = state.pendingGet.compactMapValues { queue in
+                    let remaining = queue.filter { $0.linkID != linkID }
+                    return remaining.isEmpty ? nil : remaining
+                }
                 return .none
 
             case let .client(.endpoint(.delegate(.requestFailed(linkID, _)))):
-                state.pendingGet = state.pendingGet.filter { $0.value.linkID != linkID }
+                state.pendingGet = state.pendingGet.compactMapValues { queue in
+                    let remaining = queue.filter { $0.linkID != linkID }
+                    return remaining.isEmpty ? nil : remaining
+                }
                 return .none
 
             case .client, .pn, .delegate:

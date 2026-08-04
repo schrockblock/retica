@@ -22,7 +22,11 @@ public struct PropagationNode {
 
     public enum Action: Equatable {
         case ingestContainer(Data)
-        case messagesRequested(destinationHash: Data, wants: [Data], haves: [Data])
+        /// `transferLimitBytes`: the client's declared per-transfer cap (from `data[2]` in the /get
+        /// request). `nil` means no cap. Per the reference (LXMRouter.py:1547) the cap is applied per
+        /// message inclusively (skip — do NOT stop — on overflow). **Do not pass 0 as unlimited** — 0
+        /// is a 0-byte cap that serves nothing (reference `float(data[2])*1000 = 0.0 < cumulative`).
+        case messagesRequested(destinationHash: Data, wants: [Data], haves: [Data], transferLimitBytes: Int? = nil)
         case messageListRequested(destinationHash: Data)
         case messagesDelivered(transientIds: [Data])
         case peerOffered(peerHash: Data, transientIds: [Data])
@@ -51,20 +55,43 @@ public struct PropagationNode {
         Reduce { state, action in
             switch action {
             case let .ingestContainer(data):
-                let added = state.store.ingest(container: data)
+                let (added, evicted) = state.store.ingest(container: data)
                 let entries = state.store.entries(forTransientIds: added)
-                return .merge(.send(.delegate(.stored(transientIds: added))),
-                              .send(.delegate(.storedEntries(entries: entries))))
-
-            case let .messagesRequested(destinationHash, wants, haves):
-                let purged = haves.filter { state.store.contains(transientId: $0) }
-                for tid in haves { state.store.remove(transientId: tid) }          // purge what the client already has
-                let wantSet = Set(wants)
-                let entries = state.store.entries(forDestination: destinationHash)
-                    .filter { wantSet.contains($0.transientId) }
-                    .map { LXMFPropagation.strippedCore(lxmfData: $0.lxmfData) }   // serve stampless (reference LXMRouter.py:1551)
                 var effects: [Effect<Action>] = [
-                    .send(.delegate(.deliverMessages(destinationHash: destinationHash, entries: entries)))
+                    .send(.delegate(.stored(transientIds: added))),
+                    .send(.delegate(.storedEntries(entries: entries)))
+                ]
+                // Eviction is a third removal route; surface evicted ids so the host's mirror stays in sync.
+                if !evicted.isEmpty { effects.append(.send(.delegate(.purged(transientIds: evicted)))) }
+                return .merge(effects)
+
+            case let .messagesRequested(destinationHash, wants, haves, transferLimitBytes):
+                // Ownership check: only purge entries that belong to the requesting destination
+                // (reference LXMRouter.py:1510). Without this any identified client could evict
+                // entries for other destinations.
+                let ownedIds = Set(state.store.entries(forDestination: destinationHash).map(\.transientId))
+                let ownedHaves = haves.filter { ownedIds.contains($0) }
+                let purged = ownedHaves.filter { state.store.contains(transientId: $0) }
+                for tid in ownedHaves { state.store.remove(transientId: tid) }     // purge what the client already has
+                let wantSet = Set(wants)
+                let candidates = state.store.entries(forDestination: destinationHash)
+                    .filter { wantSet.contains($0.transientId) }
+                // Apply the client's declared per-transfer limit, matching reference LXMRouter.py:1524-1550.
+                // Overhead constants mirror the Python: per_message_overhead=16, cumulative_size starts at 24.
+                // Messages that exceed the cap are SKIPPED (not truncated) — reference uses `pass` on overflow.
+                // 0 is NOT treated as unlimited: float(0)*1000=0.0 serves nothing (same as reference).
+                let perMessageOverhead = 16
+                var cumulativeSize = 24
+                var served: [Data] = []
+                for entry in candidates {
+                    let stripped = LXMFPropagation.strippedCore(lxmfData: entry.lxmfData)   // serve stampless (reference LXMRouter.py:1551)
+                    let nextSize = cumulativeSize + stripped.count + perMessageOverhead
+                    if let limit = transferLimitBytes, nextSize > limit { continue }   // skip — do not stop
+                    served.append(stripped)
+                    cumulativeSize += stripped.count + perMessageOverhead
+                }
+                var effects: [Effect<Action>] = [
+                    .send(.delegate(.deliverMessages(destinationHash: destinationHash, entries: served)))
                 ]
                 if !purged.isEmpty { effects.append(.send(.delegate(.purged(transientIds: purged)))) }
                 return .merge(effects)

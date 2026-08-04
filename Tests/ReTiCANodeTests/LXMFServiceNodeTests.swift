@@ -39,11 +39,15 @@ import ComposableArchitecture
     #expect(store.state.linkDestinations[servedLink] == servedPropHash)
     #expect(store.state.linkDestinations[otherLink] == otherHash)
 
-    // Data on the served propagation link must NOT reach the router: send while .off, then flip to .on.
+    // linkDataReceived on the served propagation link must NOT reach the router.
     // A stray .router(.received) from the propagation link would survive as an unhandled effect and
     // fail teardown (or the next send in .on mode).
     await store.send(.endpoint(.delegate(.linkDataReceived(linkID: servedLink, data: Data("container".utf8)))))
-    store.exhaustivity = .on   // a stray .router(.received) from the propagation link would fail teardown
+    // resourceReceived on the served propagation link must ALSO not reach the router (Minor-1).
+    // Both guards must block — deleting either one leaves a stray .router(.received) in the queue
+    // that causes teardown to fail when exhaustivity is flipped to .on.
+    await store.send(.endpoint(.delegate(.resourceReceived(linkID: servedLink, data: Data("resource".utf8)))))
+    store.exhaustivity = .on   // any stray .router(.received) from either send above now fails teardown
 
     // Data on any other link keeps the existing direct-message path.
     // This also proves the guard is not simply disabling everything.
@@ -209,10 +213,12 @@ import ComposableArchitecture
     await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: client)))))
     #expect(store.state.clientIdentities[linkID] == client)
 
-    // Disarm: the served destination and every serve-side table are cleared.
+    // Disarm: every serve-side table is cleared. propagationDestinationHash is intentionally KEPT —
+    // the destination cannot be unregistered, so links to it are still accepted; retaining the hint
+    // ensures arriving data is classified and dropped rather than misrouted as a direct message.
     await store.send(.setNodeMode(false))
     #expect(store.state.nodeModeEnabled == false)
-    #expect(store.state.client.propagationDestinationHash == nil)
+    #expect(store.state.client.propagationDestinationHash == propDest.hash)   // retained (Important-4)
     #expect(store.state.clientIdentities.isEmpty)
     #expect(store.state.pendingGet.isEmpty)
 }
@@ -493,6 +499,179 @@ import ComposableArchitecture
 
     await node.send(.client(.endpoint(.tcp(.disconnect)))); await c.send(.disconnect)
 }
+
+// MARK: - Important-4: propagationDestinationHash retained on disarm
+
+/// On `setNodeMode(false)`, `propagationDestinationHash` MUST be kept (not cleared) so data arriving
+/// on the still-open lxmf.propagation link is classified and dropped rather than misrouted as a
+/// direct delivery message. Every serve behaviour is independently gated on `nodeModeEnabled`, so the
+/// hint's retention is safe and necessary.
+@MainActor @Test func serviceNodeRetainsPropDestHashAfterDisarm() async {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: false)
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+
+    await store.send(.setNodeMode(true))
+    await store.receive { if case .registerPropagation = $0 { return true }; return false }
+    #expect(store.state.client.propagationDestinationHash == propDest.hash)
+
+    await store.send(.setNodeMode(false))
+    // propagationDestinationHash must NOT be cleared — the lxmf.propagation destination still
+    // accepts incoming links; clearing the hint would misroute their data as direct messages.
+    #expect(store.state.client.propagationDestinationHash == propDest.hash)
+    // Serve-side tables ARE cleared.
+    #expect(store.state.clientIdentities.isEmpty)
+    #expect(store.state.pendingGet.isEmpty)
+
+    // And with node-mode off, data on the propagation link IS still suppressed (not misrouted).
+    let linkID = Data(repeating: 0xC1, count: 16)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: Data("offer".utf8))))))
+    store.exhaustivity = .on   // no stray .router(.received) from the disabled-but-still-open link
+}
+
+// MARK: - Minor-4: requestReceived gated on propagation link
+
+/// A /get request arriving on a NON-propagation link (e.g. the delivery link) must be silently dropped.
+/// Without this guard a delivery-link peer could trigger the /get handler (Important-3 compounds this
+/// since no ownership check on haves = cross-destination eviction).
+@MainActor @Test func serviceNodeDropsGetRequestOnNonPropagationLink() async {
+    let identity = Identity()
+    let client = Identity()
+    let otherHash = Data(repeating: 0x5B, count: 16)   // some correspondent, NOT our propagation dest
+    let deliveryLink = Data(repeating: 0xD1, count: 16)
+
+    // Pre-arm: seed clientIdentities directly so only the isPropagationLink guard on requestReceived
+    // stands between the /get and a response. Without this, the IDENTIFY guard also blocks it and the
+    // test cannot distinguish which guard is effective.
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 0)
+    initial.nodeModeEnabled = true
+    initial.clientIdentities[deliveryLink] = client    // bypass the IDENTIFY guard — only isPropagationLink matters
+    let store = makeServiceNodeStore(initial)
+
+    await store.send(.registerPropagation)
+    // The delivery link terminates on a different destination.
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: deliveryLink, destinationHash: otherHash)))))
+
+    // A /get on the non-propagation link must be dropped even though the client is IDENTIFY'd.
+    // Without the isPropagationLink guard, a stray .sendResponseOverLink would appear here.
+    await store.send(.client(.endpoint(.delegate(.requestReceived(
+        linkID: deliveryLink, requestID: Data([99]),
+        pathHash: Crypto.truncatedHash(Data("/get".utf8)),
+        data: MsgPack.encode(.array([.null, .null])))))))
+
+    store.exhaustivity = .on   // a stray .sendResponseOverLink would fail teardown
+    #expect(store.state.pendingGet.isEmpty)
+}
+
+/// linkIdentified on a non-propagation link must NOT be recorded in `clientIdentities`.
+/// Without this guard a delivery-link peer's identity leaks into the serve bookkeeping and could be
+/// misused by a subsequent /get gating check.
+@MainActor @Test func serviceNodeIgnoresLinkIdentifiedOnNonPropagationLink() async {
+    let identity = Identity()
+    let client = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)
+    let otherHash = Data(repeating: 0x5B, count: 16)
+    let deliveryLink = Data(repeating: 0xD1, count: 16)
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: deliveryLink, destinationHash: otherHash)))))
+    await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: deliveryLink, remoteIdentity: client)))))
+
+    #expect(store.state.clientIdentities[deliveryLink] == nil)   // must not have been recorded
+}
+
+// MARK: - Minor-3: concurrent /get queue
+
+/// Two concurrent /get requests from the same identity (e.g. a client retry before the first
+/// response arrives) must be served in FIFO order. The second request must NOT silently overwrite
+/// the first (which would leave the first's linkID orphaned with no response).
+///
+/// Verification strategy: pre-seed ONE pending /get (req1, linkID1) in the initial state, then
+/// send requestReceived for req2 on linkID2. With the fix (append), the queue grows to [req1, req2].
+/// With the scalar mutation (overwrite), the queue becomes [req2] and req1 is lost. We then check
+/// that the response to the first deliverMessageList goes to linkID1 (FIFO) — with the mutation it
+/// would go to linkID2 (the overwritten entry), failing the assertion.
+@MainActor @Test func serviceNodeQueuesConcurrentGets() async {
+    let identity = Identity()
+    let client = Identity()
+    let clientHash = LXMessage.deliveryHash(identityHash: client.hash)
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID1 = Data(repeating: 0xC1, count: 16)
+    let linkID2 = Data(repeating: 0xC2, count: 16)
+    let reqID1 = Data([1])
+    let reqID2 = Data([2])
+    let getPath = Crypto.truncatedHash(Data("/get".utf8))
+
+    // Pre-seed the initial state with req1 already in the queue and both links set up.
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 0)
+    initial.nodeModeEnabled = true
+    initial.client.propagationDestinationHash = propDest.hash
+    initial.client.linkDestinations[linkID1] = propDest.hash
+    initial.client.linkDestinations[linkID2] = propDest.hash
+    initial.clientIdentities[linkID2] = client    // only linkID2 needs IDENTIFY (req1 is pre-seeded)
+    // req1 is already in the queue — simulates it arriving before req2 was sent.
+    initial.pendingGet[clientHash] = [LXMFServiceNode.PendingGet(linkID: linkID1, requestID: reqID1)]
+    let store = makeServiceNodeStore(initial)
+
+    // req2 arrives on linkID2. With the fix, this APPENDS; with the mutation, this OVERWRITES req1.
+    await store.send(.client(.endpoint(.delegate(.requestReceived(
+        linkID: linkID2, requestID: reqID2, pathHash: getPath,
+        data: MsgPack.encode(.array([.null, .null])))))))
+    // NOTE: This also triggers a messageListRequested effect which produces a deliverMessageList
+    // which pops from the queue. With the fix (queue=[req1,req2]) the pop returns req1 → responds
+    // to linkID1. With the mutation (queue=[req2]) the pop returns req2 → responds to linkID2.
+    await store.receive { action in
+        if case let .client(.endpoint(.sendResponseOverLink(lid, rid, _))) = action {
+            // The FIRST response must be to req1/linkID1 (the pre-existing entry, FIFO order).
+            // With the scalar mutation this would be req2/linkID2 → test FAILS.
+            #expect(lid == linkID1, "FIFO: pre-existing req1 must be answered before the new req2")
+            #expect(rid == reqID1)
+            return true
+        }
+        return false
+    }
+    // req2 must still be in the queue (req1 was answered, req2 is next).
+    #expect((store.state.pendingGet[clientHash] ?? []).count == 1)
+}
+
+// MARK: - Minor-2: syncPhase leak on link close
+
+/// `syncPhase` must be cleared when a link closes (Minor-2). Without this, a sync that dies
+/// mid-phase (e.g. network drop) leaves a stale entry in `syncPhase` for the closed linkID
+/// permanently — it can never be GC'd because no other code path touches it.
+@MainActor @Test func lxmfNodeClearsSyncPhaseOnLinkClose() async {
+    let identity = Identity()
+    var initial = LXMFNode.State(identity: identity,
+                                  endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    let linkID = Data(repeating: 0xC1, count: 16)
+    // Simulate a mid-phase sync that is interrupted: plant syncPhase state directly.
+    initial.syncPhase[linkID] = .awaitingMessages
+    initial.linkDestinations[linkID] = Data(repeating: 0xAB, count: 16)
+
+    let store = TestStore(initialState: initial) { LXMFNode() } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+
+    await store.send(.endpoint(.delegate(.linkClosed(linkID: linkID, reason: .initiatorClosed))))
+    await store.skipReceivedActions(strict: false)
+
+    #expect(store.state.syncPhase[linkID] == nil)   // must have been cleared
+}
+
+// MARK: - Phase-3 purge
 
 /// Phase-3 purge: the client's `haves` evict from the store and surface for the host's mirror.
 @MainActor @Test func serviceNodePurgesOnHavesAndSurfacesIt() async {

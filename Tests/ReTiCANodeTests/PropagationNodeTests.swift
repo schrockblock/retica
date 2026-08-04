@@ -248,6 +248,87 @@ private func container(_ entries: [Data]) -> Data {
     }
 }
 
+// MARK: - Ownership check (Important-3)
+
+/// The `haves` purge in a /get request must only remove entries owned by the requesting destination.
+/// Without this check any identified client can evict entries for other destinations.
+@Test @MainActor func propagationNodeDoesNotPurgeHavesOwnedByOtherDestination() async {
+    let a1 = entry(dest: 0xAA, tail: "a1")   // owned by dest-AA
+    let b1 = entry(dest: 0xBB, tail: "b1")   // owned by dest-BB
+    let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
+    let tidB1 = LXMFPropagation.transientId(lxmfData: b1)
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    let store = TestStore(initialState: PropagationNode.State(minStampCost: 0)) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([a1, b1])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+
+    // Client A claims tidB1 as a have — it must NOT be purged (wrong destination).
+    await store.send(.messagesRequested(destinationHash: destA, wants: [], haves: [tidB1]))
+    await store.receive { action in
+        if case let .delegate(.deliverMessages(_, entries)) = action { #expect(entries.isEmpty); return true }
+        return false
+    }
+    // tidB1 must still be present — the cross-destination purge was blocked.
+    #expect(store.state.store.contains(transientId: tidB1) == true)
+    // tidA1 is unaffected (wasn't in haves).
+    #expect(store.state.store.contains(transientId: tidA1) == true)
+
+    store.exhaustivity = .on   // no stray .purged should remain
+}
+
+// MARK: - Transfer limit (Important-5)
+
+/// The client's declared per-transfer limit is respected: messages that would exceed the cap are
+/// skipped (not truncated, not stop-processing), matching reference LXMRouter.py:1547 `pass`.
+@Test @MainActor func propagationNodeRespectsTransferLimit() async {
+    // Each of a1, a2, a3 is (16 + 3) = 19 bytes stampless. overhead=16/msg, cumulative_start=24.
+    // After a1: cumulative = 24 + (19+16) = 59. After a2: 59 + 35 = 94. a3 would make 129.
+    // With limit 100, a3 (next_size=129 > 100) is skipped; a1 and a2 are served.
+    let a1 = entry(dest: 0xAA, tail: "aa1")   // 19 bytes
+    let a2 = entry(dest: 0xAA, tail: "aa2")
+    let a3 = entry(dest: 0xAA, tail: "aa3")   // would push over limit
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
+    let tidA2 = LXMFPropagation.transientId(lxmfData: a2)
+    let tidA3 = LXMFPropagation.transientId(lxmfData: a3)
+
+    let store = TestStore(initialState: PropagationNode.State(minStampCost: 0)) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([a1, a2, a3])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+
+    await store.send(.messagesRequested(destinationHash: destA, wants: [tidA1, tidA2, tidA3], haves: [],
+                                        transferLimitBytes: 100))
+    await store.receive { action in
+        if case let .delegate(.deliverMessages(_, entries)) = action {
+            #expect(entries == [a1, a2])   // a3 skipped (over limit), a1+a2 served
+            #expect(entries.count == 2)
+            return true
+        }
+        return false
+    }
+}
+
+/// A zero-byte transfer limit serves nothing (not treated as unlimited — reference LXMRouter.py:1547
+/// reads `float(data[2])*1000 = 0.0` which is never > 0-byte cumulative).
+@Test @MainActor func propagationNodeZeroTransferLimitServesNothing() async {
+    let a1 = entry(dest: 0xAA, tail: "msg")
+    let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+    let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
+    let store = TestStore(initialState: PropagationNode.State(minStampCost: 0)) { PropagationNode() }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([a1])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+
+    await store.send(.messagesRequested(destinationHash: destA, wants: [tidA1], haves: [],
+                                        transferLimitBytes: 0))
+    await store.receive { action in
+        if case let .delegate(.deliverMessages(_, entries)) = action { #expect(entries.isEmpty); return true }
+        return false
+    }
+}
+
 // MARK: - Persistence delegates
 
 @Test @MainActor func propagationNodeEmitsStoredEntriesForPersistence() async {
@@ -266,6 +347,33 @@ private func container(_ entries: [Data]) -> Data {
         }
         return false
     }
+}
+
+/// When eviction fires during ingest (storage cap hit), the evicted ids are reported via
+/// `.purged` so the host's mirror can delete them. Without this the DB grows without bound
+/// across relaunches as each rehydration re-ingests then re-evicts silently (Important-1).
+@Test @MainActor func propagationNodeEmitsPurgedOnEviction() async {
+    // 16-byte dest + 4-byte tail = 20 bytes per entry. Limit at 25 → a second entry evicts the first.
+    let e1 = entry(dest: 0xAA, tail: "aaaa")   // 20 bytes
+    let e2 = entry(dest: 0xAA, tail: "bbbb")   // 20 bytes → triggers eviction of e1
+    let tid1 = LXMFPropagation.transientId(lxmfData: e1)
+    var initial = PropagationNode.State(storageLimitBytes: 25, minStampCost: 0)
+    let store = TestStore(initialState: initial) { PropagationNode() }
+    store.exhaustivity = .off
+
+    await store.send(.ingestContainer(container([e1])))
+    await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
+
+    // Second ingest: e2 is accepted but e1 is evicted. A .purged must arrive for tid1.
+    await store.send(.ingestContainer(container([e2])))
+    // Collect all delegates from this ingest to assert .purged is present.
+    var sawPurged = false
+    await store.receive { action in
+        if case let .delegate(.purged(ids)) = action { sawPurged = ids.contains(tid1); return true }
+        return false
+    }
+    #expect(sawPurged)
+    #expect(store.state.store.contains(transientId: tid1) == false)
 }
 
 /// Entries leave the store by two routes — the `haves` purge inside messagesRequested and the

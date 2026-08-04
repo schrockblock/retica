@@ -246,6 +246,7 @@ public struct LXMFNode {
 
             case let .endpoint(.delegate(.linkClosed(linkID, _))):
                 state.linkDestinations[linkID] = nil
+                state.syncPhase[linkID] = nil   // Minor-2: clear leak from a mid-phase sync death
                 guard let dest = state.directLinks.first(where: { $0.value == linkID })?.key else { return .none }
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))
