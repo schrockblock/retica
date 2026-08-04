@@ -19,6 +19,12 @@ public struct LXMFNode {
         public var identity: Identity
         public var directLinks: [Data: Data] = [:]   // destinationHash → linkID (close/linkClosed correlation)
         public var syncPhase: [Data: SyncPhase] = [:]   // linkID → current download phase (one sync/link)
+        /// linkID → the destination hash that link terminates on. For an inbound (responder) link this is
+        /// OUR local destination; for an outbound link it is the remote one.
+        public var linkDestinations: [Data: Data] = [:]
+        /// Our served `lxmf.propagation` destination hash while node-mode is on (nil = not serving).
+        /// Data arriving on a link to this destination is a propagation offer, not a direct message.
+        public var propagationDestinationHash: Data?
 
         public init(identity: Identity, endpoint: TransportEndpoint.State) {
             self.identity = identity
@@ -69,6 +75,10 @@ public struct LXMFNode {
         Scope(state: \.endpoint, action: \.endpoint) { TransportEndpoint() }
         Scope(state: \.router, action: \.router) { LXMFRouter() }
         Reduce { [date] state, action in
+            func isServedPropagationLink(_ state: LXMFNode.State, _ linkID: Data) -> Bool {
+                guard let served = state.propagationDestinationHash else { return false }
+                return state.linkDestinations[linkID] == served
+            }
             switch action {
             case .registerDelivery:
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
@@ -231,9 +241,11 @@ public struct LXMFNode {
             // --- Direct-over-link: endpoint delegates → router actions ---
             case let .endpoint(.delegate(.linkEstablished(linkID, dest))):
                 state.directLinks[dest] = linkID
+                state.linkDestinations[linkID] = dest
                 return .send(.router(.linkEstablished(destinationHash: dest, linkID: linkID)))
 
             case let .endpoint(.delegate(.linkClosed(linkID, _))):
+                state.linkDestinations[linkID] = nil
                 guard let dest = state.directLinks.first(where: { $0.value == linkID })?.key else { return .none }
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))
@@ -242,10 +254,13 @@ public struct LXMFNode {
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))
 
-            case let .endpoint(.delegate(.linkDataReceived(_, data))):
+            case let .endpoint(.delegate(.linkDataReceived(linkID, data))):
+                // On our served lxmf.propagation link this is an offer for the node, not a message for us.
+                guard !isServedPropagationLink(state, linkID) else { return .none }
                 return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
 
-            case let .endpoint(.delegate(.resourceReceived(_, data))):
+            case let .endpoint(.delegate(.resourceReceived(linkID, data))):
+                guard !isServedPropagationLink(state, linkID) else { return .none }
                 return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
 
             case let .endpoint(.delegate(.resourceConcluded(linkID, _))):
