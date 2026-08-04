@@ -161,9 +161,18 @@ public struct LXMFServiceNode {
                 // link must be silently dropped rather than served.
                 guard state.nodeModeEnabled,
                       isPropagationLink(state, linkID),
-                      pathHash == Crypto.truncatedHash(Data("/get".utf8)),
-                      let clientIdentity = state.clientIdentities[linkID]   // no IDENTIFY → drop
+                      pathHash == Crypto.truncatedHash(Data("/get".utf8))
                 else { return .none }
+                // Reference LXMRouter.py:1483 — `message_get_request` returns LXMPeer.ERROR_NO_IDENTITY
+                // (0xF0) as the response BODY when the link never IDENTIFY'd. Reference clients branch on
+                // exactly that value (LXMRouter.py:1563 / :1608) to tear the link down and set
+                // PR_NO_IDENTITY_RCVD; dropping silently instead makes them wait out the full request
+                // timeout. Encoded the way the reference does: umsgpack.packb(0xF0) → uint8 0xCC 0xF0.
+                guard let clientIdentity = state.clientIdentities[linkID] else {
+                    return .send(.client(.endpoint(.sendResponseOverLink(
+                        linkID: linkID, requestID: requestID,
+                        data: MsgPack.encode(.uint(LXMFPropagation.errorNoIdentity))))))
+                }
                 guard case let .array(items)? = MsgPack.decodeValue(data), items.count >= 2 else { return .none }
                 let clientHash = LXMessage.deliveryHash(identityHash: clientIdentity.hash)
                 let pending = PendingGet(linkID: linkID, requestID: requestID)
@@ -176,9 +185,12 @@ public struct LXMFServiceNode {
                 }
                 // Parse the optional third element as the client's per-transfer limit (Important-5).
                 // Reference LXMRouter.py:1526-1529: client_transfer_limit = float(data[2])*1000.
-                // Missing or unparseable → nil (no limit). 0 is a valid 0-byte cap, NOT unlimited.
+                // Missing or unparseable → nil (no limit). 0 is a valid 0-byte cap, NOT unlimited:
+                // the reference computes `float(0)*1000 = 0.0` and then skips every message that would
+                // exceed it (LXMRouter.py:1547), i.e. serves nothing. There is deliberately no `kb > 0`
+                // guard here — that guard would silently turn a wire-level 0 into "unlimited".
                 var transferLimitBytes: Int? = nil
-                if items.count >= 3, case let .uint(kb) = items[2], kb > 0 {
+                if items.count >= 3, case let .uint(kb) = items[2] {
                     transferLimitBytes = Int(kb) * 1000
                 }
                 return .send(.pn(.messagesRequested(destinationHash: clientHash,

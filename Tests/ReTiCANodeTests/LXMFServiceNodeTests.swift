@@ -263,14 +263,18 @@ import ComposableArchitecture
     #expect(store.state.pn.store.contains(transientId: LXMFPropagation.transientId(lxmfData: e)) == false)
 }
 
-/// IDENTIFY gate: a /get request arriving BEFORE the client sends IDENTIFY must be silently dropped.
+/// IDENTIFY gate: a /get on a link that never IDENTIFY'd must be answered with `ERROR_NO_IDENTITY`
+/// (0xF0) as the response BODY — not silently dropped.
 ///
-/// Mutation-sensitivity: if the `clientIdentity` guard in the `requestReceived` case is deleted,
-/// the request produces a stray `.sendResponseOverLink` which stays in `receivedActions` after the
-/// only `store.send` call. Flipping exhaustivity to .on before teardown causes the store to report
-/// the unexpected action → test fails. Without the mutation the guard returns .none so nothing is
-/// queued → teardown is clean.
-@MainActor @Test func serviceNodeDropsRequestWithoutIdentify() async {
+/// Reference: `LXMRouter.message_get_request` returns `LXMPeer.ERROR_NO_IDENTITY` when
+/// `remote_identity == None` (LXMRouter.py:1483; the constant is LXMPeer.py:24). Reference clients
+/// compare the decoded response to that integer (LXMRouter.py:1563 / :1608) to tear the link down
+/// immediately and set `PR_NO_IDENTITY_RCVD`. Dropping instead makes them wait out the full request
+/// timeout. The encoding must be the reference's: `umsgpack.packb(0xf0)` → uint8 `CC F0`.
+///
+/// Also asserts the request is NOT queued: an error response ends the exchange, so a `pendingGet`
+/// entry would be an orphan that only a link close could clear.
+@MainActor @Test func serviceNodeAnswersErrorNoIdentityWhenNotIdentified() async {
     let identity = Identity()
     let store = makeServiceNode(identity, nodeMode: true)
     let client = Identity()
@@ -286,16 +290,26 @@ import ComposableArchitecture
     await store.send(.client(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container)))))
     await store.receive { if case .delegate(.messagesStored) = $0 { return true }; return false }
 
-    // No IDENTIFY → must be dropped. No more store.send calls after this so any stray
-    // sendResponseOverLink stays in receivedActions until teardown.
+    // No IDENTIFY → the reference error, back on the same link/request.
     await store.send(.client(.endpoint(.delegate(.requestReceived(
         linkID: linkID, requestID: Data([9]),
         pathHash: Crypto.truncatedHash(Data("/get".utf8)),
         data: MsgPack.encode(.array([.null, .null])))))))
 
-    // Flip to .on: if the IDENTIFY guard was deleted the stray sendResponseOverLink is still in the
-    // queue and teardown reports "store received N unexpected actions" → FAIL.
-    store.exhaustivity = .on
+    await store.receive { action in
+        if case let .client(.endpoint(.sendResponseOverLink(lid, rid, data))) = action {
+            #expect(lid == linkID)
+            #expect(rid == Data([9]))
+            // Value the reference client compares against…
+            #expect(MsgPack.decodeValue(data) == .uint(0xF0))
+            // …and the exact bytes `umsgpack.packb(0xf0)` produces.
+            #expect(data == Data([0xCC, 0xF0]))
+            return true
+        }
+        return false
+    }
+    // The failed request must not be left queued.
+    #expect(store.state.pendingGet.isEmpty)
 }
 
 /// Two-phase /get. Only IDENTIFY'd clients are served (reference LXMRouter.py:1483 ERROR_NO_IDENTITY).
@@ -595,6 +609,59 @@ import ComposableArchitecture
     store.exhaustivity = .on   // a stray provePacketOverLink now fails teardown
     await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: Data("offer".utf8),
                                                                    packetHash: Data(repeating: 0xF9, count: 32))))))
+}
+
+// MARK: - Wire-level transfer limit of 0 means "serve nothing"
+
+/// A client-sent per-transfer limit of 0 is a 0-BYTE CAP, not "unlimited". The reference computes
+/// `client_transfer_limit = float(data[2])*1000` (LXMRouter.py:1526-1529) and then skips every message
+/// whose cumulative size would exceed it (LXMRouter.py:1547) — with a cap of 0 that is every message.
+///
+/// This drives the /get through `LXMFServiceNode` so the msgpack PARSE path is exercised: the existing
+/// `propagationNodeZeroTransferLimitServesNothing` test calls `PropagationNode` directly with
+/// `transferLimitBytes: 0` and therefore could not catch a `kb > 0` guard turning wire-0 into nil.
+@MainActor @Test func serviceNodeParsesWireZeroTransferLimitAsServeNothing() async {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)
+    let client = Identity()
+    let clientHash = LXMessage.deliveryHash(identityHash: client.hash)
+    let e = clientHash + Data("too-big-for-a-zero-cap".utf8)
+    let tid = LXMFPropagation.transientId(lxmfData: e)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    let getPath = Crypto.truncatedHash(Data("/get".utf8))
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    await store.send(.client(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container)))))
+    await store.receive { if case .delegate(.messagesStored) = $0 { return true }; return false }
+    await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: client)))))
+
+    // Phase-2 /get WITH an explicit wire-level limit of 0 in data[2].
+    await store.send(.client(.endpoint(.delegate(.requestReceived(
+        linkID: linkID, requestID: Data([7]), pathHash: getPath,
+        data: MsgPack.encode(.array([.array([.bin(tid)]), .array([]), .uint(0)])))))))
+
+    // The parsed limit must be a 0-byte cap, not nil.
+    await store.receive { action in
+        if case let .pn(.messagesRequested(_, _, _, limit)) = action {
+            #expect(limit == 0, "wire-level 0 must parse to a 0-byte cap, not nil (unlimited)")
+            return true
+        }
+        return false
+    }
+    // …so nothing is served.
+    await store.receive { action in
+        if case let .client(.endpoint(.sendResponseOverLink(_, rid, data))) = action {
+            #expect(rid == Data([7]))
+            #expect(MsgPack.decodeValue(data) == .array([]), "a 0-byte cap must serve nothing")
+            return true
+        }
+        return false
+    }
+    #expect(store.state.pn.store.contains(transientId: tid))   // still stored, just not served
 }
 
 // MARK: - Important-4: propagationDestinationHash retained on disarm

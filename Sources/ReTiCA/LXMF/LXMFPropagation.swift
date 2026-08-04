@@ -32,6 +32,13 @@ public enum LXMFPropagation {
     /// Default propagation stamp cost for client→PN offers (RNS PROPAGATION_COST = 16).
     public static let defaultPropagationStampCost = 16
 
+    /// `LXMPeer.ERROR_NO_IDENTITY` (lxmf 1.1.0 LXMPeer.py:24) — the response BODY a propagation node
+    /// returns for a request on a link that never IDENTIFY'd (LXMRouter.py:1483). Reference clients
+    /// compare the decoded response against this integer (LXMRouter.py:1563 / :1608) to tear the link
+    /// down and set `PR_NO_IDENTITY_RCVD`, so it must round-trip as the msgpack integer 0xF0 —
+    /// `umsgpack.packb(0xf0)` → `CC F0` (uint8), which `MsgPack.encode(.uint(240))` reproduces.
+    public static let errorNoIdentity: UInt64 = 0xF0
+
     /// Strip the trailing 32-byte PN stamp from a raw `lxmf_data` entry when the entry is long enough
     /// to contain one (i.e. `count > destinationLength + stampSize`), and return the stampless core.
     /// When the entry is at or below the threshold the bytes are returned unchanged.
