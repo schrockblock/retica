@@ -51,13 +51,9 @@ import ComposableArchitecture
     await store.receive { if case .router(.received) = $0 { return true }; return false }
 }
 
-private func makeServiceNode(_ identity: Identity, nodeMode: Bool)
+/// Builds a non-exhaustive TestStore over an arbitrary LXMFServiceNode.State.
+@MainActor private func makeServiceNodeStore(_ initial: LXMFServiceNode.State)
     -> TestStore<LXMFServiceNode.State, LXMFServiceNode.Action> {
-    var initial = LXMFServiceNode.State(
-        identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 0)                       // 0 → accept synthetic unstamped test entries
-    initial.nodeModeEnabled = nodeMode
     let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
@@ -66,6 +62,16 @@ private func makeServiceNode(_ identity: Identity, nodeMode: Bool)
     }
     store.exhaustivity = .off
     return store
+}
+
+@MainActor private func makeServiceNode(_ identity: Identity, nodeMode: Bool)
+    -> TestStore<LXMFServiceNode.State, LXMFServiceNode.Action> {
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 0)                       // 0 → accept synthetic unstamped test entries
+    initial.nodeModeEnabled = nodeMode
+    return makeServiceNodeStore(initial)
 }
 
 /// registerPropagation registers lxmf.propagation, announces it, and the announce advertises exactly
@@ -132,27 +138,119 @@ private func makeServiceNode(_ identity: Identity, nodeMode: Bool)
     #expect(store.state.pn.store.contains(transientId: tid))
 }
 
-/// With node-mode OFF nothing is registered, ingested, or served — a plain client.
+/// Node-mode is the master switch: with it OFF nothing is ingested, bookkept, or served — EVEN when
+/// every other precondition for serving is already satisfied.
+///
+/// The initial state is deliberately ARMED (propagationDestinationHash set, the link registered as
+/// terminating on it, and the client already IDENTIFY'd) so that `isPropagationLink` and the IDENTIFY
+/// lookup both PASS. That isolates `state.nodeModeEnabled` as the only thing standing between these
+/// delegates and the propagation machinery — deleting it from the `resourceReceived` /
+/// `linkDataReceived` / `requestReceived` / `linkIdentified` guards makes this test fail. (An
+/// un-armed store cannot distinguish "node mode is off" from "propagation was never registered",
+/// because the other guards would independently block everything.)
 @MainActor @Test func serviceNodeDoesNotServeWhenNodeModeOff() async {
     let identity = Identity()
-    let store = makeServiceNode(identity, nodeMode: false)
-    let container = LXMFPropagation.container(
-        timestamp: 1700000000.5,
-        entries: [Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("ignored".utf8)])
+    let client = Identity()
+    let clientHash = LXMessage.deliveryHash(identityHash: client.hash)
+    let e = clientHash + Data("ignored".utf8)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
     let linkID = Data(repeating: 0xC1, count: 16)
+    let otherLink = Data(repeating: 0xC2, count: 16)
 
-    await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: Identity())))))
+    // Fully armed EXCEPT the master switch.
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 0)
+    initial.nodeModeEnabled = false
+    initial.client.propagationDestinationHash = propDest.hash   // isPropagationLink would pass…
+    initial.client.linkDestinations[linkID] = propDest.hash     // …for this link
+    initial.clientIdentities[linkID] = client                   // IDENTIFY lookup would pass
+    let store = makeServiceNodeStore(initial)
+
+    // Offers on the (otherwise valid) propagation link: both framings must be ignored.
     await store.send(.client(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container)))))
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: container)))))
+    // A fresh IDENTIFY must not be recorded either.
+    await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: otherLink, remoteIdentity: Identity())))))
+    // …and a /get from the already-IDENTIFY'd client must not be answered. Sent LAST so a stray
+    // .sendResponseOverLink survives in receivedActions until the .on teardown below.
     await store.send(.client(.endpoint(.delegate(.requestReceived(
         linkID: linkID, requestID: Data([1]),
         pathHash: Crypto.truncatedHash(Data("/get".utf8)),
         data: MsgPack.encode(.array([.null, .null])))))))
 
-    store.exhaustivity = .on   // a stray .client(.endpoint(.sendResponseOverLink)) from the request fails teardown
+    store.exhaustivity = .on   // a stray .client(.endpoint(.sendResponseOverLink)) now fails teardown
 
-    #expect(store.state.pn.store.count == 0)          // nothing ingested
-    #expect(store.state.clientIdentities.isEmpty)     // no serve bookkeeping
-    // No response emitted: a stray .client(.endpoint(.sendResponseOverLink)) fails teardown.
+    #expect(store.state.pn.store.count == 0)               // nothing ingested by either framing
+    #expect(store.state.clientIdentities[otherLink] == nil) // no new serve bookkeeping
+    #expect(store.state.pendingGet.isEmpty)                // the /get was never accepted
+}
+
+/// `.setNodeMode` arms (registers + announces the propagation destination) and disarms (drops the
+/// served destination and all serve bookkeeping so the client resumes normal handling).
+@MainActor @Test func serviceNodeSetNodeModeArmsThenDisarms() async {
+    let identity = Identity()
+    let client = Identity()
+    let store = makeServiceNode(identity, nodeMode: false)
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+
+    // Arm.
+    await store.send(.setNodeMode(true))
+    await store.receive { if case .registerPropagation = $0 { return true }; return false }
+    #expect(store.state.nodeModeEnabled)
+    #expect(store.state.client.propagationDestinationHash == propDest.hash)
+
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: client)))))
+    #expect(store.state.clientIdentities[linkID] == client)
+
+    // Disarm: the served destination and every serve-side table are cleared.
+    await store.send(.setNodeMode(false))
+    #expect(store.state.nodeModeEnabled == false)
+    #expect(store.state.client.propagationDestinationHash == nil)
+    #expect(store.state.clientIdentities.isEmpty)
+    #expect(store.state.pendingGet.isEmpty)
+}
+
+/// Link routing: with node-mode ON, data arriving on a link that does NOT terminate on the
+/// propagation destination we serve is NOT an offer — it is the client's own inbound traffic and must
+/// never reach the propagation store. Covers BOTH framings the production code guards
+/// (`resourceReceived` and `linkDataReceived`).
+///
+/// This is the mirror image of Task 2's `clientIgnoresLinkDataOnServedPropagationLink`, which asserts
+/// the LXMFNode side (the client stops delivering on the SERVED link). Here we assert the service-node
+/// side: the propagation store stays empty for the NON-served link.
+@MainActor @Test func serviceNodeIgnoresDataOnNonPropagationLink() async {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)
+    let e = Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("not-an-offer".utf8)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+    let otherHash = Data(repeating: 0x5B, count: 16)     // some correspondent, NOT our propagation dest
+    let otherLink = Data(repeating: 0xC2, count: 16)
+
+    await store.send(.registerPropagation)               // we ARE serving — but not on this link
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: otherLink, destinationHash: otherHash)))))
+
+    // NOTE: in a `.off` TestStore, state produced by an effect-emitted action is not visible via
+    // `store.state` until those actions are drained, so each leg is flushed with
+    // `skipReceivedActions` before asserting. Without the flush the assertion reads pre-effect state
+    // and would pass even when the container WAS ingested.
+
+    // Framing 1: a concluded resource on the non-propagation link.
+    await store.send(.client(.endpoint(.delegate(.resourceReceived(linkID: otherLink, data: container)))))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.pn.store.count == 0)
+
+    // Framing 2: the same bytes as plain link data on the non-propagation link.
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: container)))))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.pn.store.count == 0)
+    #expect(store.state.pn.store.contains(transientId: LXMFPropagation.transientId(lxmfData: e)) == false)
 }
 
 /// IDENTIFY gate: a /get request arriving BEFORE the client sends IDENTIFY must be silently dropped.
