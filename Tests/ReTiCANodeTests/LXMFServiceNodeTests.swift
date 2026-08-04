@@ -333,6 +333,167 @@ import ComposableArchitecture
     }
 }
 
+/// End-to-end over a REAL link: client C offers a stamped container to an LXMFServiceNode in node-mode
+/// (ingested + persisted-signal), then IDENTIFYs and runs the two-phase /get; the node serves C's id list
+/// and blob, and C opens the blob to the original signature-valid message.
+@Test @MainActor func serviceNodeIngestsAndServesOverRealLink() async {
+    let clock = TestClock()
+    let nodeIdentity = Identity()
+    let cIdentity = Identity()      // the client AND the recipient of the stored message
+    let sIdentity = Identity()      // the original sender
+    let cDeliveryHash = LXMessage.deliveryHash(identityHash: cIdentity.hash)
+
+    // A real stamped container at the cost the node enforces.
+    let msg = LXMessage.create(source: sIdentity, destinationHash: cDeliveryHash,
+                               timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi C".utf8))
+    let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: cIdentity,
+                                                timestamp: 1700000000.5, stampCost: 4)
+
+    func makeNode(_ host: String, _ sent: LockIsolated<[Data]>)
+        -> (TestStore<LXMFServiceNode.State, LXMFServiceNode.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        var initial = LXMFServiceNode.State(
+            identity: nodeIdentity,
+            endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false),
+            minStampCost: 4)
+        initial.nodeModeEnabled = true
+        let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } }, close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    func makeClient(_ host: String, _ sent: LockIsolated<[Data]>)
+        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } }, close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    func nodeSend(_ act: LXMFServiceNode.Action) -> Bool {
+        if case .client(.endpoint(.tcp(.interface(.send)))) = act { return true }; return false
+    }
+    func cSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+
+    let sentNode = LockIsolated<[Data]>([])
+    let sentC = LockIsolated<[Data]>([])
+    let (node, eventsNode) = makeNode("node", sentNode)
+    let (c, eventsC) = makeClient("c", sentC)
+
+    await node.send(.client(.endpoint(.tcp(.connect)))); eventsNode.yield(.connected)
+    await c.send(.connect); eventsC.yield(.connected)
+
+    // Node registers + announces lxmf.propagation; bridge the announce so C learns its path + identity.
+    await node.send(.registerPropagation)
+    await node.receive { if case .client(.endpoint(.registerLocalDestination)) = $0 { return true }; return false }
+    await node.receive(nodeSend)   // announce frame out
+    eventsC.yield(.data(sentNode.value.last!))
+    await c.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+
+    // C opens a link to the node's propagation destination.
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: nodeIdentity)!
+    await c.send(.openLink(destinationHash: propDest.hash))
+    await c.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await c.receive(cSend)         // LINKREQUEST out
+
+    // Handshake: LINKREQUEST → node (LRPROOF out); LRPROOF → C (LRRTT out); LRRTT → node (both active).
+    eventsNode.yield(.data(sentC.value.last!))
+    await node.receive(nodeSend)   // LRPROOF out
+    let lrrttIdx = sentC.value.count
+    eventsC.yield(.data(sentNode.value.last!))
+    await c.receive(cSend)         // LRRTT out
+    let lrrttBytes = sentC.value[lrrttIdx]
+    eventsNode.yield(.data(lrrttBytes))
+    await c.receive { if case .delegate(.linkEstablished) = $0 { return true }; return false }
+    await node.receive { if case .client(.endpoint(.delegate(.linkEstablished))) = $0 { return true }; return false }
+
+    let linkID = c.state.links[0].linkID
+
+    // C offers the container as a Resource.
+    await c.send(.sendResourceOverLink(linkID: linkID, data: container))
+    await c.receive(cSend)         // RESOURCE_ADV out
+    eventsNode.yield(.data(sentC.value.last!))
+    await node.receive(nodeSend)   // RESOURCE_REQ out
+    eventsC.yield(.data(sentNode.value.last!))
+    let partCount = c.state.links[0].transfers[0].parts.count
+    for _ in 0..<partCount { await c.receive(cSend) }
+
+    let parts = Array(sentC.value.suffix(partCount))
+    for (i, frame) in parts.enumerated() {
+        eventsNode.yield(.data(frame))
+        if i == partCount - 1 {
+            await node.receive(nodeSend)   // RESOURCE_PRF out
+            await node.receive { action in
+                if case let .delegate(.messagesStored(entries)) = action {
+                    #expect(entries.map(\.transientId) == [tid]); return true
+                }
+                return false
+            }
+        }
+    }
+
+    // C identifies.
+    await c.send(.identifyOverLink(linkID: linkID, identity: cIdentity))
+    await c.receive(cSend)
+    eventsNode.yield(.data(sentC.value.last!))
+    await node.receive { if case .client(.endpoint(.delegate(.linkIdentified))) = $0 { return true }; return false }
+
+    // Phase-1 /get → id list.
+    await c.send(.sendRequestOverLink(linkID: linkID, path: "/get",
+                                      data: MsgPack.encode(.array([.null, .null]))))
+    await c.receive(cSend)
+    eventsNode.yield(.data(sentC.value.last!))
+    await node.receive { if case .client(.endpoint(.delegate(.requestReceived))) = $0 { return true }; return false }
+    await node.receive(nodeSend)   // response frame out
+    let gotList = LockIsolated<Data?>(nil)
+    eventsC.yield(.data(sentNode.value.last!))
+    await c.receive { action in
+        if case let .delegate(.responseReceived(_, _, d)) = action { gotList.setValue(d); return true }
+        return false
+    }
+    #expect(MsgPack.decodeValue(gotList.value!) == .array([.bin(tid)]))
+
+    // Phase-2 /get → the blob, served STAMPLESS (reference LXMRouter.py:1551).
+    await c.send(.sendRequestOverLink(linkID: linkID, path: "/get",
+                                      data: MsgPack.encode(.array([.array([.bin(tid)]), .array([])]))))
+    await c.receive(cSend)
+    eventsNode.yield(.data(sentC.value.last!))
+    await node.receive { if case .client(.endpoint(.delegate(.requestReceived))) = $0 { return true }; return false }
+    await node.receive(nodeSend)   // response frame out
+    let gotBlob = LockIsolated<Data?>(nil)
+    eventsC.yield(.data(sentNode.value.last!))
+    await c.receive { action in
+        if case let .delegate(.responseReceived(_, _, d)) = action { gotBlob.setValue(d); return true }
+        return false
+    }
+
+    // The served blob opens to the original signature-valid message, and its full_hash == the stored key
+    // (so a reference client's phase-3 purge would match — the invariant the live purge bug violated).
+    guard case let .array(items)? = MsgPack.decodeValue(gotBlob.value!), case let .bin(served)? = items.first
+    else { Issue.record("phase-2 response was not [bin]"); return }
+    #expect(LXMFPropagation.transientId(lxmfData: served) == tid)
+    let recovered = LXMFPropagation.open(lxmfData: served, recipientIdentity: cIdentity)
+    #expect(recovered?.content == Data("hi C".utf8))
+    #expect(recovered?.validateSignature(source: sIdentity) == true)
+
+    await node.send(.client(.endpoint(.tcp(.disconnect)))); await c.send(.disconnect)
+}
+
 /// Phase-3 purge: the client's `haves` evict from the store and surface for the host's mirror.
 @MainActor @Test func serviceNodePurgesOnHavesAndSurfacesIt() async {
     let identity = Identity()
