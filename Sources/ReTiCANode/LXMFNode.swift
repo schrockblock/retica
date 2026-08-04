@@ -25,6 +25,9 @@ public struct LXMFNode {
         /// Our served `lxmf.propagation` destination hash while node-mode is on (nil = not serving).
         /// Data arriving on a link to this destination is a propagation offer, not a direct message.
         public var propagationDestinationHash: Data?
+        /// Our `lxmf.delivery` destination hash, set when `registerDelivery` is called (nil = not registered).
+        /// Used to scope packet proving to inbound direct-delivery links only.
+        public var deliveryDestinationHash: Data?
 
         public init(identity: Identity, endpoint: TransportEndpoint.State) {
             self.identity = identity
@@ -84,6 +87,7 @@ public struct LXMFNode {
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
                                           aspects: LXMessage.deliveryAspects, identity: state.identity)
                 else { return .none }
+                state.deliveryDestinationHash = d.hash
                 return .merge(.send(.endpoint(.registerLocalDestination(d))),
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: nil))))
 
@@ -264,15 +268,31 @@ public struct LXMFNode {
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))
 
-            case let .endpoint(.delegate(.linkDataReceived(linkID, data, _))):
+            case let .endpoint(.delegate(.linkDataReceived(linkID, data, packetHash))):
                 // On our served lxmf.propagation link this is an offer for the node, not a message for us.
-                // Proving decision: the reference `LXMRouter.delivery_packet` calls `packet.prove()`
-                // unconditionally as its FIRST statement (LXMRouter.py:1926-1927), for both link and
-                // opportunistic delivery packets. NOT proving here is a KNOWN GAP: a reference client
-                // sending a small direct message will time out waiting for the proof and tear the link
-                // down (LXMessage.py:616-619). This is tracked as a follow-up; the current behavior is
-                // NOT reference-correct. `LXMFServiceNode` handles proving for propagation-link packets.
+                // `LXMFServiceNode` handles proving for propagation-link packets; return early here so
+                // that proving is never double-counted and delivery is not attempted for propagation data.
                 guard !isServedPropagationLink(state, linkID) else { return .none }
+                // Reference `LXMRouter.delivery_packet` (LXMRouter.py:1925-1927) calls `packet.prove()`
+                // as its FIRST statement for every inbound delivery-link packet. Without this proof,
+                // a reference client's `LXMessage.__link_packet_timed_out` (LXMessage.py:616-619)
+                // tears the link down and retries forever, never marking the message sent.
+                //
+                // Scope: prove ONLY when the link terminates on OUR delivery destination. This excludes:
+                //   • the served lxmf.propagation link (handled above),
+                //   • our client's outbound sync link to a remote PN (linkDestinations holds the REMOTE
+                //     hash there, which cannot match deliveryDestinationHash),
+                //   • any link when registerDelivery was never called (deliveryDestinationHash == nil).
+                //
+                // Resource-framed direct messages are proved by the resource transfer protocol, so no
+                // prove is needed for the `.resourceReceived` path.
+                let isDeliveryLink = state.deliveryDestinationHash != nil
+                    && state.linkDestinations[linkID] == state.deliveryDestinationHash
+                if isDeliveryLink {
+                    return .merge(
+                        .send(.endpoint(.provePacketOverLink(linkID: linkID, packetHash: packetHash))),
+                        .send(.router(.received(method: .direct, destinationHash: Data(), data: data))))
+                }
                 return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
 
             case let .endpoint(.delegate(.resourceReceived(linkID, data))):
