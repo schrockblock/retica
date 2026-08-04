@@ -39,6 +39,12 @@ public enum LXMFPropagation {
     /// `umsgpack.packb(0xf0)` → `CC F0` (uint8), which `MsgPack.encode(.uint(240))` reproduces.
     public static let errorNoIdentity: UInt64 = 0xF0
 
+    /// `LXMPeer.ERROR_INVALID_STAMP` (lxmf 1.1.0 LXMPeer.py:28) — sent as a raw data packet (not a
+    /// response) on the link when an inbound PACKET-framed propagation offer contains entries with
+    /// invalid or absent PN stamps (LXMRouter.py:2258). After sending, the reference tears the link down
+    /// (LXMRouter.py:2259). Wire encoding: `msgpack.packb([0xf5])` → array of one uint8 `91 CC F5`.
+    public static let errorInvalidStamp: UInt64 = 0xF5
+
     /// Strip the trailing 32-byte PN stamp from a raw `lxmf_data` entry when the entry is long enough
     /// to contain one (i.e. `count > destinationLength + stampSize`), and return the stampless core.
     /// When the entry is at or below the threshold the bytes are returned unchanged.

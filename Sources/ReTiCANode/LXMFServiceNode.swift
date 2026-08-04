@@ -12,7 +12,9 @@ import ReTiCATransport
 /// with node-mode off this behaves exactly like a bare `LXMFNode`.
 ///
 /// Serve scope is client-facing only (register/announce, ingest offers, two-phase `/get`). PN↔PN mesh
-/// peering, inbound proving, and time-based expiry are out of scope — see `PNNode` for the peering path.
+/// peering and time-based expiry are out of scope — see `PNNode` for the peering path. Inbound proving
+/// of PACKET-framed propagation offers is in scope and lives at the `.linkDataReceived` handler below
+/// (reference LXMRouter.py:2255); Resource-framed offers are proved by the resource transfer protocol.
 @Reducer
 public struct LXMFServiceNode {
     @ObservableState
@@ -132,17 +134,33 @@ public struct LXMFServiceNode {
 
             case let .client(.endpoint(.delegate(.linkDataReceived(linkID, data, packetHash)))):
                 guard state.nodeModeEnabled, isPropagationLink(state, linkID) else { return .none }
-                // Reference LXMRouter.py:2255 — after ingesting a PACKET-framed offer the node calls
-                // `packet.prove()`, which completes the sending client's packet receipt. Without it a
-                // reference client (which picks the PACKET path whenever the packed propagation payload
-                // fits the link MDU — LXMessage.py:426-444, the ordinary chat-sized case) times out,
-                // tears the link down and retries forever, never marking the message sent.
+                // Reference LXMRouter.py:2252-2260: validate ALL entries in the container before deciding
+                // whether to prove. If ANY entry fails stamp validation, send ERROR_INVALID_STAMP and tear
+                // the link down — without a prove, which would falsely confirm delivery to the client.
+                // If ALL entries pass (or the container is unstamped because minStampCost == 0), prove the
+                // packet to complete the client's receipt (reference LXMRouter.py:2255).
                 //
                 // Deliberately scoped: this is the ONLY place ReTiCA proves an inbound data packet.
                 // RNS proves per-destination (`proof_strategy`, default PROVE_NONE), so a blanket
                 // auto-prove would be wrong; the decision lives here, in the composition that knows
                 // the link terminates on the lxmf.propagation destination we serve AND that node mode
                 // is on. Resource-framed offers already get a resource proof from `ResourceTransfer`.
+                //
+                // Unparseable containers: guard on parseContainer so a malformed wire payload neither
+                // proves nor ingests (reference LXMRouter.py:2262 except block skips the prove).
+                guard let (_, entries) = LXMFPropagation.parseContainer(data) else { return .none }
+                if state.minStampCost > 0 {
+                    let anyRejected = entries.contains {
+                        LXStamper.validatePnStamp(transientData: $0, targetCost: state.minStampCost) == nil
+                    }
+                    if anyRejected {
+                        // Reference LXMRouter.py:2258-2260: send the error as a plain data packet, then teardown.
+                        let errorBytes = MsgPack.encode(.array([.uint(LXMFPropagation.errorInvalidStamp)]))
+                        return .merge(
+                            .send(.client(.endpoint(.sendOverLink(linkID: linkID, data: errorBytes)))),
+                            .send(.client(.endpoint(.closeLink(linkID: linkID)))))
+                    }
+                }
                 return .merge(
                     .send(.pn(.ingestContainer(data))),
                     .send(.client(.endpoint(.provePacketOverLink(linkID: linkID, packetHash: packetHash)))))
@@ -185,13 +203,22 @@ public struct LXMFServiceNode {
                 }
                 // Parse the optional third element as the client's per-transfer limit (Important-5).
                 // Reference LXMRouter.py:1526-1529: client_transfer_limit = float(data[2])*1000.
-                // Missing or unparseable → nil (no limit). 0 is a valid 0-byte cap, NOT unlimited:
-                // the reference computes `float(0)*1000 = 0.0` and then skips every message that would
-                // exceed it (LXMRouter.py:1547), i.e. serves nothing. There is deliberately no `kb > 0`
-                // guard here — that guard would silently turn a wire-level 0 into "unlimited".
+                // The wire value may be a uint or a float (reference reads it via float()). Missing or
+                // unparseable → nil (no limit). 0 is a valid 0-byte cap, NOT unlimited: the reference
+                // computes `float(0)*1000 = 0.0` and then skips every message that would exceed it
+                // (LXMRouter.py:1547), i.e. serves nothing. There is deliberately no `kb > 0` guard
+                // here — that guard would silently turn a wire-level 0 into "unlimited".
+                // Clamp: UInt64.max * 1000 overflows Int. Cap to Int.max when kb is too large.
                 var transferLimitBytes: Int? = nil
-                if items.count >= 3, case let .uint(kb) = items[2] {
-                    transferLimitBytes = Int(kb) * 1000
+                if items.count >= 3 {
+                    switch items[2] {
+                    case let .uint(kb):
+                        transferLimitBytes = kb > UInt64(Int.max / 1000) ? Int.max : Int(kb) * 1000
+                    case let .double(kb):
+                        let raw = kb * 1000
+                        transferLimitBytes = raw >= Double(Int.max) ? Int.max : Int(raw)
+                    default: break
+                    }
                 }
                 return .send(.pn(.messagesRequested(destinationHash: clientHash,
                                                     wants: LXMFServiceNode.arrayOfBin(items[0]),

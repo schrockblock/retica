@@ -149,6 +149,15 @@ public struct LXMFNode {
             case let .endpoint(.delegate(.responseReceived(linkID, _, data))):
                 switch state.syncPhase[linkID] {
                 case .awaitingList:
+                    // Detect the ERROR_NO_IDENTITY error value: the reference PN sends this when the link
+                    // was never IDENTIFY'd (LXMRouter.py:1483). Reference clients branch on exactly this
+                    // value (LXMRouter.py:1563-1567) to tear the link down and set PR_NO_IDENTITY_RCVD.
+                    // Not reachable against our own node (we IDENTIFY before the first /get) but reachable
+                    // against any reference PN. Leaving the phase as .awaitingList would stall the sync.
+                    if case .uint(LXMFPropagation.errorNoIdentity)? = MsgPack.decodeValue(data) {
+                        state.syncPhase[linkID] = nil
+                        return .send(.endpoint(.closeLink(linkID: linkID)))
+                    }
                     guard case let .array(items)? = MsgPack.decodeValue(data) else { return .none }
                     let ids = items.compactMap { item -> Data? in
                         if case let .bin(d) = item { return d } else { return nil }
@@ -257,8 +266,12 @@ public struct LXMFNode {
 
             case let .endpoint(.delegate(.linkDataReceived(linkID, data, _))):
                 // On our served lxmf.propagation link this is an offer for the node, not a message for us.
-                // (The packet hash is ignored here: as a plain LXMF CLIENT we prove nothing — RNS's
-                // default proof_strategy is PROVE_NONE. Proving is `LXMFServiceNode`'s decision.)
+                // Proving decision: the reference `LXMRouter.delivery_packet` calls `packet.prove()`
+                // unconditionally as its FIRST statement (LXMRouter.py:1926-1927), for both link and
+                // opportunistic delivery packets. NOT proving here is a KNOWN GAP: a reference client
+                // sending a small direct message will time out waiting for the proof and tear the link
+                // down (LXMessage.py:616-619). This is tracked as a follow-up; the current behavior is
+                // NOT reference-correct. `LXMFServiceNode` handles proving for propagation-link packets.
                 guard !isServedPropagationLink(state, linkID) else { return .none }
                 return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
 

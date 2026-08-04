@@ -141,8 +141,11 @@ import ComposableArchitecture
     await s.receive(sSend)                                    // link data packet (already queued in S's store)
 
     // PN genuinely receives the link data packet → linkDataReceived → ingestContainer → messagesStored.
-    // (ReTiCA is a non-proving client and the PN does NOT auto-prove inbound link packets — matching RNS's
-    // default prove-none strategy — so no DATA_PROOF is emitted by the PN here.)
+    // This node is a bare `LXMFNode` (not `LXMFServiceNode`), acting as a RECEIVE-side PN. `LXMFNode`
+    // is a non-proving client: it does NOT auto-prove inbound link packets (matching RNS's default
+    // prove-none strategy). `LXMFServiceNode.linkDataReceived` is the place that proves propagation
+    // offers — that path is covered by serviceNodeProvesPacketOfferOnPropagationLink. So no DATA_PROOF
+    // is emitted by the bare PN here; the capstone drives a synthetic proof below to unblock S.
     let gotTid = LockIsolated<Data?>(nil)
     eventsPN.yield(.data(propPacketBytes))
     await pn.receive { action in

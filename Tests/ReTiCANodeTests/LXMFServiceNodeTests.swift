@@ -867,3 +867,363 @@ import ComposableArchitecture
     }
     #expect(store.state.pn.store.contains(transientId: tid) == false)
 }
+
+// MARK: - FIX 1 + FIX 6: transfer limit parse — clamp and float support
+
+/// A wire-level UInt64.max in data[2] must NOT trap. The reference reads the limit via `float(data[2])`
+/// (LXMRouter.py:1528), which saturates rather than trapping. Our clamp caps to Int.max.
+/// UInt64.max * 1000 would overflow Int; with the fix it clamps to Int.max (effectively unlimited).
+///
+/// The crash was: `Fatal error: Not enough bits to represent the passed value` at `Int(kb) * 1000`.
+@MainActor @Test func serviceNodeClampsUInt64MaxTransferLimit() async {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)
+    let client = Identity()
+    let clientHash = LXMessage.deliveryHash(identityHash: client.hash)
+    let e = clientHash + Data("any".utf8)
+    let tid = LXMFPropagation.transientId(lxmfData: e)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    let getPath = Crypto.truncatedHash(Data("/get".utf8))
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    await store.send(.client(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container)))))
+    await store.receive { if case .delegate(.messagesStored) = $0 { return true }; return false }
+    await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: client)))))
+
+    // data[2] = UInt64.max — previously trapped with "Not enough bits to represent the passed value".
+    // With the clamp fix this must not crash and must parse as Int.max (effectively unlimited),
+    // so the message IS served (no transfer limit cap reached).
+    await store.send(.client(.endpoint(.delegate(.requestReceived(
+        linkID: linkID, requestID: Data([8]), pathHash: getPath,
+        data: MsgPack.encode(.array([.array([.bin(tid)]), .array([]), .uint(UInt64.max)])))))))
+
+    // Must succeed: the clamped limit is Int.max, so the message fits and is served.
+    await store.receive { action in
+        if case let .pn(.messagesRequested(_, _, _, limit)) = action {
+            #expect(limit == Int.max, "UInt64.max must clamp to Int.max, not trap")
+            return true
+        }
+        return false
+    }
+}
+
+/// A float-valued data[2] (e.g. from a reference client that sends `float(kb)`) must be accepted and
+/// parsed. Without the `.double` arm a float limit silently becomes nil (unlimited), hiding the cap.
+@MainActor @Test func serviceNodeParsesFloatTransferLimit() async {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)
+    let client = Identity()
+    let clientHash = LXMessage.deliveryHash(identityHash: client.hash)
+    let e = clientHash + Data("any".utf8)
+    let tid = LXMFPropagation.transientId(lxmfData: e)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    let getPath = Crypto.truncatedHash(Data("/get".utf8))
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    await store.send(.client(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container)))))
+    await store.receive { if case .delegate(.messagesStored) = $0 { return true }; return false }
+    await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: client)))))
+
+    // data[2] = 500.0 (float) → transferLimitBytes should be 500000.
+    await store.send(.client(.endpoint(.delegate(.requestReceived(
+        linkID: linkID, requestID: Data([9]), pathHash: getPath,
+        data: MsgPack.encode(.array([.array([.bin(tid)]), .array([]), .double(500.0)])))))))
+
+    await store.receive { action in
+        if case let .pn(.messagesRequested(_, _, _, limit)) = action {
+            #expect(limit == 500_000, "float 500.0 must parse to 500000 bytes, not nil")
+            return true
+        }
+        return false
+    }
+}
+
+// MARK: - FIX 2: stamp rejection — ERROR_INVALID_STAMP on under-cost packet offer
+
+/// A PACKET-framed offer whose stamp fails validation (absent or below minStampCost) must NOT be
+/// proved. Instead the node sends ERROR_INVALID_STAMP (LXMPeer.ERROR_INVALID_STAMP = 0xF5,
+/// LXMRouter.py:2258) as a plain data packet on the link, then tears it down. Without this fix the
+/// node proved the packet, giving the sender a false delivery confirmation while storing nothing.
+///
+/// Uses minStampCost: 4 and an unstamped entry (effectively cost 0 — would be rejected by the store).
+@MainActor @Test func serviceNodeRejectsPacketOfferWithInvalidStamp() async {
+    let identity = Identity()
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 4)   // enforce: any un-/under-stamped entry is invalid
+    initial.nodeModeEnabled = true
+    let store = makeServiceNodeStore(initial)
+
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    let packetHash = Data(repeating: 0xF7, count: 32)
+    // Unstamped entry: 16-byte dest prefix + payload — stamp cost is effectively 0 < minStampCost=4.
+    let badEntry = Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("bad-stamp".utf8)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [badEntry])
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: container,
+                                                                   packetHash: packetHash)))))
+
+    // Must send ERROR_INVALID_STAMP (0xF5) as a plain data packet on the link (sendOverLink),
+    // NOT provePacketOverLink. The action bubbles through TransportEndpoint → TCPEndpoint, so
+    // it appears as .client(.endpoint(.tcp(.sendOverLink(...)))).
+    // Order: the error is emitted before the close (both in the same merge).
+    await store.receive { action in
+        if case let .client(.endpoint(.tcp(.sendOverLink(lid, data)))) = action {
+            #expect(lid == linkID)
+            #expect(MsgPack.decodeValue(data) == .array([.uint(LXMFPropagation.errorInvalidStamp)]),
+                    "must send msgpack([0xF5]) per LXMPeer.ERROR_INVALID_STAMP / LXMRouter.py:2258")
+            return true
+        }
+        return false
+    }
+    await store.receive { action in
+        if case let .client(.endpoint(.tcp(.closeLink(lid)))) = action {
+            #expect(lid == linkID)
+            return true
+        }
+        return false
+    }
+    // Nothing must have been stored.
+    #expect(store.state.pn.store.count == 0, "invalid-stamp offer must not be stored")
+
+    // Prove must NOT have been sent (flip to .on so any stray prove fails teardown).
+    store.exhaustivity = .on
+}
+
+/// A PACKET-framed offer whose container is unparseable (malformed msgpack) must neither prove nor
+/// ingest — reference LXMRouter.py:2262 `except` block skips the prove on parse error.
+@MainActor @Test func serviceNodeDoesNotProveOrIngestOnUnparseableContainer() async {
+    let identity = Identity()
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 0)
+    initial.nodeModeEnabled = true
+    let store = makeServiceNodeStore(initial)
+
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    let packetHash = Data(repeating: 0xF7, count: 32)
+    let garbage = Data([0xFF, 0xFE, 0xFD])   // not a valid msgpack propagation container
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    // Drain setup effects (linkEstablished → router.linkEstablished) before flipping to .on.
+    await store.skipReceivedActions(strict: false)
+
+    // An unparseable container must produce NO actions (no prove, no error packet, no ingest).
+    // Flip to .on so any stray action causes teardown to fail.
+    store.exhaustivity = .on
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: garbage,
+                                                                   packetHash: packetHash)))))
+    #expect(store.state.pn.store.count == 0)
+}
+
+/// A DUPLICATE (already-stored) valid offer must STILL be proved. The duplicate contributes 0 to
+/// `rejected` (it is not a stamp failure), so the prove path is taken. Without this, a re-offered
+/// duplicate would be silently dropped while the client waited for a receipt that never comes.
+@MainActor @Test func serviceNodeProvesDuplicatePacketOffer() async {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)   // minStampCost: 0 → accept any entry
+    let e = Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("dup-offer".utf8)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    let packetHash1 = Data(repeating: 0xF7, count: 32)
+    let packetHash2 = Data(repeating: 0xF8, count: 32)
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+
+    // First offer: ingested and proved.
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: container,
+                                                                   packetHash: packetHash1)))))
+    await store.receive { if case .client(.endpoint(.provePacketOverLink)) = $0 { return true }; return false }
+
+    // Second offer (duplicate): NOT newly stored, but MUST still be proved.
+    await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: container,
+                                                                   packetHash: packetHash2)))))
+    await store.receive { action in
+        if case let .client(.endpoint(.provePacketOverLink(lid, h))) = action {
+            #expect(lid == linkID)
+            #expect(h == packetHash2, "duplicate offer must be proved with the new packet's hash")
+            return true
+        }
+        return false
+    }
+    #expect(store.state.pn.store.count == 1, "store must still contain exactly one entry")
+}
+
+// MARK: - FIX 4: awaitingList handles ERROR_NO_IDENTITY from reference PN
+
+/// When the phase-1 /get response is `LXMPeer.ERROR_NO_IDENTITY` (0xF0) — sent by a reference PN
+/// that never received an IDENTIFY — `LXMFNode` must clear `syncPhase[linkID]` and close the link
+/// (reference LXMRouter.py:1563-1567: set PR_NO_IDENTITY_RCVD + teardown). Without the fix,
+/// `syncPhase[linkID]` stays `.awaitingList` forever (stuck sync, link never closed).
+@MainActor @Test func lxmfNodeHandlesNoIdentityErrorOnAwaitingList() async {
+    let identity = Identity()
+    var initial = LXMFNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    let linkID = Data(repeating: 0xC1, count: 16)
+    initial.syncPhase[linkID] = .awaitingList   // simulate: we sent a phase-1 /get, waiting for list
+    initial.linkDestinations[linkID] = Data(repeating: 0xAB, count: 16)
+
+    let store = TestStore(initialState: initial) { LXMFNode() } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+
+    // The reference PN responds with ERROR_NO_IDENTITY (uint 0xF0) — not an array.
+    let errorData = MsgPack.encode(.uint(LXMFPropagation.errorNoIdentity))
+    await store.send(.endpoint(.delegate(.responseReceived(linkID: linkID, requestID: Data([1]),
+                                                           data: errorData))))
+
+    // The link must be closed. Receive this BEFORE skipReceivedActions — in a .off store receive
+    // skips non-matching actions, so asserting state first and then receiving would drain the close.
+    // closeLink is routed through TransportEndpoint → TCPEndpoint, so appears as .endpoint(.tcp(.closeLink(...))).
+    await store.receive { action in
+        if case let .endpoint(.tcp(.closeLink(lid))) = action {
+            #expect(lid == linkID)
+            return true
+        }
+        return false
+    }
+
+    // syncPhase must be cleared (no longer stuck at awaitingList).
+    // drain any remaining actions before checking state.
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.syncPhase[linkID] == nil, "syncPhase must be cleared on ERROR_NO_IDENTITY")
+}
+
+// MARK: - FIX 5: packet-path prove crosses the real link stack
+
+/// The existing `serviceNodeIngestsAndServesOverRealLink` exercises the Resource path. This test
+/// verifies that the PACKET path (used by ordinary chat-sized offers — `LXMessage.py:426-444`) also
+/// crosses `TransportEndpoint → TCPEndpoint → LinkPlane → LinkSession` correctly: the node receives
+/// the packet, ingest it, and sends a DATA_PROOF back over the real link.
+///
+/// Without this test a plumbing regression between those layers would go uncaught — the unit-level
+/// `serviceNodeProvesPacketOfferOnPropagationLink` only exercises the TCA action path, not the wire.
+@Test @MainActor func serviceNodeProvesPacketOfferOverRealLink() async {
+    let clock = TestClock()
+    let nodeIdentity = Identity()
+    let cIdentity = Identity()
+    let cDeliveryHash = LXMessage.deliveryHash(identityHash: cIdentity.hash)
+    // Unstamped container (minStampCost:0 on node), small enough to go as a packet.
+    let e = cDeliveryHash + Data("hello-packet".utf8)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+
+    func makeNode(_ host: String, _ sent: LockIsolated<[Data]>)
+        -> (TestStore<LXMFServiceNode.State, LXMFServiceNode.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        var initial = LXMFServiceNode.State(
+            identity: nodeIdentity,
+            endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false),
+            minStampCost: 0)   // accept unstamped entries
+        initial.nodeModeEnabled = true
+        let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } }, close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    func makeClient(_ host: String, _ sent: LockIsolated<[Data]>)
+        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
+            TCPEndpoint()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } }, close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    func nodeSend(_ act: LXMFServiceNode.Action) -> Bool {
+        if case .client(.endpoint(.tcp(.interface(.send)))) = act { return true }; return false
+    }
+    func cSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+
+    let sentNode = LockIsolated<[Data]>([])
+    let sentC    = LockIsolated<[Data]>([])
+    let (node, eventsNode) = makeNode("node", sentNode)
+    let (c, eventsC) = makeClient("c", sentC)
+
+    await node.send(.client(.endpoint(.tcp(.connect)))); eventsNode.yield(.connected)
+    await c.send(.connect); eventsC.yield(.connected)
+
+    // Node registers + announces lxmf.propagation; bridge the announce so C learns the path.
+    await node.send(.registerPropagation)
+    await node.receive { if case .client(.endpoint(.registerLocalDestination)) = $0 { return true }; return false }
+    await node.receive(nodeSend)   // announce frame out
+    eventsC.yield(.data(sentNode.value.last!))
+    await c.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+
+    // C opens a link to the node's propagation destination.
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: nodeIdentity)!
+    await c.send(.openLink(destinationHash: propDest.hash))
+    await c.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await c.receive(cSend)         // LINKREQUEST out
+
+    // Handshake: LINKREQUEST → node; LRPROOF → C; LRRTT → node.
+    eventsNode.yield(.data(sentC.value.last!))
+    await node.receive(nodeSend)   // LRPROOF out
+    eventsC.yield(.data(sentNode.value.last!))
+    await c.receive(cSend)         // LRRTT out
+    eventsNode.yield(.data(sentC.value.last!))
+    await c.receive { if case .delegate(.linkEstablished) = $0 { return true }; return false }
+    await node.receive { if case .client(.endpoint(.delegate(.linkEstablished))) = $0 { return true }; return false }
+
+    let linkID = c.state.links[0].linkID
+
+    // C sends the container as a PACKET (sendWithReceiptOverLink — the packet path).
+    let token = Data(repeating: 0xBB, count: 32)   // stands in for messageHash
+    await c.send(.sendWithReceiptOverLink(linkID: linkID, data: container, token: token))
+    await c.receive(cSend)         // DATA packet out
+
+    // Bridge the packet to the node → node ingests + emits provePacketOverLink → DATA_PROOF out.
+    eventsNode.yield(.data(sentC.value.last!))
+    await node.receive { if case .client(.endpoint(.delegate(.linkDataReceived))) = $0 { return true }; return false }
+    await node.receive(nodeSend)   // DATA_PROOF frame out
+
+    // Bridge the DATA_PROOF back to C → C surfaces .delegate(.packetDelivered(token:)).
+    eventsC.yield(.data(sentNode.value.last!))
+    await c.receive { action in
+        if case let .delegate(.packetDelivered(t)) = action {
+            #expect(t == token, "proof must be for the correct token")
+            return true
+        }
+        return false
+    }
+
+    await node.send(.client(.endpoint(.tcp(.disconnect)))); await c.send(.disconnect)
+}
