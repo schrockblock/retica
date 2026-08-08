@@ -444,6 +444,10 @@ public struct Transport {
                 where now.timeIntervalSince(startedAt) > Transport.pathRequestTimeout {
                     state.discoveryPathRequests[dest] = nil
                 }
+                for (id, queue) in state.announceQueues {
+                    let live = queue.filter { now.timeIntervalSince($0.queuedAt) <= Transport.queuedAnnounceLife }
+                    state.announceQueues[id] = live.isEmpty ? nil : live
+                }
                 return .none
 
             case let .announceRetransmitDue(destinationHash):
@@ -462,8 +466,10 @@ public struct Transport {
                         sends.append(.send(.delegate(.transmit(id, entry.raw))))
                         state.announceAllowedAt[id] = now.addingTimeInterval(wait)
                     } else {
-                        state.announceQueues[id, default: []].append(
-                            State.QueuedAnnounce(raw: entry.raw, hops: entry.rebroadcastHops, queuedAt: now))
+                        if state.announceQueues[id, default: []].count < Transport.announceQueueLimit {
+                            state.announceQueues[id, default: []].append(
+                                State.QueuedAnnounce(raw: entry.raw, hops: entry.rebroadcastHops, queuedAt: now))
+                        }
                         let opensIn = max(0, state.announceAllowedAt[id]!.timeIntervalSince(now))
                         sends.append(.run { send in
                             try await clock.sleep(for: .seconds(opensIn))
@@ -492,7 +498,12 @@ public struct Transport {
                     return .none
                 }
                 guard var queue = state.announceQueues[id], !queue.isEmpty else { return .none }
-                let item = queue.removeFirst()            // Task 3 refines the selection order
+                // Fewest hops first, older first among equals (RNS orders by hops, then timestamp).
+                let pick = queue.indices.min { a, b in
+                    queue[a].hops != queue[b].hops ? queue[a].hops < queue[b].hops
+                                                   : queue[a].queuedAt < queue[b].queuedAt
+                }!
+                let item = queue.remove(at: pick)
                 state.announceQueues[id] = queue.isEmpty ? nil : queue
                 let now = date.now
                 let wait = Transport.announcePacingWait(byteCount: item.raw.count,

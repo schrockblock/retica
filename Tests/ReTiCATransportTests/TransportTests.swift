@@ -2759,3 +2759,87 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
                                makePathRequest(for: unknown, tag: Data(repeating: 0xB2, count: 16))))
     store.exhaustivity = .on
 }
+
+// MARK: - C3 queue discipline
+
+/// The drain emits the FEWEST-HOP announce first, then the older of equal-hop entries
+/// (RNS orders the announce queue by hops, then timestamp).
+@Test @MainActor func drainEmitsFewestHopAnnounceFirst() async {
+    var initial = Transport.State()
+    let id = InterfaceID("i0")
+    initial.interfaces[id] = .default
+    initial.announceQueues[id] = [
+        .init(raw: Data("far".utf8),   hops: 5, queuedAt: Date(timeIntervalSince1970: 10)),
+        .init(raw: Data("near".utf8),  hops: 1, queuedAt: Date(timeIntervalSince1970: 30)),
+        .init(raw: Data("near2".utf8), hops: 1, queuedAt: Date(timeIntervalSince1970: 20)),
+    ]
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    let out = LockIsolated<Data?>(nil)
+    await store.send(.announceQueueDrainDue(id))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, d)) = action { out.setValue(d); return true }
+        return false
+    }
+    // hops 1 beats hops 5; between the two hops-1 entries the OLDER (t=20) wins.
+    #expect(out.value == Data("near2".utf8))
+    #expect(store.state.announceQueues[id]?.count == 2)
+}
+
+/// A full queue drops further announces rather than growing without bound.
+@Test @MainActor func announceQueueDropsWhenAtCapacity() async {
+    var initial = Transport.State()
+    let id = InterfaceID("iSlow")
+    initial.interfaces[id] = InterfaceProfile(name: "slow", bitrate: 8_000, mode: .full)
+    initial.interfaces[InterfaceID("i0")] = .default
+    initial.transportIdentity = Identity()
+    // Saturate the queue and close the pacing window so the next announce must queue.
+    initial.announceQueues[id] = Array(
+        repeating: .init(raw: Data([0xAA]), hops: 3,
+                         queuedAt: Date(timeIntervalSince1970: 0)),
+        count: Transport.announceQueueLimit)
+    initial.announceAllowedAt[id] = Date(timeIntervalSince1970: 9_999)
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.transportDate = DateGenerator { Date(timeIntervalSince1970: 0) }
+        $0.randomBytes = RandomBytesGenerator { _ in Data([0]) }
+    }
+    store.exhaustivity = .off
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await store.receive(.announceRetransmitDue(destinationHash: destHash))
+    #expect(store.state.announceQueues[id]?.count == Transport.announceQueueLimit)  // no growth
+}
+
+/// maintenanceTick drops queued announces older than QUEUED_ANNOUNCE_LIFE and removes the
+/// queue entry entirely once empty.
+@Test @MainActor func maintenanceTickExpiresStaleQueuedAnnounces() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    var initial = Transport.State()
+    let id = InterfaceID("i0")
+    initial.interfaces[id] = .default
+    initial.announceQueues[id] = [
+        .init(raw: Data("old".utf8),   hops: 1, queuedAt: Date(timeIntervalSince1970: 0)),
+        .init(raw: Data("fresh".utf8), hops: 1, queuedAt: Date(timeIntervalSince1970: 80_000)),
+    ]
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.startMaintenance)
+    now.setValue(Date(timeIntervalSince1970: Transport.queuedAnnounceLife + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.announceQueues[id]?.count == 1)          // only "old" expired
+    // Push past the fresh one's lifetime too: the queue entry disappears entirely.
+    now.setValue(Date(timeIntervalSince1970: 80_000 + Transport.queuedAnnounceLife + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.announceQueues[id] == nil)
+    await store.send(.stopMaintenance)
+}
