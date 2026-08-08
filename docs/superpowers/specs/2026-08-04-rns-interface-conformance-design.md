@@ -1,6 +1,11 @@
 # RNS Interface Conformance — Design
 
-**Status:** approved 2026-08-04
+**Status:** approved 2026-08-04; re-verified against HEAD `594f046` on
+2026-08-08 after the propagation-node work (PNNode / LXMFServiceNode /
+delivery-link proving) landed. `Transport.swift` was untouched by that work,
+so all `Transport.swift` citations remain exact; endpoint send-site and
+silent-drop line numbers were refreshed; the 108-site ripple count re-measured
+identical (the ~1500 new test lines added zero sites).
 **Supersedes nothing.** Follows sub-project A (LinkPlane) and sub-project B (TransportEndpoint / LXMF-over-BLE).
 
 ## Goal
@@ -176,8 +181,15 @@ Six read sites migrate from `Set` to `.keys`, each mechanically:
 `public var profile: InterfaceProfile`, defaulted to `.tcp` / `.ble` in
 their inits. The send sites become:
 
-- `TCPEndpoint.swift:111` — `.interfaceConnected(id, state.profile)`
-- `BLEEndpoint.swift:120` — `.interfaceConnected(id, state.profile)`
+- `TCPEndpoint.swift:112` — `.interfaceConnected(id, state.profile)`
+- `BLEEndpoint.swift:121` — `.interfaceConnected(id, state.profile)`
+
+**Downstream consumers (verified 2026-08-08):** `PNNode` composes
+`TCPEndpoint` directly (`PNNode.swift:14, 65`) and `LXMFServiceNode` has
+three inits mirroring `LXMFNode`'s (`LXMFServiceNode.swift:39-56`). Both are
+untouched by C1: because the profile defaults inside the endpoint `State`
+inits, every existing construction site inherits it transitively. Neither
+composition's tests reference `interfaceConnected` at all.
 
 BLE registers one interface per peer, all sharing the endpoint's profile.
 Per-peer profile variation (e.g. a negotiated per-link bitrate) is a non-goal;
@@ -353,7 +365,7 @@ Unchanged from the rest of the project, and binding:
   `TransportEndpoint.State` is a two-case enum. Separate sub-project.
 - BLE-specific residue carried from sub-project B: link re-homing when a peer
   reconnects under a new token, `peerOffline` not proactively closing links,
-  the silent drops at `BLEEndpoint.swift:140-142` and `:195-197`, and the
+  the silent drops at `BLEEndpoint.swift:142` and `:199`, and the
   >391-byte direct path being unproven over BLE.
 - Unified `transportOnline`/`transportOffline` delegates on
   `TransportEndpoint` (the known connectivity leak from sub-project B).
