@@ -69,6 +69,21 @@ public struct Transport {
         }
         /// Fresh announces held for a jittered re-broadcast, keyed by destinationHash (4b-3b-1).
         public var announceTable: [Data: PendingAnnounce] = [:]
+
+        /// An announce held for an interface until its pacing window opens (RNS announce_queue).
+        public struct QueuedAnnounce: Equatable, Sendable {
+            public var raw: Data
+            public var hops: UInt8
+            public var queuedAt: Date
+            public init(raw: Data, hops: UInt8, queuedAt: Date) {
+                self.raw = raw; self.hops = hops; self.queuedAt = queuedAt
+            }
+        }
+        /// Earliest time each interface may emit its next RELAYED announce (RNS announce_allowed_at).
+        public var announceAllowedAt: [InterfaceID: Date] = [:]
+        /// Per-interface announces awaiting their pacing slot (RNS announce_queue).
+        public var announceQueues: [InterfaceID: [QueuedAnnounce]] = [:]
+
         public init() {}
 
         public struct LinkTableEntry: Equatable, Sendable {
@@ -97,6 +112,7 @@ public struct Transport {
         case requestPath(destinationHash: Data)
         case send(destinationHash: Data, plaintext: Data)
         case announceRetransmitDue(destinationHash: Data)
+        case announceQueueDrainDue(InterfaceID)
         case startMaintenance
         case stopMaintenance
         case maintenanceTick
@@ -117,7 +133,9 @@ public struct Transport {
     @Dependency(\.continuousClock) var clock
     @Dependency(\.randomBytes) var randomBytes
 
-    private enum CancelID: Hashable { case announceRetransmit(Data); case maintenance }
+    private enum CancelID: Hashable {
+        case announceRetransmit(Data); case maintenance; case announceDrain(InterfaceID)
+    }
 
     public init() {}
 
@@ -149,7 +167,9 @@ public struct Transport {
 
             case let .interfaceDisconnected(id):
                 state.interfaces[id] = nil
-                return .none
+                state.announceAllowedAt[id] = nil
+                state.announceQueues[id] = nil
+                return .cancel(id: CancelID.announceDrain(id))
 
             case let .registerLocalDestination(destination):
                 state.localDestinations[destination.hash] = destination
@@ -429,10 +449,28 @@ public struct Transport {
             case let .announceRetransmitDue(destinationHash):
                 guard var entry = state.announceTable[destinationHash] else { return .none }
                 let arrivalMode = state.interfaces[entry.arrivalInterface]?.mode
-                let sends = state.interfaces
+                let now = date.now
+                let eligible = state.interfaces
                     .filter { $0.key != entry.arrivalInterface
                         && Transport.mayRelayAnnounce(to: $0.value.mode, arrivalMode: arrivalMode) }
-                    .map { Effect<Action>.send(.delegate(.transmit($0.key, entry.raw))) }
+                var sends: [Effect<Action>] = []
+                for (id, profile) in eligible {
+                    let wait = Transport.announcePacingWait(byteCount: entry.raw.count,
+                                                            bitrate: profile.bitrate,
+                                                            announceCap: profile.announceCap)
+                    if (state.announceAllowedAt[id] ?? .distantPast) <= now {
+                        sends.append(.send(.delegate(.transmit(id, entry.raw))))
+                        state.announceAllowedAt[id] = now.addingTimeInterval(wait)
+                    } else {
+                        state.announceQueues[id, default: []].append(
+                            State.QueuedAnnounce(raw: entry.raw, hops: entry.rebroadcastHops, queuedAt: now))
+                        let opensIn = max(0, state.announceAllowedAt[id]!.timeIntervalSince(now))
+                        sends.append(.run { send in
+                            try await clock.sleep(for: .seconds(opensIn))
+                            await send(.announceQueueDrainDue(id))
+                        }.cancellable(id: CancelID.announceDrain(id), cancelInFlight: true))
+                    }
+                }
                 entry.rebroadcasts += 1
                 if entry.rebroadcasts >= Transport.announceMaxRebroadcasts {
                     state.announceTable[destinationHash] = nil          // lifecycle complete
@@ -447,6 +485,28 @@ public struct Transport {
                     await send(.announceRetransmitDue(destinationHash: destinationHash))
                 }.cancellable(id: CancelID.announceRetransmit(destinationHash), cancelInFlight: true)
                 return .merge(sends + [retry])
+
+            case let .announceQueueDrainDue(id):
+                guard let profile = state.interfaces[id] else {
+                    state.announceQueues[id] = nil        // interface vanished; drop its backlog
+                    return .none
+                }
+                guard var queue = state.announceQueues[id], !queue.isEmpty else { return .none }
+                let item = queue.removeFirst()            // Task 3 refines the selection order
+                state.announceQueues[id] = queue.isEmpty ? nil : queue
+                let now = date.now
+                let wait = Transport.announcePacingWait(byteCount: item.raw.count,
+                                                        bitrate: profile.bitrate,
+                                                        announceCap: profile.announceCap)
+                state.announceAllowedAt[id] = now.addingTimeInterval(wait)
+                var effects: [Effect<Action>] = [.send(.delegate(.transmit(id, item.raw)))]
+                if !queue.isEmpty {
+                    effects.append(.run { send in
+                        try await clock.sleep(for: .seconds(wait))
+                        await send(.announceQueueDrainDue(id))
+                    }.cancellable(id: CancelID.announceDrain(id), cancelInFlight: true))
+                }
+                return .merge(effects)
 
             case let .send(destinationHash, plaintext):
                 guard let entry = state.learned[destinationHash] else {

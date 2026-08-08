@@ -369,6 +369,14 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, D
                        hops: hops, emitted: emitted)
 }
 
+// Convenience: build a HEADER_1 announce for a synthetic remote identity with a specific randomPrefix
+// (controls the random hash and thus the blob — different prefix → different announce blob/destHash).
+private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000,
+                                randomPrefix: Data) -> (Data, Data) {
+    makeAnnouncePacket(identity: Identity(), appName: "relay", aspects: ["svc"],
+                       hops: hops, emitted: emitted, randomPrefix: randomPrefix)
+}
+
 // MARK: - #4c-2 announce cache
 
 /// Learning a path caches the announce payload verbatim (for later relay path-responses).
@@ -1305,18 +1313,36 @@ private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.Stat
 
 // MARK: - 4b-3b-1 jittered delayed re-broadcast
 
+/// A simulated wall clock that tracks a `TestClock`, so `clock.advance(by:)` remains the single
+/// time control in relay tests. C3 pacing compares `date.now` against a per-interface
+/// `allowedAt`; with the default frozen epoch-0 `transportDate`, every announce after the first
+/// would queue forever. `TestClock.Instant.offset` is fileprivate, so elapsed time is recovered
+/// via the public `Instant()` (offset .zero) + `duration(to:)`.
+private func clockTrackingDate(_ clock: TestClock<Duration>) -> DateGenerator {
+    DateGenerator {
+        let elapsed = TestClock<Duration>.Instant().duration(to: clock.now)
+        let seconds = Double(elapsed.components.seconds)
+                    + Double(elapsed.components.attoseconds) * 1e-18
+        return Date(timeIntervalSince1970: seconds)
+    }
+}
+
 /// A relay with two interfaces and a controllable clock/jitter.
+/// Uses TCP-profile interfaces (10 Mbps) so the announce pacing window (~0.0001 s) is far
+/// shorter than any jitter or retry advance in the existing relay-lifecycle tests, keeping
+/// those tests focused on jitter/retry/cancellation behaviour rather than pacing.
 @MainActor
 private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>, jitterByte: UInt8)
     async -> TestStore<Transport.State, Transport.Action> {
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.transportDate = clockTrackingDate(clock)
         $0.continuousClock = clock
         $0.randomBytes = RandomBytesGenerator { _ in Data([jitterByte]) }
     }
     store.exhaustivity = .off
-    await store.send(.interfaceConnected(InterfaceID("i0")))
-    await store.send(.interfaceConnected(InterfaceID("i1")))
+    await store.send(.interfaceConnected(InterfaceID("i0"), .tcp))
+    await store.send(.interfaceConnected(InterfaceID("i1"), .tcp))
     await store.send(.setTransportIdentity(relay))
     return store
 }
@@ -1438,6 +1464,7 @@ private func makeModedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     async -> TestStore<Transport.State, Transport.Action> {
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.transportDate = clockTrackingDate(clock)
         $0.continuousClock = clock
         $0.randomBytes = RandomBytesGenerator { _ in Data([jitterByte]) }
     }
@@ -1675,6 +1702,136 @@ private let boundaryProfile = InterfaceProfile(name: "bound", bitrate: 62_500, m
 @Test func announceQueueBoundsMatchReference() {
     #expect(Transport.announceQueueLimit == 16384)
     #expect(Transport.queuedAnnounceLife == 86_400)
+}
+
+// MARK: - C3 bitrate-paced announce queueing
+
+/// A slow interface relays the first announce immediately, then QUEUES the next one that
+/// arrives inside its pacing window rather than transmitting it.
+@Test @MainActor func secondAnnounceInsidePacingWindowIsQueuedNotSent() async {
+    let clock = TestClock()
+    let slow = InterfaceProfile(name: "slow", bitrate: 8_000, mode: .full)   // 1000 B/s
+    let (a1, d1) = makeAnnouncePacket(hops: 2, emitted: 1000,
+                                      randomPrefix: Data([1, 0, 0, 0, 0]))
+    let (a2, d2) = makeAnnouncePacket(hops: 2, emitted: 2000,
+                                      randomPrefix: Data([2, 0, 0, 0, 0]))
+    let store = await makeModedRelayStore(Identity(), clock, interfaces: [
+        (InterfaceID("i0"),    .default),      // arrival
+        (InterfaceID("iSlow"), slow),
+    ])
+    await store.send(.received(InterfaceID("i0"), a1))
+    await store.receive(.delegate(.pathLearned(destinationHash: d1, hops: 2)))
+    await clock.advance(by: .seconds(0.25))                 // jitter → send #1 goes out
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceQueues[InterfaceID("iSlow")] == nil)   // nothing queued yet
+    #expect(store.state.announceAllowedAt[InterfaceID("iSlow")] != nil)
+
+    // A second announce arrives well inside the pacing window (183 B at 8 kbps / 0.02 ≈ 9 s).
+    await store.send(.received(InterfaceID("i0"), a2))
+    await store.receive(.delegate(.pathLearned(destinationHash: d2, hops: 2)))
+    await clock.advance(by: .seconds(0.25))                 // its jitter elapses
+    // TCA .off mode: state from effect-dispatched actions is only visible after skipReceivedActions
+    // drains the internal announceRetransmitDue action from the received-actions queue.
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.announceQueues[InterfaceID("iSlow")]?.count == 1)  // QUEUED, not sent
+    await store.send(.stopMaintenance)                      // quiesce
+}
+
+/// A queued announce is transmitted when the pacing window expires — the drain timer fires
+/// on its own, without another announce arriving.
+@Test @MainActor func queuedAnnounceIsDrainedWhenPacingWindowExpires() async {
+    let clock = TestClock()
+    let slow = InterfaceProfile(name: "slow", bitrate: 8_000, mode: .full)
+    let (a1, d1) = makeAnnouncePacket(hops: 2, emitted: 1000,
+                                      randomPrefix: Data([1, 0, 0, 0, 0]))
+    let (a2, d2) = makeAnnouncePacket(hops: 2, emitted: 2000,
+                                      randomPrefix: Data([2, 0, 0, 0, 0]))
+    let store = await makeModedRelayStore(Identity(), clock, interfaces: [
+        (InterfaceID("i0"),    .default),
+        (InterfaceID("iSlow"), slow),
+    ])
+    await store.send(.received(InterfaceID("i0"), a1))
+    await store.receive(.delegate(.pathLearned(destinationHash: d1, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.send(.received(InterfaceID("i0"), a2))
+    await store.receive(.delegate(.pathLearned(destinationHash: d2, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    // TCA .off mode: drain internal announceRetransmitDue to make queue visible in store.state.
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.announceQueues[InterfaceID("iSlow")]?.count == 1)
+
+    // Stop relay mode so lifecycle retries (which would also queue) are cancelled before
+    // advancing past the pacing window — leaving exactly the one drain timer in-flight.
+    // The drain handler is independent of relay identity and will still fire.
+    await store.send(.setTransportIdentity(nil))
+
+    // Advance past the pacing window: the drain fires and emits the held announce.
+    let drained = LockIsolated<Data?>(nil)
+    await clock.advance(by: .seconds(12))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, d)) = action, i == InterfaceID("iSlow") {
+            drained.setValue(d); return true
+        }
+        return false
+    }
+    #expect(drained.value != nil)
+    #expect(store.state.announceQueues[InterfaceID("iSlow")] == nil)   // queue emptied
+    await store.send(.stopMaintenance)
+}
+
+/// A fast interface never queues: its pacing window is far shorter than the retransmit grace,
+/// so back-to-back announces both go out immediately.
+@Test @MainActor func fastInterfaceNeverQueuesAnnounces() async {
+    let clock = TestClock()
+    let (a1, d1) = makeAnnouncePacket(hops: 2, emitted: 1000,
+                                      randomPrefix: Data([1, 0, 0, 0, 0]))
+    let (a2, d2) = makeAnnouncePacket(hops: 2, emitted: 2000,
+                                      randomPrefix: Data([2, 0, 0, 0, 0]))
+    let store = await makeModedRelayStore(Identity(), clock, interfaces: [
+        (InterfaceID("i0"),    .default),
+        (InterfaceID("iFast"), .tcp),          // 10 Mbps → ~0.0001 s window
+    ])
+    await store.send(.received(InterfaceID("i0"), a1))
+    await store.receive(.delegate(.pathLearned(destinationHash: d1, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.send(.received(InterfaceID("i0"), a2))
+    await store.receive(.delegate(.pathLearned(destinationHash: d2, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.announceQueues[InterfaceID("iFast")] == nil)   // never queued
+    await store.send(.stopMaintenance)
+}
+
+/// Disconnecting an interface drops its pacing state and queued announces — no residue, and
+/// no drain timer left running for an interface that is gone.
+@Test @MainActor func disconnectClearsPacingStateAndQueue() async {
+    let clock = TestClock()
+    let slow = InterfaceProfile(name: "slow", bitrate: 8_000, mode: .full)
+    let (a1, d1) = makeAnnouncePacket(hops: 2, emitted: 1000,
+                                      randomPrefix: Data([1, 0, 0, 0, 0]))
+    let (a2, d2) = makeAnnouncePacket(hops: 2, emitted: 2000,
+                                      randomPrefix: Data([2, 0, 0, 0, 0]))
+    let store = await makeModedRelayStore(Identity(), clock, interfaces: [
+        (InterfaceID("i0"),    .default),
+        (InterfaceID("iSlow"), slow),
+    ])
+    await store.send(.received(InterfaceID("i0"), a1))
+    await store.receive(.delegate(.pathLearned(destinationHash: d1, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    await store.send(.received(InterfaceID("i0"), a2))
+    await store.receive(.delegate(.pathLearned(destinationHash: d2, hops: 2)))
+    await clock.advance(by: .seconds(0.25))
+    // TCA .off mode: drain internal announceRetransmitDue to make queue visible in store.state.
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.announceQueues[InterfaceID("iSlow")]?.count == 1)
+
+    await store.send(.interfaceDisconnected(InterfaceID("iSlow")))
+    #expect(store.state.announceQueues[InterfaceID("iSlow")] == nil)
+    #expect(store.state.announceAllowedAt[InterfaceID("iSlow")] == nil)
+    await store.send(.stopMaintenance)
 }
 
 // MARK: - 4b-3b-2 announce re-broadcast retries + grace
