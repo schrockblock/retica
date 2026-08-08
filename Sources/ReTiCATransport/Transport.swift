@@ -90,6 +90,23 @@ public struct Transport {
         /// Per-interface announces awaiting their pacing slot (RNS announce_queue).
         public var announceQueues: [InterfaceID: [QueuedAnnounce]] = [:]
 
+        // MARK: - C4 ingress control state
+
+        /// An announce held by ingress control until the burst subsides (RNS held_announces).
+        public struct HeldAnnounce: Equatable, Sendable {
+            public var raw: Data
+            public var hops: UInt8
+            public init(raw: Data, hops: UInt8) { self.raw = raw; self.hops = hops }
+        }
+        /// Arrival times of recent signature-valid announces per interface (RNS ia_freq_deque).
+        public var announceArrivals: [InterfaceID: [Date]] = [:]
+        /// Per-interface announce burst state (RNS ic_burst_*).
+        public var ingressBursts: [InterfaceID: Transport.IngressBurst] = [:]
+        /// Held announces per interface, keyed by destination (RNS held_announces).
+        public var heldAnnounces: [InterfaceID: [Data: HeldAnnounce]] = [:]
+        /// When each interface connected — drives the young/established burst threshold (RNS age()).
+        public var interfaceConnectedAt: [InterfaceID: Date] = [:]
+
         public init() {}
 
         public struct LinkTableEntry: Equatable, Sendable {
@@ -169,12 +186,17 @@ public struct Transport {
             switch action {
             case let .interfaceConnected(id, profile):
                 state.interfaces[id] = profile
+                state.interfaceConnectedAt[id] = date.now
                 return .none
 
             case let .interfaceDisconnected(id):
                 state.interfaces[id] = nil
                 state.announceAllowedAt[id] = nil
                 state.announceQueues[id] = nil
+                state.announceArrivals[id] = nil
+                state.ingressBursts[id] = nil
+                state.heldAnnounces[id] = nil
+                state.interfaceConnectedAt[id] = nil
                 return .cancel(id: CancelID.announceDrain(id))
 
             case let .registerLocalDestination(destination):
@@ -239,6 +261,42 @@ public struct Transport {
                                                       destinationHash: packet.destinationHash,
                                                       contextFlagSet: packet.contextFlag)
                     else { return .none }
+                    // C4 ingress control (RNS Transport.py:1748-1766). Record the arrival first — the deque
+                    // counts every signature-valid announce, including this one, before the decision.
+                    let icNow = date.now
+                    var arrivals = state.announceArrivals[interfaceID] ?? []
+                    arrivals.append(icNow)
+                    // Decay: drop samples older than the window, then cap the deque length.
+                    arrivals.removeAll { icNow.timeIntervalSince($0) > Transport.arFreqDecay }
+                    if arrivals.count > Transport.iaFreqSamples {
+                        arrivals.removeFirst(arrivals.count - Transport.iaFreqSamples)
+                    }
+                    state.announceArrivals[interfaceID] = arrivals
+
+                    // Limiting applies ONLY to destinations we have no path to, and never to one we have an
+                    // outstanding path request for. Holding must happen BEFORE the blob ring records this
+                    // announce, or the later release would look like a replay and be dropped.
+                    let destinationKnown = state.learned[packet.destinationHash] != nil
+                    let awaitingPath = state.discoveryPathRequests[packet.destinationHash] != nil
+                    if !destinationKnown, !awaitingPath {
+                        let age = icNow.timeIntervalSince(state.interfaceConnectedAt[interfaceID] ?? icNow)
+                        let decision = Transport.shouldIngressLimit(
+                            samples: arrivals, now: icNow, interfaceAge: age,
+                            burst: state.ingressBursts[interfaceID] ?? Transport.IngressBurst())
+                        state.ingressBursts[interfaceID] = decision.burst
+                        if decision.limit {
+                            // hold_announce (Interface.py:223-229): too-far announces are dropped, an existing
+                            // entry for this destination is replaced, otherwise held while under the cap.
+                            if Int(packet.hops) < Transport.ingressHoldHopLimit {
+                                var held = state.heldAnnounces[interfaceID] ?? [:]
+                                if held[packet.destinationHash] != nil || held.count < Transport.maxHeldAnnounces {
+                                    held[packet.destinationHash] = State.HeldAnnounce(raw: data, hops: packet.hops)
+                                    state.heldAnnounces[interfaceID] = held
+                                }
+                            }
+                            return .none
+                        }
+                    }
                     // Anti-replay: a previously-seen random-blob for this destination is a replay.
                     // RingSet.insert both tests and records; false → already present → drop.
                     // NOTE: we record the blob for EVERY fresh announce here. RNS only appends the

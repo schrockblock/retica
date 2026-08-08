@@ -3050,3 +3050,145 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(r.limit == true)
     #expect(r.burst.active == true)
 }
+
+// MARK: - C4 Task 2: receive-side gate
+
+/// Under a burst, an announce for an UNKNOWN destination is held rather than admitted:
+/// no path is learned and no blob is recorded, so the later release is not a replay.
+@Test @MainActor func burstHoldsAnnounceForUnknownDestination() async {
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    let i0 = InterfaceID("i0")
+    await store.send(.interfaceConnected(i0, .default))
+    // Drive the arrival rate over the 3 Hz young-interface threshold with distinct announces.
+    for k in 0..<6 {
+        now.setValue(Date(timeIntervalSince1970: 1000 + Double(k) * 0.1))
+        let (raw, _) = makeAnnouncePacket(hops: 2, emitted: UInt64(1000 + k),
+                                          randomPrefix: Data([UInt8(k + 1), 0, 0, 0, 0]))
+        await store.send(.received(i0, raw))
+    }
+    #expect(store.state.ingressBursts[i0]?.active == true)
+    #expect((store.state.heldAnnounces[i0]?.count ?? 0) > 0)
+    // A held announce must not have been admitted: no path, and its blob is unrecorded.
+    let heldDest = store.state.heldAnnounces[i0]!.keys.first!
+    #expect(store.state.learned[heldDest] == nil)
+    #expect(store.state.announceBlobs[heldDest] == nil)
+}
+
+/// An announce for a destination we ALREADY have a path to is never held, even mid-burst
+/// (RNS limits only unknown destinations — known ones are governed by announce rate limiting).
+@Test @MainActor func burstDoesNotHoldAnnounceForKnownDestination() async {
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    let i0 = InterfaceID("i0")
+    await store.send(.interfaceConnected(i0, .default))
+    // Learn a path for this identity BEFORE the burst.
+    let known = Identity()
+    let (first, knownDest) = makeAnnouncePacket(identity: known, appName: "app", aspects: ["s"],
+                                                hops: 2, emitted: 1,
+                                                randomPrefix: Data([9, 0, 0, 0, 0]))
+    await store.send(.received(i0, first))
+    #expect(store.state.learned[knownDest] != nil)
+    // Now drive a burst with OTHER destinations.
+    for k in 0..<6 {
+        now.setValue(Date(timeIntervalSince1970: 1000 + Double(k) * 0.1))
+        let (raw, _) = makeAnnouncePacket(hops: 2, emitted: UInt64(2000 + k),
+                                          randomPrefix: Data([UInt8(k + 1), 0, 0, 0, 0]))
+        await store.send(.received(i0, raw))
+    }
+    #expect(store.state.ingressBursts[i0]?.active == true)
+    // A fresh announce for the KNOWN destination is still admitted, not held.
+    now.setValue(Date(timeIntervalSince1970: 1002))
+    let (again, _) = makeAnnouncePacket(identity: known, appName: "app", aspects: ["s"],
+                                        hops: 1, emitted: 5000,
+                                        randomPrefix: Data([8, 0, 0, 0, 0]))
+    await store.send(.received(i0, again))
+    #expect(store.state.heldAnnounces[i0]?[knownDest] == nil)
+    #expect(store.state.learned[knownDest]?.hops == 1)          // the better path was adopted
+}
+
+/// An announce for a destination we have an outstanding path request for is never held —
+/// we asked for it (RNS skips the ingress check for pending path requests).
+@Test @MainActor func pendingPathRequestExemptsAnnounceFromHolding() async {
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    var initial = Transport.State()
+    let i0 = InterfaceID("i0")
+    let wanted = Identity()
+    let (raw, wantedDest) = makeAnnouncePacket(identity: wanted, appName: "app", aspects: ["s"],
+                                               hops: 2, emitted: 7000,
+                                               randomPrefix: Data([7, 0, 0, 0, 0]))
+    initial.discoveryPathRequests[wantedDest] = Date(timeIntervalSince1970: 999)
+    // Pre-arm an active burst so the gate would otherwise hold.
+    initial.ingressBursts[i0] = Transport.IngressBurst(
+        active: true, activatedAt: Date(timeIntervalSince1970: 999),
+        heldRelease: Date(timeIntervalSince1970: 1014))
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(i0, .default))
+    await store.send(.received(i0, raw))
+    #expect(store.state.heldAnnounces[i0]?[wantedDest] == nil)   // exempt
+    #expect(store.state.learned[wantedDest] != nil)              // admitted normally
+}
+
+/// Holding replaces an existing entry for the same destination and never exceeds the cap;
+/// an announce at the hop limit is dropped rather than held (RNS hold_announce).
+@Test @MainActor func holdReplacesPerDestinationAndRespectsCapAndHopLimit() async {
+    var initial = Transport.State()
+    let i0 = InterfaceID("i0")
+    initial.interfaces[i0] = .default
+    initial.interfaceConnectedAt[i0] = Date(timeIntervalSince1970: 0)
+    initial.ingressBursts[i0] = Transport.IngressBurst(
+        active: true, activatedAt: Date(timeIntervalSince1970: 0),
+        heldRelease: Date(timeIntervalSince1970: 15))
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.transportDate = DateGenerator { Date(timeIntervalSince1970: 1) }
+    }
+    store.exhaustivity = .off
+    let id = Identity()
+    let (a1, dest) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["s"],
+                                        hops: 4, emitted: 1, randomPrefix: Data([1, 0, 0, 0, 0]))
+    let (a2, _)    = makeAnnouncePacket(identity: id, appName: "app", aspects: ["s"],
+                                        hops: 2, emitted: 2, randomPrefix: Data([2, 0, 0, 0, 0]))
+    await store.send(.received(i0, a1))
+    await store.send(.received(i0, a2))
+    #expect(store.state.heldAnnounces[i0]?.count == 1)           // replaced, not appended
+    #expect(store.state.heldAnnounces[i0]?[dest]?.hops == 2)     // newest wins
+
+    // An announce at the hop limit is dropped outright, not held.
+    let (far, farDest) = makeAnnouncePacket(hops: UInt8(Transport.ingressHoldHopLimit),
+                                            emitted: 3, randomPrefix: Data([3, 0, 0, 0, 0]))
+    await store.send(.received(i0, far))
+    #expect(store.state.heldAnnounces[i0]?[farDest] == nil)
+}
+
+/// Disconnecting an interface drops all of its ingress state.
+@Test @MainActor func disconnectClearsIngressState() async {
+    var initial = Transport.State()
+    let i0 = InterfaceID("i0")
+    initial.interfaces[i0] = .default
+    initial.interfaceConnectedAt[i0] = Date(timeIntervalSince1970: 0)
+    initial.announceArrivals[i0] = [Date(timeIntervalSince1970: 1)]
+    initial.ingressBursts[i0] = Transport.IngressBurst(active: true)
+    initial.heldAnnounces[i0] = [Data([0xAB]): .init(raw: Data([0xCD]), hops: 1)]
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceDisconnected(i0))
+    #expect(store.state.announceArrivals[i0] == nil)
+    #expect(store.state.ingressBursts[i0] == nil)
+    #expect(store.state.heldAnnounces[i0] == nil)
+    #expect(store.state.interfaceConnectedAt[i0] == nil)
+}
