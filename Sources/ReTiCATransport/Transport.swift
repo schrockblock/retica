@@ -52,7 +52,15 @@ public struct Transport {
 
         /// destHash → when a recursive search for it began. Coalesces concurrent searches for the
         /// same destination; GC'd after pathRequestTimeout (RNS discovery_path_requests, Transport.py:3060).
+        /// Written ONLY by the relay path (transportIdentity != nil && recursivePathRequests).
         public var discoveryPathRequests: [Data: Date] = [:]
+
+        /// destHash → when THIS node issued a local path request for it (RNS Transport.path_requests,
+        /// Transport.py:2899). Written by .requestPath regardless of relay/leaf mode. Distinct from
+        /// discoveryPathRequests which is relay-only; both gate the ingress exemption so that a
+        /// path-response announce for a destination we explicitly asked for is never held mid-burst
+        /// (RNS Transport.py:1759 checks BOTH tables). GC'd after pathRequestGateTimeout (120 s).
+        public var pathRequests: [Data: Date] = [:]
 
         public struct PendingAnnounce: Equatable, Sendable {
             public var raw: Data
@@ -279,8 +287,17 @@ public struct Transport {
                     // Limiting applies ONLY to destinations we have no path to, and never to one we have an
                     // outstanding path request for. Holding must happen BEFORE the blob ring records this
                     // announce, or the later release would look like a replay and be dropped.
+                    //
+                    // KNOWN DEFERRAL (I2): RNS Interface.received_announce() (Interface.py:257-260)
+                    // propagates each arrival to parent_interface, so a listening interface sees the
+                    // AGGREGATE rate across all spawned children. ReTiCA's BLEEndpoint mints a distinct
+                    // InterfaceID per BLE peer (BLEEndpoint.swift:125-127), giving N independent
+                    // ingress-control domains with no parent. N peers can each sustain just under 3 Hz
+                    // without any burst activating, where reference would see 3N Hz and burst. Parent
+                    // aggregation requires InterfaceProfile C1 rework and is its own slice.
                     let destinationKnown = state.learned[packet.destinationHash] != nil
                     let awaitingPath = state.discoveryPathRequests[packet.destinationHash] != nil
+                                   || state.pathRequests[packet.destinationHash] != nil
                     if !destinationKnown, !awaitingPath {
                         let age = icNow.timeIntervalSince(state.interfaceConnectedAt[interfaceID] ?? icNow)
                         let decision = Transport.shouldIngressLimit(
@@ -296,8 +313,9 @@ public struct Transport {
                                     held[packet.destinationHash] = State.HeldAnnounce(raw: data, hops: packet.hops)
                                     state.heldAnnounces[interfaceID] = held
                                 }
-                                let releaseIn = max(0, (state.ingressBursts[interfaceID]?.heldRelease ?? icNow)
-                                                          .timeIntervalSince(icNow))
+                                let releaseIn = max(Transport.icHeldReleaseInterval,
+                                                   (state.ingressBursts[interfaceID]?.heldRelease ?? icNow)
+                                                       .timeIntervalSince(icNow))
                                 return .run { send in
                                     try await clock.sleep(for: .seconds(releaseIn))
                                     await send(.heldAnnounceReleaseDue(interfaceID))
@@ -517,6 +535,10 @@ public struct Transport {
                 where now.timeIntervalSince(startedAt) > Transport.pathRequestTimeout {
                     state.discoveryPathRequests[dest] = nil
                 }
+                for (dest, issuedAt) in state.pathRequests
+                where now.timeIntervalSince(issuedAt) > Transport.pathRequestGateTimeout {
+                    state.pathRequests[dest] = nil
+                }
                 for (id, queue) in state.announceQueues {
                     let live = queue.filter { now.timeIntervalSince($0.queuedAt) <= Transport.queuedAnnounceLife }
                     state.announceQueues[id] = live.isEmpty ? nil : live
@@ -708,6 +730,10 @@ public struct Transport {
             case let .requestPath(destinationHash):
                 // RNS request_path (Transport.py:2799): a DATA/BROADCAST/HEADER_1 packet to the
                 // well-known PLAIN control destination; payload = destHash [+ our transport_id] + tag.
+                // Record this request so that an arriving path-response announce for this destination
+                // is exempt from ingress-control holding (RNS Transport.path_requests, Transport.py:2899).
+                // This is the LOCAL gate entry (leaf+relay); discoveryPathRequests is relay-only.
+                state.pathRequests[destinationHash] = date.now
                 var payload = destinationHash
                 if let relayID = state.transportIdentity { payload.append(relayID.hash) }
                 payload.append(randomBytes(16))                        // request tag (RNS get_random_hash)
@@ -856,7 +882,12 @@ public struct Transport {
     /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
     /// RNS PATH_REQUEST_TIMEOUT (Transport.py:79): in-flight recursive path searches expire, seconds.
+    /// Governs discoveryPathRequests (relay-only). Do NOT use this for pathRequests.
     static let pathRequestTimeout: TimeInterval = 15
+    /// RNS PATH_REQUEST_GATE_TIMEOUT (Transport.py:80): how long a local path-request entry stays
+    /// in pathRequests to exempt arriving path-response announces from ingress holding. Distinct
+    /// from pathRequestTimeout (which governs the relay discoveryPathRequests table and is 15 s).
+    static let pathRequestGateTimeout: TimeInterval = 120
     /// Sweep cadence — a local tuning constant (NOT wire-visible, NOT cross-validated).
     static let maintenanceTickInterval: TimeInterval = 60
 

@@ -3116,16 +3116,18 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
 }
 
 /// An announce for a destination we have an outstanding path request for is never held —
-/// we asked for it (RNS skips the ingress check for pending path requests).
+/// we asked for it (RNS skips the ingress check for pending path requests, Transport.py:1759).
+/// The exemption is established via .requestPath, which writes pathRequests (the LOCAL gate
+/// table, Transport.path_requests). Seeding discoveryPathRequests directly was the original
+/// approach but never proved the state was reachable from a leaf node.
 @Test @MainActor func pendingPathRequestExemptsAnnounceFromHolding() async {
     let now = LockIsolated(Date(timeIntervalSince1970: 1000))
-    var initial = Transport.State()
     let i0 = InterfaceID("i0")
     let wanted = Identity()
     let (raw, wantedDest) = makeAnnouncePacket(identity: wanted, appName: "app", aspects: ["s"],
                                                hops: 2, emitted: 7000,
                                                randomPrefix: Data([7, 0, 0, 0, 0]))
-    initial.discoveryPathRequests[wantedDest] = Date(timeIntervalSince1970: 999)
+    var initial = Transport.State()
     // Pre-arm an active burst so the gate would otherwise hold.
     initial.ingressBursts[i0] = Transport.IngressBurst(
         active: true, activatedAt: Date(timeIntervalSince1970: 999),
@@ -3133,12 +3135,17 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     let store = TestStore(initialState: initial) { Transport() } withDependencies: {
         $0.continuousClock = ImmediateClock()
         $0.transportDate = DateGenerator { now.value }
+        $0.randomBytes = RandomBytesGenerator { _ in Data(repeating: 0xAB, count: 16) }
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(i0, .default))
+    // Drive the exemption via .requestPath — this is the only production write site for
+    // pathRequests and is reachable on leaf nodes (transportIdentity == nil).
+    await store.send(.requestPath(destinationHash: wantedDest))
+    #expect(store.state.pathRequests[wantedDest] != nil)         // gate entry recorded
     await store.send(.received(i0, raw))
-    #expect(store.state.heldAnnounces[i0]?[wantedDest] == nil)   // exempt
-    #expect(store.state.learned[wantedDest] != nil)              // admitted normally
+    #expect(store.state.heldAnnounces[i0]?[wantedDest] == nil)  // exempt
+    #expect(store.state.learned[wantedDest] != nil)             // admitted normally
 }
 
 /// Holding replaces an existing entry for the same destination and never exceeds the cap;
@@ -3295,4 +3302,118 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     await store.send(.heldAnnounceReleaseDue(i0))
     #expect(store.state.heldAnnounces[i0]?.count == 1)        // rate still ~10 Hz → blocked
     #expect(store.state.learned[dest] == nil)
+}
+
+// MARK: - #C4 C1 fix: leaf-node pathRequests gate
+
+/// C1 regression test: a LEAF node (transportIdentity == nil) can call .requestPath, and
+/// the resulting pathRequests entry causes the arriving path-response announce to be admitted
+/// even mid-burst. Under the old code (exemption only from discoveryPathRequests, which is
+/// never written by a leaf) the announce would be held indefinitely.
+@Test @MainActor func leafNodeRequestPathExemptsIncomingAnnounceFromBurst() async {
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    let i0 = InterfaceID("i0")
+    // transportIdentity == nil → leaf node (LXMFNode/app configuration)
+    var initial = Transport.State()
+    // Pre-arm an active burst so any unknown-dest announce would be held.
+    initial.ingressBursts[i0] = Transport.IngressBurst(
+        active: true, activatedAt: Date(timeIntervalSince1970: 999),
+        heldRelease: Date(timeIntervalSince1970: 1014))
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.transportDate = DateGenerator { now.value }
+        $0.randomBytes = RandomBytesGenerator { _ in Data(repeating: 0xCC, count: 16) }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(i0, .default))
+    // Confirm this is a leaf node.
+    #expect(store.state.transportIdentity == nil)
+    // Leaf issues a path request — this is the ONLY write site for pathRequests on a leaf.
+    let target = Identity()
+    let (announceRaw, targetDest) = makeAnnouncePacket(identity: target, appName: "app", aspects: ["s"],
+                                                        hops: 2, emitted: 9000,
+                                                        randomPrefix: Data([9, 0, 0, 0, 0]))
+    await store.send(.requestPath(destinationHash: targetDest))
+    // discoveryPathRequests is NOT written (relay-only); pathRequests IS written.
+    #expect(store.state.discoveryPathRequests[targetDest] == nil)
+    #expect(store.state.pathRequests[targetDest] != nil)
+    // Path-response announce arrives mid-burst → must be admitted, not held.
+    await store.send(.received(i0, announceRaw))
+    #expect(store.state.heldAnnounces[i0]?[targetDest] == nil)  // NOT held
+    #expect(store.state.learned[targetDest] != nil)             // path learned
+}
+
+// MARK: - #C4 I1 fix: release timer flood-resistance
+
+/// I1 regression test: with a burst active and its penalty already elapsed (heldRelease in
+/// the past), holding a new announce must arm a release timer at least icHeldReleaseInterval
+/// (5 s) in the future, not 0 s.
+///
+/// Old code: max(0, heldRelease - now) where heldRelease < now → releaseIn=0 → 0s sleep.
+///   After clock.advance(5s): both the 0s sleep AND a rescheduled 5s sleep fire →
+///   TWO heldAnnounceReleaseDue dispatches. The 0s fires first → handler bumps heldRelease
+///   to t(2005) → second fire is BLOCKED (now < heldRelease) but the action is still
+///   dispatched and in the queue.
+///
+/// Fix: max(icHeldReleaseInterval, ...) → releaseIn=5 → 5s sleep.
+///   After clock.advance(5s): exactly ONE heldAnnounceReleaseDue dispatch (the 5s timer).
+///   Handler bumps heldRelease to t(2005), schedules new timer at T+10 (in-flight).
+///
+/// Test: advance 5s, consume EXACTLY ONE heldAnnounceReleaseDue, then skipInFlightEffects.
+/// With old code: second action is dispatched (queue, not in-flight) → not cancelled by
+///   skipInFlightEffects → unhandled at test end → FAIL.
+/// With new code: no second action → T+10 timer in-flight → skipInFlightEffects cancels →
+///   PASS.
+///
+/// Setup: activatedAt=RECENT (hold NOT elapsed) so shouldIngressLimit cannot deactivate the
+/// burst during .received → burst stays active → all re-injections are re-held, not admitted.
+@Test @MainActor func holdArmsDeferredReleaseTimerNotImmediateFireDuringFlood() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 2000))
+    let i0 = InterfaceID("i0")
+    var initial = Transport.State()
+    initial.interfaces[i0] = .default
+    initial.interfaceConnectedAt[i0] = Date(timeIntervalSince1970: 0)
+    // activatedAt=t(1999): hold check: now(2000) > 1999+15=2014 → FALSE → hold NOT elapsed.
+    // Burst stays ACTIVE through all re-injections (shouldIngressLimit cannot deactivate).
+    // heldRelease=t(1998) (PAST): old code max(0,1998-2000)=0; fix max(5,1998-2000)=5.
+    initial.ingressBursts[i0] = Transport.IngressBurst(
+        active: true, activatedAt: Date(timeIntervalSince1970: 1999),
+        heldRelease: Date(timeIntervalSince1970: 1998))
+    // Pre-seed one held announce for heldAnnounceReleaseDue to release (bumps heldRelease).
+    let (existingRaw, existingDest) = makeAnnouncePacket(hops: 1, emitted: 4000,
+                                                          randomPrefix: Data([4, 0, 0, 0, 0]))
+    initial.heldAnnounces[i0] = [existingDest: .init(raw: existingRaw, hops: 1)]
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    // Hold a new announce — arms the release timer.
+    // Old code: releaseIn=max(0,-2)=0 → 0s sleep. Fix: releaseIn=max(5,-2)=5 → 5s sleep.
+    let (raw, dest) = makeAnnouncePacket(hops: 2, emitted: 5000, randomPrefix: Data([5, 0, 0, 0, 0]))
+    await store.send(.received(i0, raw))
+    #expect(store.state.heldAnnounces[i0]?[dest] != nil)   // held as expected
+
+    // Advance exactly icHeldReleaseInterval (5 s).
+    // Old code: TWO timer fires result — the 0s fire at T=0 (successful release, bumps
+    //   heldRelease to t(2005)), then a rescheduled 5s timer fires at T=5 (BLOCKED since
+    //   now=t(2000) < heldRelease=t(2005)). After advance(5s): 2 heldAnnounceReleaseDue
+    //   in queue plus the inner .received re-injection from T=0.
+    // New code: ONE timer fire — the 5s timer at T=5 (successful). After advance(5s): 1
+    //   heldAnnounceReleaseDue in queue plus the inner .received re-injection.
+    await clock.advance(by: .seconds(Transport.icHeldReleaseInterval))
+
+    // With .off exhaustivity, consume the FIRST heldAnnounceReleaseDue and its re-injection.
+    // This consumes the T=0 fire for old code, or the T=5 fire for new code.
+    await store.receive { if case .heldAnnounceReleaseDue = $0 { return true }; return false }
+    await store.receive { if case .received = $0 { return true }; return false }
+
+    // Switch to .on exhaustivity: any remaining unhandled actions now cause test failure.
+    // Old code: SECOND heldAnnounceReleaseDue (T=5, blocked) is still in the action queue
+    //   — it was dispatched (timer fired), not cancelled. .on exhaustivity catches it → FAIL.
+    // New code: NO second action. Only an in-flight T+10 timer (sleeping). skipInFlightEffects
+    //   cancels it → test ends cleanly → PASS.
+    store.exhaustivity = .on
+    await store.skipInFlightEffects()
 }
