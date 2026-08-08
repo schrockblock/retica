@@ -1650,19 +1650,24 @@ private let boundaryProfile = InterfaceProfile(name: "bound", bitrate: 62_500, m
 /// 80 kbps that is 0.015 s of air time, and at a 2% cap the interface must then stay quiet
 /// for 0.015 / 0.02 = 0.75 s. The same announce on TCP's 10 Mbps costs 0.006 s — the 125×
 /// spread that makes pacing matter on a slow radio and vanish on a socket.
+/// 0.75, 1.5 and 0.375 are dyadic (3/4, 3/2, 3/8) so they are exactly representable in
+/// binary64 and stay exact `==` oracles. 0.006 and 0.015 are not dyadic; they compare within
+/// a tolerance so the assertion pins the reference formula's VALUE rather than one particular
+/// rounding path — an algebraically identical rewrite such as bits / (bitrate * cap) would
+/// otherwise trip them for a rounding reason instead of a correctness one.
 @Test func announcePacingWaitMatchesReferenceFormula() {
     #expect(Transport.announcePacingWait(byteCount: 150, bitrate: 80_000, announceCap: 0.02)
             == 0.75)
-    #expect(Transport.announcePacingWait(byteCount: 150, bitrate: 10_000_000, announceCap: 0.02)
-            == 0.006)
+    #expect(abs(Transport.announcePacingWait(byteCount: 150, bitrate: 10_000_000,
+                                             announceCap: 0.02) - 0.006) < 1e-12)
     // Doubling the payload doubles the wait; doubling the cap halves it.
     #expect(Transport.announcePacingWait(byteCount: 300, bitrate: 80_000, announceCap: 0.02)
             == 1.5)
     #expect(Transport.announcePacingWait(byteCount: 150, bitrate: 80_000, announceCap: 0.04)
             == 0.375)
     // A full-rate cap (1.0) still yields exactly the air time.
-    #expect(Transport.announcePacingWait(byteCount: 150, bitrate: 80_000, announceCap: 1.0)
-            == 0.015)
+    #expect(abs(Transport.announcePacingWait(byteCount: 150, bitrate: 80_000,
+                                             announceCap: 1.0) - 0.015) < 1e-12)
 }
 
 /// Queue bounds are the reference constants (RNS Transport.py MAX_QUEUED_ANNOUNCES /
