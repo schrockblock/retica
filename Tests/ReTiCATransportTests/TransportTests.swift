@@ -1627,6 +1627,8 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
 
 /// An aged-out learned path (and its random-blob ring) is swept once now − learnedAt > pathExpiry;
 /// a not-yet-expired path survives an earlier tick.
+/// (C1) Also covers the mode-fallback branch: i0 is never connected, so the sweep finds no
+/// profile and must use the 7-day default rather than expiring early.
 @Test @MainActor func expiredPathAndBlobsAreSweptByMaintenanceTick() async {
     let clock = TestClock()
     let now = LockIsolated(Date(timeIntervalSince1970: 0))
@@ -1655,6 +1657,93 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     #expect(store.state.learned[destHash] == nil)
     #expect(store.state.announceBlobs[destHash] == nil)
     #expect(store.state.announceCache[destHash] == nil)
+    await store.send(.stopMaintenance)
+}
+
+/// A path learned on an ACCESS-POINT interface expires after 1 day (RNS AP_PATH_TIME,
+/// Transport.py:787-792), not the 7-day default.
+@Test @MainActor func accessPointPathExpiresAfterOneDay() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    let ap = InterfaceProfile(name: "ap", bitrate: 62_500, mode: .accessPoint)
+    await store.send(.interfaceConnected(InterfaceID("i0"), ap))
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+
+    await store.send(.startMaintenance)
+    // Just inside the AP window: survives.
+    now.setValue(Date(timeIntervalSince1970: Transport.apPathExpiry - 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] != nil)
+    // Just past it: swept — days before the 7-day default would fire.
+    now.setValue(Date(timeIntervalSince1970: Transport.apPathExpiry + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] == nil)
+    #expect(store.state.announceBlobs[destHash] == nil)   // blob GC piggybacks (spec)
+    #expect(store.state.announceCache[destHash] == nil)
+    await store.send(.stopMaintenance)
+}
+
+/// A path learned on a ROAMING interface expires after 6 hours (RNS ROAMING_PATH_TIME).
+@Test @MainActor func roamingPathExpiresAfterSixHours() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    let roaming = InterfaceProfile(name: "cell", bitrate: 80_000, mode: .roaming)
+    await store.send(.interfaceConnected(InterfaceID("i0"), roaming))
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+
+    await store.send(.startMaintenance)
+    now.setValue(Date(timeIntervalSince1970: Transport.roamingPathExpiry - 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] != nil)
+    now.setValue(Date(timeIntervalSince1970: Transport.roamingPathExpiry + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] == nil)
+    await store.send(.stopMaintenance)
+}
+
+/// A path on a FULL-mode interface is NOT shortened: it survives past both the AP and roaming
+/// windows and holds to the 7-day default. Proves the sweep branches per-path rather than
+/// globally shortening.
+@Test @MainActor func fullModePathSurvivesShortWindows() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0"), .default))   // mode .full
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+
+    await store.send(.startMaintenance)
+    now.setValue(Date(timeIntervalSince1970: Transport.apPathExpiry + 1))       // past AP window
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] != nil)
+    now.setValue(Date(timeIntervalSince1970: Transport.pathExpiry + 1))         // past 7 days
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] == nil)
     await store.send(.stopMaintenance)
 }
 

@@ -408,7 +408,8 @@ public struct Transport {
             case .maintenanceTick:
                 let now = date.now
                 for (dest, entry) in state.learned
-                where now.timeIntervalSince(entry.learnedAt) > Transport.pathExpiry {
+                where now.timeIntervalSince(entry.learnedAt)
+                    > Self.pathExpiry(forMode: state.interfaces[entry.interfaceID]?.mode) {
                     state.learned[dest] = nil
                     state.announceBlobs[dest] = nil          // blob GC piggybacks on path expiry
                     state.announceCache[dest] = nil          // cached announce GC piggybacks too
@@ -502,6 +503,20 @@ public struct Transport {
 
     /// RNS DESTINATION_TIMEOUT (Transport.py:91): learned paths expire after one week unused, seconds.
     static let pathExpiry: TimeInterval = 60 * 60 * 24 * 7      // 604800
+    /// Mode-dependent path lifetimes (RNS Transport.py:787-792).
+    static let apPathExpiry: TimeInterval = 60 * 60 * 24       // AP_PATH_TIME, 1 day
+    static let roamingPathExpiry: TimeInterval = 60 * 60 * 6   // ROAMING_PATH_TIME, 6 hours
+
+    /// Path lifetime for a path learned on an interface of the given mode. nil mode = the
+    /// interface has disconnected since; fall back to the 7-day default rather than expiring
+    /// early (a cycling BLE peer must not silently drop paths).
+    static func pathExpiry(forMode mode: InterfaceMode?) -> TimeInterval {
+        switch mode {
+        case .accessPoint: return apPathExpiry
+        case .roaming:     return roamingPathExpiry
+        default:           return pathExpiry
+        }
+    }
     /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
     /// RNS PATH_REQUEST_TIMEOUT (Transport.py:79): in-flight recursive path searches expire, seconds.
