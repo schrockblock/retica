@@ -647,43 +647,26 @@ public struct Transport {
                 remaining[pick.key] = nil
                 state.heldAnnounces[id] = remaining.isEmpty ? nil : remaining
                 var next = burst
-                next.active = false
                 next.heldRelease = now.addingTimeInterval(Transport.icHeldReleaseInterval)
                 state.ingressBursts[id] = next
-                // Re-inject inline: parse and learn the path directly so state is updated
-                // synchronously (TCA publisher effects are not guaranteed synchronous from
-                // @MainActor async test context; inline avoids the race).  The blob ring is
-                // written here, so if a peer re-broadcasts the same announce later it is deduped
-                // correctly — identical to what the normal .received path would do.
-                var effects: [Effect<Action>] = []
-                if let packet = Packet(raw: pick.value.raw),
-                   let parsed = Announce.parse(payload: packet.payload,
-                                               destinationHash: packet.destinationHash,
-                                               contextFlagSet: packet.contextFlag) {
-                    var ring = state.announceBlobs[packet.destinationHash]
-                        ?? RingSet(capacity: Transport.announceBlobRingSize)
-                    _ = ring.insert(parsed.randomHash)
-                    state.announceBlobs[packet.destinationHash] = ring
-                    let emitted = Transport.announceEmitted(parsed.randomHash)
-                    let nextHop = packet.transportId ?? packet.destinationHash
-                    let candidate = LearnedDestination(
-                        identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
-                        interfaceID: id, hops: packet.hops, nextHop: nextHop,
-                        announceEmitted: emitted, learnedAt: now)
-                    if Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate) {
-                        state.learned[packet.destinationHash] = candidate
-                        state.announceCache[packet.destinationHash] = packet.payload
-                        effects.append(.send(.delegate(.pathLearned(
-                            destinationHash: packet.destinationHash, hops: packet.hops))))
-                    }
-                }
+                // Full re-entry (RNS process_held_announces → Transport.inbound): the released
+                // announce takes the IDENTICAL path a freshly-arrived one takes — admission,
+                // path adoption, AND relay re-broadcast with its mode gating and pacing. Do not
+                // inline an admission copy here; it would silently drop the relay half.
+                // Replaying the ORIGINAL bytes is safe because the hold gate sits BEFORE the
+                // blob-ring insert, so this is not seen as a replay.
+                // NOTE: while the burst is still active the gate holds it again — that bounce is
+                // reference behaviour (should_ingress_limit returns limit even on the call that
+                // deactivates). Releases are spaced icHeldReleaseInterval apart (~0.2 Hz), so the
+                // rate stays far under threshold and the burst converges to inactive.
+                var effects: [Effect<Action>] = [.send(.received(id, pick.value.raw))]
                 if !remaining.isEmpty {
                     effects.append(.run { send in
                         try await clock.sleep(for: .seconds(Transport.icHeldReleaseInterval))
                         await send(.heldAnnounceReleaseDue(id))
                     }.cancellable(id: CancelID.ingressRelease(id), cancelInFlight: true))
                 }
-                return effects.isEmpty ? .none : .merge(effects)
+                return .merge(effects)
 
             case let .send(destinationHash, plaintext):
                 guard let entry = state.learned[destinationHash] else {

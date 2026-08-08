@@ -3195,8 +3195,13 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
 
 // MARK: - #C4 Task 3: release held announces
 
-/// Once the rate subsides and the penalty has elapsed, the release timer re-injects the
-/// FEWEST-HOP held announce, which is then admitted normally (path learned).
+/// Once the rate subsides and the penalty has elapsed, the release re-injects the FEWEST-HOP
+/// held announce through the FULL receive path.
+///
+/// Convergence, not an exemption: the first re-injection still meets an ACTIVE burst, so the
+/// gate holds it again (RNS should_ingress_limit returns `limit` even on the call that flips
+/// the burst off — Task 1 pins that asymmetry). That bounce is what deactivates the burst;
+/// the NEXT release, spaced icHeldReleaseInterval apart, is admitted and the path is learned.
 @Test @MainActor func heldAnnounceIsReleasedFewestHopsFirstAndAdmitted() async {
     let clock = TestClock()
     let now = LockIsolated(Date(timeIntervalSince1970: 1000))
@@ -3207,6 +3212,9 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     initial.ingressBursts[i0] = Transport.IngressBurst(
         active: true, activatedAt: Date(timeIntervalSince1970: 900),
         heldRelease: Date(timeIntervalSince1970: 1000))
+    // Burst deactivation also needs >= icDequeMinSample arrivals on record, so seed one that
+    // is still inside the arFreqDecay window. Two samples keep the measured rate at 0.
+    initial.announceArrivals[i0] = [Date(timeIntervalSince1970: 998)]
     let far = Identity(), near = Identity()
     let (farRaw, farDest)   = makeAnnouncePacket(identity: far, appName: "app", aspects: ["s"],
                                                  hops: 5, emitted: 1,
@@ -3221,8 +3229,21 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
         $0.transportDate = DateGenerator { now.value }
     }
     store.exhaustivity = .off
+
+    // First release: fewest hops is picked and re-injected, but the still-active burst holds
+    // it again. The re-injection is delivered as an effect, so await it before asserting.
     now.setValue(Date(timeIntervalSince1970: 1001))          // past heldRelease, rate is 0
     await store.send(.heldAnnounceReleaseDue(i0))
+    await store.receive { if case .received = $0 { return true }; return false }
+    #expect(store.state.learned[nearDest] == nil)            // bounced: not admitted yet
+    #expect(store.state.heldAnnounces[i0]?.count == 2)       // back under hold
+    #expect(store.state.ingressBursts[i0]?.active == false)  // ...but the burst is now off
+
+    // Second release, one spacing interval later: the burst is inactive, so the same fewest-hop
+    // announce is admitted on re-entry and its path is learned.
+    now.setValue(Date(timeIntervalSince1970: 1007))
+    await store.send(.heldAnnounceReleaseDue(i0))
+    await store.receive { if case .received = $0 { return true }; return false }
     #expect(store.state.learned[nearDest] != nil)            // fewest hops released first
     #expect(store.state.learned[farDest] == nil)             // still held
     #expect(store.state.heldAnnounces[i0]?.count == 1)
