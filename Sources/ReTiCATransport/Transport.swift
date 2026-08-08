@@ -75,8 +75,14 @@ public struct Transport {
             public var raw: Data
             public var hops: UInt8
             public var queuedAt: Date
-            public init(raw: Data, hops: UInt8, queuedAt: Date) {
+            /// Destination hash — used for per-destination dedup (Finding 2 / RNS Transport.py:1292-1306).
+            public var destination: Data
+            /// Emission timestamp from the announce's random hash — used to pick the newer entry on upsert.
+            public var emitted: UInt64
+            public init(raw: Data, hops: UInt8, queuedAt: Date,
+                        destination: Data = Data(), emitted: UInt64 = 0) {
                 self.raw = raw; self.hops = hops; self.queuedAt = queuedAt
+                self.destination = destination; self.emitted = emitted
             }
         }
         /// Earliest time each interface may emit its next RELAYED announce (RNS announce_allowed_at).
@@ -457,20 +463,55 @@ public struct Transport {
                 let eligible = state.interfaces
                     .filter { $0.key != entry.arrivalInterface
                         && Transport.mayRelayAnnounce(to: $0.value.mode, arrivalMode: arrivalMode) }
+                // NOTE: reference Transport.py reaches the pacing block only in the final `else`
+                // of the interface-mode ladder, so roaming and boundary interfaces are never paced
+                // there. We pace every relay-eligible interface, which is more conservative and
+                // appropriate since roaming links are often exactly the slow ones.
                 var sends: [Effect<Action>] = []
+                // Emission timestamp for per-destination upsert comparison (Finding 2).
+                // state.learned is always populated before we schedule a retransmit (the
+                // path-learning step that creates the announceTable entry also updates learned),
+                // so this lookup reliably returns the announce's true emitted value.
+                let emitted = state.learned[destinationHash]?.announceEmitted ?? 0
                 for (id, profile) in eligible {
                     let wait = Transport.announcePacingWait(byteCount: entry.raw.count,
                                                             bitrate: profile.bitrate,
                                                             announceCap: profile.announceCap)
-                    if (state.announceAllowedAt[id] ?? .distantPast) <= now {
+                    // Finding 1 (RNS Transport.py:1281-1282): only take the send-now branch when
+                    // the queue is empty. While a backlog exists the drain is the sole emitter,
+                    // keeping it self-serializing and preventing a send-now from jumping the queue.
+                    let queueEmpty = state.announceQueues[id]?.isEmpty ?? true
+                    if queueEmpty, (state.announceAllowedAt[id] ?? .distantPast) <= now {
                         sends.append(.send(.delegate(.transmit(id, entry.raw))))
                         state.announceAllowedAt[id] = now.addingTimeInterval(wait)
                     } else {
-                        if state.announceQueues[id, default: []].count < Transport.announceQueueLimit {
+                        // Finding 2 (RNS Transport.py:1292-1306): at most one queued entry per
+                        // destination per interface. If an entry for this destination already
+                        // exists, upsert (replace raw/hops/queuedAt/emitted if our emitted is
+                        // strictly newer) rather than appending a second entry.
+                        //
+                        // NOTE: reference Transport.py:1300-1305 uses `e` as the loop variable
+                        // which after the loop refers to the LAST element, not the matched entry —
+                        // a Python aliasing bug that corrupts the wrong queue slot when the match
+                        // is not last. We deliberately diverge and replace the entry that matched.
+                        if let existingIdx = state.announceQueues[id, default: []]
+                            .firstIndex(where: { $0.destination == destinationHash }) {
+                            // Entry for this destination exists: replace if our emitted is newer.
+                            if emitted > state.announceQueues[id]![existingIdx].emitted {
+                                state.announceQueues[id]![existingIdx] = State.QueuedAnnounce(
+                                    raw: entry.raw, hops: entry.rebroadcastHops, queuedAt: now,
+                                    destination: destinationHash, emitted: emitted)
+                            }
+                            // Drain timer already scheduled; the cancelInFlight below keeps it live.
+                        } else if state.announceQueues[id, default: []].count < Transport.announceQueueLimit {
                             state.announceQueues[id, default: []].append(
-                                State.QueuedAnnounce(raw: entry.raw, hops: entry.rebroadcastHops, queuedAt: now))
+                                State.QueuedAnnounce(raw: entry.raw, hops: entry.rebroadcastHops,
+                                                     queuedAt: now, destination: destinationHash,
+                                                     emitted: emitted))
                         }
-                        let opensIn = max(0, state.announceAllowedAt[id]!.timeIntervalSince(now))
+                        // When the window is open but the queue is non-empty (Finding 1 guard
+                        // redirected us here), opensIn is 0 — the drain should fire immediately.
+                        let opensIn = max(0, (state.announceAllowedAt[id] ?? now).timeIntervalSince(now))
                         sends.append(.run { send in
                             try await clock.sleep(for: .seconds(opensIn))
                             await send(.announceQueueDrainDue(id))

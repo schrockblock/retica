@@ -2843,3 +2843,107 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(store.state.announceQueues[id] == nil)
     await store.send(.stopMaintenance)
 }
+
+/// When an interface's pacing queue already has a backlog, retransmitDue must NOT take the
+/// send-now branch even if the pacing window is open (RNS Transport.py:1281-1282, Finding 1).
+/// The drain is the sole emitter while a backlog exists so the queue stays self-serializing.
+///
+/// Scenario: interface queue has a bystander entry for destB; pacing window is open (no
+/// allowedAt set). retransmitDue fires for destA. Without the queueEmpty guard the window
+/// check passes and destA would be transmitted directly (queue stays at 1, just destB).
+/// With the guard the else-branch is taken, destA is enqueued alongside destB (count = 2).
+@Test @MainActor func retransmitDueDoesNotBypassQueueWhenBacklogExists() async {
+    let relay = Identity()
+    let slowID = InterfaceID("iSlow")
+    let slow = InterfaceProfile(name: "slow", bitrate: 8_000, mode: .full)
+    // Build destA's announce and its destination hash.
+    let (rawA, destHashA) = makeAnnouncePacket(hops: 2, emitted: 1000,
+                                               randomPrefix: Data([0xAA, 0, 0, 0, 0]))
+    let destHashB = Data(repeating: 0xBB, count: 16)
+
+    var initial = Transport.State()
+    initial.interfaces[slowID] = slow
+    initial.interfaces[InterfaceID("i0")] = .default
+    initial.transportIdentity = relay
+    // Pre-populate the announce table so retransmitDue processes destA.
+    initial.announceTable[destHashA] = Transport.State.PendingAnnounce(
+        raw: rawA, arrivalInterface: InterfaceID("i0"), rebroadcastHops: 3, rebroadcasts: 0)
+    // Pre-populate learned so emitted lookup works.
+    initial.learned[destHashA] = LearnedDestination(
+        identity: Identity(), appData: nil, ratchet: nil,
+        interfaceID: InterfaceID("i0"), hops: 2, nextHop: destHashA,
+        announceEmitted: 1000)
+    // Pre-populate queue with a bystander for destB.
+    initial.announceQueues[slowID] = [
+        Transport.State.QueuedAnnounce(raw: Data("bystander".utf8), hops: 5, queuedAt: Date(),
+                                       destination: destHashB, emitted: 500),
+    ]
+    // Leave announceAllowedAt[slowID] unset → window is open (distantPast).
+
+    let clock = TestClock()
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { Date(timeIntervalSince1970: 0) }
+    }
+    store.exhaustivity = .off
+
+    // Fire retransmitDue directly (no jitter needed — we own the announce table entry).
+    await store.send(.announceRetransmitDue(destinationHash: destHashA))
+    await store.skipReceivedActions(strict: false)
+
+    // Key assertion: destA must have been QUEUED (not sent directly).
+    // Queue should now have 2 entries: bystander destB + newly-enqueued destA.
+    let queue = store.state.announceQueues[slowID] ?? []
+    #expect(queue.count == 2, "expected bystander + destA in queue (got \(queue.count)); direct send would leave only bystander")
+    #expect(queue.contains { $0.destination == destHashA }, "destA must be in queue, not sent directly")
+}
+
+/// Both retransmit rounds of a single-destination announce lifecycle on a slow interface
+/// produce AT MOST ONE queued entry for that destination — not two.
+///
+/// By pre-closing the pacing window we ensure BOTH rounds of the 2-try lifecycle must queue.
+/// Without the per-destination collapse (Finding 2), both rounds would append a separate entry
+/// and the queue would hold two entries for the same destination.
+/// With the fix only the newer entry survives (upsert), so the queue holds exactly one.
+@Test @MainActor func bothRetransmitRoundsLeaveAtMostOneQueuedEntryPerDestination() async {
+    // Pre-close the pacing window for iSlow so BOTH retransmit rounds are forced to queue.
+    // With a 9+ s pacing window (8 kbps, 2% cap) and a window pinned to t=9999, the first
+    // retransmitDue at ~0.25 s AND the retry at ~5.75 s both land inside the closed window.
+    var initial = Transport.State()
+    let slowID = InterfaceID("iSlow")
+    let slow = InterfaceProfile(name: "slow", bitrate: 8_000, mode: .full)
+    initial.interfaces[slowID] = slow
+    initial.interfaces[InterfaceID("i0")] = .default
+    initial.transportIdentity = Identity()
+    // Close the window so every retransmitDue must queue rather than send directly.
+    initial.announceAllowedAt[slowID] = Date(timeIntervalSince1970: 9_999)
+
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000,
+                                             randomPrefix: Data([1, 0, 0, 0, 0]))
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = clockTrackingDate(clock)
+        $0.randomBytes = RandomBytesGenerator { _ in Data([128]) }  // jitter = 0.25 s
+    }
+    store.exhaustivity = .off
+
+    // Deliver the announce — schedules retransmitDue round 1 at ~0.25 s.
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+
+    // Round 1 (~0.25 s): window still closed → enqueues. Schedules retry at +5.5 s.
+    await clock.advance(by: .seconds(0.25))
+    await store.skipReceivedActions(strict: false)
+    let afterRound1 = store.state.announceQueues[slowID]?.count ?? 0
+    #expect(afterRound1 == 1, "expected 1 entry after round 1, got \(afterRound1)")
+
+    // Round 2 (+5.5 s retry): window still closed → must upsert the SAME destination,
+    // not append a second entry. Queue must still hold exactly 1 entry.
+    await clock.advance(by: .seconds(5.5))
+    await store.skipReceivedActions(strict: false)
+    let afterRound2 = store.state.announceQueues[slowID]?.count ?? 0
+    #expect(afterRound2 == 1, "expected 1 entry after round 2, got \(afterRound2)")
+
+    await store.send(.stopMaintenance)
+}
