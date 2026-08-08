@@ -517,6 +517,22 @@ public struct Transport {
         default:           return pathExpiry
         }
     }
+
+    /// Whether a RECEIVED announce may be relayed out an interface of mode `outMode`, given the
+    /// mode of the interface it arrived on (RNS Transport.py:1224-1270). Applies ONLY to relay
+    /// re-broadcast — locally-originated announces go everywhere (an access point "originates
+    /// only"). nil arrivalMode = the arrival interface has disconnected since; permissive by
+    /// C2 spec decision. `.interfaceInternal` is treated as `.full` (its announces_to_internal
+    /// rule is deferred; no ReTiCA composition uses internal-mode interfaces).
+    static func mayRelayAnnounce(to outMode: InterfaceMode, arrivalMode: InterfaceMode?) -> Bool {
+        switch outMode {
+        case .accessPoint: return false
+        case .roaming:     return arrivalMode != .roaming && arrivalMode != .boundary
+        case .boundary:    return arrivalMode != .roaming
+        case .full, .pointToPoint, .gateway, .interfaceInternal: return true
+        }
+    }
+
     /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
     /// RNS PATH_REQUEST_TIMEOUT (Transport.py:79): in-flight recursive path searches expire, seconds.

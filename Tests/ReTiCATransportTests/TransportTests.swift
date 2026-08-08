@@ -1439,6 +1439,32 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     #expect(Transport.announceJitter(255) < Transport.announceRebroadcastWindow)    // strictly inside
 }
 
+/// The complete mode-gating table from RNS Transport.py:1224-1270. The blocked set is
+/// enumerated as data; every combination not listed must relay. nil arrival = the arrival
+/// interface disconnected mid-window — permissive by decision (C2 spec).
+@Test func mayRelayAnnounceMatchesReferenceTable() {
+    let blocked: [(InterfaceMode, InterfaceMode?)] = [
+        // accessPoint out: never relays, regardless of arrival (incl. disconnected).
+        (.accessPoint, nil), (.accessPoint, .full), (.accessPoint, .pointToPoint),
+        (.accessPoint, .accessPoint), (.accessPoint, .roaming), (.accessPoint, .boundary),
+        (.accessPoint, .gateway), (.accessPoint, .interfaceInternal),
+        // roaming out: no re-advertising what came from roaming/boundary peers.
+        (.roaming, .roaming), (.roaming, .boundary),
+        // boundary out: no re-advertising what came from roaming peers.
+        (.boundary, .roaming),
+    ]
+    let all: [InterfaceMode] = [.full, .pointToPoint, .accessPoint, .roaming,
+                                .boundary, .gateway, .interfaceInternal]
+    let arrivals: [InterfaceMode?] = all.map { $0 } + [nil]
+    for out in all {
+        for arrival in arrivals {
+            let expected = !blocked.contains { $0.0 == out && $0.1 == arrival }
+            #expect(Transport.mayRelayAnnounce(to: out, arrivalMode: arrival) == expected,
+                    "out=\(out) arrival=\(String(describing: arrival))")
+        }
+    }
+}
+
 // MARK: - 4b-3b-2 announce re-broadcast retries + grace
 
 /// A fresh announce is re-broadcast twice (initial after jitter, one retry after grace+jitter),
