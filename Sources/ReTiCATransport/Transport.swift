@@ -665,6 +665,86 @@ public struct Transport {
     /// RNS QUEUED_ANNOUNCE_LIFE: a queued announce older than this is dropped, seconds.
     static let queuedAnnounceLife: TimeInterval = 86_400
 
+    // MARK: - C4 ingress control (RNS Interface.py:58-92, 152-255)
+
+    /// Rolling window of announce arrival times used for the rate estimate (RNS IA_FREQ_SAMPLES).
+    static let iaFreqSamples = 48
+    /// Samples older than this decay out of the window (RNS AR_FREQ_DECAY = 1/AR_MINFREQ_HZ).
+    static let arFreqDecay: TimeInterval = 10
+    /// Per-interface cap on held announces (RNS MAX_HELD_ANNOUNCES).
+    static let maxHeldAnnounces = 256
+    /// Interfaces younger than this use the stricter burst threshold (RNS IC_NEW_TIME).
+    static let icNewTime: TimeInterval = 7200
+    /// Burst thresholds in Hz for young / established interfaces (RNS IC_BURST_FREQ_NEW / IC_BURST_FREQ).
+    static let icBurstFreqNew: Double = 3
+    static let icBurstFreq: Double = 10
+    /// Minimum time a burst stays active once triggered (RNS IC_BURST_HOLD), seconds.
+    static let icBurstHold: TimeInterval = 15
+    /// Delay before the first held announce may be released (RNS IC_BURST_PENALTY), seconds.
+    static let icBurstPenalty: TimeInterval = 15
+    /// Spacing between held-announce releases (RNS IC_HELD_RELEASE_INTERVAL), seconds.
+    static let icHeldReleaseInterval: TimeInterval = 5
+    /// The rate estimate needs MORE than this many samples to be meaningful (RNS IC_DEQUE_MIN_SAMPLE).
+    static let icDequeMinSample = 2
+    /// RNS PATHFINDER_M: an announce at or past `maxHops - 1` is never held (it is dropped).
+    static let ingressHoldHopLimit = Int(Packet.maxHops) - 1
+
+    /// Per-interface announce burst state (RNS ic_burst_active / ic_burst_activated / ic_held_release).
+    public struct IngressBurst: Equatable, Sendable {
+        public var active: Bool
+        public var activatedAt: Date
+        public var heldRelease: Date
+        public init(active: Bool = false,
+                    activatedAt: Date = .distantPast,
+                    heldRelease: Date = .distantPast) {
+            self.active = active
+            self.activatedAt = activatedAt
+            self.heldRelease = heldRelease
+        }
+    }
+
+    /// Announce arrival rate in Hz over the sample window (RNS incoming_announce_frequency,
+    /// Interface.py:276-285). Returns 0 until more than `icDequeMinSample` samples exist, and
+    /// on a non-positive span.
+    static func announceFrequency(samples: [Date], now: Date) -> Double {
+        let n = samples.count
+        guard n > icDequeMinSample, let oldest = samples.first else { return 0 }
+        let span = now.timeIntervalSince(oldest)
+        guard span > 0 else { return 0 }
+        return Double(n) / span
+    }
+
+    /// Burst threshold for an interface of the given age (RNS Interface.py:154).
+    static func ingressBurstThreshold(interfaceAge: TimeInterval) -> Double {
+        interfaceAge < icNewTime ? icBurstFreqNew : icBurstFreq
+    }
+
+    /// Whether this announce should be held, plus the updated burst state
+    /// (RNS should_ingress_limit, Interface.py:152-172).
+    ///
+    /// Note the asymmetry, faithful to reference: the call that DEACTIVATES a burst still
+    /// returns `limit == true`, so the announce that ends a burst is itself held.
+    static func shouldIngressLimit(samples: [Date], now: Date, interfaceAge: TimeInterval,
+                                   burst: IngressBurst) -> (limit: Bool, burst: IngressBurst) {
+        let threshold = ingressBurstThreshold(interfaceAge: interfaceAge)
+        let freq = announceFrequency(samples: samples, now: now)
+        var next = burst
+        if burst.active {
+            if freq < threshold, now > burst.activatedAt.addingTimeInterval(icBurstHold),
+               samples.count >= icDequeMinSample {
+                next.active = false
+            }
+            return (true, next)
+        }
+        if freq > threshold {
+            next.active = true
+            next.activatedAt = now
+            next.heldRelease = now.addingTimeInterval(icBurstPenalty)
+            return (true, next)
+        }
+        return (false, next)
+    }
+
     /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
     /// RNS PATH_REQUEST_TIMEOUT (Transport.py:79): in-flight recursive path searches expire, seconds.

@@ -2947,3 +2947,106 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
 
     await store.send(.stopMaintenance)
 }
+
+// MARK: - C4 announce ingress control (pure primitives)
+
+/// Ingress constants are the reference values (RNS Interface.py:58-92).
+@Test func ingressControlConstantsMatchReference() {
+    #expect(Transport.iaFreqSamples == 48)
+    #expect(Transport.arFreqDecay == 10)
+    #expect(Transport.maxHeldAnnounces == 256)
+    #expect(Transport.icNewTime == 7200)
+    #expect(Transport.icBurstFreqNew == 3)
+    #expect(Transport.icBurstFreq == 10)
+    #expect(Transport.icBurstHold == 15)
+    #expect(Transport.icBurstPenalty == 15)
+    #expect(Transport.icHeldReleaseInterval == 5)
+    #expect(Transport.icDequeMinSample == 2)
+}
+
+/// Frequency is samples/span, and is 0 until MORE THAN icDequeMinSample samples exist
+/// (RNS `if not n > IC_DEQUE_MIN_SAMPLE: return 0`, Interface.py:277-278) — so 2 samples
+/// still yields 0 and cannot trip a burst.
+@Test func announceFrequencyNeedsMoreThanMinimumSamples() {
+    let t0 = Date(timeIntervalSince1970: 100)
+    #expect(Transport.announceFrequency(samples: [], now: t0) == 0)
+    #expect(Transport.announceFrequency(samples: [t0, t0], now: t0.addingTimeInterval(1)) == 0)
+    // 3 samples spanning 1 s → 3 Hz.
+    let s = [t0, t0.addingTimeInterval(0.5), t0.addingTimeInterval(0.9)]
+    #expect(Transport.announceFrequency(samples: s, now: t0.addingTimeInterval(1)) == 3.0)
+}
+
+/// A non-positive span yields 0 rather than dividing by zero (Interface.py:281).
+@Test func announceFrequencyGuardsNonPositiveSpan() {
+    let t0 = Date(timeIntervalSince1970: 100)
+    #expect(Transport.announceFrequency(samples: [t0, t0, t0], now: t0) == 0)
+}
+
+/// A young interface is held to the stricter threshold (RNS ic_burst_freq_new for
+/// age < IC_NEW_TIME, Interface.py:154).
+@Test func burstThresholdIsStricterForYoungInterfaces() {
+    #expect(Transport.ingressBurstThreshold(interfaceAge: 60) == 3)
+    #expect(Transport.ingressBurstThreshold(interfaceAge: 7199) == 3)
+    #expect(Transport.ingressBurstThreshold(interfaceAge: 7200) == 10)
+    #expect(Transport.ingressBurstThreshold(interfaceAge: 100_000) == 10)
+}
+
+/// Crossing the threshold activates the burst, stamps activatedAt, and pushes heldRelease
+/// out by the penalty (Interface.py:163-168).
+@Test func exceedingThresholdActivatesBurstAndSetsPenalty() {
+    let t0 = Date(timeIntervalSince1970: 1000)
+    // 5 samples over 1 s = 5 Hz > 3 Hz young threshold.
+    let s = (0..<5).map { t0.addingTimeInterval(Double($0) * 0.2) }
+    let idle = Transport.IngressBurst()
+    let r = Transport.shouldIngressLimit(samples: s, now: t0.addingTimeInterval(1),
+                                         interfaceAge: 60, burst: idle)
+    #expect(r.limit == true)
+    #expect(r.burst.active == true)
+    #expect(r.burst.activatedAt == t0.addingTimeInterval(1))
+    #expect(r.burst.heldRelease == t0.addingTimeInterval(1 + Transport.icBurstPenalty))
+}
+
+/// Below the threshold with no active burst, nothing is limited and no state changes.
+@Test func belowThresholdDoesNotLimit() {
+    let t0 = Date(timeIntervalSince1970: 1000)
+    let s = (0..<3).map { t0.addingTimeInterval(Double($0) * 5) }   // 3 samples / 10 s = 0.3 Hz
+    let idle = Transport.IngressBurst()
+    let r = Transport.shouldIngressLimit(samples: s, now: t0.addingTimeInterval(10),
+                                         interfaceAge: 60, burst: idle)
+    #expect(r.limit == false)
+    #expect(r.burst.active == false)
+}
+
+/// An active burst keeps limiting until BOTH the rate has fallen below the threshold AND
+/// icBurstHold has elapsed since activation. Crucially, the call that DEACTIVATES still
+/// returns limit == true (RNS returns True on that path, Interface.py:157-161) — the
+/// announce that ends the burst is itself still held.
+@Test func activeBurstDeactivatesOnlyAfterHoldElapsesAndStillLimitsThatCall() {
+    let t0 = Date(timeIntervalSince1970: 1000)
+    let quiet = [t0, t0.addingTimeInterval(4), t0.addingTimeInterval(8)]   // 3/9 s = 0.33 Hz
+    let active = Transport.IngressBurst(active: true, activatedAt: t0,
+                                        heldRelease: t0.addingTimeInterval(15))
+    // Rate is low but the hold window has NOT elapsed → stays active.
+    let early = Transport.shouldIngressLimit(samples: quiet, now: t0.addingTimeInterval(9),
+                                             interfaceAge: 60, burst: active)
+    #expect(early.limit == true)
+    #expect(early.burst.active == true)
+    // Past the hold window with a low rate → deactivates, but THIS call still limits.
+    let late = Transport.shouldIngressLimit(samples: quiet, now: t0.addingTimeInterval(16),
+                                            interfaceAge: 60, burst: active)
+    #expect(late.limit == true)
+    #expect(late.burst.active == false)
+}
+
+/// A still-hot rate keeps an active burst active past the hold window.
+@Test func activeBurstStaysActiveWhileRateRemainsHigh() {
+    let t0 = Date(timeIntervalSince1970: 1000)
+    // 10 samples in the second before now=t0+20: oldest=t0+19, span=1 s → 10 Hz.
+    let hot = (0..<10).map { t0.addingTimeInterval(19 + Double($0) * 0.1) }
+    let active = Transport.IngressBurst(active: true, activatedAt: t0,
+                                        heldRelease: t0.addingTimeInterval(15))
+    let r = Transport.shouldIngressLimit(samples: hot, now: t0.addingTimeInterval(20),
+                                         interfaceAge: 60, burst: active)
+    #expect(r.limit == true)
+    #expect(r.burst.active == true)
+}
