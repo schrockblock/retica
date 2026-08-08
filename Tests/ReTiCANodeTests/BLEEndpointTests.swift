@@ -36,8 +36,8 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     let idA = bleInterfaceID(tokenA)
 
     await store.send(.ble(.delegate(.peerOnline(tokenA))))
-    await store.receive(.transport(.interfaceConnected(idA))) {
-        $0.transport.interfaces.insert(idA)
+    await store.receive(.transport(.interfaceConnected(idA, .ble))) {
+        $0.transport.interfaces[idA] = .ble
     }
     await store.receive(.delegate(.peerOnline(tokenA)))
     await store.receive(.transport(.startMaintenance))
@@ -46,8 +46,8 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     // A second peer connects: interfaceConnected fires, but NOT a second startMaintenance.
     let idB = bleInterfaceID(tokenB)
     await store.send(.ble(.delegate(.peerOnline(tokenB))))
-    await store.receive(.transport(.interfaceConnected(idB))) {
-        $0.transport.interfaces.insert(idB)
+    await store.receive(.transport(.interfaceConnected(idB, .ble))) {
+        $0.transport.interfaces[idB] = .ble
     }
     await store.receive(.delegate(.peerOnline(tokenB)))
     // (no .startMaintenance here — .off exhaustivity tolerates its absence)
@@ -55,12 +55,12 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     // Drive both peers offline to cancel the maintenance effect cleanly.
     await store.send(.ble(.delegate(.peerOffline(tokenA))))
     await store.receive(.transport(.interfaceDisconnected(idA))) {
-        $0.transport.interfaces.remove(idA)
+        $0.transport.interfaces[idA] = nil
     }
     await store.receive(.delegate(.peerOffline(tokenA)))
     await store.send(.ble(.delegate(.peerOffline(tokenB))))
     await store.receive(.transport(.interfaceDisconnected(idB))) {
-        $0.transport.interfaces.remove(idB)
+        $0.transport.interfaces[idB] = nil
     }
     await store.receive(.delegate(.peerOffline(tokenB)))
     await store.receive(.transport(.stopMaintenance))
@@ -71,12 +71,12 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     let store = makeStore()
     let idA = bleInterfaceID(tokenA)
     await store.send(.ble(.delegate(.peerOnline(tokenA))))
-    await store.receive(.transport(.interfaceConnected(idA))) { $0.transport.interfaces.insert(idA) }
+    await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
     await store.receive(.delegate(.peerOnline(tokenA)))
     await store.receive(.transport(.startMaintenance))
 
     await store.send(.ble(.delegate(.peerOffline(tokenA))))
-    await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces.remove(idA) }
+    await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
     await store.receive(.delegate(.peerOffline(tokenA)))
     await store.receive(.transport(.stopMaintenance))
 }
@@ -86,7 +86,7 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     let idA = bleInterfaceID(tokenA)
     // Bring the peer online first (so maintenance can be cancelled at the end).
     await store.send(.ble(.delegate(.peerOnline(tokenA))))
-    await store.receive(.transport(.interfaceConnected(idA))) { $0.transport.interfaces.insert(idA) }
+    await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
     await store.receive(.delegate(.peerOnline(tokenA)))
     await store.receive(.transport(.startMaintenance))
 
@@ -95,7 +95,7 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     await store.receive(.transport(.received(idA, packet)))
 
     await store.send(.ble(.delegate(.peerOffline(tokenA))))
-    await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces.remove(idA) }
+    await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
     await store.receive(.delegate(.peerOffline(tokenA)))
     await store.receive(.transport(.stopMaintenance))
 }
@@ -104,7 +104,7 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     let store = makeStore()
     let idA = bleInterfaceID(tokenA)
     await store.send(.ble(.delegate(.peerOnline(tokenA))))
-    await store.receive(.transport(.interfaceConnected(idA))) { $0.transport.interfaces.insert(idA) }
+    await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
     await store.receive(.delegate(.peerOnline(tokenA)))
     await store.receive(.transport(.startMaintenance))
 
@@ -113,7 +113,7 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     await store.receive(.ble(.send(peer: tokenA, packet: raw)))
 
     await store.send(.ble(.delegate(.peerOffline(tokenA))))
-    await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces.remove(idA) }
+    await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
     await store.receive(.delegate(.peerOffline(tokenA)))
     await store.receive(.transport(.stopMaintenance))
 }

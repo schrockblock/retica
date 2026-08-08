@@ -67,7 +67,7 @@ private func bringPeerOnline(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.A
     events.yield(.channelOpened(channel, handle, direction: .inbound))
     events.yield(.channelData(channel, framedHello(peerToken)))
     await store.receive { if case .transport(.interfaceConnected) = $0 { return true }; return false }
-    #expect(store.state.transport.interfaces.contains(bleInterfaceID(peerToken)))
+    #expect(store.state.transport.interfaces[bleInterfaceID(peerToken)] == .ble)
 }
 
 /// Cancel the driver stream + maintenance: `.stop` emits `peerOffline`, whose cascade

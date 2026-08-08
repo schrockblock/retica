@@ -27,6 +27,10 @@ public struct BLEEndpoint {
         public var transport: Transport.State
         public var linkPlane: LinkPlane.State = LinkPlane.State()
         var peerInterfaces: [InterfaceID: Data] = [:]   // InterfaceID → 16-byte peer token
+        /// Profile registered for EVERY peer interface (C1). BLE registers one InterfaceID per
+        /// peer; all share the endpoint's profile — per-peer variation is a spec non-goal
+        /// (BLEHello carries no such field).
+        public let profile: InterfaceProfile
 
         /// Live links (owned by the embedded LinkPlane).
         public var links: IdentifiedArrayOf<LinkSession.State> {
@@ -40,9 +44,11 @@ public struct BLEEndpoint {
         }
 
         public init(maxPeers: Int = BLEInterface.defaultMaxPeers,
-                    pairingMode: BLEPairingMode = .open) {
+                    pairingMode: BLEPairingMode = .open,
+                    profile: InterfaceProfile = .ble) {
             self.ble = BLEInterface.State(maxPeers: maxPeers, pairingMode: pairingMode)
             self.transport = Transport.State()
+            self.profile = profile
         }
     }
 
@@ -118,7 +124,7 @@ public struct BLEEndpoint {
                 let wasEmpty = state.peerInterfaces.isEmpty
                 state.peerInterfaces[id] = token
                 var effects: [Effect<Action>] = [
-                    .send(.transport(.interfaceConnected(id))),
+                    .send(.transport(.interfaceConnected(id, state.profile))),
                     .send(.delegate(.peerOnline(token))),
                 ]
                 if wasEmpty { effects.append(.send(.transport(.startMaintenance))) }

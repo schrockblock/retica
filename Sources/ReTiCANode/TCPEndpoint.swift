@@ -20,6 +20,9 @@ public struct TCPEndpoint {
         public var transport: Transport.State
         public var linkPlane: LinkPlane.State = LinkPlane.State()
         public let interfaceID: InterfaceID
+        /// Metadata registered with Transport for this interface (C1). Mode/bitrate are
+        /// configuration — override at init to declare e.g. a roaming node.
+        public let profile: InterfaceProfile
 
         /// Live links (owned by the embedded `LinkPlane`).
         public var links: IdentifiedArrayOf<LinkSession.State> {
@@ -33,11 +36,13 @@ public struct TCPEndpoint {
         }
 
         public init(host: String, port: UInt16, reconnectOnDrop: Bool = true,
-                    interfaceID: InterfaceID = InterfaceID("tcp")) {
+                    interfaceID: InterfaceID = InterfaceID("tcp"),
+                    profile: InterfaceProfile = .tcp) {
             self.interface = TCPClientInterface.State(host: host, port: port,
                                                       reconnectOnDrop: reconnectOnDrop)
             self.transport = Transport.State()
             self.interfaceID = interfaceID
+            self.profile = profile
         }
     }
 
@@ -109,7 +114,7 @@ public struct TCPEndpoint {
             case let .interface(.delegate(.packetReceived(data))):
                 return .send(.transport(.received(id, data)))
             case .interface(.connectionEvent(.connected)):
-                return .merge(.send(.transport(.interfaceConnected(id))),
+                return .merge(.send(.transport(.interfaceConnected(id, state.profile))),
                               .send(.transport(.startMaintenance)))
             case .interface(.connectionEvent(.disconnected)):
                 return .merge(.send(.transport(.interfaceDisconnected(id))),

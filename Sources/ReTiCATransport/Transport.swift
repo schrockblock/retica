@@ -27,7 +27,7 @@ public struct Transport {
     public struct State: Equatable {
         public var localDestinations: [Data: Destination] = [:]
         public var learned: [Data: LearnedDestination] = [:]
-        public var interfaces: Set<InterfaceID> = []
+        public var interfaces: [InterfaceID: InterfaceProfile] = [:]
         public var transportIdentity: Identity? = nil
         var seenPacketHashes = RingSet()
         public var linkTable: [Data: LinkTableEntry] = [:]
@@ -87,7 +87,7 @@ public struct Transport {
     public enum SendFailure: Equatable, Sendable { case notLearned, tooLarge }
 
     public enum Action: Equatable {
-        case interfaceConnected(InterfaceID)
+        case interfaceConnected(InterfaceID, InterfaceProfile)
         case interfaceDisconnected(InterfaceID)
         case registerLocalDestination(Destination)
         case setTransportIdentity(Identity?)
@@ -143,12 +143,12 @@ public struct Transport {
             }
 
             switch action {
-            case let .interfaceConnected(id):
-                state.interfaces.insert(id)
+            case let .interfaceConnected(id, profile):
+                state.interfaces[id] = profile
                 return .none
 
             case let .interfaceDisconnected(id):
-                state.interfaces.remove(id)
+                state.interfaces[id] = nil
                 return .none
 
             case let .registerLocalDestination(destination):
@@ -267,7 +267,7 @@ public struct Transport {
                     // Transport.py:1925. Only schedule when there is somewhere to send it.
                     if let relayID = state.transportIdentity,
                        Int(packet.hops) + 1 < Int(Packet.maxHops),
-                       state.interfaces.contains(where: { $0 != interfaceID }) {
+                       state.interfaces.keys.contains(where: { $0 != interfaceID }) {
                         let rebroadcast = Packet(
                             headerType: .header2, packetType: .announce, transportType: .transport,
                             destinationType: packet.destinationType, context: packet.context,
@@ -353,7 +353,7 @@ public struct Transport {
                                 destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
                                 payload: requested + relayID.hash + tag)
                             guard let raw = try? fwd.packed() else { return .none }
-                            let sends = state.interfaces.filter { $0 != interfaceID }
+                            let sends = state.interfaces.keys.filter { $0 != interfaceID }
                                 .map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
                             return sends.isEmpty ? .none : .merge(sends)
                         }
@@ -425,7 +425,7 @@ public struct Transport {
 
             case let .announceRetransmitDue(destinationHash):
                 guard var entry = state.announceTable[destinationHash] else { return .none }
-                let sends = state.interfaces
+                let sends = state.interfaces.keys
                     .filter { $0 != entry.arrivalInterface }
                     .map { Effect<Action>.send(.delegate(.transmit($0, entry.raw))) }
                 entry.rebroadcasts += 1
@@ -478,7 +478,7 @@ public struct Transport {
                                                     ratchet: nil, appData: appData)
                 let packet = Packet.announce(from: dest, payload: payload)
                 guard let raw = try? packet.packed() else { return .none }
-                return .merge(state.interfaces.map { .send(.delegate(.transmit($0, raw))) })
+                return .merge(state.interfaces.keys.map { .send(.delegate(.transmit($0, raw))) })
 
             case let .requestPath(destinationHash):
                 // RNS request_path (Transport.py:2799): a DATA/BROADCAST/HEADER_1 packet to the
@@ -491,7 +491,7 @@ public struct Transport {
                                     destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
                                     payload: payload)
                 guard let raw = try? packet.packed() else { return .none }
-                let sends = state.interfaces.map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
+                let sends = state.interfaces.keys.map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
                 return sends.isEmpty ? .none : .merge(sends)
 
             case .delegate:

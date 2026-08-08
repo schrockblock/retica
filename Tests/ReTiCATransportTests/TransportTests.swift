@@ -4,6 +4,16 @@ import ComposableArchitecture
 @testable import ReTiCATransport
 @testable import ReTiCA
 
+// C1 shim: the case gained a profile payload; ~54 construction sites in this module
+// (including Vectors/RelayCrossValidationTests) predate it and don't care which profile.
+// A static func with the case's base name resolves the one-argument spelling.
+// TESTS ONLY — production must always pass a profile explicitly.
+extension Transport.Action {
+    static func interfaceConnected(_ id: InterfaceID) -> Self {
+        .interfaceConnected(id, .default)
+    }
+}
+
 @Test func ringSetInsertReportsNoveltyAndDedups() {
     var set = RingSet(capacity: 3)
     #expect(set.insert(Data([1])) == true)
@@ -48,13 +58,13 @@ import ComposableArchitecture
     store.exhaustivity = .off
 
     await store.send(.interfaceConnected(InterfaceID("i1"))) {
-        $0.interfaces = [InterfaceID("i1")]
+        $0.interfaces = [InterfaceID("i1"): .default]
     }
     await store.send(.registerLocalDestination(dest)) {
         $0.localDestinations = [dest.hash: dest]
     }
     await store.send(.interfaceDisconnected(InterfaceID("i1"))) {
-        $0.interfaces = []
+        $0.interfaces = [:]
     }
 }
 
@@ -189,7 +199,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
         $0.transportDate = .constant(Date(timeIntervalSince1970: 1_700_000_000))
     }
     store.exhaustivity = .off
-    await store.send(.interfaceConnected(InterfaceID("i1"))) { $0.interfaces = [InterfaceID("i1")] }
+    await store.send(.interfaceConnected(InterfaceID("i1"))) { $0.interfaces = [InterfaceID("i1"): .default] }
     await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
 
     let captured = LockIsolated<Data?>(nil)
@@ -386,7 +396,7 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, D
     // A genuine-shape HEADER_1 announce for a REMOTE destination, heard on i0 at hops = 2.
     let (announceRaw, destHash) = makeAnnouncePacket(hops: 2)
     // Verify exactly 2 interfaces are registered before the announce arrives.
-    #expect(store.state.interfaces == [InterfaceID("i0"), InterfaceID("i1")])
+    #expect(store.state.interfaces == [InterfaceID("i0"): .default, InterfaceID("i1"): .default])
 
     await store.send(.received(InterfaceID("i0"), announceRaw))
 
@@ -518,8 +528,8 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000) -> (Data, D
         $0.transportDate = .constant(Date(timeIntervalSince1970: 1_700_000_000))
     }
     store.exhaustivity = .off
-    await store.send(.interfaceConnected(InterfaceID("i1"))) { $0.interfaces = [InterfaceID("i1")] }
-    await store.send(.interfaceConnected(InterfaceID("i2"))) { $0.interfaces = [InterfaceID("i1"), InterfaceID("i2")] }
+    await store.send(.interfaceConnected(InterfaceID("i1"))) { $0.interfaces = [InterfaceID("i1"): .default] }
+    await store.send(.interfaceConnected(InterfaceID("i2"))) { $0.interfaces = [InterfaceID("i1"): .default, InterfaceID("i2"): .default] }
     await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
 
     let seen = LockIsolated<Set<InterfaceID>>([])
@@ -1038,7 +1048,7 @@ private func relayHostingLinkTableEntry(rcvdIf: String, nhIf: String)
     async -> (TestStore<Transport.State, Transport.Action>, Data) {
     let linkID = Data(repeating: 0xEE, count: 16)   // synthetic link_id (16-byte dest hash)
     var initialState = Transport.State()
-    initialState.interfaces = [InterfaceID(rcvdIf), InterfaceID(nhIf)]
+    initialState.interfaces = [InterfaceID(rcvdIf): .default, InterfaceID(nhIf): .default]
     initialState.linkTable[linkID] = Transport.State.LinkTableEntry(
         rcvdIf: InterfaceID(rcvdIf), nhIf: InterfaceID(nhIf))
     let store = TestStore(initialState: initialState) { Transport() }
@@ -2198,7 +2208,7 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     let relay = Identity()
     let dest = Data(repeating: 0x99, count: 16)
     var initial = Transport.State()
-    initial.interfaces = [InterfaceID("i0"), InterfaceID("i1")]
+    initial.interfaces = [InterfaceID("i0"): .default, InterfaceID("i1"): .default]
     initial.transportIdentity = relay
     initial.recursivePathRequests = true
     initial.learned[dest] = LearnedDestination(

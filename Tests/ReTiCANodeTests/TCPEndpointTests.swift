@@ -45,7 +45,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.send(.connect)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
-    #expect(store.state.transport.interfaces.contains(store.state.interfaceID))
+    #expect(store.state.transport.interfaces[store.state.interfaceID] == .tcp)
     #expect(store.state.interface.status == .online)
     await store.send(.disconnect)
     await store.receive(\.interface.disconnect)
@@ -1448,8 +1448,8 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
         $0.continuousClock = ImmediateClock()
     }
     storeR.exhaustivity = .off
-    await storeR.send(.interfaceConnected(ifAR))
-    await storeR.send(.interfaceConnected(ifRB))
+    await storeR.send(.interfaceConnected(ifAR, .default))
+    await storeR.send(.interfaceConnected(ifRB, .default))
     await storeR.send(.setTransportIdentity(rIdentity))
 
     // Connect A and B.
