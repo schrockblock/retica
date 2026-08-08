@@ -136,6 +136,7 @@ public struct Transport {
         case send(destinationHash: Data, plaintext: Data)
         case announceRetransmitDue(destinationHash: Data)
         case announceQueueDrainDue(InterfaceID)
+        case heldAnnounceReleaseDue(InterfaceID)
         case startMaintenance
         case stopMaintenance
         case maintenanceTick
@@ -158,6 +159,7 @@ public struct Transport {
 
     private enum CancelID: Hashable {
         case announceRetransmit(Data); case maintenance; case announceDrain(InterfaceID)
+        case ingressRelease(InterfaceID)
     }
 
     public init() {}
@@ -197,7 +199,8 @@ public struct Transport {
                 state.ingressBursts[id] = nil
                 state.heldAnnounces[id] = nil
                 state.interfaceConnectedAt[id] = nil
-                return .cancel(id: CancelID.announceDrain(id))
+                return .merge(.cancel(id: CancelID.announceDrain(id)),
+                              .cancel(id: CancelID.ingressRelease(id)))
 
             case let .registerLocalDestination(destination):
                 state.localDestinations[destination.hash] = destination
@@ -293,6 +296,12 @@ public struct Transport {
                                     held[packet.destinationHash] = State.HeldAnnounce(raw: data, hops: packet.hops)
                                     state.heldAnnounces[interfaceID] = held
                                 }
+                                let releaseIn = max(0, (state.ingressBursts[interfaceID]?.heldRelease ?? icNow)
+                                                          .timeIntervalSince(icNow))
+                                return .run { send in
+                                    try await clock.sleep(for: .seconds(releaseIn))
+                                    await send(.heldAnnounceReleaseDue(interfaceID))
+                                }.cancellable(id: CancelID.ingressRelease(interfaceID), cancelInFlight: true)
                             }
                             return .none
                         }
@@ -617,6 +626,64 @@ public struct Transport {
                     }.cancellable(id: CancelID.announceDrain(id), cancelInFlight: true))
                 }
                 return .merge(effects)
+
+            case let .heldAnnounceReleaseDue(id):
+                guard let held = state.heldAnnounces[id], !held.isEmpty else { return .none }
+                let now = date.now
+                let burst = state.ingressBursts[id] ?? Transport.IngressBurst()
+                // Not yet past the penalty, or the rate is still hot: try again later.
+                let age = now.timeIntervalSince(state.interfaceConnectedAt[id] ?? now)
+                let threshold = Transport.ingressBurstThreshold(interfaceAge: age)
+                let freq = Transport.announceFrequency(samples: state.announceArrivals[id] ?? [], now: now)
+                guard now > burst.heldRelease, freq < threshold else {
+                    return .run { send in
+                        try await clock.sleep(for: .seconds(Transport.icHeldReleaseInterval))
+                        await send(.heldAnnounceReleaseDue(id))
+                    }.cancellable(id: CancelID.ingressRelease(id), cancelInFlight: true)
+                }
+                // Release the fewest-hop announce, then space the next release.
+                guard let pick = held.min(by: { $0.value.hops < $1.value.hops }) else { return .none }
+                var remaining = held
+                remaining[pick.key] = nil
+                state.heldAnnounces[id] = remaining.isEmpty ? nil : remaining
+                var next = burst
+                next.active = false
+                next.heldRelease = now.addingTimeInterval(Transport.icHeldReleaseInterval)
+                state.ingressBursts[id] = next
+                // Re-inject inline: parse and learn the path directly so state is updated
+                // synchronously (TCA publisher effects are not guaranteed synchronous from
+                // @MainActor async test context; inline avoids the race).  The blob ring is
+                // written here, so if a peer re-broadcasts the same announce later it is deduped
+                // correctly — identical to what the normal .received path would do.
+                var effects: [Effect<Action>] = []
+                if let packet = Packet(raw: pick.value.raw),
+                   let parsed = Announce.parse(payload: packet.payload,
+                                               destinationHash: packet.destinationHash,
+                                               contextFlagSet: packet.contextFlag) {
+                    var ring = state.announceBlobs[packet.destinationHash]
+                        ?? RingSet(capacity: Transport.announceBlobRingSize)
+                    _ = ring.insert(parsed.randomHash)
+                    state.announceBlobs[packet.destinationHash] = ring
+                    let emitted = Transport.announceEmitted(parsed.randomHash)
+                    let nextHop = packet.transportId ?? packet.destinationHash
+                    let candidate = LearnedDestination(
+                        identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
+                        interfaceID: id, hops: packet.hops, nextHop: nextHop,
+                        announceEmitted: emitted, learnedAt: now)
+                    if Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate) {
+                        state.learned[packet.destinationHash] = candidate
+                        state.announceCache[packet.destinationHash] = packet.payload
+                        effects.append(.send(.delegate(.pathLearned(
+                            destinationHash: packet.destinationHash, hops: packet.hops))))
+                    }
+                }
+                if !remaining.isEmpty {
+                    effects.append(.run { send in
+                        try await clock.sleep(for: .seconds(Transport.icHeldReleaseInterval))
+                        await send(.heldAnnounceReleaseDue(id))
+                    }.cancellable(id: CancelID.ingressRelease(id), cancelInFlight: true))
+                }
+                return effects.isEmpty ? .none : .merge(effects)
 
             case let .send(destinationHash, plaintext):
                 guard let entry = state.learned[destinationHash] else {

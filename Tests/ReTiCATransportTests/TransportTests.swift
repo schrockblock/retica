@@ -3192,3 +3192,86 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(store.state.heldAnnounces[i0] == nil)
     #expect(store.state.interfaceConnectedAt[i0] == nil)
 }
+
+// MARK: - #C4 Task 3: release held announces
+
+/// Once the rate subsides and the penalty has elapsed, the release timer re-injects the
+/// FEWEST-HOP held announce, which is then admitted normally (path learned).
+@Test @MainActor func heldAnnounceIsReleasedFewestHopsFirstAndAdmitted() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    var initial = Transport.State()
+    let i0 = InterfaceID("i0")
+    initial.interfaces[i0] = .default
+    initial.interfaceConnectedAt[i0] = Date(timeIntervalSince1970: 0)
+    initial.ingressBursts[i0] = Transport.IngressBurst(
+        active: true, activatedAt: Date(timeIntervalSince1970: 900),
+        heldRelease: Date(timeIntervalSince1970: 1000))
+    let far = Identity(), near = Identity()
+    let (farRaw, farDest)   = makeAnnouncePacket(identity: far, appName: "app", aspects: ["s"],
+                                                 hops: 5, emitted: 1,
+                                                 randomPrefix: Data([1, 0, 0, 0, 0]))
+    let (nearRaw, nearDest) = makeAnnouncePacket(identity: near, appName: "app", aspects: ["s"],
+                                                 hops: 1, emitted: 2,
+                                                 randomPrefix: Data([2, 0, 0, 0, 0]))
+    initial.heldAnnounces[i0] = [farDest:  .init(raw: farRaw,  hops: 5),
+                                 nearDest: .init(raw: nearRaw, hops: 1)]
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    now.setValue(Date(timeIntervalSince1970: 1001))          // past heldRelease, rate is 0
+    await store.send(.heldAnnounceReleaseDue(i0))
+    #expect(store.state.learned[nearDest] != nil)            // fewest hops released first
+    #expect(store.state.learned[farDest] == nil)             // still held
+    #expect(store.state.heldAnnounces[i0]?.count == 1)
+}
+
+/// A release is not attempted before the penalty elapses (RNS gates on ic_held_release).
+@Test @MainActor func releaseWaitsForThePenaltyToElapse() async {
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    var initial = Transport.State()
+    let i0 = InterfaceID("i0")
+    initial.interfaces[i0] = .default
+    initial.interfaceConnectedAt[i0] = Date(timeIntervalSince1970: 0)
+    initial.ingressBursts[i0] = Transport.IngressBurst(
+        active: true, activatedAt: Date(timeIntervalSince1970: 990),
+        heldRelease: Date(timeIntervalSince1970: 1015))       // penalty not yet elapsed
+    let (raw, dest) = makeAnnouncePacket(hops: 1, emitted: 1, randomPrefix: Data([1, 0, 0, 0, 0]))
+    initial.heldAnnounces[i0] = [dest: .init(raw: raw, hops: 1)]
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.heldAnnounceReleaseDue(i0))
+    #expect(store.state.heldAnnounces[i0]?.count == 1)        // still held
+    #expect(store.state.learned[dest] == nil)
+}
+
+/// While the arrival rate is still above the threshold, releases stay blocked even past
+/// the penalty (RNS re-checks the frequency inside process_held_announces).
+@Test @MainActor func releaseIsBlockedWhileRateStaysHot() async {
+    let clock = TestClock()
+    let t0 = Date(timeIntervalSince1970: 1000)
+    let now = LockIsolated(t0.addingTimeInterval(1))
+    var initial = Transport.State()
+    let i0 = InterfaceID("i0")
+    initial.interfaces[i0] = .default
+    initial.interfaceConnectedAt[i0] = Date(timeIntervalSince1970: 0)
+    initial.ingressBursts[i0] = Transport.IngressBurst(
+        active: true, activatedAt: t0, heldRelease: t0)
+    initial.announceArrivals[i0] = (0..<10).map { t0.addingTimeInterval(Double($0) * 0.1) }
+    let (raw, dest) = makeAnnouncePacket(hops: 1, emitted: 1, randomPrefix: Data([1, 0, 0, 0, 0]))
+    initial.heldAnnounces[i0] = [dest: .init(raw: raw, hops: 1)]
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.heldAnnounceReleaseDue(i0))
+    #expect(store.state.heldAnnounces[i0]?.count == 1)        // rate still ~10 Hz → blocked
+    #expect(store.state.learned[dest] == nil)
+}
