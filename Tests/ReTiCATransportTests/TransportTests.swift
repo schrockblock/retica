@@ -1429,6 +1429,186 @@ private func makeTimedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>
     #expect(store.state.announceTable[destHash] == nil)  // no other interface → not held
 }
 
+// MARK: - C2 mode-gated relay
+
+@MainActor
+private func makeModedRelayStore(_ relay: Identity, _ clock: TestClock<Duration>,
+                                 interfaces: [(InterfaceID, InterfaceProfile)],
+                                 jitterByte: UInt8 = 128)
+    async -> TestStore<Transport.State, Transport.Action> {
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = clock
+        $0.randomBytes = RandomBytesGenerator { _ in Data([jitterByte]) }
+    }
+    store.exhaustivity = .off
+    for (id, profile) in interfaces {
+        await store.send(.interfaceConnected(id, profile))
+    }
+    await store.send(.setTransportIdentity(relay))
+    return store
+}
+
+private let apProfile       = InterfaceProfile(name: "ap",    bitrate: 62_500, mode: .accessPoint)
+private let roamingProfile  = InterfaceProfile(name: "roam",  bitrate: 62_500, mode: .roaming)
+private let boundaryProfile = InterfaceProfile(name: "bound", bitrate: 62_500, mode: .boundary)
+
+/// An access-point interface is excluded from announce relay while a full interface still
+/// receives it (RNS: AP never retransmits announces from the network).
+@Test @MainActor func accessPointInterfaceIsExcludedFromAnnounceRelay() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeModedRelayStore(Identity(), clock, interfaces: [
+        (InterfaceID("i0"),    .default),        // arrival, mode .full
+        (InterfaceID("iAP"),   apProfile),
+        (InterfaceID("iFull"), .default),
+    ])
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    let sent = LockIsolated<Set<InterfaceID>>([])
+    await clock.advance(by: .seconds(0.25))                 // jittered send #1
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    await clock.advance(by: .seconds(5.5))                  // capped retry (send #2, lifecycle ends)
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    #expect(sent.value == [InterfaceID("iFull")])           // iAP excluded both rounds
+    #expect(store.state.announceTable[destHash] == nil)     // lifecycle complete, no timer in flight
+    store.exhaustivity = .on   // teardown now fails on any skipped transmit (e.g. one to iAP)
+}
+
+/// A roaming interface does not re-advertise an announce that arrived from another roaming
+/// interface; a full interface alongside it still relays.
+@Test @MainActor func roamingDoesNotRelayAnnouncesArrivingFromRoaming() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeModedRelayStore(Identity(), clock, interfaces: [
+        (InterfaceID("i0"),    roamingProfile),  // arrival is ROAMING
+        (InterfaceID("iRoam"), roamingProfile),
+        (InterfaceID("iFull"), .default),
+    ])
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    let sent = LockIsolated<Set<InterfaceID>>([])
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    await clock.advance(by: .seconds(5.5))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    #expect(sent.value == [InterfaceID("iFull")])
+    #expect(store.state.announceTable[destHash] == nil)
+    store.exhaustivity = .on
+}
+
+/// A roaming interface also does not re-advertise announces arriving from a BOUNDARY interface.
+@Test @MainActor func roamingDoesNotRelayAnnouncesArrivingFromBoundary() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeModedRelayStore(Identity(), clock, interfaces: [
+        (InterfaceID("i0"),    boundaryProfile), // arrival is BOUNDARY
+        (InterfaceID("iRoam"), roamingProfile),
+        (InterfaceID("iFull"), .default),
+    ])
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    let sent = LockIsolated<Set<InterfaceID>>([])
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    await clock.advance(by: .seconds(5.5))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    #expect(sent.value == [InterfaceID("iFull")])
+    #expect(store.state.announceTable[destHash] == nil)
+    store.exhaustivity = .on
+}
+
+/// A boundary interface does not re-advertise announces arriving from a ROAMING interface —
+/// and the full interface alongside proves full-out DOES relay from a roaming arrival.
+@Test @MainActor func boundaryDoesNotRelayAnnouncesArrivingFromRoaming() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = await makeModedRelayStore(Identity(), clock, interfaces: [
+        (InterfaceID("i0"),     roamingProfile), // arrival is ROAMING
+        (InterfaceID("iBound"), boundaryProfile),
+        (InterfaceID("iFull"),  .default),
+    ])
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    let sent = LockIsolated<Set<InterfaceID>>([])
+    await clock.advance(by: .seconds(0.25))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    await clock.advance(by: .seconds(5.5))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    #expect(sent.value == [InterfaceID("iFull")])
+    #expect(store.state.announceTable[destHash] == nil)
+    store.exhaustivity = .on
+}
+
+/// A relay whose only other interface cannot relay (access point) schedules nothing — the
+/// scheduling gate, not just the fan-out, consults eligibility. Modeled on
+/// singleInterfaceRelayDoesNotSchedule.
+@Test @MainActor func relayWithOnlyIneligibleTargetsDoesNotSchedule() async {
+    let clock = TestClock()
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0"), .default))
+    await store.send(.interfaceConnected(InterfaceID("iAP"), apProfile))
+    await store.send(.setTransportIdentity(Identity()))
+    await store.send(.received(InterfaceID("i0"), raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.announceTable[destHash] == nil)   // nowhere eligible → not held
+}
+
+/// LOCALLY-ORIGINATED announces are ungated: an access point "originates only", so its own
+/// announce still goes out every interface including AP-mode ones. Modeled on
+/// announceFansOutToAllInterfaces.
+@Test @MainActor func locallyOriginatedAnnounceStillFansOutToAccessPointInterfaces() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.transportDate = DateGenerator { Date(timeIntervalSince1970: 1_700_000_000) }
+    }
+    store.exhaustivity = .off
+    let dest = Destination(kind: .single, direction: .in, appName: "app",
+                           aspects: ["s"], identity: Identity())!
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.interfaceConnected(InterfaceID("iAP"), apProfile))
+    await store.send(.interfaceConnected(InterfaceID("iFull"), .default))
+    let sent = LockIsolated<Set<InterfaceID>>([])
+    await store.send(.announce(destinationHash: dest.hash, appData: nil))
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    await store.receive { action in
+        if case let .delegate(.transmit(i, _)) = action { sent.withValue { _ = $0.insert(i) }; return true }
+        return false
+    }
+    #expect(sent.value == [InterfaceID("iAP"), InterfaceID("iFull")])   // BOTH — no gate here
+}
+
 /// The jitter formula maps a random byte to `byte/256` of the window, always within `[0, window)`.
 /// Pins the exact delay value directly (the clock/async tests can only observe that *a* delay
 /// elapsed, not the precise fraction).

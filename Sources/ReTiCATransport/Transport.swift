@@ -265,9 +265,11 @@ public struct Transport {
                     // Relay mode: instead of re-broadcasting now, HOLD this fresh announce and
                     // re-broadcast it once after a jittered delay in [0, PATHFINDER_RW) — RNS
                     // Transport.py:1925. Only schedule when there is somewhere to send it.
+                    let arrivalMode = state.interfaces[interfaceID]?.mode
                     if let relayID = state.transportIdentity,
                        Int(packet.hops) + 1 < Int(Packet.maxHops),
-                       state.interfaces.keys.contains(where: { $0 != interfaceID }) {
+                       state.interfaces.contains(where: { $0.key != interfaceID
+                           && Transport.mayRelayAnnounce(to: $0.value.mode, arrivalMode: arrivalMode) }) {
                         let rebroadcast = Packet(
                             headerType: .header2, packetType: .announce, transportType: .transport,
                             destinationType: packet.destinationType, context: packet.context,
@@ -426,9 +428,11 @@ public struct Transport {
 
             case let .announceRetransmitDue(destinationHash):
                 guard var entry = state.announceTable[destinationHash] else { return .none }
-                let sends = state.interfaces.keys
-                    .filter { $0 != entry.arrivalInterface }
-                    .map { Effect<Action>.send(.delegate(.transmit($0, entry.raw))) }
+                let arrivalMode = state.interfaces[entry.arrivalInterface]?.mode
+                let sends = state.interfaces
+                    .filter { $0.key != entry.arrivalInterface
+                        && Transport.mayRelayAnnounce(to: $0.value.mode, arrivalMode: arrivalMode) }
+                    .map { Effect<Action>.send(.delegate(.transmit($0.key, entry.raw))) }
                 entry.rebroadcasts += 1
                 if entry.rebroadcasts >= Transport.announceMaxRebroadcasts {
                     state.announceTable[destinationHash] = nil          // lifecycle complete
