@@ -537,6 +537,22 @@ public struct Transport {
         }
     }
 
+    /// How long an interface must stay quiet after emitting a relayed announce of `byteCount`
+    /// bytes, so relayed announces consume at most `announceCap` of its bandwidth
+    /// (RNS Transport.py:1282-1285: tx_time = bits/bitrate; wait = tx_time / announce_cap).
+    /// `bitrate` is guaranteed > 0 and `announceCap` ∈ (0, 1] by `InterfaceProfile`'s
+    /// preconditions, so this needs no zero guard.
+    static func announcePacingWait(byteCount: Int, bitrate: Int,
+                                   announceCap: Double) -> TimeInterval {
+        let txTime = (Double(byteCount) * 8.0) / Double(bitrate)
+        return txTime / announceCap
+    }
+
+    /// RNS MAX_QUEUED_ANNOUNCES: per-interface cap on announces awaiting their pacing slot.
+    static let announceQueueLimit = 16384
+    /// RNS QUEUED_ANNOUNCE_LIFE: a queued announce older than this is dropped, seconds.
+    static let queuedAnnounceLife: TimeInterval = 86_400
+
     /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
     /// RNS PATH_REQUEST_TIMEOUT (Transport.py:79): in-flight recursive path searches expire, seconds.

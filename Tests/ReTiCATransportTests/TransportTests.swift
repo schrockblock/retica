@@ -1645,6 +1645,33 @@ private let boundaryProfile = InterfaceProfile(name: "bound", bitrate: 62_500, m
     }
 }
 
+/// Pacing wait = transmit-time / announce_cap (RNS Transport.py:1282-1285). Values are
+/// hand-derived from the reference formula: a 150-byte announce is 1200 bits; at BLE's
+/// 80 kbps that is 0.015 s of air time, and at a 2% cap the interface must then stay quiet
+/// for 0.015 / 0.02 = 0.75 s. The same announce on TCP's 10 Mbps costs 0.006 s — the 125×
+/// spread that makes pacing matter on a slow radio and vanish on a socket.
+@Test func announcePacingWaitMatchesReferenceFormula() {
+    #expect(Transport.announcePacingWait(byteCount: 150, bitrate: 80_000, announceCap: 0.02)
+            == 0.75)
+    #expect(Transport.announcePacingWait(byteCount: 150, bitrate: 10_000_000, announceCap: 0.02)
+            == 0.006)
+    // Doubling the payload doubles the wait; doubling the cap halves it.
+    #expect(Transport.announcePacingWait(byteCount: 300, bitrate: 80_000, announceCap: 0.02)
+            == 1.5)
+    #expect(Transport.announcePacingWait(byteCount: 150, bitrate: 80_000, announceCap: 0.04)
+            == 0.375)
+    // A full-rate cap (1.0) still yields exactly the air time.
+    #expect(Transport.announcePacingWait(byteCount: 150, bitrate: 80_000, announceCap: 1.0)
+            == 0.015)
+}
+
+/// Queue bounds are the reference constants (RNS Transport.py MAX_QUEUED_ANNOUNCES /
+/// QUEUED_ANNOUNCE_LIFE).
+@Test func announceQueueBoundsMatchReference() {
+    #expect(Transport.announceQueueLimit == 16384)
+    #expect(Transport.queuedAnnounceLife == 86_400)
+}
+
 // MARK: - 4b-3b-2 announce re-broadcast retries + grace
 
 /// A fresh announce is re-broadcast twice (initial after jitter, one retry after grace+jitter),
