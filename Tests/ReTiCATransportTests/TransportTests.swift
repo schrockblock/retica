@@ -3437,20 +3437,41 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(store.state.learned[destHash] != nil)
 }
 
-/// A packet from a DIFFERENT network is dropped — no path learned, nothing emitted.
+/// A packet from a DIFFERENT network is dropped — no path learned at all, under any key.
+///
+/// The drop assertion is `learned.isEmpty`, not `learned[destHash] == nil`: `protect()` inserts
+/// `size` bytes of access code after the 2-byte header, so a masked packet that slipped past the
+/// guard would parse with a GARBLED destination hash and would file any path under the wrong key.
+/// The keyed form would read nil for that reason alone; the emptiness form is the stronger one.
+///
+/// KNOWN LIMIT — this assertion pins the required behaviour but does NOT discriminate removal of
+/// the `unprotect`-nil guard. Verified empirically, not assumed: see the note on
+/// `protectedPacketOnPlainInterfaceIsDropped` below for the measured mechanism. Do not mistake
+/// this for a mutation-proven test.
+///
+/// The positive control at the end proves the store is capable of learning on this interface,
+/// so the drop assertion is not vacuous.
 @Test @MainActor func packetFromAnotherIFACNetworkIsDropped() async {
     let ours = IFAC(networkName: "ours", passphrase: nil, size: 16)!
     let theirs = IFAC(networkName: "theirs", passphrase: nil, size: 16)!
     var profile = InterfaceProfile.default
     profile.ifac = ours
-    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let (foreignRaw, _) = makeAnnouncePacket(hops: 2, emitted: 1000)
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.continuousClock = ImmediateClock()
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i0"), profile))
-    await store.send(.received(InterfaceID("i0"), theirs.protect(raw)))
-    #expect(store.state.learned[destHash] == nil)
+    await store.send(.received(InterfaceID("i0"), theirs.protect(foreignRaw)))
+    #expect(store.state.learned.isEmpty)          // nothing learned, under ANY key
+
+    // Positive control: the SAME store on the SAME interface DOES admit a packet correctly
+    // protected for OUR network. Without this the drop assertion above could pass vacuously
+    // (e.g. a mis-set-up store in which nothing could ever be learned).
+    let (ourRaw, ourDest) = makeAnnouncePacket(hops: 2, emitted: 2000)
+    await store.send(.received(InterfaceID("i0"), ours.protect(ourRaw)))
+    await store.receive(.delegate(.pathLearned(destinationHash: ourDest, hops: 2)))
+    #expect(store.state.learned[ourDest] != nil)
 }
 
 /// An UNPROTECTED packet on an IFAC interface is dropped (RNS Transport.py:1478-1480).
@@ -3469,16 +3490,47 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
 }
 
 /// A PROTECTED packet on a NON-IFAC interface is dropped (RNS Transport.py:1482-1486).
+///
+/// KNOWN LIMIT — this assertion pins the required behaviour but does NOT discriminate removal
+/// of the bit-7 flag guard, and neither does `learned.isEmpty`. The mechanism was MEASURED, not
+/// assumed (2000 masked announces, and 300 driven through Transport with the guard removed):
+///
+///   * Only ~95% of masked packets die in `Packet(raw:)` — and NOT via a single structural
+///     guard. Roughly half fail `hops < Packet.maxHops` (byte 1 is now a masked byte) and
+///     roughly half fail the context-byte enum. Rejection here is PROBABILISTIC, not structural:
+///     ~5% of masked packets parse into a well-formed `Packet` with a garbage destination hash.
+///   * Those survivors are then stopped by announce SIGNATURE validation in `Announce.parse` —
+///     an Ed25519 signature over masked bytes cannot verify. Measured: 300 trials with the guard
+///     removed produced 15 parseable packets and 0 learned entries.
+///
+/// So `learned` is unreachable with or without the guard, and no assertion over it can catch the
+/// guard's removal. The guard remains semantically required: it refuses IFAC-flagged traffic on
+/// an open interface as POLICY, rather than relying on a ~5%-leaky parser plus signature checks
+/// downstream. (A masked packet that parses can still touch other paths — e.g. a
+/// `destinationType == .link` parse emits a `.linkPacket` delegate, and every parse pollutes the
+/// packet-hash dedup ring. Those effects are real but arise only for a random ~5% of inputs, so
+/// they are not a sound basis for a deterministic test.)
+///
+/// Do not "strengthen" this test to chase a mutation failure; there is not a deterministic one
+/// to catch. The positive control at the end proves the store is capable of learning on this
+/// interface, so the drop assertion is not vacuous.
 @Test @MainActor func protectedPacketOnPlainInterfaceIsDropped() async {
     let ifac = IFAC(networkName: "xnet", passphrase: nil, size: 16)!
-    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let (raw, _) = makeAnnouncePacket(hops: 2, emitted: 1000)
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.continuousClock = ImmediateClock()
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i0"), .default))   // no ifac
     await store.send(.received(InterfaceID("i0"), ifac.protect(raw)))
-    #expect(store.state.learned[destHash] == nil)
+    #expect(store.state.learned.isEmpty)          // nothing learned, under ANY key
+
+    // Positive control: the SAME store on the SAME plain interface DOES admit an unprotected
+    // packet. Without this the drop assertion above could pass vacuously.
+    let (plainRaw, plainDest) = makeAnnouncePacket(hops: 2, emitted: 2000)
+    await store.send(.received(InterfaceID("i0"), plainRaw))
+    await store.receive(.delegate(.pathLearned(destinationHash: plainDest, hops: 2)))
+    #expect(store.state.learned[plainDest] != nil)
 }
 
 // MARK: - #C5 C4 interaction regression
