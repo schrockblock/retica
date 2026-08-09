@@ -5,13 +5,16 @@ import Foundation
 
 /// Cross-validation fixture: values produced by genuine reference RNS code paths.
 ///
-/// Fixture script: /tmp/ReTiCA/ifac_fixture.py — it CALLS `RNS.Identity.full_hash`,
-/// `RNS.Cryptography.hkdf`, `RNS.Identity.from_bytes` and, crucially, the real
-/// `RNS.Transport.transmit()` against a stub interface that captures `process_outgoing`.
-/// The masking loop is not reimplemented in the fixture, so the expectations here cannot
-/// drift into being circular.
+/// Fixture script: `Tests/ReTiCATransportTests/Vectors/generate_ifac_fixtures.py` — it
+/// CALLS `RNS.Identity.full_hash`, `RNS.Cryptography.hkdf`, `RNS.Identity.from_bytes`
+/// and, crucially, the real `RNS.Transport.transmit()` against a stub interface that
+/// captures `process_outgoing`. The masking loop is not reimplemented in the fixture, so
+/// the expectations here cannot drift into being circular.
 ///
-/// Reference output (conda env "rns", `python /tmp/ReTiCA/ifac_fixture.py`), RNS 1.4.2:
+/// Run: `python Tests/ReTiCATransportTests/Vectors/generate_ifac_fixtures.py`
+/// (conda env "rns", RNS 1.4.2 stock)
+///
+/// Reference output, RNS 1.4.2:
 ///   rns_version=1.4.2
 ///   ifac_key_hex=1c5c27f6fc0d316eb5376fa9a2a95499fd27d475aa6a6beedbbd7324ced99ab597a4dd52d698a0195e8669ef49401092c476453a1edf5168d7024af419ed9eb9
 ///   wire_hex=980846f1ec10f55cd3faf71fec155c8f29091f10b2c6aae03108812ed6346474d78cfaf5930783258cc74cd4d34eda2801a6cc070249b10c060b24130e6cedd3
@@ -22,7 +25,7 @@ import Foundation
 @Suite("IFAC cross-validation against reference RNS")
 struct IFACCrossValidationTests {
 
-    // Fixture values — produced by /tmp/ReTiCA/ifac_fixture.py against real RNS.
+    // Fixture values — produced by generate_ifac_fixtures.py against real RNS 1.4.2.
     let referenceKeyHex  = "1c5c27f6fc0d316eb5376fa9a2a95499fd27d475aa6a6beedbbd7324ced99ab597a4dd52d698a0195e8669ef49401092c476453a1edf5168d7024af419ed9eb9"
     let referenceWireHex = "980846f1ec10f55cd3faf71fec155c8f29091f10b2c6aae03108812ed6346474d78cfaf5930783258cc74cd4d34eda2801a6cc070249b10c060b24130e6cedd3"
 

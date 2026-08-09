@@ -3,7 +3,7 @@ import Foundation
 @testable import ReTiCA
 @testable import ReTiCATransport
 
-/// The salt is the reference constant (RNS Reticulum.py:151).
+/// The salt is the reference constant (`Reticulum.py:150`, RNS 1.4.2 stock).
 @Test func ifacSaltMatchesReference() {
     #expect(IFAC.salt.map { String(format: "%02x", $0) }.joined()
             == "adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")

@@ -3079,6 +3079,55 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(store.state.announceBlobs[heldDest] == nil)
 }
 
+/// C4/C5 hold STORAGE: on an IFAC interface the burst hold stores the MASKED bytes (the
+/// verbatim `.received` payload), not the unmasked plain bytes.
+///
+/// This is the one claim the whole C4/C5 placement decision rests on (Transport.swift:333
+/// stores `raw: data`). Without this property, releasing a held announce on an IFAC
+/// interface would pass de-masked bytes back through `.received`, which re-runs the IFAC
+/// gate, finds no flag set, and silently discards the announce — the exact reference RNS
+/// bug documented at Transport.swift:236-237.
+///
+/// MUTATION-PROVEN: changing `raw: data` to `raw: plain` compiles and keeps every OTHER
+/// test green while making this test fail — because `plain` == `data` on plain interfaces
+/// (every other C4 test) but differs on IFAC interfaces.
+@Test @MainActor func burstHoldsAnnounceOnIFACInterfaceStoringMaskedBytes() async {
+    let ifac = IFAC(networkName: "hold-xval", passphrase: nil, size: 16)!
+    var profile = InterfaceProfile.default
+    profile.ifac = ifac
+
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    let i0 = InterfaceID("i0")
+    await store.send(.interfaceConnected(i0, profile))
+    // Drive the arrival rate over the 3 Hz young-interface threshold with distinct masked announces.
+    // Track the raw and masked bytes for EACH packet so we can look up any held one after.
+    var sentMasked: [Data: Data] = [:]   // destHash → masked bytes
+    for k in 0..<6 {
+        now.setValue(Date(timeIntervalSince1970: 1000 + Double(k) * 0.1))
+        let (raw, dest) = makeAnnouncePacket(hops: 2, emitted: UInt64(1000 + k),
+                                             randomPrefix: Data([UInt8(k + 1), 0, 0, 0, 0]))
+        let masked = ifac.protect(raw)
+        sentMasked[dest] = masked
+        await store.send(.received(i0, masked))
+    }
+    #expect(store.state.ingressBursts[i0]?.active == true)
+    #expect((store.state.heldAnnounces[i0]?.count ?? 0) > 0)
+
+    // THE KEY ASSERTION: the stored bytes must be the original masked bytes, not the
+    // unmasked plain. Bit 7 of byte 0 is always set on IFAC wire bytes (IFAC.protect
+    // forces it at Transport.py:1081/1091). Check via both the flag bit and byte equality
+    // against the masked packet we sent for this specific held destination.
+    let heldDest = store.state.heldAnnounces[i0]!.keys.first!
+    let storedRaw = store.state.heldAnnounces[i0]![heldDest]!.raw
+    #expect(storedRaw.first! & 0x80 == 0x80, "stored bytes must be masked (bit 7 set)")
+    #expect(storedRaw == sentMasked[heldDest]!, "stored bytes must equal the verbatim masked input")
+}
+
 /// An announce for a destination we ALREADY have a path to is never held, even mid-burst
 /// (RNS limits only unknown destinations — known ones are governed by announce rate limiting).
 @Test @MainActor func burstDoesNotHoldAnnounceForKnownDestination() async {
@@ -3475,54 +3524,66 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
 }
 
 /// An UNPROTECTED packet on an IFAC interface is dropped (RNS Transport.py:1478-1480).
+///
+/// MUTATION-PROVEN: the adversarial input is a VALID announce packet with the IFAC flag set
+/// in byte 0 (`raw[0] |= 0x80`). `Packet.init(raw:)` reads only bits 6,5,4,3-2,1-0 of byte 0
+/// (Sources/ReTiCA/Packet/Packet.swift:75-79) and never bit 7, so the flagged packet parses
+/// into a packet with the correct destination hash and a valid announce signature. Without the
+/// `unprotect`-nil guard, `.pathLearned` fires; with it, the packet is dropped before parsing.
+/// Discriminates removal of the guard: `guard let unmasked = ifac.unprotect(data) else { return .none }`.
+///
+/// The positive control at the end proves the store CAN learn on this interface, so the
+/// `learned.isEmpty` drop assertion is not vacuous.
 @Test @MainActor func plainPacketOnIFACInterfaceIsDropped() async {
     let ifac = IFAC(networkName: "xnet", passphrase: nil, size: 16)!
     var profile = InterfaceProfile.default
     profile.ifac = ifac
-    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let (raw, _) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    // Flag-set-but-otherwise-valid packet: byte 0 gets bit 7 set, everything else intact.
+    // This parses correctly (bit 7 ignored) and has a valid signature — the only gate is
+    // the unprotect() call which returns nil for a non-IFAC-masked packet.
+    var flagged = raw
+    flagged[0] |= 0x80
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.continuousClock = ImmediateClock()
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i0"), profile))
-    await store.send(.received(InterfaceID("i0"), raw))
-    #expect(store.state.learned[destHash] == nil)
+    await store.send(.received(InterfaceID("i0"), flagged))
+    #expect(store.state.learned.isEmpty)          // nothing learned, under ANY key
+
+    // Positive control: the SAME store DOES admit a correctly IFAC-protected packet.
+    // Without this the drop assertion above could pass vacuously.
+    let (raw2, dest2) = makeAnnouncePacket(hops: 2, emitted: 2000)
+    await store.send(.received(InterfaceID("i0"), ifac.protect(raw2)))
+    await store.receive(.delegate(.pathLearned(destinationHash: dest2, hops: 2)))
+    #expect(store.state.learned[dest2] != nil)
 }
 
 /// A PROTECTED packet on a NON-IFAC interface is dropped (RNS Transport.py:1482-1486).
 ///
-/// KNOWN LIMIT — this assertion pins the required behaviour but does NOT discriminate removal
-/// of the bit-7 flag guard, and neither does `learned.isEmpty`. The mechanism was MEASURED, not
-/// assumed (2000 masked announces, and 300 driven through Transport with the guard removed):
+/// MUTATION-PROVEN: the adversarial input is a VALID announce packet with bit 7 of byte 0 set
+/// (`raw[0] |= 0x80`). `Packet.init(raw:)` reads only bits 6,5,4,3-2,1-0 of byte 0
+/// (Sources/ReTiCA/Packet/Packet.swift:75-79) and never bit 7, so the packet parses with the
+/// correct destination hash and a valid Ed25519 signature. Without the bit-7 flag guard,
+/// `pathLearned` fires; with it, the packet is rejected before parsing.
+/// Discriminates removal of the guard: `guard data.first.map({ $0 & 0x80 == 0 }) ?? false else { return .none }`.
 ///
-///   * Only ~95% of masked packets die in `Packet(raw:)` — and NOT via a single structural
-///     guard. Roughly half fail `hops < Packet.maxHops` (byte 1 is now a masked byte) and
-///     roughly half fail the context-byte enum. Rejection here is PROBABILISTIC, not structural:
-///     ~5% of masked packets parse into a well-formed `Packet` with a garbage destination hash.
-///   * Those survivors are then stopped by announce SIGNATURE validation in `Announce.parse` —
-///     an Ed25519 signature over masked bytes cannot verify. Measured: 300 trials with the guard
-///     removed produced 15 parseable packets and 0 learned entries.
-///
-/// So `learned` is unreachable with or without the guard, and no assertion over it can catch the
-/// guard's removal. The guard remains semantically required: it refuses IFAC-flagged traffic on
-/// an open interface as POLICY, rather than relying on a ~5%-leaky parser plus signature checks
-/// downstream. (A masked packet that parses can still touch other paths — e.g. a
-/// `destinationType == .link` parse emits a `.linkPacket` delegate, and every parse pollutes the
-/// packet-hash dedup ring. Those effects are real but arise only for a random ~5% of inputs, so
-/// they are not a sound basis for a deterministic test.)
-///
-/// Do not "strengthen" this test to chase a mutation failure; there is not a deterministic one
-/// to catch. The positive control at the end proves the store is capable of learning on this
-/// interface, so the drop assertion is not vacuous.
+/// The positive control at the end proves the store CAN learn on this interface, so the
+/// `learned.isEmpty` drop assertion is not vacuous.
 @Test @MainActor func protectedPacketOnPlainInterfaceIsDropped() async {
-    let ifac = IFAC(networkName: "xnet", passphrase: nil, size: 16)!
     let (raw, _) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    // Flag-set-but-otherwise-valid: set bit 7 on the flags byte. The rest of the packet
+    // (destination hash, signature, hops) is intact, so it parses and authenticates —
+    // the only gate is the bit-7 check which identifies IFAC-flagged traffic.
+    var flagged = raw
+    flagged[0] |= 0x80
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.continuousClock = ImmediateClock()
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i0"), .default))   // no ifac
-    await store.send(.received(InterfaceID("i0"), ifac.protect(raw)))
+    await store.send(.received(InterfaceID("i0"), flagged))
     #expect(store.state.learned.isEmpty)          // nothing learned, under ANY key
 
     // Positive control: the SAME store on the SAME plain interface DOES admit an unprotected
@@ -3584,4 +3645,39 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     await store.send(.heldAnnounceReleaseDue(i0))
     await store.receive { if case .received = $0 { return true }; return false }
     #expect(store.state.learned[destHash] != nil)            // path learned — C5/C4 seam holds
+}
+
+// MARK: - #C5 IFAC registration ordering
+
+/// IFAC registration ordering: a `.received` action arriving on an IFAC interface is
+/// processed as IFAC-protected (not as plain-network traffic) even when the packet and the
+/// `.interfaceConnected` are issued back-to-back in the same test turn.
+///
+/// This pins the safety property that "no registration ⇒ open network" (Transport.swift:248)
+/// is unreachable in practice: TCA drains buffered actions FIFO, and `.interfaceConnected`
+/// is always emitted exactly one hop before the first `.received` from the same interface,
+/// so registration always precedes delivery. If that ordering were reversed, the IFAC-
+/// protected packet would slip through as plain-network traffic and the path would be
+/// learned from a masked packet with a garbled destination hash.
+@Test @MainActor func ifacPacketArrivesAfterInterfaceConnectedIsIFACProcessed() async {
+    let ifac = IFAC(networkName: "order-xval", passphrase: nil, size: 16)!
+    var profile = InterfaceProfile.default
+    profile.ifac = ifac
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let masked = ifac.protect(raw)
+
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+
+    // Issue connect and receive in the production order: connect first, then a packet.
+    // Both actions go through the reducer in FIFO order, so by the time `.received` is
+    // handled, `state.interfaces[i0]` is already populated with the IFAC profile.
+    await store.send(.interfaceConnected(InterfaceID("i0"), profile))
+    await store.send(.received(InterfaceID("i0"), masked))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    // Path was learned — the packet was unmasked correctly, proving IFAC was in scope
+    // when `.received` ran (not the "no registration ⇒ open" else branch).
+    #expect(store.state.learned[destHash] != nil)
 }

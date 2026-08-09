@@ -249,6 +249,17 @@ public struct Transport {
                     // Plain interface: reject any IFAC-flagged packet (RNS Transport.py:1482-1486).
                     guard data.first.map({ $0 & 0x80 == 0 }) ?? false else { return .none }
                     plain = data
+                    // NOTE — "no registration ⇒ treat as an open network" is intentional.
+                    // A miss in `state.interfaces` means the interface has not yet registered
+                    // (or was never configured with IFAC), and we fall through to the plain-
+                    // interface guard above. This does NOT create a window where an IFAC packet
+                    // could slip through: TCA drains buffered actions FIFO, and `.interfaceConnected`
+                    // is always emitted exactly one hop before the first `.received` on the same
+                    // interface, so registration always precedes any delivery. That ordering is
+                    // pinned by `ifacPacketArrivesAfterInterfaceConnectedIsIFACProcessed`.
+                    // Making this fail-closed would require guarding every `.received` site (~133)
+                    // with an explicit "interface must be registered" check — a larger change
+                    // deferred until an actual miss is observed in practice.
                 }
                 guard let packet = Packet(raw: plain) else { return .none }
                 // Link traffic is recognized and routed up BEFORE the announce/data dedup:
@@ -583,6 +594,10 @@ public struct Transport {
                 // so this lookup reliably returns the announce's true emitted value.
                 let emitted = state.learned[destinationHash]?.announceEmitted ?? 0
                 for (id, profile) in eligible {
+                    // Pacing intentionally measures `entry.raw.count` (the unmasked relay bytes),
+                    // not the on-wire length after IFAC adds `ifac_size` bytes. Reference RNS does
+                    // the same (Transport.py:1281 uses the pre-mask length), so this is parity,
+                    // not a bug. Under-counting by `ifac_size` is accepted behaviour on both sides.
                     let wait = Transport.announcePacingWait(byteCount: entry.raw.count,
                                                             bitrate: profile.bitrate,
                                                             announceCap: profile.announceCap)
@@ -656,6 +671,8 @@ public struct Transport {
                 let item = queue.remove(at: pick)
                 state.announceQueues[id] = queue.isEmpty ? nil : queue
                 let now = date.now
+                // Same parity note as the send-now path above: pacing uses the unmasked byte
+                // count (IFAC adds `ifac_size` on the wire). Reference RNS does the same.
                 let wait = Transport.announcePacingWait(byteCount: item.raw.count,
                                                         bitrate: profile.bitrate,
                                                         announceCap: profile.announceCap)

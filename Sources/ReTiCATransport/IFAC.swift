@@ -3,8 +3,8 @@ import ReTiCA
 
 /// Interface Access Code — authenticates and masks packets on a named/passphrase-protected
 /// network segment.  Mirrors the algorithm in RNS `Reticulum.py:958-973` (key derivation)
-/// and `Transport.py:1069-1104` / `1440-1476` (protect / unprotect). Line numbers are for
-/// the pinned cross-validation reference, RNS 1.4.2.
+/// and `Transport.py:1069-1104` / `1440-1476` (protect / unprotect). All line numbers are
+/// for the pinned cross-validation reference, RNS 1.4.2 stock.
 ///
 /// ### Bit-7 asymmetry — do NOT "fix" this
 /// Outbound: byte 0 is masked then OR'd with `0x80` (`(x ^ mask[0]) | 0x80`).
@@ -16,7 +16,7 @@ public struct IFAC: Equatable, Sendable {
 
     // MARK: — Public interface
 
-    /// Reticulum's IFAC key-derivation salt (`Reticulum.py:150`, RNS 1.4.2).
+    /// Reticulum's IFAC key-derivation salt (`Reticulum.py:150`, RNS 1.4.2 stock).
     public static let salt: Data = {
         let bytes: [UInt8] = [
             0xad, 0xf5, 0x4d, 0x88, 0x2c, 0x9a, 0x9b, 0x80,
@@ -30,7 +30,9 @@ public struct IFAC: Equatable, Sendable {
     /// Derive an IFAC from a network name and/or passphrase.
     ///
     /// Returns `nil` when both credentials are absent or empty, or when `size` is outside
-    /// `1...64` (`Reticulum.py:958`).
+    /// `1...64`. Reference RNS 1.4.2 defines `IFAC_MIN_SIZE = 1` but imposes no upper bound
+    /// (`Reticulum.py:958`, RNS 1.4.2 stock); the 64-byte cap is ours, matching the Ed25519
+    /// signature length so the access code never exceeds what a single signature can produce.
     ///
     /// - Parameters:
     ///   - networkName:  The interface's `ifac_netname` (optional).

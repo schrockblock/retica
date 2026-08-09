@@ -16,14 +16,22 @@ import SwiftEdDSA
 /// elsewhere signatures are VERIFIED (deterministic) or relayed verbatim, so hedging is
 /// harmless there.
 ///
+/// `internal` access is intentional: callers in `ReTiCANode` should use CryptoKit's hedged
+/// signer for identity keys (correct for signing) and never reach for this type, which would
+/// silently defeat CryptoKit's fault-injection resistance. `@testable import` gives tests
+/// access without advertising the API surface beyond this module.
+///
 /// Do not replace this with CryptoKit. `DeterministicSignerTests` will fail if you do.
-public enum DeterministicSigner {
+enum DeterministicSigner {
     /// Signs `message` with a 32-byte Ed25519 seed, returning the 64-byte signature.
     /// Traps on a wrong-sized seed: every caller derives the seed via HKDF, so a bad
     /// length is a programmer error rather than a runtime condition.
-    public static func sign(message: Data, seed: Data) -> Data {
+    static func sign(message: Data, seed: Data) -> Data {
         precondition(seed.count == 32, "Ed25519 seed must be 32 bytes, got \(seed.count)")
         let key = try! PrivateKey(s: [UInt8](seed))
-        return Data(try! key.sign(message: [UInt8](message)))
+        // `deterministic: true` is the default, but this is the single most important
+        // property of this backend — IFAC auth fails silently if signatures are randomized.
+        // Pass it explicitly so the intent is readable at the call site.
+        return Data(try! key.sign(message: [UInt8](message), deterministic: true))
     }
 }
