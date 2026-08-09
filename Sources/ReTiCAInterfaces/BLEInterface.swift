@@ -247,8 +247,12 @@ public struct BLEInterface {
                 return .merge(effects)
 
             case let .send(peer, packet):
-                // Lifecycle race: the peer's channel is gone. Nothing to report at this layer —
-                // BLEEndpoint already surfaces undeliverability as sendFailed.
+                // Lifecycle race: the peer's channel is gone. BLEEndpoint covers the case where
+                // ITS OWN peerInterfaces lookup misses (it never even calls .ble(.send)), but
+                // there is a one-action-hop window — N hops wide on adapter loss or .stop for N
+                // peers — where BLEEndpoint's lookup succeeds (peerInterfaces not yet cleared)
+                // and this guard is the one that drops. This is a KNOWN remaining gap: the drop
+                // is silent because there is no peer-level channel to report the failure on.
                 guard let channelID = state.peers[peer] else { return .none }
                 // Programmer error: the packet cannot be framed (empty, or over
                 // BLEFraming.maxFrameLength). Distinct from a departed peer.

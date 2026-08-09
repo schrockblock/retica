@@ -153,9 +153,12 @@ public struct BLEEndpoint {
                     // Not deliverable: the interface is gone. Surface it rather than dropping — a
                     // stale binding otherwise presents as a link that dies on the ~60s inactivity
                     // watchdog with no indication why. `Packet(raw:)` recovers the destination
-                    // hash; for a link packet that value IS the link ID (Transport.swift:283), so
-                    // the failure correlates exactly. An unparseable packet still drops silently
-                    // because there is no destination to report.
+                    // hash; for established link traffic that value IS the link ID
+                    // (Transport.swift:291 derives `linkID: packet.destinationHash`), so the
+                    // failure correlates exactly. (Exception: the initial LINKREQUEST is packed to
+                    // the destination hash, not the link ID — Transport.swift:220, 246.) An
+                    // unparseable packet still drops silently because there is no destination to
+                    // report.
                     guard let destHash = Packet(raw: raw)?.destinationHash else { return .none }
                     return .send(.delegate(.sendFailed(destinationHash: destHash,
                                                        reason: .interfaceUnavailable)))
@@ -221,9 +224,12 @@ public struct BLEEndpoint {
                     // Not deliverable: the interface is gone. Surface it rather than dropping — a
                     // stale binding otherwise presents as a link that dies on the ~60s inactivity
                     // watchdog with no indication why. `Packet(raw:)` recovers the destination
-                    // hash; for a link packet that value IS the link ID (Transport.swift:283), so
-                    // the failure correlates exactly. An unparseable packet still drops silently
-                    // because there is no destination to report.
+                    // hash; for established link traffic that value IS the link ID
+                    // (Transport.swift:291 derives `linkID: packet.destinationHash`), so the
+                    // failure correlates exactly. (Exception: the initial LINKREQUEST is packed to
+                    // the destination hash, not the link ID — Transport.swift:220, 246.) An
+                    // unparseable packet still drops silently because there is no destination to
+                    // report.
                     guard let destHash = Packet(raw: raw)?.destinationHash else { return .none }
                     return .send(.delegate(.sendFailed(destinationHash: destHash,
                                                        reason: .interfaceUnavailable)))

@@ -67,7 +67,7 @@ The existing `BLEEndpointTests.swift` already has helpers that bring a peer onli
 }
 
 /// The same for link-plane traffic. For a link packet the packet's destination hash IS the
-/// link ID (Transport.swift:283 derives `linkID: packet.destinationHash`), so the reported
+/// link ID (Transport.swift:291 derives `linkID: packet.destinationHash`), so the reported
 /// destinationHash correlates the failure to the link exactly.
 @Test @MainActor func linkPlaneTransmitToUnknownInterfaceReportsSendFailed() async {
     // As above but drive `.linkPlane(.delegate(.transmit(unknownID, raw)))`.
@@ -112,7 +112,7 @@ guard let token = state.peerInterfaces[txID] else {
     // Not deliverable: the interface is gone. Surface it rather than dropping — a stale
     // binding otherwise presents as a link that dies on the ~60s inactivity watchdog with
     // no indication why. `Packet(raw:)` recovers the destination hash; for a link packet
-    // that value IS the link ID (Transport.swift:283), so the failure correlates exactly.
+    // that value IS the link ID (Transport.swift:291), so the failure correlates exactly.
     guard let destHash = Packet(raw: raw)?.destinationHash else { return .none }
     return .send(.delegate(.sendFailed(destinationHash: destHash,
                                        reason: .interfaceUnavailable)))

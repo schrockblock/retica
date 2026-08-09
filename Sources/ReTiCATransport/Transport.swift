@@ -137,6 +137,15 @@ public struct Transport {
         /// InterfaceID is derived from the peer's HELLO session token, so a reconnected peer is a
         /// DIFFERENT interface — anything still bound to the old one (notably a LinkSession, which
         /// binds its interfaceID once at creation) lands here. Previously a silent drop.
+        ///
+        /// WARNING — `destinationHash` is semantically overloaded across callers:
+        /// • For a `.send`/link packet it is the unreachable peer's destination hash.
+        /// • For an announce it is OUR OWN destination hash (Transport.swift:773).
+        /// • For a path request it is the fixed `pathRequestDestinationHash` for every
+        ///   request (Transport.swift:790) — not the destination being sought.
+        /// • For relayed traffic it is a third party's destination hash.
+        /// A consumer MUST NOT read it as "delivery to this destination failed" without
+        /// knowing the packet type that produced the failure.
         case interfaceUnavailable
     }
 

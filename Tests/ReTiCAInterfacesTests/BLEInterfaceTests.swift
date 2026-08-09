@@ -370,15 +370,25 @@ func establishPeer(
 // MARK: - Send failure paths
 
 /// A send to a peer with no channel is a lifecycle race and drops quietly.
+/// The bad send is LAST (after teardown) so no subsequent send clears the queue;
+/// with .on exhaustivity teardown catches any stray delegate action that was emitted.
 @Test @MainActor func sendToUnknownPeerDropsQuietly() async {
     let (store, events, calls, _, _) = await makeOnlineStore()
     await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    // Send to tokenLow — a token that has no established channel.
-    let before = calls.value.count
-    await store.send(.send(peer: tokenLow, packet: Data(repeating: 0xAB, count: 10)))
-    // No driver send and no delegate action emitted.
-    #expect(calls.value.count == before)
+
+    // Teardown first — state.peers is now empty after .stop.
     await store.send(.stop) { $0.status = .stopped }
+    // .stop emits .delegate(.peerOffline(tokenHigh)); tolerate it under .off so we
+    // don't have to enumerate all teardown actions, then flip .on for the critical check.
+    await store.receive(.delegate(.peerOffline(tokenHigh)))
+
+    // Send to tokenLow — a token that has no established channel.
+    // This is the last send; .on exhaustivity ensures teardown catches any stray delegate.
+    let before = calls.value.count
+    store.exhaustivity = .on
+    await store.send(.send(peer: tokenLow, packet: Data(repeating: 0xAB, count: 10)))
+    // No driver send (queue count unchanged).
+    #expect(calls.value.count == before)
 }
 
 /// An oversized packet is a programmer error, not a lifecycle race: it must be
