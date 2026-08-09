@@ -18,12 +18,18 @@ private let handle     = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-
 private let channel2   = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000003")!)
 private let handle2    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000004")!)
 
+/// The driver is handed a `BLEChannelID`, not a token, so the stub resolves the channel back to
+/// the peer it belongs to. An unmapped channel yields an empty token — deliberately a value no
+/// assertion can match by accident, so a mis-routed send fails loudly rather than silently
+/// reading as the default peer.
+private let tokenForChannel: [BLEChannelID: Data] = [channel: peerToken, channel2: peerTokenB]
+
 @MainActor
 private func makeNode() -> (TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
                             AsyncStream<BLEDriverEvent>.Continuation,
                             LockIsolated<[(Data, Data)]>) {
     let events = AsyncStream<BLEDriverEvent>.makeStream()
-    let sent = LockIsolated<[(Data, Data)]>([])   // (peerToken, packet)
+    let sent = LockIsolated<[(Data, Data)]>([])   // (peerToken the send actually went to, packet)
     let store = TestStore(initialState: BLEEndpoint.State()) {
         BLEEndpoint()
     } withDependencies: {
@@ -34,7 +40,9 @@ private func makeNode() -> (TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
             readDirectory: { _ in }, openChannel: { _, _ in },
-            send: { _, data in sent.withValue { $0.append((peerToken, data)) } },
+            send: { chan, data in
+                sent.withValue { $0.append((tokenForChannel[chan] ?? Data(), data)) }
+            },
             closeChannel: { _ in }, stop: { }
         )
     }
@@ -259,6 +267,10 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
         if case .ble(.send(peer: let peer, packet: _)) = action { return peer == peerTokenB }
         return false
     }
+    // And the packet reached the DRIVER on tokenB's channel, not tokenA's — the action assertion
+    // above proves the endpoint addressed tokenB; this proves BLEInterface resolved that token to
+    // channel2 and actually transmitted there.
+    #expect(sent.value.last?.0 == peerTokenB)
 
     await teardown(store)
 }
