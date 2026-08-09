@@ -38,11 +38,17 @@ It updates that element's `interfaceID` when the arrival differs, then forwards 
 - **Re-home from `peerOnline`.** `BLEEndpoint` cannot know the new token corresponds to the same device as the old one — the tokens are unrelated randoms and the HELLO carries no stable identity. Would require identity correlation we do not have.
 - **Fall back to "any live peer" on an outbound miss.** Wrong under multi-peer: a link's traffic would go to an arbitrary peer. Also unauthenticated.
 
-## Why this is safe
+## Why this is safe (and where it is not)
 
-- **The move is authenticated.** Re-homing follows only a packet that decrypted and validated under that link's keys. An attacker cannot redirect a link by injecting traffic on another interface without already holding the link keys.
+- **Re-homing follows link addressing, not link authentication.** The gate here is cleartext addressing only: `destinationType == .link` and `destinationHash == linkID`. Decryption and validation happen downstream in `LinkSession.received`, which may still reject the packet — by which time the interface has already moved. Consequently:
+  - **No replay protection.** Link traffic deliberately bypasses `seenPacketHashes` (`Transport.swift:283-285`), so a captured link packet re-injected from another interface re-homes the link. In a multi-peer mesh a duplicate arriving over a second peer does the same non-adversarially.
+  - **RNS divergence.** RNS gates delivery on interface match (`RNS/Transport.py:2166-2187`) and handles endpoint re-appearance via a stable `tunnel_id` exchanged in the interface handshake — the stable identity the rejected-alternatives section notes we lack.
+  - **Keepalive wrinkle blocks the obvious fix.** Keepalives are plaintext `0xFF`/`0xFE` byte compares (`LinkSession.swift:309-310, 534`), so on an idle link the only inbound packet available to re-home from is one that does not authenticate. Gating re-homing on successful decryption would therefore break the idle-link recovery case — this is a real design decision, not a one-liner, and is deferred.
 - **TCP is provably inert.** `TCPEndpoint` uses one fixed `InterfaceID` (`TCPEndpoint.swift:22`), so the arrival always equals the stored value and the assignment is a no-op. This is asserted, not assumed.
-- **Recovery beats the watchdog with margin.** Keepalives run every 30 s against a ~60 s stale timer, so the first inbound packet after reconnect re-homes the link well inside the window.
+- **Recovery window is narrower than originally stated, and recovery is one-sided.**
+  - `staleTime = keepaliveInterval * 2` (`LinkSession.swift:62`) is reset only by **inbound** traffic, and the timer runs through the outage untouched. The real budget is `60 s − (elapsed since last inbound at disconnect)` — anywhere from 60 s down to ~0, not a fixed 60 s margin.
+  - Keepalives are **initiator-only**: `guard state.status == .active, state.role == .initiator` (`LinkSession.swift:533`). A responder speaks only in reply.
+  - Recovery is therefore structurally one-sided. The side whose session token changed (call it X) can still transmit; the other side can only re-home when X sends. If X is the **initiator**, its 30 s keepalive re-homes the peer (the case the E2E test covers). If X is the **responder**, it never sends unprompted — the initiator's keepalives go to the dead interface, neither side receives, and both die at the watchdog. Responder-side reconnect does not self-heal without app traffic. This is the honest scope of what this slice delivers.
 
 ## Known boundary (deliberate, not a gap)
 
@@ -72,3 +78,4 @@ Out:
 - `FCBDriverAdapter`'s `try?` swallowing L2CAP write errors (needs a new `BLEDriverEvent`; mechanism layer).
 - The `BLEInterface` no-channel window recorded in the previous slice: `state.peers` clears synchronously while `peerOffline` propagates as an effect, so there is a one-action-hop window (N hops on adapter loss / `.stop`) where both layers drop silently. Re-homing does not address it; it remains a recorded residue.
 - Notifying a link so it can close or retry early. Re-homing is expected to make this largely moot; revisit only with evidence.
+- **Staleness of `learned[dest].interfaceID` (sibling defect, not fixed here).** `Transport` captures the arrival interface from the announce (`Transport.swift:414`) and replaces it only when a strictly-newer announce arrives (`shouldReplace`). It is never purged by `interfaceDisconnected`. After a peer restarts, until its next announce, opportunistic sends go to a dead interface and a new link cannot be opened at all — the LINKREQUEST is dropped, `establishmentDeadline` fires, and `linkFailed` is surfaced. This is distinct from the link re-homing fix (which operates on already-established links) and is deferred.

@@ -96,10 +96,35 @@ public struct LinkPlane {
                 // Re-home: a BLE InterfaceID is derived from the peer's HELLO session token, so a
                 // reconnected peer is a DIFFERENT interface and the binding taken at link creation is
                 // stale — outbound would go to a dead interface until the ~60s watchdog closed the link.
-                // Safe because this packet already decrypted and validated under THIS link's keys, so the
-                // arrival is authenticated. Inert on TCP, whose single fixed InterfaceID always matches.
-                if state.links[id: element.id]?.interfaceID != arrivalInterface {
+                //
+                // Re-homing follows link ADDRESSING, not link authentication. The gate here is
+                // cleartext addressing only (destinationType == .link, destinationHash == linkID).
+                // Decryption and validation happen downstream in LinkSession.received, which may still
+                // reject the packet — by which time the interface has already moved. Consequently:
+                //
+                // - No replay protection: link traffic bypasses seenPacketHashes (Transport.swift:283-285)
+                //   so a captured link packet re-injected from another interface re-homes the link.
+                //   In a multi-peer mesh a duplicate arriving over a second peer does the same
+                //   non-adversarially.
+                // - RNS divergence: RNS gates delivery on interface match (RNS/Transport.py:2166-2187)
+                //   and uses a stable tunnel_id exchanged in the interface handshake for endpoint
+                //   re-appearance. We lack that stable identity.
+                // - Keepalive wrinkle: keepalives are plaintext 0xFF/0xFE byte compares
+                //   (LinkSession.swift:309-310, 534), so on an idle link the only inbound packet
+                //   available to re-home from does NOT authenticate. Gating re-homing on successful
+                //   decryption is therefore a real design decision, not a one-liner — deferred.
+                //
+                // Inert on TCP, whose single fixed InterfaceID always matches.
+                if element.interfaceID != arrivalInterface {
                     state.links[id: element.id]?.interfaceID = arrivalInterface
+                    // Re-home all in-flight resource transfers. ResourceTransfer.State.interfaceID is
+                    // a snapshot taken at creation; every transfer transmit uses that stored copy
+                    // (ResourceTransfer.swift:20, forwarded verbatim at LinkSession.swift:597-598).
+                    // Without this loop, any transfer already running when the peer reconnects keeps
+                    // firing parts, hashmap updates, proofs, and cancels at the dead interface.
+                    for tid in state.links[id: element.id]?.transfers.ids ?? [] {
+                        state.links[id: element.id]?.transfers[id: tid]?.interfaceID = arrivalInterface
+                    }
                 }
                 return .send(.link(.element(id: element.id, action: .received(data))))
 

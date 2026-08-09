@@ -236,6 +236,57 @@ private let ifA = InterfaceID("iface-a")
     #expect(store.state.links[id: sessionB.id]?.interfaceID == ifB)
 }
 
+/// Re-homing must extend to in-flight resource transfers: ResourceTransfer.State.interfaceID is
+/// a snapshot taken at creation, and every transfer transmit uses that stored copy verbatim.
+/// Without the transfer loop, parts/hashmap-updates/proofs/cancels would keep going to the
+/// dead interface after the session itself moved.
+///
+/// Mutation guard: deleting the transfer loop in LinkPlane while keeping the session line causes
+/// this test to FAIL on the transfer assertion, proving the test actually exercises the fix.
+@Test @MainActor func linkPacketFromANewInterfaceReHomesSessionAndItsTransfers() async {
+    let ifOld = InterfaceID("old-xfer")
+    let ifNew = InterfaceID("new-xfer")
+    let linkID = Data(repeating: 0xEE, count: 16)
+    let dest = Data(repeating: 0x05, count: 16)
+    let xferID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
+    var session = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-000000000011")!,
+                                    initiatorTo: Identity(), destinationHash: dest,
+                                    interfaceID: ifOld)
+    session.linkID = linkID
+    // Seed one in-flight sender transfer on the old interface.
+    let transfer = ResourceTransfer.State(
+        sending: Data(repeating: 0xAB, count: 64),
+        linkID: linkID,
+        sessionKey: Data(repeating: 0x00, count: 32),
+        interfaceID: ifOld,
+        prefix: Data(repeating: 0x00, count: 16),
+        randomHash: Data(repeating: 0x01, count: 32),
+        sdu: 464,
+        id: xferID
+    )
+    session.transfers.append(transfer)
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [session])
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    let payload = Data([0x01, 0x02])
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: ifNew, data: payload)) {
+        $0.links[id: session.id]?.interfaceID = ifNew
+        $0.links[id: session.id]?.transfers[id: xferID]?.interfaceID = ifNew
+    }
+    await store.receive { action in
+        if case let .link(.element(_, .received(d))) = action { return d == payload }
+        return false
+    }
+    // Confirm both bindings moved — session and transfer.
+    #expect(store.state.links[id: session.id]?.interfaceID == ifNew)
+    #expect(store.state.links[id: session.id]?.transfers[id: xferID]?.interfaceID == ifNew)
+}
+
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {
     let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
         $0.uuid = .incrementing
