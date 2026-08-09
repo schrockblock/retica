@@ -105,3 +105,32 @@ import Foundation
     #expect(wire.count == raw.count + 8)
     #expect(ifac.unprotect(wire) == raw)
 }
+
+/// Inbound bytes routinely arrive as a `dropFirst`-style deframer slice, whose indices do
+/// NOT rebase to 0. Both entry points must normalise, or indexing traps at runtime — which
+/// on the network-facing decoder would be a remote abort. Same convention as
+/// `Packet.init(raw:)` (Sources/ReTiCA/Packet/Packet.swift:70).
+@Test func sliceInputsAreRebasedRatherThanTrapping() {
+    let ifac = IFAC(networkName: "testnet", passphrase: nil, size: 16)!
+    let raw = Data([0x00, 0x00] + Array(repeating: UInt8(0x6B), count: 32))
+
+    // protect() over a non-zero-based input slice.
+    let rawSlice = Data([0xFF, 0xFF] + raw).dropFirst(2)
+    #expect(rawSlice.startIndex == 2)          // precondition: genuinely not rebased
+    let wireFromSlice = ifac.protect(rawSlice)
+    #expect(wireFromSlice == ifac.protect(raw))
+
+    // unprotect() over a non-zero-based wire slice.
+    let wire = ifac.protect(raw)
+    let wireSlice = Data([0xFF, 0xFF] + wire).dropFirst(2)
+    #expect(wireSlice.startIndex == 2)         // precondition: genuinely not rebased
+    #expect(ifac.unprotect(wireSlice) == raw)
+}
+
+/// A too-short packet is a programmer error, not a runtime condition — `protect` requires
+/// the two-byte RNS header. Pinned so the guard is not silently dropped.
+@Test func protectRequiresATwoByteHeader() {
+    let ifac = IFAC(networkName: "testnet", passphrase: nil, size: 16)!
+    // A 2-byte packet is the minimum and must not trap.
+    #expect(ifac.protect(Data([0x00, 0x00])).count == 2 + 16)
+}

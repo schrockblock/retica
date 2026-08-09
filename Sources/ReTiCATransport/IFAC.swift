@@ -3,7 +3,8 @@ import ReTiCA
 
 /// Interface Access Code — authenticates and masks packets on a named/passphrase-protected
 /// network segment.  Mirrors the algorithm in RNS `Reticulum.py:958-973` (key derivation)
-/// and `Transport.py:1068-1102` / `1440-1474` (protect / unprotect).
+/// and `Transport.py:1069-1104` / `1440-1476` (protect / unprotect). Line numbers are for
+/// the pinned cross-validation reference, RNS 1.4.2.
 ///
 /// ### Bit-7 asymmetry — do NOT "fix" this
 /// Outbound: byte 0 is masked then OR'd with `0x80` (`(x ^ mask[0]) | 0x80`).
@@ -15,7 +16,7 @@ public struct IFAC: Equatable, Sendable {
 
     // MARK: — Public interface
 
-    /// Reticulum's IFAC key-derivation salt (`Reticulum.py:150`).
+    /// Reticulum's IFAC key-derivation salt (`Reticulum.py:150`, RNS 1.4.2).
     public static let salt: Data = {
         let bytes: [UInt8] = [
             0xad, 0xf5, 0x4d, 0x88, 0x2c, 0x9a, 0x9b, 0x80,
@@ -34,7 +35,10 @@ public struct IFAC: Equatable, Sendable {
     /// - Parameters:
     ///   - networkName:  The interface's `ifac_netname` (optional).
     ///   - passphrase:   The interface's `ifac_netkey`  (optional).
-    ///   - size:         Number of bytes of the access code to carry on the wire (default 16).
+    ///   - size:         Number of bytes of the access code to carry on the wire. There is no
+    ///                   universal default: RNS sets `DEFAULT_IFAC_SIZE` PER INTERFACE TYPE —
+    ///                   16 for TCP/UDP/Auto/BLE but 8 for KISS/Serial/RNode/AX25. Callers must
+    ///                   pass the value for the interface in hand rather than assuming 16.
     public init?(networkName: String?, passphrase: String?, size: Int) {
         guard (1...64).contains(size) else { return nil }
 
@@ -52,19 +56,27 @@ public struct IFAC: Equatable, Sendable {
         // RNS private key layout: X25519(32) ‖ Ed25519(32) — so suffix(32) is the Ed25519 seed.
         let originHash = Crypto.fullHash(origin)
         let key = Crypto.hkdf(length: 64, derivedFrom: originHash, salt: Self.salt, context: nil)
-        let signingSeed = key.suffix(32)   // ← the LAST 32 bytes; prefix(32) would be wrong
+        // The LAST 32 bytes; prefix(32) would be wrong. Rebased via Data(...) because
+        // `suffix` returns a non-zero-based slice, and storing a slice in a long-lived
+        // struct is an index trap waiting for a future caller.
+        let signingSeed = Data(key.suffix(32))
 
         self.key  = key
-        self.seed = Data(signingSeed)
+        self.seed = signingSeed
         self.size = size
     }
 
-    // MARK: — protect  (Transport.py:1068-1102)
+    // MARK: — protect  (Transport.py:1069-1104)
 
     /// Authenticate and mask `raw`, returning the wire bytes (length = `raw.count + size`).
     ///
     /// - Precondition: `raw` must begin with the two-byte RNS header (bytes 0 and 1).
-    public func protect(_ raw: Data) -> Data {
+    public func protect(_ rawInput: Data) -> Data {
+        let raw = Data(rawInput) // normalize to 0-based indices
+        // A packet shorter than the RNS header is a programmer error, not a runtime
+        // condition — surface it with a message rather than an opaque index trap.
+        precondition(raw.count >= 2, "IFAC.protect requires the 2-byte RNS header, got \(raw.count)")
+
         // Sign the original packet — access code = last `size` bytes of the 64-byte signature.
         let ifac = Data(DeterministicSigner.sign(message: raw, seed: seed).suffix(size))
 
@@ -93,17 +105,23 @@ public struct IFAC: Equatable, Sendable {
         return masked
     }
 
-    // MARK: — unprotect  (Transport.py:1440-1474)
+    // MARK: — unprotect  (Transport.py:1440-1476)
 
     /// Authenticate and unmask `wire`, returning the original raw bytes on success, or `nil`
     /// if the packet is too short, the IFAC flag is missing, or the code doesn't match.
     ///
     /// Returns `nil` on every rejection path; Transport drops silently.
-    public func unprotect(_ wire: Data) -> Data? {
-        // Guard: flag must be set (Transport.py:1444).
-        guard wire[safe: 0].map({ $0 & 0x80 == 0x80 }) == true else { return nil }
-        // Guard: must be long enough to hold the code (Transport.py:1445).
+    public func unprotect(_ wireInput: Data) -> Data? {
+        // Normalize to 0-based indices. Inbound bytes routinely arrive as a `dropFirst`-style
+        // deframer slice, whose indices do NOT rebase — indexing one directly traps, which on
+        // the network-facing decoder would be a remote abort. Same convention as
+        // `Packet.init(raw:)` (Sources/ReTiCA/Packet/Packet.swift:70).
+        let wire = Data(wireInput)
+
+        // Guard: must be long enough to hold a header plus the code (Transport.py:1441, 1445).
         guard wire.count > 2 + size else { return nil }
+        // Guard: flag must be set (Transport.py:1444).
+        guard wire[0] & 0x80 == 0x80 else { return nil }
 
         // Extract the unmasked IFAC from bytes 2..<2+size (Transport.py:1447).
         let ifac = wire.subdata(in: 2..<(2 + size))
@@ -162,11 +180,4 @@ public struct IFAC: Equatable, Sendable {
 private func constantTimeEqual(_ a: Data, _ b: Data) -> Bool {
     guard a.count == b.count else { return false }
     return zip(a, b).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
-}
-
-private extension Data {
-    subscript(safe index: Int) -> UInt8? {
-        guard index >= 0, index < count else { return nil }
-        return self[index]
-    }
 }
