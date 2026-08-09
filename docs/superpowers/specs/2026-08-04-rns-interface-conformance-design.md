@@ -328,8 +328,9 @@ interval 5 s). Additive and defensive; matters most on BLE fan-out.
 
 ## C5 — IFAC (scoped)
 
-**STATUS: BLOCKED (2026-08-08) — not implementable on CryptoKit. Do not start
-this slice without first resolving the crypto dependency below.**
+**STATUS: UNBLOCKED (2026-08-08) — resolved by a pinned deterministic-Ed25519
+dependency. See "Resolution" below. The blocker analysis is retained because
+it explains why the dependency exists and must not be swapped for CryptoKit.**
 
 Truncated Ed25519 signature plus HKDF payload masking behind header flag
 `0x80` (`Transport.py:1068-1104` outbound, `:1442-1486` inbound). Wire-level:
@@ -376,8 +377,77 @@ Apple platforms — it shims to CryptoKit. Hand-rolling curve arithmetic is
 explicitly out of scope: an error there is a silent security failure rather
 than a failing test.
 
-Until then C5 stays closed, and ReTiCA cannot join an IFAC-protected network
-on any transport. Everything C1–C4 delivered is unaffected.
+### Resolution (2026-08-08)
+
+**Dependency:** `leif-ibsen/SwiftEdDSA`, pinned `.exact("4.1.0")`. Pure Swift,
+MIT, RFC 8032, `sign(message:context:deterministic:)` with `deterministic`
+defaulting to `true`. Used **only** for IFAC's derived keypair — every other
+signing path in the stack stays on CryptoKit and is untouched.
+
+Verified empirically before adoption (2026-08-08):
+
+| check | result |
+|---|---|
+| RFC 8032 §7.1 TEST 1 — public key and full 64-byte signature | exact match |
+| RFC 8032 §7.1 TEST 2 — public key and full 64-byte signature | exact match |
+| same seed + message signed twice (default) | identical bytes |
+| `deterministic: false` | differing bytes, as documented |
+| CryptoKit public key from the same 32-byte seed | agrees |
+| CryptoKit `isValidSignature` on a SwiftEdDSA signature | verifies |
+
+The last two matter most: they prove the new backend is interoperable with the
+CryptoKit-based identity layer rather than a parallel universe.
+
+**Prior art.** `vk3xxx/Lower-Sideband` (Swift) ships a complete, correct IFAC
+built the same way — a deterministic Ed25519 (`AndrewBarba/ed25519`, wrapping
+orlp/ed25519 in C) used solely for IFAC while the rest of the stack uses
+CryptoKit. Its `protect`/`unprotect` were read and match the Python line for
+line, including the `signingSeed = derived.suffix(32)` detail (RNS's 64-byte
+private key is `X25519(32) ‖ Ed25519(32)`, so the signing seed is the *last*
+32 bytes). It is a second independent implementation to cross-check against.
+Of eight Swift Reticulum projects surveyed, it is the only one implementing
+IFAC; the rest use CryptoKit and omit the feature.
+
+**Supply-chain precautions (required, not optional):**
+1. `.exact("4.1.0")` — never a range. A version requirement propagates to
+   consumers; a lockfile does not.
+2. `Package.resolved` must be **committed** (it is currently gitignored). It
+   records the resolved commit SHA per dependency — `142009cf…` for
+   SwiftEdDSA — so a force-moved upstream tag cannot silently swap code. Note
+   the limits: SPM honours only the *root* package's lockfile, so this pins
+   ReTiCA's own builds and tests, not a consuming app's resolution. SPM's true
+   checksum pinning (`checksum:`) exists only for `binaryTarget`, which this
+   is not.
+3. SwiftEdDSA's own transitive dependencies (ASN1, BigInt, Digest — same
+   author) are declared with `from:`, so their *resolved versions* can drift
+   upward within semver even with our dep pinned exactly. `Package.resolved`
+   pins their revisions for our builds; the guard tests below are the real
+   backstop.
+4. **Guard tests on the bare library** (Task 1) assert the RFC 8032 vectors,
+   determinism, and CryptoKit cross-verification. If the dependency is ever
+   substituted, updated, or silently changes nonce derivation, these fail
+   loudly rather than producing packets no RNS node will accept.
+
+### IFAC placement in ReTiCA — load-bearing
+
+**Inbound unmasking happens at the top of Transport's `.received` handler, not
+in an Endpoint.** C4 holds burst-limited announces by storing the *verbatim*
+`.received` action payload and replaying it through `.send(.received(id, raw))`.
+If IFAC were removed upstream in an Endpoint, held announces would be stored
+de-masked and, on replay, fail the "IFAC flag absent on an IFAC interface →
+drop" check and vanish silently. Storing the still-masked bytes and unmasking
+again on replay is self-consistent. (Reference RNS has this exact bug:
+`process_held_announces` re-injects post-IFAC `raw`.)
+
+**Outbound masking happens in the Endpoints**, where `.delegate(.transmit)`
+from both Transport and LinkPlane is consumed and the `InterfaceProfile` is in
+scope. That is fewer call sites than masking at each of Transport's emission
+points, and outbound has no replay constraint. The asymmetry is deliberate and
+must be commented as such.
+
+IFAC configuration lives on `InterfaceProfile` (C1), consistent with the
+roadmap's "mode is configuration" steer: an app opts an interface into a
+private network without forking an interface reducer.
 
 ## Testing strategy
 
