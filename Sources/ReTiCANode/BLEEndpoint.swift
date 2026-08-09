@@ -149,7 +149,17 @@ public struct BLEEndpoint {
                 // is in scope at the Endpoint — fewer sites than masking at every Transport
                 // emission point — and outbound has no C4 replay constraint (inbound unmasks in
                 // Transport so that C4's hold stores the original masked bytes for replay safety).
-                guard let token = state.peerInterfaces[txID] else { return .none }
+                guard let token = state.peerInterfaces[txID] else {
+                    // Not deliverable: the interface is gone. Surface it rather than dropping — a
+                    // stale binding otherwise presents as a link that dies on the ~60s inactivity
+                    // watchdog with no indication why. `Packet(raw:)` recovers the destination
+                    // hash; for a link packet that value IS the link ID (Transport.swift:283), so
+                    // the failure correlates exactly. An unparseable packet still drops silently
+                    // because there is no destination to report.
+                    guard let destHash = Packet(raw: raw)?.destinationHash else { return .none }
+                    return .send(.delegate(.sendFailed(destinationHash: destHash,
+                                                       reason: .interfaceUnavailable)))
+                }
                 return .send(.ble(.send(peer: token, packet: state.profile.ifac?.protect(raw) ?? raw)))
 
             case let .transport(.delegate(.received(h, p))):
@@ -207,7 +217,17 @@ public struct BLEEndpoint {
             // --- LinkPlane delegates: route transmit per-peer, forward the rest ---
             case let .linkPlane(.delegate(.transmit(txID, raw))):
                 // C5 IFAC outbound masking (same rationale as transport transmit above).
-                guard let peer = state.peerInterfaces[txID] else { return .none }
+                guard let peer = state.peerInterfaces[txID] else {
+                    // Not deliverable: the interface is gone. Surface it rather than dropping — a
+                    // stale binding otherwise presents as a link that dies on the ~60s inactivity
+                    // watchdog with no indication why. `Packet(raw:)` recovers the destination
+                    // hash; for a link packet that value IS the link ID (Transport.swift:283), so
+                    // the failure correlates exactly. An unparseable packet still drops silently
+                    // because there is no destination to report.
+                    guard let destHash = Packet(raw: raw)?.destinationHash else { return .none }
+                    return .send(.delegate(.sendFailed(destinationHash: destHash,
+                                                       reason: .interfaceUnavailable)))
+                }
                 return .send(.ble(.send(peer: peer, packet: state.profile.ifac?.protect(raw) ?? raw)))
 
             case let .linkPlane(.delegate(.linkEstablished(linkID, destHash))):

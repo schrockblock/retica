@@ -130,7 +130,15 @@ public struct Transport {
         }
     }
 
-    public enum SendFailure: Equatable, Sendable { case notLearned, tooLarge }
+    public enum SendFailure: Equatable, Sendable {
+        case notLearned
+        case tooLarge
+        /// The packet was addressed to an interface that is not currently connected. On BLE an
+        /// InterfaceID is derived from the peer's HELLO session token, so a reconnected peer is a
+        /// DIFFERENT interface — anything still bound to the old one (notably a LinkSession, which
+        /// binds its interfaceID once at creation) lands here. Previously a silent drop.
+        case interfaceUnavailable
+    }
 
     public enum Action: Equatable {
         case interfaceConnected(InterfaceID, InterfaceProfile)
