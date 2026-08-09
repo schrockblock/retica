@@ -3417,3 +3417,119 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     store.exhaustivity = .on
     await store.skipInFlightEffects()
 }
+
+// MARK: - #C5 IFAC inbound gate
+
+/// An IFAC-protected packet arriving on a matching interface is unmasked and processed
+/// normally (the path is learned from the recovered announce).
+@Test @MainActor func ifacProtectedAnnounceIsUnmaskedAndProcessed() async {
+    let ifac = IFAC(networkName: "xnet", passphrase: nil, size: 16)!
+    var profile = InterfaceProfile.default
+    profile.ifac = ifac
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0"), profile))
+    await store.send(.received(InterfaceID("i0"), ifac.protect(raw)))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.learned[destHash] != nil)
+}
+
+/// A packet from a DIFFERENT network is dropped — no path learned, nothing emitted.
+@Test @MainActor func packetFromAnotherIFACNetworkIsDropped() async {
+    let ours = IFAC(networkName: "ours", passphrase: nil, size: 16)!
+    let theirs = IFAC(networkName: "theirs", passphrase: nil, size: 16)!
+    var profile = InterfaceProfile.default
+    profile.ifac = ours
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0"), profile))
+    await store.send(.received(InterfaceID("i0"), theirs.protect(raw)))
+    #expect(store.state.learned[destHash] == nil)
+}
+
+/// An UNPROTECTED packet on an IFAC interface is dropped (RNS Transport.py:1478-1480).
+@Test @MainActor func plainPacketOnIFACInterfaceIsDropped() async {
+    let ifac = IFAC(networkName: "xnet", passphrase: nil, size: 16)!
+    var profile = InterfaceProfile.default
+    profile.ifac = ifac
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0"), profile))
+    await store.send(.received(InterfaceID("i0"), raw))
+    #expect(store.state.learned[destHash] == nil)
+}
+
+/// A PROTECTED packet on a NON-IFAC interface is dropped (RNS Transport.py:1482-1486).
+@Test @MainActor func protectedPacketOnPlainInterfaceIsDropped() async {
+    let ifac = IFAC(networkName: "xnet", passphrase: nil, size: 16)!
+    let (raw, destHash) = makeAnnouncePacket(hops: 2, emitted: 1000)
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0"), .default))   // no ifac
+    await store.send(.received(InterfaceID("i0"), ifac.protect(raw)))
+    #expect(store.state.learned[destHash] == nil)
+}
+
+// MARK: - #C5 C4 interaction regression
+
+/// C4/C5 interaction regression: on an IFAC interface with an active ingress burst, a held
+/// announce is stored MASKED (the verbatim `.received` payload) and, on release, re-enters
+/// `.received` still masked so that it unmasks correctly a second time.
+///
+/// This is the specific failure that would result if IFAC unmasking lived upstream in an
+/// Endpoint: the Endpoint would store de-masked bytes; on replay the IFAC flag check (bit-7
+/// absent → drop) would silently discard the released announce. Reference RNS has exactly
+/// this bug in process_held_announces. We are deliberately better.
+@Test @MainActor func heldAnnounceOnIFACInterfaceIsReleasedAndAdmitted() async {
+    let ifac = IFAC(networkName: "xnet", passphrase: nil, size: 16)!
+    var profile = InterfaceProfile.default
+    profile.ifac = ifac
+
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    var initial = Transport.State()
+    let i0 = InterfaceID("i0")
+    initial.interfaces[i0] = profile
+    initial.interfaceConnectedAt[i0] = Date(timeIntervalSince1970: 0)
+    // Pre-arm an active burst that is past its penalty (heldRelease in the past, so the
+    // first release attempt can proceed past the penalty gate).
+    initial.ingressBursts[i0] = Transport.IngressBurst(
+        active: true, activatedAt: Date(timeIntervalSince1970: 900),
+        heldRelease: Date(timeIntervalSince1970: 1000))
+    // Seed one arrival so burst deactivation can evaluate the rate (needs > icDequeMinSample).
+    initial.announceArrivals[i0] = [Date(timeIntervalSince1970: 998)]
+
+    let (raw, destHash) = makeAnnouncePacket(hops: 1, emitted: 1000)
+    // Store the MASKED bytes — this is what C4's hold always stores (verbatim .received payload).
+    initial.heldAnnounces[i0] = [destHash: .init(raw: ifac.protect(raw), hops: 1)]
+
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+
+    // First release: burst is still active so it is held again (deactivates burst).
+    now.setValue(Date(timeIntervalSince1970: 1001))
+    await store.send(.heldAnnounceReleaseDue(i0))
+    await store.receive { if case .received = $0 { return true }; return false }
+    #expect(store.state.learned[destHash] == nil)            // bounced, burst deactivated
+    #expect(store.state.ingressBursts[i0]?.active == false)
+
+    // Second release: burst inactive, announce is admitted and path is learned.
+    now.setValue(Date(timeIntervalSince1970: 1007))
+    await store.send(.heldAnnounceReleaseDue(i0))
+    await store.receive { if case .received = $0 { return true }; return false }
+    #expect(store.state.learned[destHash] != nil)            // path learned — C5/C4 seam holds
+}

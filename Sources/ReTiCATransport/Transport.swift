@@ -230,7 +230,27 @@ public struct Transport {
                 return .none
 
             case let .received(interfaceID, data):
-                guard let packet = Packet(raw: data) else { return .none }
+                // C5 IFAC (RNS Transport.py:1442-1486). MUST happen here, not in an Endpoint: C4
+                // holds burst-limited announces by storing the VERBATIM `.received` payload and
+                // replaying it through `.send(.received(id, raw))`. Unmasking upstream in an
+                // Endpoint would store de-masked bytes that fail the flag check on replay and
+                // vanish silently. (Reference RNS has that exact bug in process_held_announces.)
+                // Storing masked bytes and unmasking again on replay is self-consistent.
+                //
+                // Asymmetry with outbound: IFAC masking on the transmit side lives in the
+                // Endpoints (TCPEndpoint/BLEEndpoint), where `state.profile` is already in scope.
+                // Masking there touches fewer sites than masking at each of Transport's emission
+                // points, and outbound has no C4 replay constraint.
+                let plain: Data
+                if let ifac = state.interfaces[interfaceID]?.ifac {
+                    guard let unmasked = ifac.unprotect(data) else { return .none }
+                    plain = unmasked
+                } else {
+                    // Plain interface: reject any IFAC-flagged packet (RNS Transport.py:1482-1486).
+                    guard data.first.map({ $0 & 0x80 == 0 }) ?? false else { return .none }
+                    plain = data
+                }
+                guard let packet = Packet(raw: plain) else { return .none }
                 // Link traffic is recognized and routed up BEFORE the announce/data dedup:
                 // byte-identical keepalives share a packet hash and must not be deduped, and a
                 // retried link request should still reach us.
@@ -249,11 +269,11 @@ public struct Transport {
                         guard let raw = try? fwd.packed() else { return .none }
                         return .send(.delegate(.transmit(outIf, raw)))
                     }
-                    return .send(.delegate(.linkPacket(linkID: packet.destinationHash, data: data)))
+                    return .send(.delegate(.linkPacket(linkID: packet.destinationHash, data: plain)))
                 }
                 if packet.packetType == .linkRequest, state.localDestinations[packet.destinationHash] != nil {
                     return .send(.delegate(.linkRequest(destinationHash: packet.destinationHash,
-                                                        arrivalInterface: interfaceID, data: data)))
+                                                        arrivalInterface: interfaceID, data: plain)))
                 }
                 // Announces are deduped by per-destination random-blob (in the `.announce` case
                 // below), NOT by packetHash: keying on the unforgeable-per-announce random_hash

@@ -26,9 +26,14 @@ public struct InterfaceProfile: Equatable, Sendable {
     /// Fraction of bandwidth for relayed announces — 0.02 = 2%, NEVER a percent. Reference has
     /// a lazy-init bug storing the raw `2` (Interface.py:322-323); we store the fraction once.
     public var announceCap: Double
+    /// C5: IFAC configuration for this interface. `nil` means the interface is on an open
+    /// network (no access control). When set, inbound packets are unmasked by Transport and
+    /// outbound packets are masked by the Endpoint. `Equatable` still holds because `IFAC`
+    /// is `Equatable`.
+    public var ifac: IFAC? = nil
 
     public init(name: String, bitrate: Int, mode: InterfaceMode = .full,
-                hwMTU: Int? = nil, announceCap: Double = 0.02) {
+                hwMTU: Int? = nil, announceCap: Double = 0.02, ifac: IFAC? = nil) {
         precondition(bitrate > 0, "InterfaceProfile.bitrate must be > 0")
         precondition(announceCap > 0 && announceCap <= 1,
                      "announceCap is a fraction in (0, 1], e.g. 0.02 — not a percent")
@@ -37,6 +42,7 @@ public struct InterfaceProfile: Equatable, Sendable {
         self.mode = mode
         self.hwMTU = hwMTU
         self.announceCap = announceCap
+        self.ifac = ifac
     }
 
     /// Reference TCPInterface declared values (TCPInterface.py:76, 42).

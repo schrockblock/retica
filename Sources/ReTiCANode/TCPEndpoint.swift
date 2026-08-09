@@ -121,8 +121,12 @@ public struct TCPEndpoint {
                               .send(.transport(.stopMaintenance)))
 
             case let .transport(.delegate(.transmit(txID, raw))):
+                // C5 IFAC outbound masking. Lives here (not in Transport) because `state.profile`
+                // is in scope at the Endpoint — fewer sites than masking at every Transport
+                // emission point — and outbound has no C4 replay constraint (inbound unmasks in
+                // Transport so that C4's hold stores the original masked bytes for replay safety).
                 guard txID == id else { return .none }
-                return .send(.interface(.send(raw)))
+                return .send(.interface(.send(state.profile.ifac?.protect(raw) ?? raw)))
             case let .transport(.delegate(.received(h, p))):
                 return .send(.delegate(.messageReceived(destinationHash: h, plaintext: p)))
             case let .transport(.delegate(.pathLearned(h, hops))):
@@ -158,8 +162,9 @@ public struct TCPEndpoint {
             // --- LinkPlane delegates → interface / TCPEndpoint delegates ---
 
             case let .linkPlane(.delegate(.transmit(txID, raw))):
+                // C5 IFAC outbound masking (same rationale as transport transmit above).
                 guard txID == id else { return .none }
-                return .send(.interface(.send(raw)))
+                return .send(.interface(.send(state.profile.ifac?.protect(raw) ?? raw)))
 
             case let .linkPlane(.delegate(.linkEstablished(linkID, destHash))):
                 return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))

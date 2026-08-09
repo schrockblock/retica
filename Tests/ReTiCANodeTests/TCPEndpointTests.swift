@@ -1698,3 +1698,56 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
 
     await store.send(.disconnect)
 }
+
+// MARK: - #C5 IFAC outbound masking
+
+/// Outbound packets on an IFAC-configured endpoint reach the interface MASKED — the IFAC
+/// flag is set and the bytes are longer by the code size. The unprotected content is also
+/// verifiable via IFAC.unprotect.
+@Test @MainActor func outboundPacketsAreIFACProtected() async {
+    let ifac = IFAC(networkName: "xnet", passphrase: nil, size: 16)!
+    var profile = InterfaceProfile.tcp
+    profile.ifac = ifac
+
+    let events = AsyncStream<TCPEvent>.makeStream()
+    let captured = LockIsolated<Data?>(nil)
+    let store = TestStore(
+        initialState: TCPEndpoint.State(host: "node", port: 4242, reconnectOnDrop: false, profile: profile)
+    ) {
+        TCPEndpoint()
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                         send: { _ in }, close: { })
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
+                           identity: Identity())!
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.connect)
+    events.continuation.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+
+    await store.send(.announce(destinationHash: dest.hash, appData: nil))
+    await store.receive { action in
+        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+
+    let wire = captured.value!
+    // IFAC flag must be set in the masked wire bytes (bit 7 of byte 0).
+    #expect(wire[0] & 0x80 == 0x80)
+    // The wire is longer than a plain announce by the code size.
+    // Verify by round-tripping through unprotect and parsing as a valid announce packet.
+    let unmasked = ifac.unprotect(wire)
+    #expect(unmasked != nil)
+    let packet = unmasked.flatMap { Packet(raw: $0) }
+    #expect(packet?.packetType == .announce)
+    #expect(packet?.destinationHash == dest.hash)
+
+    await store.send(.disconnect)
+    await store.receive(\.interface.disconnect)
+}
