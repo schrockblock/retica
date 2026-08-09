@@ -10,10 +10,13 @@ private func framedHello(_ token: Data) -> Data {
     try! BLEFraming.frame(BLEHello.pack(version: BLEInterface.protocolVersion, token: token))
 }
 
-private let ownToken  = Data(repeating: 0x5A, count: 16)
-private let peerToken = Data(repeating: 0xC7, count: 16)
-private let channel   = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000001")!)
-private let handle    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000002")!)
+private let ownToken   = Data(repeating: 0x5A, count: 16)
+private let peerToken  = Data(repeating: 0xC7, count: 16)
+private let peerTokenB = Data(repeating: 0xD4, count: 16)   // second session token for peer-cycle test
+private let channel    = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000001")!)
+private let handle     = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000002")!)
+private let channel2   = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000003")!)
+private let handle2    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000004")!)
 
 @MainActor
 private func makeNode() -> (TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
@@ -40,13 +43,21 @@ private func makeNode() -> (TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
 }
 
 /// Bring one inbound peer online through the real BLEInterface handshake.
+/// Parameters default to the file-level constants so existing call sites need no changes.
+/// Pass `startFirst: false` when the node is already running (e.g. second peer in a peer-cycle).
 @MainActor
 private func bringPeerOnline(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
-                             _ events: AsyncStream<BLEDriverEvent>.Continuation) async {
-    await store.send(.start)
-    events.yield(.ready)                       // BLEInterface gates channelOpened on .online
-    events.yield(.channelOpened(channel, handle, direction: .inbound))
-    events.yield(.channelData(channel, framedHello(peerToken)))
+                             _ events: AsyncStream<BLEDriverEvent>.Continuation,
+                             token: Data = peerToken,
+                             channelID: BLEChannelID = channel,
+                             peerHandle: BLEPeerHandle = handle,
+                             startFirst: Bool = true) async {
+    if startFirst {
+        await store.send(.start)
+        events.yield(.ready)                   // BLEInterface gates channelOpened on .online
+    }
+    events.yield(.channelOpened(channelID, peerHandle, direction: .inbound))
+    events.yield(.channelData(channelID, framedHello(token)))
     await store.receive { if case .transport(.interfaceConnected) = $0 { return true }; return false }
 }
 
@@ -150,5 +161,104 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     // A transmit addressed to an interface with no live peer must not reach the driver.
     await store.send(.linkPlane(.delegate(.transmit(InterfaceID("ble:deadbeef"), Data([0x01])))))
     #expect(sent.value.count == before)
+    await teardown(store)
+}
+
+/// End-to-end: a link survives its peer reconnecting under a NEW session token.
+///
+/// Before the re-homing fix, this was the half-alive case: inbound kept working (Transport
+/// routes by linkID, which is unchanged) while every outbound transmit hit a dead InterfaceID
+/// because `LinkSession.interfaceID` still pointed to tokenA's now-gone BLE interface. The link
+/// would silently stall until the ~60 s watchdog fired.
+///
+/// ABSENCE ASSERTION — `sendFailed(reason: .interfaceUnavailable)` must NOT fire after
+/// re-homing. The mechanism: `store.send(.sendOverLink)` is the LAST `store.send` in this test.
+/// If re-homing failed, the stale interfaceID lookup in `BLEEndpoint.peerInterfaces` returns
+/// nil → `sendFailed` is dispatched instead of `ble(.send)`. The subsequent `store.receive`
+/// predicate matches ONLY `ble(.send(peer: peerTokenB, _))`, so it will never match a
+/// `sendFailed` action — the test fails with "no matching action received". This cannot be
+/// vacuously wiped: no later `store.send` follows to flush the action queue.
+@Test @MainActor func linkSurvivesPeerReconnectUnderANewToken() async {
+    // We own `initEph` so we can derive the session key after seeing the LRPROOF.
+    let initEph = Identity()
+    let owner   = Identity()
+
+    let (store, events, sent) = makeNode()
+
+    // ── Phase 1: tokenA online; establish a link ────────────────────────────────────────────
+    await bringPeerOnline(store, events)
+
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                           identity: owner)!
+    await store.send(.registerLocalDestination(dest))
+
+    // Send LINKREQUEST from initEph → our local destination over tokenA's channel.
+    let request = Packet(headerType: .header1, packetType: .linkRequest,
+                         transportType: .broadcast, destinationType: .single,
+                         context: .none, contextFlag: false, hops: 0,
+                         destinationHash: dest.hash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    events.yield(.channelData(channel, try! BLEFraming.frame(try! request.packed())))
+
+    // Responder creates a link and sends LRPROOF back to tokenA.
+    await store.receive { if case .ble(.send) = $0 { return true }; return false }
+    #expect(store.state.links.count == 1)
+    let linkID = store.state.links[0].linkID
+
+    // Extract the responder's X25519 pub from the LRPROOF (signature‖X25519pub‖signalling).
+    // `sent` captures (peerToken, framedBytes); unframe to reach the Packet payload.
+    let proofFramed   = sent.value.last!.1
+    let proofUnframed = Data(proofFramed.dropFirst(BLEFraming.headerLength))
+    let proofPayload  = Packet(raw: proofUnframed)!.payload      // 99 bytes
+    let responderX25519Pub = Data(proofPayload[64..<96])
+
+    // Derive session key (initiator side): ECDH(initEph.x25519Private, responderX25519Pub, linkID).
+    let sessionKey = Link.sessionKey(
+        ephemeralPrivateX25519: Data(initEph.privateKey!.prefix(32)),
+        peerPublicX25519: responderX25519Pub,
+        linkID: linkID)
+
+    // Complete handshake: initiator sends the RTT packet → responder transitions to .active.
+    let rttPayload = Link.encrypt(MsgPack.encode(1.0), sessionKey: sessionKey)
+    let rttPkt = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .link, context: .linkRequestRTT, contextFlag: false,
+                        hops: 0, destinationHash: linkID, transportId: nil, payload: rttPayload)
+    events.yield(.channelData(channel, try! BLEFraming.frame(try! rttPkt.packed())))
+    await store.receive { if case .delegate(.linkEstablished) = $0 { return true }; return false }
+    #expect(store.state.links[0].interfaceID == bleInterfaceID(peerToken))
+
+    // ── Phase 2: tokenA goes offline ────────────────────────────────────────────────────────
+    // The link's stored interfaceID is now stale: tokenA is gone from peerInterfaces, so any
+    // outbound link transmit would hit a dead lookup and fire sendFailed.
+    events.yield(.channelClosed(channel, reason: nil))
+    await store.receive { if case .delegate(.peerOffline) = $0 { return true }; return false }
+
+    // ── Phase 3: peer reconnects under tokenB (a DIFFERENT InterfaceID) ─────────────────────
+    await bringPeerOnline(store, events, token: peerTokenB, channelID: channel2,
+                          peerHandle: handle2, startFirst: false)
+
+    // ── Phase 4: inbound link packet over tokenB → re-homes the session ─────────────────────
+    // Any link-addressed packet arriving on tokenB's channel triggers routeLinkPacket with
+    // bleInterfaceID(peerTokenB), which re-homes state.links[0].interfaceID to tokenB.
+    let pingPayload = Link.encrypt(Data("ping".utf8), sessionKey: sessionKey)
+    let pingPkt = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                         destinationType: .link, context: .none, contextFlag: false,
+                         hops: 0, destinationHash: linkID, transportId: nil, payload: pingPayload)
+    events.yield(.channelData(channel2, try! BLEFraming.frame(try! pingPkt.packed())))
+    // linkDataReceived confirms both re-homing AND that tokenB's interface carried the packet.
+    await store.receive { if case .delegate(.linkDataReceived) = $0 { return true }; return false }
+
+    // Positive state assertion: link is now homed to tokenB.
+    #expect(store.state.links[0].interfaceID == bleInterfaceID(peerTokenB))
+
+    // ── Phase 5: outbound traffic must reach tokenB — the last store.send in this test ───────
+    // If re-homing failed, peerInterfaces lookup for the stale tokenA interfaceID returns nil
+    // → sendFailed fires instead of ble(.send) → the receive below never matches → test FAILS.
+    await store.send(.sendOverLink(linkID: linkID, data: Data("pong".utf8)))
+    await store.receive { action in
+        if case .ble(.send(peer: let peer, packet: _)) = action { return peer == peerTokenB }
+        return false
+    }
+
     await teardown(store)
 }
