@@ -59,6 +59,12 @@ public struct BLEInterface {
             case peerOnline(Data)
             case peerOffline(Data)
             case packetReceived(peer: Data, packet: Data)
+            case sendFailed(peer: Data, reason: SendFailedReason)
+        }
+        public enum SendFailedReason: Equatable {
+            /// The packet is empty or exceeds `BLEFraming.maxFrameLength` and cannot
+            /// be framed. This is a programmer error, not a lifecycle race.
+            case unframable
         }
     }
 
@@ -241,9 +247,14 @@ public struct BLEInterface {
                 return .merge(effects)
 
             case let .send(peer, packet):
-                guard let channelID = state.peers[peer],
-                      let framed = try? BLEFraming.frame(packet)
-                else { return .none }
+                // Lifecycle race: the peer's channel is gone. Nothing to report at this layer —
+                // BLEEndpoint already surfaces undeliverability as sendFailed.
+                guard let channelID = state.peers[peer] else { return .none }
+                // Programmer error: the packet cannot be framed (empty, or over
+                // BLEFraming.maxFrameLength). Distinct from a departed peer.
+                guard let framed = try? BLEFraming.frame(packet) else {
+                    return .send(.delegate(.sendFailed(peer: peer, reason: .unframable)))
+                }
                 return .run { [bleDriver] _ in await bleDriver.send(channelID, framed) }
 
             case let .helloDeadline(channelID):

@@ -367,6 +367,36 @@ func establishPeer(
     await store.send(.stop) { $0.status = .stopped }
 }
 
+// MARK: - Send failure paths
+
+/// A send to a peer with no channel is a lifecycle race and drops quietly.
+@Test @MainActor func sendToUnknownPeerDropsQuietly() async {
+    let (store, events, calls, _, _) = await makeOnlineStore()
+    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
+    // Send to tokenLow — a token that has no established channel.
+    let before = calls.value.count
+    await store.send(.send(peer: tokenLow, packet: Data(repeating: 0xAB, count: 10)))
+    // No driver send and no delegate action emitted.
+    #expect(calls.value.count == before)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+/// An oversized packet is a programmer error, not a lifecycle race: it must be
+/// distinguishable rather than silently identical to a departed peer.
+@Test @MainActor func sendOfUnframablePacketIsDistinguishedFromAbsentChannel() async {
+    let (store, events, calls, _, _) = await makeOnlineStore()
+    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
+    // Send a packet that exceeds BLEFraming.maxFrameLength to a LIVE peer.
+    let oversized = Data(repeating: 0xFF, count: BLEFraming.maxFrameLength + 1)
+    let before = calls.value.count
+    await store.send(.send(peer: tokenHigh, packet: oversized))
+    // No driver send.
+    #expect(calls.value.count == before)
+    // The sendFailed delegate action must be emitted, distinguishing this from a silent drop.
+    await store.receive(.delegate(.sendFailed(peer: tokenHigh, reason: .unframable)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
 // MARK: - Dedup
 
 @Test @MainActor func crossConnectKeepsLowerInitiatorsChannelFromBothPerspectives() async {
