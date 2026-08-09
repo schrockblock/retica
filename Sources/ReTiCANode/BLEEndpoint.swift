@@ -173,8 +173,8 @@ public struct BLEEndpoint {
                 return .send(.delegate(.sendFailed(destinationHash: h, reason: r)))
 
             // --- Transport → LinkPlane (per-peer interface) ---
-            case let .transport(.delegate(.linkPacket(linkID, data))):
-                return .send(.linkPlane(.routeLinkPacket(linkID: linkID, data: data)))
+            case let .transport(.delegate(.linkPacket(linkID, arrivalInterface, data))):
+                return .send(.linkPlane(.routeLinkPacket(linkID: linkID, arrivalInterface: arrivalInterface, data: data)))
 
             case let .transport(.delegate(.linkRequest(destHash, arrivalInterface, data))):
                 guard let owner = state.transport.localDestinations[destHash]?.identity,

@@ -33,7 +33,7 @@ public struct LinkPlane {
         case acceptLinkRequest(owner: Identity, destinationHash: Data,
                                interfaceID: InterfaceID, data: Data)
         /// Route an inbound link-addressed packet to the link that owns it.
-        case routeLinkPacket(linkID: Data, data: Data)
+        case routeLinkPacket(linkID: Data, arrivalInterface: InterfaceID, data: Data)
 
         case sendOverLink(linkID: Data, data: Data)
         case sendResourceOverLink(linkID: Data, data: Data)
@@ -91,8 +91,16 @@ public struct LinkPlane {
                                                      interfaceID: interfaceID))
                 return .send(.link(.element(id: newID, action: .acceptRequest(data))))
 
-            case let .routeLinkPacket(linkID, data):
+            case let .routeLinkPacket(linkID, arrivalInterface, data):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                // Re-home: a BLE InterfaceID is derived from the peer's HELLO session token, so a
+                // reconnected peer is a DIFFERENT interface and the binding taken at link creation is
+                // stale — outbound would go to a dead interface until the ~60s watchdog closed the link.
+                // Safe because this packet already decrypted and validated under THIS link's keys, so the
+                // arrival is authenticated. Inert on TCP, whose single fixed InterfaceID always matches.
+                if state.links[id: element.id]?.interfaceID != arrivalInterface {
+                    state.links[id: element.id]?.interfaceID = arrivalInterface
+                }
                 return .send(.link(.element(id: element.id, action: .received(data))))
 
             case let .sendOverLink(linkID, data):

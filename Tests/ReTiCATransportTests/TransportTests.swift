@@ -295,7 +295,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let captured = LockIsolated<(Data, Data)?>(nil)
     await store.send(.received(InterfaceID("i"), raw))
     await store.receive { action in
-        if case let .delegate(.linkPacket(l, d)) = action { captured.setValue((l, d)); return true }
+        if case let .delegate(.linkPacket(l, _, d)) = action { captured.setValue((l, d)); return true }
         return false
     }
     #expect(captured.value?.0 == linkID)
@@ -1114,7 +1114,7 @@ private func relayHostingLinkTableEntry(rcvdIf: String, nhIf: String)
     let captured = LockIsolated<(Data, Data)?>(nil)
     await store.send(.received(InterfaceID("i"), lp))
     await store.receive { action in
-        if case let .delegate(.linkPacket(l, d)) = action { captured.setValue((l, d)); return true }
+        if case let .delegate(.linkPacket(l, _, d)) = action { captured.setValue((l, d)); return true }
         return false
     }
     #expect(captured.value?.0 == unknownLinkID)

@@ -93,6 +93,7 @@ private let ifA = InterfaceID("iface-a")
 
     // .routeLinkPacket — NOT aliased; rides .linkPlane(...)
     #expect(roundTrips(.routeLinkPacket(linkID: Data(repeating: 0x03, count: 16),
+                                        arrivalInterface: InterfaceID("test-iface"),
                                         data: Data([0x01, 0x02]))))
 
     // Verb cases — aliased to TCPEndpoint.Action top-level
@@ -129,6 +130,110 @@ private let ifA = InterfaceID("iface-a")
     let tok = Data(repeating: 0x0B, count: 16)
     #expect(roundTrips(.delegate(.packetDelivered(token: tok))))
     #expect(roundTrips(.delegate(.packetDeliveryFailed(token: tok))))
+}
+
+// MARK: - Re-homing tests (Task 1: BLE peer reconnect)
+
+/// A link packet arriving on a DIFFERENT interface re-homes the session, so subsequent
+/// outbound traffic goes to the new interface. This is the BLE peer-reconnect case: an
+/// InterfaceID is derived from the peer's session token, so a reconnected peer is a
+/// different interface and the link's stored binding is stale.
+@Test @MainActor func linkPacketFromANewInterfaceReHomesTheSession() async {
+    let ifOld = InterfaceID("old")
+    let ifNew = InterfaceID("new")
+    let linkID = Data(repeating: 0xAA, count: 16)
+    let dest = Data(repeating: 0x01, count: 16)
+    var session = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+                                    initiatorTo: Identity(), destinationHash: dest,
+                                    interfaceID: ifOld)
+    session.linkID = linkID
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [session])
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    let payload = Data([0x01, 0x02])
+    // After routing a packet from the new interface, the session must be re-homed AND
+    // the packet forwarded unchanged.
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: ifNew, data: payload)) {
+        $0.links[id: session.id]?.interfaceID = ifNew
+    }
+    await store.receive { action in
+        if case let .link(.element(_, .received(d))) = action { return d == payload }
+        return false
+    }
+    #expect(store.state.links[id: session.id]?.interfaceID == ifNew)
+}
+
+/// A link packet arriving on the SAME interface changes nothing — the common case must not
+/// churn state. This is also the TCP case: TCPEndpoint has one fixed InterfaceID, so the
+/// arrival always equals the stored value and the assignment is inert.
+@Test @MainActor func linkPacketFromTheSameInterfaceLeavesTheSessionUnchanged() async {
+    let ifTCP = InterfaceID("tcp")
+    let linkID = Data(repeating: 0xBB, count: 16)
+    let dest = Data(repeating: 0x02, count: 16)
+    var session = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+                                    initiatorTo: Identity(), destinationHash: dest,
+                                    interfaceID: ifTCP)
+    session.linkID = linkID
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [session])
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    let payload = Data([0x03, 0x04])
+    // Same interface: no state mutation, packet still forwarded.
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: ifTCP, data: payload))
+    await store.receive { action in
+        if case let .link(.element(_, .received(d))) = action { return d == payload }
+        return false
+    }
+    #expect(store.state.links[id: session.id]?.interfaceID == ifTCP)
+}
+
+/// Re-homing is keyed to the addressed link only: an unrelated session on another interface
+/// is untouched.
+@Test @MainActor func reHomingDoesNotDisturbOtherSessions() async {
+    let ifA2 = InterfaceID("ifA")
+    let ifB = InterfaceID("ifB")
+    let ifNew = InterfaceID("ifNew")
+    let linkIDA = Data(repeating: 0xCC, count: 16)
+    let linkIDB = Data(repeating: 0xDD, count: 16)
+    let destA = Data(repeating: 0x03, count: 16)
+    let destB = Data(repeating: 0x04, count: 16)
+    var sessionA = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!,
+                                     initiatorTo: Identity(), destinationHash: destA,
+                                     interfaceID: ifA2)
+    sessionA.linkID = linkIDA
+    var sessionB = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-000000000004")!,
+                                     initiatorTo: Identity(), destinationHash: destB,
+                                     interfaceID: ifB)
+    sessionB.linkID = linkIDB
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [sessionA, sessionB])
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    let payload = Data([0x05])
+    // Route packet for A on "ifNew" — A should re-home; B must remain on ifB.
+    await store.send(.routeLinkPacket(linkID: linkIDA, arrivalInterface: ifNew, data: payload)) {
+        $0.links[id: sessionA.id]?.interfaceID = ifNew
+    }
+    await store.receive { action in
+        if case let .link(.element(_, .received(d))) = action { return d == payload }
+        return false
+    }
+    #expect(store.state.links[id: sessionA.id]?.interfaceID == ifNew)
+    #expect(store.state.links[id: sessionB.id]?.interfaceID == ifB)
 }
 
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {

@@ -136,8 +136,8 @@ public struct TCPEndpoint {
 
             // --- Transport → LinkPlane ---
 
-            case let .transport(.delegate(.linkPacket(linkID, data))):
-                return .send(.linkPlane(.routeLinkPacket(linkID: linkID, data: data)))
+            case let .transport(.delegate(.linkPacket(linkID, arrivalInterface, data))):
+                return .send(.linkPlane(.routeLinkPacket(linkID: linkID, arrivalInterface: arrivalInterface, data: data)))
 
             case let .transport(.delegate(.linkRequest(destHash, _, data))):
                 guard let owner = state.transport.localDestinations[destHash]?.identity,

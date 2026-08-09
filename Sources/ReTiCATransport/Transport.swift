@@ -173,7 +173,7 @@ public struct Transport {
             case received(destinationHash: Data, plaintext: Data)
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: SendFailure)
-            case linkPacket(linkID: Data, data: Data)
+            case linkPacket(linkID: Data, arrivalInterface: InterfaceID, data: Data)
             case linkRequest(destinationHash: Data, arrivalInterface: InterfaceID, data: Data)
         }
     }
@@ -297,7 +297,7 @@ public struct Transport {
                         guard let raw = try? fwd.packed() else { return .none }
                         return .send(.delegate(.transmit(outIf, raw)))
                     }
-                    return .send(.delegate(.linkPacket(linkID: packet.destinationHash, data: plain)))
+                    return .send(.delegate(.linkPacket(linkID: packet.destinationHash, arrivalInterface: interfaceID, data: plain)))
                 }
                 if packet.packetType == .linkRequest, state.localDestinations[packet.destinationHash] != nil {
                     return .send(.delegate(.linkRequest(destinationHash: packet.destinationHash,
