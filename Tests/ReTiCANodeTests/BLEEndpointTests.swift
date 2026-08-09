@@ -118,16 +118,23 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     await store.receive(.transport(.stopMaintenance))
 }
 
-@Test @MainActor func transmitForUnknownInterfaceIsDropped() async {
+/// Pins the deliberate residue of the undeliverable-transmit path: a packet that cannot be
+/// parsed drops SILENTLY, emitting neither `.ble(.send)` nor `.delegate(.sendFailed)`.
+/// `sendFailed` carries a destinationHash, and an unparseable packet has no destination to
+/// report — so there is nothing meaningful to surface and the drop stands. This is the ONLY
+/// case that still vanishes; the unknown-interface case it superficially resembles is now
+/// reported, and is covered by `transportTransmitToUnknownInterfaceReportsSendFailed` and
+/// `linkPlaneTransmitToUnknownInterfaceReportsSendFailed`.
+@Test @MainActor func transmitForUnparseablePacketIsDropped() async {
     let store = makeStore()
-    // Use .on exhaustivity so that any spurious .ble(.send(...)) action fails the test.
-    // Mutation 4 produces such an action; with .off it would be silently swallowed.
+    // .on exhaustivity so ANY emitted action — a stray .ble(.send) or an unwanted
+    // .delegate(.sendFailed) — fails the test when finish() drains.
     store.exhaustivity = .on
-    // No peers online → no peerInterfaces entry. A stray transmit must not route.
+    // A 1-byte payload is below the 2-byte minimum `Packet(raw:)` needs for flags+hops, so
+    // it fails to parse. The interface is also unknown, which is what routes it into the
+    // guard in the first place; parseability is what decides silence vs. sendFailed there.
     let strayID = InterfaceID("ble:deadbeef")
     await store.send(.transport(.delegate(.transmit(strayID, Data([0x01])))))
-    // With .on exhaustivity, any unasserted received actions (e.g. a stray .ble(.send))
-    // will fail the test when finish() drains.
     await store.finish()
 }
 
