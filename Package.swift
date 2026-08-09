@@ -18,6 +18,7 @@ let package = Package(
         .package(url: "https://github.com/pointfreeco/swift-composable-architecture", from: "1.15.0"),
         .package(path: "../FCB"),
         .package(url: "https://github.com/NordicSemiconductor/IOS-CoreBluetooth-Mock.git", from: "1.0.0"),
+        .package(url: "https://github.com/leif-ibsen/SwiftEdDSA", exact: "4.1.0"),
     ],
     targets: [
         .target(name: "ReTiCA"),
@@ -51,6 +52,7 @@ let package = Package(
                 "ReTiCA",
                 "Cbzip2",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
+                .product(name: "SwiftEdDSA", package: "SwiftEdDSA"),
             ]
         ),
         .testTarget(
