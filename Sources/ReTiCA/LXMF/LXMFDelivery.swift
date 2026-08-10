@@ -7,6 +7,9 @@ public enum LXMFDelivery {
     /// Seconds between outbound delivery retries (RNS `LXMRouter.DELIVERY_RETRY_WAIT`).
     public static let retryWaitSeconds = 10
     /// Max delivery attempts before a message is failed (RNS `LXMRouter.MAX_DELIVERY_ATTEMPTS`).
+    /// ReTiCA also reuses this as the ceiling on consecutive link-ESTABLISHMENT attempts per
+    /// destination (`LXMFRouter.establish`), which has no counterpart in the reference constant —
+    /// do not infer reference parity for that second use.
     public static let maxAttempts = 5
     /// Seconds to wait after requesting a path before the next opportunistic delivery attempt (RNS
     /// `LXMRouter.PATH_REQUEST_WAIT`; distinct from `retryWaitSeconds`).

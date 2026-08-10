@@ -307,11 +307,19 @@ public struct LXMFRouter {
                 return .none
 
             case let .learnedPath(dest):
-                state.knownPaths.insert(dest)
-                state.establishAttempts[dest] = nil
+                // Reset the establishment budget only on GENUINELY NEW path information.
+                // knownPaths is a bare Set with no epoch, so a periodic re-announce of an
+                // already-known path carries nothing new; resetting on it would let a live
+                // peer refresh the budget forever and re-open the unbounded cycle. After a
+                // ceiling trip knownPaths is cleared, so genuine recovery still resets.
+                if state.knownPaths.insert(dest).inserted {
+                    state.establishAttempts[dest] = nil
+                }
                 if state.directLinks[dest] == .awaitingPath {
-                    state.directLinks[dest] = .establishing
-                    return .send(.delegate(.requestLink(destinationHash: dest)))
+                    // Route through establish() so there is exactly ONE counted emitter of
+                    // requestLink. Behaviour is unchanged (knownPaths now contains dest, so
+                    // establish takes the requestLink branch and sets .establishing).
+                    return establish(&state, dest)
                 }
                 return .none
 

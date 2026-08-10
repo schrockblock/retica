@@ -658,108 +658,168 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.outboundQueue[msg.destinationHash] == nil)
     #expect(store.state.knownPaths.contains(msg.destinationHash) == false)
     #expect(store.state.establishAttempts[msg.destinationHash] == nil)
+
+    // And the cycle is genuinely over: a further linkClosed emits NOTHING. Under `.off` an
+    // absence assertion is vacuous, so flip to `.on` — teardown then fails on a stray
+    // requestLink/requestPath. Safe here: a queued send arms no timers, so nothing is in flight.
+    store.exhaustivity = .on
+    await store.send(.linkClosed(destinationHash: msg.destinationHash))
 }
 
 /// A successful establishment resets the counter — a peer that flaps and recovers gets a
 /// full budget again rather than inheriting a nearly-exhausted one.
 @Test @MainActor func routerEstablishAttemptsResetOnLinkEstablished() async {
-    let msg = makeMessage(source: Identity(), content: "queued-reset-link")
+    // Two messages to the SAME destination: deliveryHash is a pure function of the recipient
+    // identity hash, so reusing it keeps both on one destination and one saga.
+    let recipientHash = Identity().hash
+    let msg = makeMessage(source: Identity(), recipientIdentityHash: recipientHash,
+                          content: "queued-reset-link")
+    let msg2 = makeMessage(source: Identity(), recipientIdentityHash: recipientHash,
+                           content: "queued-reset-link-2")
+    #expect(msg2.destinationHash == msg.destinationHash)
+    let dest = msg.destinationHash
     let linkID = Data(repeating: 0xAB, count: 16)
-    // Pre-seed the attempt counter to maxAttempts so that WITHOUT a reset the first linkClosed
-    // after linkEstablished would immediately give up (attempts > maxAttempts on the very next
-    // call). With the reset, establish starts fresh and takes maxAttempts cycles to exhaust.
+    // Pre-seed the attempt counter to maxAttempts: WITHOUT a reset the next establish() would
+    // immediately trip the ceiling. Everything after linkEstablished is reducer-driven.
     var initial = LXMFRouter.State()
-    initial.knownPaths.insert(msg.destinationHash)
-    initial.outboundQueue[msg.destinationHash] = [msg]
-    initial.directLinks[msg.destinationHash] = .establishing
-    initial.establishAttempts[msg.destinationHash] = LXMFDelivery.maxAttempts
+    initial.knownPaths.insert(dest)
+    initial.outboundQueue[dest] = [msg]
+    initial.directLinks[dest] = .establishing
+    initial.establishAttempts[dest] = LXMFDelivery.maxAttempts
     let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
         $0.continuousClock = TestClock()
     }
     store.exhaustivity = .off
 
     // Link establishes — must reset the counter.
-    await store.send(.linkEstablished(destinationHash: msg.destinationHash, linkID: linkID))
+    await store.send(.linkEstablished(destinationHash: dest, linkID: linkID))
     await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
     await store.send(.delivered(messageHash: msg.hash))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
-    #expect(store.state.establishAttempts[msg.destinationHash] == nil)   // reset confirmed
+    #expect(store.state.establishAttempts[dest] == nil)   // reset confirmed
 
-    // Build the post-reset scenario as a fresh store. establishAttempts is nil (reset);
-    // knownPaths still contains dest (the reset only clears the attempt counter, not the path).
-    // One message is queued so linkClosed will trigger establish().
-    let msg2 = makeMessage(source: Identity(), content: "queued-reset-link-2")
-    var postReset = LXMFRouter.State()
-    postReset.knownPaths.insert(msg.destinationHash)
-    // establishAttempts left empty (nil per dest) = zero, simulating what linkEstablished resets to.
-    postReset.outboundQueue[msg.destinationHash] = [msg2]
-    let store2 = TestStore(initialState: postReset) { LXMFRouter() } withDependencies: {
-        $0.continuousClock = TestClock()
-    }
-    store2.exhaustivity = .off
+    // The link later drops with nothing pending or queued → cleared, no re-establish.
+    await store.send(.linkClosed(destinationHash: dest))
+    #expect(store.state.directLinks[dest] == nil)
 
-    // Drive maxAttempts linkClosed cycles — each should produce requestLink (full budget).
-    // If the counter were not reset, the first cycle would produce deliveryFailed instead.
-    // Count via state: after maxAttempts linkClosed cycles, establishAttempts should be maxAttempts.
-    for _ in 0..<LXMFDelivery.maxAttempts {
-        await store2.send(.linkClosed(destinationHash: msg.destinationHash))
-        await store2.receive { action in
-            if case .delegate(.requestLink) = action { return true }
-            return false
-        }
+    // A second message to the same peer now queues and re-enters the establish cycle. Because
+    // the counter was reset, the FULL budget is available: maxAttempts requestLinks, then give up.
+    // Without the reset the counter would still sit at maxAttempts and this first call would fail.
+    await store.send(.send(message: msg2, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    #expect(store.state.establishAttempts[dest] == 1)
+
+    for expected in 2...LXMFDelivery.maxAttempts {
+        await store.send(.linkClosed(destinationHash: dest))
+        await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+        #expect(store.state.establishAttempts[dest] == expected)
     }
-    #expect(store2.state.establishAttempts[msg.destinationHash] == LXMFDelivery.maxAttempts)
-    // One final linkClosed trips the ceiling — deliveryFailed, not requestLink.
-    await store2.send(.linkClosed(destinationHash: msg.destinationHash))
-    await store2.receive { action in
-        if case .delegate(.deliveryFailed) = action { return true }
+    await store.send(.linkClosed(destinationHash: dest))
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg2.hash); return true }
         return false
     }
-    #expect(store2.state.establishAttempts[msg.destinationHash] == nil)   // cleared on give-up
+    #expect(store.state.establishAttempts[dest] == nil)   // cleared on give-up
 }
 
-/// Learning a path also resets the counter: it is new information that the situation changed.
-/// Without the reset, the one remaining attempt budget after burnCount burns would fire
-/// deliveryFailed on the FIRST linkClosed after learnedPath. With the reset the full
-/// budget is available again and exactly maxAttempts requestLinks precede deliveryFailed.
+/// Learning a GENUINELY NEW path resets the counter: after a ceiling trip the path is forgotten,
+/// so a later path learn is real new information and earns a full fresh budget. It also proves
+/// the learnedPath emit is routed through establish() — the requestLink it fires is COUNTED
+/// (attempts becomes 1), not an uncounted second emitter.
 @Test @MainActor func routerEstablishAttemptsResetOnLearnedPath() async {
-    let msg = makeMessage(source: Identity(), content: "queued-reset-path")
-    let clock = TestClock()
+    let recipientHash = Identity().hash
+    let msg = makeMessage(source: Identity(), recipientIdentityHash: recipientHash,
+                          content: "queued-reset-path")
+    let msg2 = makeMessage(source: Identity(), recipientIdentityHash: recipientHash,
+                           content: "queued-reset-path-2")
+    let dest = msg.destinationHash
     var initial = LXMFRouter.State()
-    initial.knownPaths.insert(msg.destinationHash)
+    initial.knownPaths.insert(dest)
     let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
-        $0.continuousClock = clock
+        $0.continuousClock = TestClock()
     }
     store.exhaustivity = .off
 
-    // Burn maxAttempts - 1 attempts. Without a reset, the very next linkClosed would give up.
-    let burnCount = LXMFDelivery.maxAttempts - 1
+    // Burn the whole budget to the ceiling. That clears knownPaths — the path belief is falsified.
     await store.send(.send(message: msg, desiredMethod: .direct))
     await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
-    for _ in 0..<(burnCount - 1) {
-        await store.send(.linkClosed(destinationHash: msg.destinationHash))
+    for expected in 2...LXMFDelivery.maxAttempts {
+        await store.send(.linkClosed(destinationHash: dest))
         await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+        #expect(store.state.establishAttempts[dest] == expected)
     }
-
-    // Deliver a .learnedPath to reset the counter. learnedPath also transitions awaitingPath→establishing,
-    // but here the state is .establishing (knownPaths was set), so no extra effect is emitted.
-    await store.send(.learnedPath(destinationHash: msg.destinationHash))
-
-    // Now exhaust the full budget and confirm it takes maxAttempts, not 1 (which it would be without
-    // the reset). Drive maxAttempts linkClosed cycles; each should produce requestLink.
-    // Verify via state that the counter increments correctly from 1 to maxAttempts.
-    for expected in 1...LXMFDelivery.maxAttempts {
-        await store.send(.linkClosed(destinationHash: msg.destinationHash))
-        await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
-        #expect(store.state.establishAttempts[msg.destinationHash] == expected)
-    }
-    // One final linkClosed trips the ceiling — deliveryFailed.
-    await store.send(.linkClosed(destinationHash: msg.destinationHash))
+    await store.send(.linkClosed(destinationHash: dest))
     await store.receive { action in
-        if case .delegate(.deliveryFailed) = action { return true }
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
         return false
     }
-    #expect(store.state.establishAttempts[msg.destinationHash] == nil)
+    #expect(store.state.knownPaths.contains(dest) == false)   // path forgotten by the ceiling
+    #expect(store.state.establishAttempts[dest] == nil)
+
+    // With no path, the next send asks for one and parks.
+    await store.send(.send(message: msg2, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestPath) = $0 { return true }; return false }
+    #expect(store.state.directLinks[dest] == .awaitingPath)
+
+    // A genuinely new path arrives → budget reset AND the establishment is counted (== 1),
+    // because learnedPath routes its emit through establish() rather than emitting inline.
+    await store.send(.learnedPath(destinationHash: dest))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    #expect(store.state.directLinks[dest] == .establishing)
+    #expect(store.state.establishAttempts[dest] == 1)
+
+    // Full fresh budget: maxAttempts in total, then give up again.
+    for expected in 2...LXMFDelivery.maxAttempts {
+        await store.send(.linkClosed(destinationHash: dest))
+        await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+        #expect(store.state.establishAttempts[dest] == expected)
+    }
+    await store.send(.linkClosed(destinationHash: dest))
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg2.hash); return true }
+        return false
+    }
+    #expect(store.state.establishAttempts[dest] == nil)
+}
+
+/// A re-announce of an ALREADY-KNOWN path is not new information and must NOT refresh the budget.
+/// `Transport.shouldReplace` accepts any fresher announce, so a live peer re-announcing on its
+/// normal period reaches `.learnedPath` repeatedly; resetting on those would let it refresh the
+/// budget forever and re-open the unbounded establish cycle this bound exists to close.
+@Test @MainActor func routerRepeatedPathAnnounceDoesNotResetEstablishAttempts() async {
+    let msg = makeMessage(source: Identity(), content: "known-path-reannounce")
+    let dest = msg.destinationHash
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(dest)   // path ALREADY known → a later learnedPath is a re-announce
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+
+    // Burn to one attempt short of the ceiling.
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    for expected in 2...(LXMFDelivery.maxAttempts - 1) {
+        await store.send(.linkClosed(destinationHash: dest))
+        await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+        #expect(store.state.establishAttempts[dest] == expected)
+    }
+    #expect(store.state.establishAttempts[dest] == LXMFDelivery.maxAttempts - 1)
+
+    // The peer re-announces the path we already know. Nothing new → counter untouched.
+    await store.send(.learnedPath(destinationHash: dest))
+    #expect(store.state.establishAttempts[dest] == LXMFDelivery.maxAttempts - 1)
+
+    // So the budget continues where it left off: one more attempt, then give up.
+    await store.send(.linkClosed(destinationHash: dest))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    #expect(store.state.establishAttempts[dest] == LXMFDelivery.maxAttempts)
+    await store.send(.linkClosed(destinationHash: dest))
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
+        return false
+    }
+    #expect(store.state.establishAttempts[dest] == nil)
 }
 
 /// Closing a link with nothing pending/queued clears it and does NOT re-establish.
