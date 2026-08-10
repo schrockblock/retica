@@ -11,7 +11,7 @@ import ReTiCATransport
 @Reducer
 public struct LXMFRouter {
     @Dependency(\.continuousClock) var clock
-    private enum CancelID: Hashable { case retry(Data); case idle(Data) }
+    private enum CancelID: Hashable { case retry(Data); case idle(Data); case pathRequest(Data) }
 
     @ObservableState
     public struct State: Equatable {
@@ -48,7 +48,7 @@ public struct LXMFRouter {
         /// this counter `linkClosed -> establish -> requestLink -> linkFailed -> linkClosed` recurs
         /// forever.
         ///
-        /// Two distinct drivers reach this counter, at opposite ends of the timing range:
+        /// Three distinct drivers reach this counter:
         ///
         ///  • `TCPEndpoint.openLink` with no `transport.learned[dest]` entry
         ///    (TCPEndpoint.swift:149-151) returns `linkFailed` IMMEDIATELY — a hot, zero-delay
@@ -57,8 +57,12 @@ public struct LXMFRouter {
         ///    (LinkSession.swift:546-547), which `LinkPlane` routes to `linkFailed(destinationHash:)`
         ///    and `LXMFNode.swift:267` forwards here keyed by DESTINATION. That paces the cycle at
         ///    the 15s establishment timeout rather than spinning.
+        ///  • `.pathRequestDeadline`: when `establish()` parks in `.awaitingPath` and the path
+        ///    response never arrives, the park timer fires and increments this counter, re-emitting
+        ///    `requestPath` until the budget is exhausted. The two establish branches therefore
+        ///    share ONE budget — a destination cannot ping-pong between them to get a fresh allowance.
         ///
-        /// So the budget bounds both, and the slow path reaches the give-up branch in roughly
+        /// The slow path (establishment timeouts) reaches the give-up branch in roughly
         /// `maxAttempts × establishmentTimeout` = 5 × 15s ≈ 75s. Queued messages are reported there
         /// as `deliveryFailed`; a PN SYNC has no message to fail, so it terminates silently — the
         /// flag is cleared but the app is not told. See the give-up branch.
@@ -98,6 +102,7 @@ public struct LXMFRouter {
         case resourceDeliveredOnLink(linkID: Data)
         case retryDue(messageHash: Data)
         case idleDeadline(destinationHash: Data)
+        case pathRequestDeadline(destinationHash: Data)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -134,8 +139,39 @@ public struct LXMFRouter {
                     await send(.idleDeadline(destinationHash: dest))
                 }.cancellable(id: CancelID.idle(dest), cancelInFlight: true)
             }
+            func pathRequestTimer(_ dest: Data) -> Effect<Action> {
+                .run { send in
+                    try await clock.sleep(for: .seconds(LXMFDelivery.pathRequestWaitSeconds))
+                    await send(.pathRequestDeadline(destinationHash: dest))
+                }.cancellable(id: CancelID.pathRequest(dest), cancelInFlight: true)
+            }
             func arm(_ state: inout State, _ hash: Data, _ resend: ResendInfo) {
                 state.pendingDeliveries[hash] = PendingDelivery(resend: resend, attempts: 1)
+            }
+            /// Give up on `dest`: cancel the path-request park timer, fail everything queued for it,
+            /// forget the path, and clear all establishment state. Both call sites (the `establish`
+            /// ceiling and `.pathRequestDeadline`) must terminate identically — extract here rather
+            /// than duplicate.
+            func giveUp(_ state: inout State, _ dest: Data) -> Effect<Action> {
+                state.establishAttempts[dest] = nil
+                state.knownPaths.remove(dest)
+                state.directLinks[dest] = nil
+                let queued = state.outboundQueue[dest] ?? []
+                let propQueued = state.propagationQueue[dest] ?? []
+                state.outboundQueue[dest] = nil
+                state.propagationQueue[dest] = nil
+                // An outstanding sync needs an explicit terminus too. Unlike the queues above
+                // (drained here) and `pendingDeliveries` (self-clearing via the retry saga),
+                // `pendingDownloadFromPN` is otherwise cleared ONLY when `.linkEstablished`
+                // drains it. Left set, it would (a) keep this destination permanently "has work"
+                // so every later `linkClosed(pn)` re-enters establish, and (b) let an unrelated
+                // future PN link resurrect the abandoned sync with a surprise `requestMessageList`.
+                // Guarded on the PN: an unrelated destination giving up says nothing about the sync.
+                if dest == state.outboundPropagationNode { state.pendingDownloadFromPN = false }
+                var effects: [Effect<Action>] = [.cancel(id: CancelID.pathRequest(dest))]
+                effects += queued.map { .send(.delegate(.deliveryFailed(messageHash: $0.hash))) }
+                effects += propQueued.map { .send(.delegate(.deliveryFailed(messageHash: $0.messageHash))) }
+                return .merge(effects)
             }
             func establish(_ state: inout State, _ dest: Data) -> Effect<Action> {
                 if state.knownPaths.contains(dest) {
@@ -144,36 +180,20 @@ public struct LXMFRouter {
                         // Give up on this destination: fail everything queued for it, and forget the
                         // path — our belief that we know a usable route has been empirically falsified,
                         // so the NEXT send should request a fresh one rather than retry links.
-                        state.establishAttempts[dest] = nil
-                        state.knownPaths.remove(dest)
-                        state.directLinks[dest] = nil
-                        let queued = state.outboundQueue[dest] ?? []
-                        let propQueued = state.propagationQueue[dest] ?? []
-                        state.outboundQueue[dest] = nil
-                        state.propagationQueue[dest] = nil
-                        // An outstanding sync needs an explicit terminus too. Unlike the queues above
-                        // (drained here) and `pendingDeliveries` (self-clearing via the retry saga),
-                        // `pendingDownloadFromPN` is otherwise cleared ONLY when `.linkEstablished`
-                        // drains it (:301-304). Left set, it would (a) keep this destination
-                        // permanently "has work" so every later `linkClosed(pn)` re-enters establish,
-                        // and (b) let an unrelated future PN link resurrect the abandoned sync with a
-                        // surprise `requestMessageList`. Guarded on the PN: an unrelated destination
-                        // giving up says nothing about the sync.
-                        if dest == state.outboundPropagationNode { state.pendingDownloadFromPN = false }
-                        var effects: [Effect<Action>] = queued.map {
-                            .send(.delegate(.deliveryFailed(messageHash: $0.hash)))
-                        }
-                        effects += propQueued.map {
-                            .send(.delegate(.deliveryFailed(messageHash: $0.messageHash)))
-                        }
-                        return effects.isEmpty ? .none : .merge(effects)
+                        return giveUp(&state, dest)
                     }
                     state.establishAttempts[dest] = attempts
+                    let wasAwaitingPath = state.directLinks[dest] == .awaitingPath
                     state.directLinks[dest] = .establishing
-                    return .send(.delegate(.requestLink(destinationHash: dest)))
+                    let requestLink = Effect<Action>.send(.delegate(.requestLink(destinationHash: dest)))
+                    // If we were parked in .awaitingPath, the park timer is still in-flight —
+                    // cancel it now that we have a path and are moving to .establishing.
+                    return wasAwaitingPath
+                        ? .merge(requestLink, .cancel(id: CancelID.pathRequest(dest)))
+                        : requestLink
                 }
                 state.directLinks[dest] = .awaitingPath
-                return .send(.delegate(.requestPath(destinationHash: dest)))
+                return .merge(.send(.delegate(.requestPath(destinationHash: dest))), pathRequestTimer(dest))
             }
             switch action {
             case let .learnedIdentity(destinationHash, identity):
@@ -284,6 +304,9 @@ public struct LXMFRouter {
             case let .linkEstablished(dest, linkID):
                 state.directLinks[dest] = .active(linkID: linkID)
                 state.establishAttempts[dest] = nil
+                // Defensive: if a link arrived while we were still parked in awaitingPath, cancel
+                // the park timer — the park is over.
+                let cancelPathTimer: Effect<Action> = .cancel(id: CancelID.pathRequest(dest))
                 let queued = state.outboundQueue[dest] ?? []
                 state.outboundQueue[dest] = nil
                 let propQueued = state.propagationQueue[dest] ?? []
@@ -313,7 +336,8 @@ public struct LXMFRouter {
                     state.pendingDownloadFromPN = false
                     effects.append(.send(.delegate(.requestMessageList(linkID: linkID))))
                 }
-                return effects.isEmpty ? .none : .merge(effects)
+                effects.append(cancelPathTimer)
+                return .merge(effects)
 
             case let .linkClosed(dest):
                 if case let .active(linkID) = state.directLinks[dest] {
@@ -357,6 +381,8 @@ public struct LXMFRouter {
                     // Route through establish() so there is exactly ONE counted emitter of
                     // requestLink. Behaviour is unchanged (knownPaths now contains dest, so
                     // establish takes the requestLink branch and sets .establishing).
+                    // `establish` cancels the path-request park timer when transitioning from
+                    // .awaitingPath to .establishing — no extra cancel needed here.
                     return establish(&state, dest)
                 }
                 return .none
@@ -422,6 +448,19 @@ public struct LXMFRouter {
                 guard case .active = state.directLinks[dest] else { return .none }
                 state.directLinks[dest] = nil
                 return .send(.delegate(.closeLink(destinationHash: dest)))
+
+            case let .pathRequestDeadline(dest):
+                // The park timer fired: the path response never arrived (or was rejected by
+                // shouldReplace). Reuse `establishAttempts` — the park is part of the same
+                // establishment saga, so the destination cannot get a fresh budget by alternating
+                // between the requestLink branch and the awaitingPath branch.
+                guard state.directLinks[dest] == .awaitingPath else { return .none }
+                let attempts = (state.establishAttempts[dest] ?? 0) + 1
+                if attempts > LXMFDelivery.maxAttempts {
+                    return giveUp(&state, dest)
+                }
+                state.establishAttempts[dest] = attempts
+                return .merge(.send(.delegate(.requestPath(destinationHash: dest))), pathRequestTimer(dest))
 
             case .delegate:
                 return .none
