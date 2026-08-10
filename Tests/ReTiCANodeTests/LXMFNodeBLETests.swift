@@ -11,10 +11,13 @@ private func framedHello(_ token: Data) -> Data {
     try! BLEFraming.frame(BLEHello.pack(version: BLEInterface.protocolVersion, token: token))
 }
 
-private let ownToken  = Data(repeating: 0x5A, count: 16)
-private let peerToken = Data(repeating: 0xC7, count: 16)
-private let channel   = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000001")!)
-private let handle    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000002")!)
+private let ownToken   = Data(repeating: 0x5A, count: 16)
+private let peerToken  = Data(repeating: 0xC7, count: 16)
+private let peerTokenB = Data(repeating: 0xD4, count: 16)   // second session token for reconnect test
+private let channel    = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000001")!)
+private let handle     = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000002")!)
+private let channel2   = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000003")!)
+private let handle2    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000004")!)
 
 /// An LXMFNode running over BLE, with a controllable mock driver.
 @MainActor
@@ -48,14 +51,44 @@ private func makeBLENode(_ identity: Identity)
 @MainActor
 private func bringPeerOnline(_ store: TestStore<LXMFNode.State, LXMFNode.Action>,
                              _ events: AsyncStream<BLEDriverEvent>.Continuation) async {
-    await store.send(.endpoint(.start))
-    events.yield(.ready)                  // BLEInterface gates channelOpened on .online
-    events.yield(.channelOpened(channel, handle, direction: .inbound))
-    events.yield(.channelData(channel, framedHello(peerToken)))
+    await bringPeerOnlineWith(store, events, token: peerToken, channelID: channel,
+                              peerHandle: handle, startFirst: true)
+}
+
+/// Parameterized peer-online helper. Pass `startFirst: false` when the node is already running
+/// (e.g. the second peer in a reconnect test).
+@MainActor
+private func bringPeerOnlineWith(_ store: TestStore<LXMFNode.State, LXMFNode.Action>,
+                                 _ events: AsyncStream<BLEDriverEvent>.Continuation,
+                                 token: Data,
+                                 channelID: BLEChannelID,
+                                 peerHandle: BLEPeerHandle,
+                                 startFirst: Bool) async {
+    if startFirst {
+        await store.send(.endpoint(.start))
+        events.yield(.ready)              // BLEInterface gates channelOpened on .online
+    }
+    events.yield(.channelOpened(channelID, peerHandle, direction: .inbound))
+    events.yield(.channelData(channelID, framedHello(token)))
     await store.receive { action in
         if case .endpoint(.ble(.transport(.interfaceConnected))) = action { return true }
         return false
     }
+}
+
+/// Build a raw HEADER_1 ANNOUNCE packet for a synthetic identity (lxmf.delivery destination).
+/// Returns (framedBytes, deliveryDestinationHash).
+private func makeLXMFAnnouncePacket(identity: Identity, emitted: UInt64) -> (Data, Data) {
+    let nameHash = Destination.nameHash(appName: LXMessage.appName, aspects: LXMessage.deliveryAspects)
+    let destHash = Destination.hash(identityHash: identity.hash,
+                                    appName: LXMessage.appName, aspects: LXMessage.deliveryAspects)
+    let randomHash = Announce.randomHash(now: emitted, randomPrefix: Data(repeating: 0xA5, count: 5))
+    let payload = Announce.buildPayload(identity: identity, destinationHash: destHash,
+                                        nameHash: nameHash, randomHash: randomHash, appData: nil)
+    let packet = Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: destHash, transportId: nil, payload: payload)
+    return (try! BLEFraming.frame(try! packet.packed()), destHash)
 }
 
 @MainActor
@@ -151,4 +184,141 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     #expect(outPacket?.destinationHash == bDest.hash)
 
     await teardown(store)
+}
+
+/// The whole point of this slice: a BLE peer that drops and reconnects is deliverable again on
+/// the NEXT message, not after ~75s and a failed one. Drives the real chain — announce learned on
+/// interface A, A disconnects, message queued (which trips the stale-path gate immediately),
+/// peer returns as interface B with a genuinely different InterfaceID (new HELLO token), B
+/// announces, path re-learned on B, router exits the awaitingPath park and opens a link on B.
+///
+/// Absence assertion: `establishAttempts[dest]` must be nil after the .pathStale bounce —
+/// confirming no link-budget was spent. The `.awaitingPath` branch of `establish()` is free
+/// (it never touches `establishAttempts`); only the `knownPaths.contains` branch increments it.
+/// A stale-path retry that incorrectly burned a link attempt would leave `establishAttempts == 1`
+/// and this assertion would catch it.
+///
+/// Harness extension: added `peerTokenB`, `channel2`, `handle2` file-level constants and a
+/// parameterized `bringPeerOnlineWith` helper (the original `bringPeerOnline` now delegates to it).
+@Test @MainActor func bleReconnectedPeerIsDeliverableOnTheNextMessage() async {
+    let clock = TestClock()
+    let aIdentity = Identity()      // us (the sender node)
+    let bIdentity = Identity()      // the remote peer (reconnects under a new token)
+    let bDeliveryHash = LXMessage.deliveryHash(identityHash: bIdentity.hash)
+
+    let events = AsyncStream<BLEDriverEvent>.makeStream()
+    let sent = LockIsolated<[Data]>([])
+    let store = TestStore(
+        initialState: LXMFNode.State(identity: aIdentity, endpoint: BLEEndpoint.State())
+    ) {
+        LXMFNode()
+    } withDependencies: {
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+        $0.uuid = .incrementing
+        $0.bleRandomBytes = BLERandomBytesGenerator { _ in ownToken }
+        $0.bleDriver = BLEDriver(
+            start: { _ in events.stream },
+            readDirectory: { _ in }, openChannel: { _, _ in },
+            send: { _, data in sent.withValue { $0.append(data) } },
+            closeChannel: { _ in }, stop: { }
+        )
+    }
+    store.exhaustivity = .off
+
+    // ── Phase 1: peer connects as tokenA; announce delivers its lxmf.delivery destination ──────
+    await bringPeerOnlineWith(store, events.continuation, token: peerToken,
+                              channelID: channel, peerHandle: handle, startFirst: true)
+
+    let (announceFramedA, _) = makeLXMFAnnouncePacket(identity: bIdentity, emitted: 1_700_000_000)
+    events.continuation.yield(.channelData(channel, announceFramedA))
+    await store.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
+
+    // Path and identity are now known: learned[bDeliveryHash] exists, knownPaths contains it.
+    #expect(store.state.endpoint.learned[bDeliveryHash] != nil)
+
+    // ── Phase 2: peer goes offline — interface A is removed; learned entry survives ─────────────
+    events.continuation.yield(.channelClosed(channel, reason: nil))
+    await store.receive { if case .endpoint(.ble(.delegate(.peerOffline))) = $0 { return true }; return false }
+    // Drain stopMaintenance (emitted when the last peer disconnects).
+    await store.receive { if case .endpoint(.ble(.transport(.stopMaintenance))) = $0 { return true }; return false }
+
+    // Sanity: learned entry survives; bleInterfaceID(peerToken) is gone.
+    #expect(store.state.endpoint.learned[bDeliveryHash] != nil)
+
+    // ── Phase 3: send a direct message — hits the stale-path gate immediately ─────────────────
+    // `establish` sees knownPaths.contains(dest) → emits requestLink → BLEEndpoint.openLink.
+    // openLink: reachableLearned returns nil (interface gone) → linkFailed(.pathStale).
+    // LXMFNode.linkFailed(.pathStale): pathLost + linkClosed → establish sees no known path →
+    //   awaitingPath park + requestPath delegate.
+    //
+    // The gate makes the failure synchronous and zero-delay: no LINKREQUEST is ever transmitted.
+    // Without the gate, openLink would succeed, a LINKREQUEST would reach the driver, and the
+    // establishment timeout (15s on the TestClock) would be the only exit — meaning `requestPath`
+    // below would never arrive (TestClock not advanced), and the test would time out.
+    let sentCountBeforeSend = sent.value.count
+    await store.send(.send(destinationHash: bDeliveryHash,
+                           title: Data("hi".utf8), content: Data("hello".utf8), method: .direct))
+
+    // The park emits requestPath immediately (via LXMFNode → endpoint(.requestPath)).
+    // Without the gate this action never arrives (link was minted, TestClock not advanced).
+    await store.receive { if case .router(.delegate(.requestPath)) = $0 { return true }; return false }
+
+    // State assertions: park is in effect.
+    #expect(store.state.router.directLinks[bDeliveryHash] == .awaitingPath,
+            "must be parked in awaitingPath — no live interface to open a link on")
+    #expect(!store.state.router.knownPaths.contains(bDeliveryHash),
+            "pathLost must have cleared the stale route belief")
+    // Corroborating assertion: no bytes reached the driver during Phase 3.
+    //
+    // The gate short-circuits openLink before any packet is emitted. Without the gate, openLink
+    // proceeds to mint a link and emits a LINKREQUEST — but since the peer interface is already
+    // gone, the transmit hits the `peerInterfaces[txID] == nil` guard in BLEEndpoint and fires
+    // `.sendFailed` instead of calling the driver. So `sent` is unchanged in both cases and
+    // this assertion alone is not the discriminator.
+    //
+    // THE PRIMARY DISCRIMINATOR is the `requestPath` receive above: with the gate,
+    // `.pathStale` fires synchronously and the park is entered immediately. Without the gate,
+    // the link times out after 15s (TestClock not advanced), so `requestPath` never arrives
+    // and the receive times out — exactly the failure seen in the mutation run.
+    #expect(sent.value.count == sentCountBeforeSend,
+            "no bytes may reach the driver on a stale-path bounce")
+    // The queued message is still parked, not failed.
+    #expect(store.state.router.outboundQueue[bDeliveryHash]?.count == 1,
+            "message must be queued in outboundQueue while parked")
+
+    // ── Phase 4: peer reconnects as tokenB (a DIFFERENT InterfaceID by construction) ─────────
+    // bringPeerOnlineWith does not yield .ready when startFirst is false; the node is running.
+    await bringPeerOnlineWith(store, events.continuation, token: peerTokenB,
+                              channelID: channel2, peerHandle: handle2, startFirst: false)
+
+    // Peer B announces its delivery destination. The announce must arrive with a FRESH timestamp
+    // so Transport's shouldReplace accepts it (later timestamp wins).
+    let (announceFramedB, _) = makeLXMFAnnouncePacket(identity: bIdentity, emitted: 1_700_000_001)
+    let beforeLinkReq = sent.value.count
+    events.continuation.yield(.channelData(channel2, announceFramedB))
+
+    // learnedPath → router(.learnedPath) → directLinks[dest] == .awaitingPath → establish() →
+    //   requestLink → BLEEndpoint.openLink → LINKREQUEST emitted on interface B.
+    // Wait for the deepest send — the BLEInterface-level driver call — so we know the
+    // LINKREQUEST actually reached the driver before asserting on `sent`.
+    await store.receive { if case .endpoint(.ble(.ble(.send))) = $0 { return true }; return false }
+
+    // A LINKREQUEST was emitted toward tokenB — the re-discovered peer.
+    #expect(sent.value.count > beforeLinkReq, "a LINKREQUEST must reach the BLE driver after path re-learn")
+    guard let lastSent = sent.value.last else {
+        Issue.record("nothing reached the BLE driver after reconnect")
+        return
+    }
+    let rawPkt = Data(lastSent.dropFirst(BLEFraming.headerLength))
+    #expect(Packet(raw: rawPkt)?.packetType == .linkRequest,
+            "the packet emitted after path re-learn must be a LINKREQUEST")
+
+    // Confirm the router exited the park: directLinks should now be .establishing.
+    #expect(store.state.router.directLinks[bDeliveryHash] == .establishing,
+            "router must transition from .awaitingPath to .establishing after path re-learn")
+
+    // Teardown: the node is still running (one active peer: tokenB).
+    await store.send(.endpoint(.stop))
+    await store.receive { if case .endpoint(.ble(.transport(.stopMaintenance))) = $0 { return true }; return false }
 }
