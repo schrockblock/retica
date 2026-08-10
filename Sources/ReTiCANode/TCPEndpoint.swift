@@ -147,7 +147,10 @@ public struct TCPEndpoint {
                                                            interfaceID: id, data: data)))
 
             case let .openLink(destinationHash):
-                guard let learned = state.transport.learned[destinationHash] else {
+                // Fail fast when the learned interface has departed, rather than minting a link on
+                // a dead interface and waiting ~15s for establishmentDeadline. TCP has one fixed
+                // InterfaceID so this only fires while TCP is disconnected — correct behavior.
+                guard let learned = state.transport.reachableLearned(destinationHash) else {
                     return .send(.delegate(.linkFailed(destinationHash: destinationHash)))
                 }
                 // Via a relay (learned nextHop != the destination) → HEADER_2 LINKREQUEST to the relay.

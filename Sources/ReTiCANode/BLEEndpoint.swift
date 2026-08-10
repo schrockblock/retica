@@ -186,7 +186,11 @@ public struct BLEEndpoint {
 
             // --- Public link actions → LinkPlane ---
             case let .openLink(destinationHash):
-                guard let learned = state.transport.learned[destinationHash] else {
+                // Fail fast when the learned interface has departed, rather than minting a link on
+                // a dead interface and waiting ~15s for establishmentDeadline. The prompt linkFailed
+                // is what lets LXMFRouter request a path (LXMFRouter.swift:311-313), which refreshes
+                // `learned` with the live interface and makes a retry succeed.
+                guard let learned = state.transport.reachableLearned(destinationHash) else {
                     return .send(.delegate(.linkFailed(destinationHash: destinationHash)))
                 }
                 let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
