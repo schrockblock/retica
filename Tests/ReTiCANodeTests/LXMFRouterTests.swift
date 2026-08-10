@@ -737,9 +737,14 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 /// establishment saga (maxAttempts × establishmentTimeout = 75s), so the final `linkClosed` for a
 /// dead peer arrives with the pending delivery already self-cleared — i.e. with NO work. That is
 /// the one exit from the saga that does not run `giveUp`, so before this fix `establishAttempts`
-/// was stranded there permanently and the next message to that peer inherited a spent budget:
-/// it got a truncated allowance, or none at all, and `knownPaths` was discarded despite never
-/// having been falsified by that message's own attempts.
+/// was stranded there permanently and the next message to that peer inherited a spent budget.
+///
+/// NOTE ON PACING: under uniform 15s pacing that timeline strands the counter at `maxAttempts - 1`
+/// (increments at t=0/15/30/45, retry ceiling at t=50, the no-work close at t=60), so the next
+/// message gets ONE attempt rather than zero. This test drives the MAXIMAL strand — exactly
+/// `maxAttempts`, the zero-attempt worst case — via five synchronous closes. That is a legitimate
+/// drive, not a synthetic one: `TCPEndpoint.openLink` with no learned path returns `linkFailed`
+/// immediately (the hot-spin driver), so consecutive closes need not be 15s apart.
 @Test @MainActor func routerStaleEstablishBudgetDoesNotTruncateTheNextMessage() async {
     let recipientHash = Identity().hash
     let msg = makeMessage(source: Identity(), recipientIdentityHash: recipientHash, content: "first")

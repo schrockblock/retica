@@ -368,11 +368,18 @@ public struct LXMFRouter {
                     return establish(&state, dest)
                 }
                 // No work left for this destination: the establishment saga is OVER, so its budget
-                // ends with it. `giveUp` is the only other clearer and it is reachable only while
-                // work still exists, so without this the counter is stranded at whatever it had
-                // reached — and the NEXT message to this peer inherits a spent budget, truncating
-                // or instantly failing a delivery that deserved a full allowance (and discarding a
-                // still-valid `knownPaths` entry on the way out).
+                // ends with it. The other clearers are `.linkEstablished` (success) and `giveUp`
+                // (the ceiling) — on the FAILURE path `giveUp` is the only one, and it is reachable
+                // only while work still exists. So without this the counter is stranded at whatever
+                // it had reached, and the NEXT message to this peer inherits a spent budget,
+                // truncating or instantly failing a delivery that deserved a full allowance.
+                //
+                // `knownPaths` is deliberately NOT removed here. This is also the ordinary healthy
+                // close, where the path is fine and discarding it would be wrong. That does mean a
+                // ceiling-stranded destination keeps a route five failed establishments argued
+                // against — the same evidence `giveUp` cites when it DOES discard — so the next
+                // message spends another full saga before reaching the `requestPath` recovery.
+                // Accepted: distinguishing the two cases needs a budget-aware condition here.
                 //
                 // This branch became reachable with a non-nil budget once establishment was paced
                 // by the 15s timeout: the establishment saga (maxAttempts × 15s = 75s) now outlives
