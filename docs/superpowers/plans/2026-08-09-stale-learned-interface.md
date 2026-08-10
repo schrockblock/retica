@@ -19,13 +19,38 @@ On BLE an `InterfaceID` derives from the peer's HELLO session token, so a restar
 
 This is the same class of defect as the link re-homing slice, one table over: a binding captured once and read forever.
 
-## The recovery loop this unlocks
+## The recovery loop this was supposed to unlock — CORRECTED, and it does not exist
 
-`LXMFRouter` already consumes `linkFailed` and requests a path when it does not know one (`LXMFRouter.swift:311-313`), tracking `knownPaths` (`:27`, inserted on `.pathLearned` at `:280`). So making `openLink` fail *fast* completes a loop that currently cannot start:
+**The original rationale below was false, and Task 2 was reverted because of it. Preserved as written, then corrected, because the error is the useful part.**
 
-`openLink` → immediate `linkFailed` → router requests a path → peer answers → `learned` refreshes with the **live** interface → retry succeeds.
+> ~~`LXMFRouter` already consumes `linkFailed` and requests a path when it does not know one (`LXMFRouter.swift:311-313`), tracking `knownPaths` (`:27`, inserted on `.pathLearned` at `:280`). So making `openLink` fail *fast* completes a loop that currently cannot start.~~
 
-C4's ingress-control exemption already protects that path request from being held under a burst. The pieces compose; only the fast failure is missing.
+Two things are wrong with that.
+
+**1. `LXMFRouter` has no `.linkFailed` case at all** — zero occurrences in the file. `LXMFRouter.swift:311-313` is the `.retryDue` → opportunistic branch, unrelated. The real consumer is `LXMFNode.swift:267`, which translates `linkFailed` into `router.linkClosed` — a *different* action taking the `establish` path, not a path request.
+
+**2. `knownPaths` is insert-only.** One write (`LXMFRouter.swift:280`), no removal anywhere. So in exactly the scenario this slice targets — an announce was heard, then the peer restarted under a new `InterfaceID` — the router still believes the path is known, takes the `knownPaths.contains` branch at `:114`, and requests a **link**, never a path.
+
+### What failing fast actually produced: an unbounded hot loop
+
+`openLink` → immediate `linkFailed` → `LXMFNode.swift:267` → `router.linkClosed` → `LXMFRouter.swift:274-275` sees a queued message → `establish` → `knownPaths.contains` is true → `.requestLink` → `LXMFNode.swift:224` → `openLink`. **Zero delay, no attempt counter.** `maxAttempts` does not bound it: the message sits in `outboundQueue`, not `pendingDeliveries`.
+
+Before the change the same cycle existed but each iteration cost a minted `LinkSession` and ~15 s of `establishmentDeadline` — so the timeout was acting as an accidental rate limiter, and each iteration at least made a real transmit attempt. Removing it converted ~4 iterations/minute into a spin lasting until the peer re-announces (minutes), on a phone, on BLE.
+
+**This is the lesson: the 15-second timeout was load-bearing, and nothing said so.** "Fail fast" is only an improvement when the failure path is bounded. Ours was bounded solely by the thing being removed.
+
+## What a correct version of this slice requires
+
+Not a two-line endpoint change. The consumer side has to change first:
+
+1. Give `linkFailed` a **reason** (or add a distinct delegate for "learned path unreachable"). Today it carries none, while `sendFailed` — which nothing consumes — carries a precise one. The precision is on the wrong signal.
+2. On that reason, have `LXMFNode` clear `dest` from `knownPaths` **before** forwarding `.router(.linkClosed)`, so `establish` takes the `requestPath` branch.
+3. Decide explicitly what bounds the resulting `.awaitingPath` park — there is no timeout on it today, and queued messages carry no retry timer, so "park forever" is what you trade the spin for.
+4. Regression test at the `LXMFNode` level: learned + `interfaceDisconnected` + `.send(.direct)` ⇒ **exactly one** `openLink`, followed by a `requestPath`. That is the test whose absence let this through.
+
+### Also worth knowing before claiming the loop closes
+
+A path request only refreshes `learned` for a **locally-owned / 1-hop** destination: `Transport.swift:486-495` builds a *fresh* announce, so `announceEmitted` is newer and `shouldReplace` accepts it. A **relay-answered** path response replays the *cached* payload verbatim (`:501-517`), leaving `announceEmitted` unchanged — so `shouldReplace` rejects it and a stale multi-hop `interfaceID` is **not** refreshed.
 
 ## Scoping decision (recorded)
 
@@ -177,7 +202,11 @@ git commit -F /tmp/ReTiCA/stale-task1-msg.txt
 
 ---
 
-### Task 2: `openLink` fails fast, unlocking the path-request recovery loop
+### Task 2: `openLink` fails fast — IMPLEMENTED (`f0c4670`), then REVERTED (`e01f0ce`)
+
+**Do not re-implement as written.** The whole-branch review found it converts a 15 s-paced retry into an unbounded zero-delay `openLink` ⇄ `linkFailed` spin, because `knownPaths` never clears and `LXMFRouter` has no `linkFailed` handling — see the corrected section above. The two-line endpoint change is correct in isolation and was well tested; what is missing is the consumer-side half that turns a fast failure into a recovery rather than a spin. The steps below are retained for whoever picks that up.
+
+**Original task text follows.**
 
 **Files:**
 - Modify: `Sources/ReTiCANode/BLEEndpoint.swift` (`openLink` ≈:187-196), `Sources/ReTiCANode/TCPEndpoint.swift` (its `openLink`)
