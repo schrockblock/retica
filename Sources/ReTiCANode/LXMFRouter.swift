@@ -41,6 +41,14 @@ public struct LXMFRouter {
         /// Client "have" set: transient_ids already downloaded from a PN. Drives the wants/haves split on
         /// the next offer (wants = offered we lack; haves = offered we have → PN purges). Unbounded for now.
         public var downloadedTransientIds: Set<Data> = []
+        /// Consecutive failed link-establishment attempts per destination.
+        ///
+        /// `pendingDeliveries.attempts` bounds the retry-TIMER saga; a message sitting in
+        /// `outboundQueue` is not armed with a timer until `linkEstablished` drains it, so without
+        /// this counter `linkClosed -> establish -> requestLink -> linkFailed -> linkClosed` recurs
+        /// forever. Reset whenever the situation genuinely changes: a link established, or a path
+        /// learned.
+        public var establishAttempts: [Data: Int] = [:]
         public init() {}
     }
 
@@ -112,6 +120,27 @@ public struct LXMFRouter {
             }
             func establish(_ state: inout State, _ dest: Data) -> Effect<Action> {
                 if state.knownPaths.contains(dest) {
+                    let attempts = (state.establishAttempts[dest] ?? 0) + 1
+                    if attempts > LXMFDelivery.maxAttempts {
+                        // Give up on this destination: fail everything queued for it, and forget the
+                        // path — our belief that we know a usable route has been empirically falsified,
+                        // so the NEXT send should request a fresh one rather than retry links.
+                        state.establishAttempts[dest] = nil
+                        state.knownPaths.remove(dest)
+                        state.directLinks[dest] = nil
+                        let queued = state.outboundQueue[dest] ?? []
+                        let propQueued = state.propagationQueue[dest] ?? []
+                        state.outboundQueue[dest] = nil
+                        state.propagationQueue[dest] = nil
+                        var effects: [Effect<Action>] = queued.map {
+                            .send(.delegate(.deliveryFailed(messageHash: $0.hash)))
+                        }
+                        effects += propQueued.map {
+                            .send(.delegate(.deliveryFailed(messageHash: $0.messageHash)))
+                        }
+                        return effects.isEmpty ? .none : .merge(effects)
+                    }
+                    state.establishAttempts[dest] = attempts
                     state.directLinks[dest] = .establishing
                     return .send(.delegate(.requestLink(destinationHash: dest)))
                 }
@@ -226,6 +255,7 @@ public struct LXMFRouter {
 
             case let .linkEstablished(dest, linkID):
                 state.directLinks[dest] = .active(linkID: linkID)
+                state.establishAttempts[dest] = nil
                 let queued = state.outboundQueue[dest] ?? []
                 state.outboundQueue[dest] = nil
                 let propQueued = state.propagationQueue[dest] ?? []
@@ -278,6 +308,7 @@ public struct LXMFRouter {
 
             case let .learnedPath(dest):
                 state.knownPaths.insert(dest)
+                state.establishAttempts[dest] = nil
                 if state.directLinks[dest] == .awaitingPath {
                     state.directLinks[dest] = .establishing
                     return .send(.delegate(.requestLink(destinationHash: dest)))
