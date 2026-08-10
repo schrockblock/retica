@@ -166,6 +166,8 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
                                              hops: 2, emitted: 500)
     let store = TestStore(initialState: Transport.State()) { Transport() }
     store.exhaustivity = .off
+    // Connect the interface first — reachableLearned now requires interfaces[entry.interfaceID] != nil.
+    await store.send(.interfaceConnected(ifID))
     await store.send(.received(ifID, raw))
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
 
@@ -188,6 +190,70 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let store = TestStore(initialState: Transport.State()) { Transport() }
     store.exhaustivity = .off
     let destHash = Data(repeating: 0x22, count: 16)
+    await store.send(.send(destinationHash: destHash, plaintext: Data("x".utf8)))
+    await store.receive(.delegate(.sendFailed(destinationHash: destHash, reason: .notLearned)))
+}
+
+/// A learned path whose interface has since disconnected is not usable: sending reports
+/// interfaceUnavailable rather than building a packet and routing it into the void. The path
+/// itself is RETAINED — it becomes usable again when the interface returns (TCP) or the peer
+/// re-announces (BLE).
+@Test @MainActor func sendToADestinationOnADepartedInterfaceReportsInterfaceUnavailable() async {
+    let remote = Identity()
+    let ifID = InterfaceID("i0")
+    let (raw, destHash) = makeAnnouncePacket(identity: remote, appName: "app", aspects: ["svc"],
+                                             hops: 2, emitted: 500)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+
+    // Connect the interface and learn the path.
+    await store.send(.interfaceConnected(ifID))
+    await store.send(.received(ifID, raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+
+    // Now disconnect the interface — path must be retained.
+    await store.send(.interfaceDisconnected(ifID))
+    #expect(store.state.learned[destHash] != nil, "entry must survive interface departure (non-destructive)")
+
+    // ABSENCE ASSERTION: .send is the LAST store.send so receivedActions cannot be wiped
+    // by a later store.send. After receiving the expected sendFailed, flip to .on — any
+    // additional queued action (e.g. a stray .transmit) would fail the test since we call
+    // no further receive.
+    await store.send(.send(destinationHash: destHash, plaintext: Data("x".utf8)))
+    await store.receive(.delegate(.sendFailed(destinationHash: destHash, reason: .interfaceUnavailable)))
+    store.exhaustivity = .on
+    // Path must still be present (non-destructive).
+    #expect(store.state.learned[destHash] != nil, "entry must still be retained after failed send")
+}
+
+/// The happy path is unchanged: a learned destination on a live interface still transmits.
+@Test @MainActor func sendToADestinationOnALiveInterfaceStillTransmits() async {
+    let remote = Identity()
+    let ifID = InterfaceID("i0")
+    let (raw, destHash) = makeAnnouncePacket(identity: remote, appName: "app", aspects: ["svc"],
+                                             hops: 2, emitted: 500)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+
+    await store.send(.interfaceConnected(ifID))
+    await store.send(.received(ifID, raw))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+
+    let captured = LockIsolated<InterfaceID?>(nil)
+    await store.send(.send(destinationHash: destHash, plaintext: Data("hello".utf8)))
+    await store.receive { action in
+        if case let .delegate(.transmit(id, _)) = action { captured.setValue(id); return true }
+        return false
+    }
+    #expect(captured.value == ifID, "must transmit on the live interface")
+}
+
+/// An unknown destination still reports notLearned — the new check must not swallow or
+/// re-label the pre-existing case.
+@Test @MainActor func sendToAnUnknownDestinationStillReportsNotLearned() async {
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    let destHash = Data(repeating: 0x33, count: 16)
     await store.send(.send(destinationHash: destHash, plaintext: Data("x".utf8)))
     await store.receive(.delegate(.sendFailed(destinationHash: destHash, reason: .notLearned)))
 }

@@ -117,6 +117,22 @@ public struct Transport {
 
         public init() {}
 
+        /// The learned path to `destinationHash`, but only when its interface is currently connected.
+        ///
+        /// `LearnedDestination.interfaceID` is captured at announce time and replaced only by a
+        /// strictly-newer announce, so after a BLE peer restarts (its InterfaceID derives from the
+        /// HELLO session token, making a reconnected peer a DIFFERENT interface) the stored binding
+        /// names a dead interface until that peer's next announce — minutes away.
+        ///
+        /// Deliberately NON-DESTRUCTIVE: the entry is retained, not purged. Purging on
+        /// `interfaceDisconnected` would discard every path on every TCP reconnect, since TCP's
+        /// InterfaceID is fixed and returns after a blip.
+        public func reachableLearned(_ destinationHash: Data) -> LearnedDestination? {
+            guard let entry = learned[destinationHash], interfaces[entry.interfaceID] != nil
+            else { return nil }
+            return entry
+        }
+
         public struct LinkTableEntry: Equatable, Sendable {
             public var rcvdIf: InterfaceID
             public var nhIf: InterfaceID
@@ -748,6 +764,10 @@ public struct Transport {
                 guard let entry = state.learned[destinationHash] else {
                     return .send(.delegate(.sendFailed(destinationHash: destinationHash,
                                                        reason: .notLearned)))
+                }
+                guard state.reachableLearned(destinationHash) != nil else {
+                    return .send(.delegate(.sendFailed(destinationHash: destinationHash,
+                                                       reason: .interfaceUnavailable)))
                 }
                 let ciphertext = entry.identity.encrypt(plaintext, ratchet: entry.ratchet)
                 let packet: Packet
