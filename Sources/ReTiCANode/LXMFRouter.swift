@@ -186,8 +186,12 @@ public struct LXMFRouter {
                     let wasAwaitingPath = state.directLinks[dest] == .awaitingPath
                     state.directLinks[dest] = .establishing
                     let requestLink = Effect<Action>.send(.delegate(.requestLink(destinationHash: dest)))
-                    // If we were parked in .awaitingPath, the park timer is still in-flight —
-                    // cancel it now that we have a path and are moving to .establishing.
+                    // Leaving `.awaitingPath` ends the park, so the park timer must die with it.
+                    // Cancelling HERE rather than in the calling case keeps the cancel adjacent to
+                    // the state transition it pairs with, so any future caller that reaches
+                    // establish() while parked is covered automatically. Today `learnedPath` is the
+                    // only such caller (every other caller either requires `directLinks[dest] == nil`
+                    // or nils it first), so this is defence-in-depth, not a live fix.
                     return wasAwaitingPath
                         ? .merge(requestLink, .cancel(id: CancelID.pathRequest(dest)))
                         : requestLink
@@ -365,17 +369,30 @@ public struct LXMFRouter {
                 return .none
 
             case let .learnedPath(dest):
-                // Deliberately does NOT reset the establishment budget, and does not need to.
-                // Invariant: establishAttempts[dest] is non-nil only for destinations already
-                // in knownPaths (it is set solely in the `contains` branch of establish), and
-                // the ceiling clears both together. So a first-time learn always finds a nil
-                // budget already, and a re-announce of an ALREADY-KNOWN path must not reset —
-                // knownPaths is a bare Set with no epoch, so a live peer re-announcing on a
-                // timer would otherwise refresh the budget forever and re-open the unbounded
-                // cycle this counter exists to close.
+                // Deliberately does NOT reset the establishment budget.
                 //
-                // A future path-expiry that removes from knownPaths must clear
-                // establishAttempts alongside it, or that invariant breaks.
+                // There is no longer any invariant tying `establishAttempts` to `knownPaths`:
+                // `.pathRequestDeadline` increments the budget for a destination that is by
+                // definition NOT in `knownPaths` (it is parked in `.awaitingPath` precisely
+                // because no path is known). So on reaching here the budget may be non-nil and
+                // already partly spent by the PARK, not just by link attempts.
+                //
+                // That is exactly why a reset here would be wrong, and the argument no longer
+                // depends on which branch spent the budget:
+                //
+                //  • The park and the link attempts deliberately SHARE one budget, so that a
+                //    destination cannot alternate between the two establish branches and draw a
+                //    fresh allowance from each. `learnedPath` is the very transition between
+                //    those branches — resetting here would hand out that fresh allowance and
+                //    reopen the unbounded cycle assembled from two bounded halves.
+                //  • `knownPaths` is a bare Set with no epoch, so a live peer re-announcing on
+                //    its normal period reaches here repeatedly; resetting would refresh the
+                //    budget forever.
+                //
+                // Consequence to keep in mind (accepted, not a bug): a path learned late in the
+                // park can arrive with the budget nearly or fully spent, so the destination may
+                // give up with few or no link attempts. The bound is on the whole establishment
+                // saga, not on either half.
                 state.knownPaths.insert(dest)
                 if state.directLinks[dest] == .awaitingPath {
                     // Route through establish() so there is exactly ONE counted emitter of

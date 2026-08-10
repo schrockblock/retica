@@ -283,10 +283,12 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     #expect(store.state.directLinks[msg.destinationHash] == .awaitingPath)
     #expect(store.state.outboundQueue[msg.destinationHash]?.count == 1)   // message parked
-    // The park timer is in-flight (TestClock: will not fire until advanced). Leave .off so
-    // teardown does not require the timer to complete — the positive assertions above already
-    // proved the correct behaviour. A stray requestLink is vacuous under .off, which is acceptable
-    // here since that guard is separately tested in routerRequestsPathOnceWhileAwaitingPath.
+    // A stray requestLink (asking for a link with no path) must not be emitted. That is an
+    // absence assertion, vacuous under .off — enforce it with flip-then-send, which unlike a
+    // trailing `.on` does not also assert that the armed park timer has completed.
+    store.exhaustivity = .on
+    await store.send(.offeredMessageList(transientIds: []))   // no-op send; forces the stray check
+    store.exhaustivity = .off
 }
 
 /// After requesting a path, learning it transitions awaitingPath → establishing (emits requestLink);
@@ -318,8 +320,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 }
 
 /// Request-path-once: a second direct send to a still-awaitingPath destination is queued but does NOT
-/// emit a second requestPath. (Removing the `directLinks[dest] == nil` guard would fire a second
-/// requestPath — an un-received delegate caught by the exhaustive teardown.)
+/// emit a second requestPath. (Loosening the `directLinks[dest] == nil` guard to also admit
+/// `.awaitingPath` fires a second requestPath — an un-received delegate caught by the
+/// flip-then-send stray check at the end of this test.)
 @Test @MainActor func routerRequestsPathOnceWhileAwaitingPath() async {
     let sender = Identity()
     let recipient = Identity().hash
@@ -335,12 +338,15 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.directLinks[m1.destinationHash] == .awaitingPath)
     await store.send(.send(message: m2, desiredMethod: .direct))   // still awaitingPath → enqueue only
     #expect(store.state.outboundQueue[m1.destinationHash]?.count == 2)   // both queued
-    // The park timer is in-flight (TestClock: won't fire unless advanced). The absence assertion
-    // (no second requestPath) is still valid — the guard is what prevents it, not the timer.
-    // Under .off teardown does not catch the in-flight timer, which is acceptable here.
-    // (Absence via .on + no-send would require draining the timer; that would change the test's
-    // focus. The guard's absence is separately verified by the TestStore detecting an extra
-    // requestPath if the guard were removed — that remains true under .off with parallel sends.)
+    // The once-ness claim is an ABSENCE assertion, and under .off it is vacuous. Enforce it with
+    // the flip-then-send idiom: `send` checks "must handle N received actions" BEFORE processing
+    // the new action, and that check is not gated on in-flight effects — so it works even though
+    // the park timer is armed. (A trailing `.on` would also catch the stray at teardown, but
+    // teardown under `.on` additionally asserts no in-flight effects, which the armed park timer
+    // would trip for an unrelated reason.) Flip back to .off so teardown tolerates that timer.
+    store.exhaustivity = .on
+    await store.send(.offeredMessageList(transientIds: []))   // no-op send; forces the stray check
+    store.exhaustivity = .off
 }
 
 /// A queued message parked in .awaitingPath must not wait forever. Before this change,
@@ -938,10 +944,12 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     #expect(store.state.directLinks[dest] == .awaitingPath)
     #expect(store.state.outboundQueue[dest]?.count == 1)
-    // The park timer is now in-flight (TestClock: won't fire unless advanced). Leave .off so
-    // teardown does not require it to complete — the positive assertions above already prove the
-    // correct behaviour (requestPath, not requestLink). The test's goal (no stray requestLink on
-    // the next send after a ceiling) is proven by the receive assertion above.
+    // "requestPath, NOT requestLink" is half positive (asserted above) and half absence. Enforce
+    // the absence half with flip-then-send; a trailing `.on` would also catch a stray but would
+    // additionally trip on the now-armed park timer for an unrelated reason.
+    store.exhaustivity = .on
+    await store.send(.offeredMessageList(transientIds: []))   // no-op send; forces the stray check
+    store.exhaustivity = .off
 }
 
 /// A re-announce of an ALREADY-KNOWN path is not new information and must NOT refresh the budget.
