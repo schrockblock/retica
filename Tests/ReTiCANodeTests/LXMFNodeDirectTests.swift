@@ -150,11 +150,18 @@ import ComposableArchitecture
     await a.send(.endpoint(.stop)); await b.send(.endpoint(.stop))
 }
 
-/// An establishment timeout must reach the router. Before this change, LinkSession emitted
-/// .closed(.timedOut) rather than .establishmentFailed, so it arrived as linkClosed(linkID:)
-/// and died at the LXMFNode reverse-map (directLinks is written only on linkEstablished) —
-/// leaving the destination pinned at .establishing forever, with the message parked in
-/// outboundQueue, no timer, no retry and no deliveryFailed.
+/// An establishment timeout must reach the router and route as a PATH-shaped failure. Before
+/// this change (Task 1), LinkSession emitted `.closed(.timedOut)` → `linkClosed(linkID:)`, which
+/// died at the LXMFNode reverse-map, leaving the destination wedged. That was fixed by emitting
+/// `.establishmentFailed(.timedOut)`.
+///
+/// This test (updated for Task 2) verifies the new routing: an establishment timeout is
+/// PATH-shaped — the peer never responded, so the most likely cause is that our route is wrong.
+/// Routing to a path request is cheaper than burning 5 × 15s against a dead route. The shared
+/// `establishAttempts` budget bounds the whole saga (path parks + link attempts together).
+///
+/// Flow: 1 timeout → pathLost + linkClosed → establish → awaitingPath park → requestPath.
+/// Park timer fires (maxAttempts - 1) more times, then giveUp → deliveryFailed.
 @Test @MainActor func establishmentTimeoutReachesRouterAndDoesNotWedgeDestination() async {
     let clock = TestClock()
     let aIdentity = Identity()
@@ -184,13 +191,6 @@ import ComposableArchitecture
         if case .endpoint(.tcp(.interface(.send))) = a { return true }; return false
     }
 
-    // Interface bytes are HDLC-framed; deframe to recover the packet before inspecting its type.
-    func packetType(of framed: Data) -> PacketType? {
-        var deframer = HDLCDeframer()
-        guard let raw = deframer.ingest(framed).first else { return nil }
-        return Packet(raw: raw)?.packetType
-    }
-
     let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
     let (a, eventsA) = make("a", aIdentity, sentA)
     let (b, eventsB) = make("b", bIdentity, sentB)
@@ -208,42 +208,152 @@ import ComposableArchitecture
     await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
 
     // A sends a direct message to B. Because A has a learned path, openLink proceeds and
-    // a LINKREQUEST goes out. B never replies — we are simulating a peer that does not answer.
-    // Rebuild the message with the same params to recover its deterministic hash.
+    // a LINKREQUEST goes out. B never replies — simulating a peer that does not answer.
     let wedgedHash = LXMessage.create(
         source: aIdentity, destinationHash: bDeliveryHash,
         timestamp: 1700000000.5, title: Data("x".utf8), content: Data("y".utf8)).hash
     await a.send(.send(destinationHash: bDeliveryHash, title: Data("x".utf8), content: Data("y".utf8), method: .direct))
     await a.receive(isInterfaceSend)                          // LINKREQUEST #1 (establishAttempts = 1)
-    #expect(packetType(of: sentA.value.last!) == .linkRequest)
-    // directLinks[bDeliveryHash] is now .establishing; message sits in outboundQueue with no timer.
 
-    // Each 15 s advance fires one establishment timeout.
-    // BEFORE this fix: LinkSession emitted .closed(.timedOut) → linkClosed(linkID:) →
-    //   LXMFNode reverse-map fails (directLinks written only on linkEstablished) →
-    //   destination stays .establishing forever; nothing more is sent, ever.
-    // AFTER this fix: LinkSession emits .establishmentFailed → linkFailed(destinationHash:) →
-    //   router receives linkClosed(dest) → establish() → the next LINKREQUEST.
-    //
-    // establish() allows attempts 1...maxAttempts(5) to emit requestLink, so timeouts 1-4 each
-    // produce another LINKREQUEST and the 5th exhausts the budget.
-    for attempt in 2...LXMFDelivery.maxAttempts {
-        await clock.advance(by: .seconds(15))
-        await a.receive(isInterfaceSend)                      // LINKREQUEST #attempt
-        #expect(packetType(of: sentA.value.last!) == .linkRequest,
-                "re-establishment \(attempt) should be a LINKREQUEST")
+    // After 15s the link times out with .establishmentTimedOut.
+    // Task 2 routing: .establishmentTimedOut is PATH-shaped →
+    //   pathLost (clear knownPaths) + linkClosed → establish() → .awaitingPath park + requestPath.
+    // establishAttempts is still 1 (the awaitingPath branch of establish() does not increment it;
+    // only pathRequestDeadline does, starting from the first park-timer fire).
+    await clock.advance(by: .seconds(15))
+    await a.receive { if case .router(.delegate(.requestPath)) = $0 { return true }; return false }
+    #expect(a.state.router.directLinks[bDeliveryHash] == .awaitingPath)
+    #expect(!a.state.router.knownPaths.contains(bDeliveryHash), "path cleared by pathLost")
+
+    // Each pathRequestWaitSeconds advance fires one pathRequestDeadline → re-request path.
+    // pathRequestDeadline increments from 1: 1→2, 2→3, 3→4, 4→5 → requestPath (4 fires).
+    // Then 5→6 > maxAttempts(5) → giveUp. So 4 requestPath re-fires from pathRequestDeadline.
+    for _ in 1...(LXMFDelivery.maxAttempts - 1) {
+        await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
+        await a.receive { if case .router(.delegate(.requestPath)) = $0 { return true }; return false }
     }
 
-    // The 5th timeout drives establish() past the budget: it gives up, drains outboundQueue and
-    // fails the message. This is the TERMINUS — the wedge does not merely un-stick, it reaches a
-    // bounded, reported outcome in maxAttempts × establishmentTimeout = 5 × 15 s = 75 s.
+    // The (maxAttempts+1)-th deadline drives giveUp: deliveryFailed is emitted.
     let failedHash = LockIsolated<Data?>(nil)
-    await clock.advance(by: .seconds(15))
+    await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
     await a.receive { action in
         if case let .delegate(.deliveryFailed(hash)) = action { failedHash.setValue(hash); return true }
         return false
     }
     #expect(failedHash.value == wedgedHash)
+    // giveUp clears all state.
+    #expect(a.state.router.outboundQueue[bDeliveryHash]?.isEmpty ?? true)
+    #expect(a.state.router.establishAttempts[bDeliveryHash] == nil)
 
     await a.send(.endpoint(.stop)); await b.send(.endpoint(.stop))
 }
+
+/// A path-shaped link failure must make the router request a PATH, not retry the LINK. Before
+/// this fix, `knownPaths` still claimed a path existed after a `.pathStale` (or `.noPath` /
+/// `.establishmentTimedOut`) failure, so `establish` took the `requestLink` branch every time and
+/// burned the whole budget against a route already known to be dead.
+///
+/// Checks all three path-shaped reasons.
+///
+/// Absence strategy: `establish` is mutually exclusive — it either emits `requestLink`
+/// (if `knownPaths` contains dest) or `requestPath` (if not). We assert `requestPath` arrived
+/// AND that `directLinks[dest] == .awaitingPath` in state. If `requestLink` had been emitted
+/// instead, the state would be `.establishing`. State is the load-bearing absence proof;
+/// a trailing `.on` is NOT used here because the `pathRequestTimer` is in flight and would
+/// cause teardown to fail on the in-flight effect. Mutation #2 (drop `pathLost`) and
+/// mutation #3 (reverse order) both break this test by routing through `.establishing`.
+@Test @MainActor func stalePathLinkFailureRequestsAPathInsteadOfRetryingTheLink() async {
+    let dest = LXMessage.deliveryHash(identityHash: Identity().hash)
+
+    for reason in [LinkFailure.pathStale, .noPath, .establishmentTimedOut] {
+        let clock = TestClock()
+        let aIdentity = Identity()
+        var initial = LXMFNode.State(
+            identity: aIdentity,
+            endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
+        // Seed the router with a known path so that without the fix `establish` would emit
+        // `requestLink`. We also need a queued message so `linkClosed` has work and calls `establish`.
+        initial.router.knownPaths.insert(dest)
+        let msg = LXMessage.create(source: aIdentity, destinationHash: dest,
+                                   timestamp: 1700000000.5, title: Data("t".utf8),
+                                   content: Data("c".utf8))
+        initial.router.outboundQueue[dest] = [msg]
+
+        let store = TestStore(initialState: initial) {
+            LXMFNode()
+        } withDependencies: {
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+            $0.uuid = .incrementing
+            $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } },
+                                             send: { _ in },
+                                             close: { })
+        }
+        store.exhaustivity = .off
+
+        // Inject a path-shaped link failure. The fix:
+        //   1. pathLost(dest)  → knownPaths.remove(dest)
+        //   2. linkClosed(dest) → establish() sees no path → .awaitingPath + requestPath
+        // Without the fix: knownPaths still contains dest → establish() → requestLink.
+        await store.send(.endpoint(.delegate(.linkFailed(destinationHash: dest, reason: reason))))
+
+        // Assert: a path request is emitted (awaitingPath park), NOT a link request.
+        await store.receive { action in
+            if case .router(.delegate(.requestPath(let d))) = action { return d == dest }
+            return false
+        }
+
+        // State confirms the routing: .awaitingPath means requestPath was emitted.
+        // .establishing would mean requestLink was emitted — the pre-fix behaviour.
+        // knownPaths must be cleared so the NEXT establish() also takes the path-request branch.
+        #expect(!store.state.router.knownPaths.contains(dest),
+                "knownPaths must be cleared by pathLost for reason \(reason)")
+        #expect(store.state.router.directLinks[dest] == .awaitingPath,
+                "destination must be parked in .awaitingPath for reason \(reason)")
+    }
+}
+
+/// An establishment failure that is NOT path-shaped (`.handshakeRejected`) must still retry the
+/// link, not request a path. The path demonstrably works — the peer replied but the proof was bad.
+/// This is the regression guard against over-routing: we must not park `.handshakeRejected` in
+/// `.awaitingPath`, because the path is fine and a path request would waste the budget.
+@Test @MainActor func handshakeRejectedLinkFailureStillRetriesTheLinkNotAPath() async {
+    let dest = LXMessage.deliveryHash(identityHash: Identity().hash)
+    let clock = TestClock()
+    let aIdentity = Identity()
+    var initial = LXMFNode.State(
+        identity: aIdentity,
+        endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
+    initial.router.knownPaths.insert(dest)
+    let msg = LXMessage.create(source: aIdentity, destinationHash: dest,
+                               timestamp: 1700000000.5, title: Data("t".utf8),
+                               content: Data("c".utf8))
+    initial.router.outboundQueue[dest] = [msg]
+
+    let store = TestStore(initialState: initial) {
+        LXMFNode()
+    } withDependencies: {
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } },
+                                         send: { _ in },
+                                         close: { })
+    }
+    store.exhaustivity = .off
+
+    await store.send(.endpoint(.delegate(.linkFailed(destinationHash: dest, reason: .handshakeRejected))))
+
+    // Assert: a link request is emitted (re-establish), NOT a path request.
+    await store.receive { action in
+        if case .router(.delegate(.requestLink(let d))) = action { return d == dest }
+        return false
+    }
+
+    // knownPaths must still contain dest (path not cleared for peer-shaped failure).
+    #expect(store.state.router.knownPaths.contains(dest),
+            "knownPaths must not be cleared for .handshakeRejected")
+    #expect(store.state.router.directLinks[dest] == .establishing,
+            "destination must be .establishing (link retry), not .awaitingPath")
+}
+

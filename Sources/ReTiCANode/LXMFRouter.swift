@@ -99,6 +99,20 @@ public struct LXMFRouter {
         case linkEstablished(destinationHash: Data, linkID: Data)
         case linkClosed(destinationHash: Data)
         case learnedPath(destinationHash: Data)
+        /// Inverse of `learnedPath`: removes the destination from `knownPaths` so that `establish`
+        /// will take its `.awaitingPath` branch (request a fresh path) instead of emitting
+        /// `requestLink` against a route already known to be wrong.
+        ///
+        /// **Ordering invariant**: `pathLost` MUST be reduced before any subsequent `linkClosed`
+        /// for the same destination. If `linkClosed` reduces first it calls `establish()`, which
+        /// reads `knownPaths` — still containing the stale entry at that point — and emits
+        /// `requestLink` instead of `requestPath`, producing exactly the bug this action fixes.
+        ///
+        /// `LXMFNode`'s `linkFailed` handler enforces this by sequencing via `.run { send in
+        ///   await send(.router(.pathLost(...))); await send(.router(.linkClosed(...))) }` — the
+        /// sequential awaits guarantee `pathLost` is fully reduced before `linkClosed` is
+        /// dispatched.
+        case pathLost(destinationHash: Data)
         case delivered(messageHash: Data)
         case resourceDeliveredOnLink(linkID: Data)
         case retryDue(messageHash: Data)
@@ -396,6 +410,17 @@ public struct LXMFRouter {
                 // into another `requestLink`) is what tames it; that routing lives in `LXMFNode`'s
                 // `linkFailed` handler, not in this file.
                 state.establishAttempts[dest] = nil
+                return .none
+
+            case let .pathLost(dest):
+                // Remove the stale path belief so the next `establish` call parks in
+                // `.awaitingPath` and requests a fresh path, rather than firing another
+                // `requestLink` against a route already known to be wrong.
+                // This case is always followed by `.linkClosed` (see the ordering invariant
+                // in the action doc comment); do not call `establish` here — `linkClosed` does
+                // that, and it will now take the `requestPath` branch because `knownPaths` no
+                // longer contains `dest`.
+                state.knownPaths.remove(dest)
                 return .none
 
             case let .learnedPath(dest):

@@ -264,9 +264,36 @@ public struct LXMFNode {
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))
 
-            case let .endpoint(.delegate(.linkFailed(dest, _))):
+            case let .endpoint(.delegate(.linkFailed(dest, reason))):
                 state.directLinks[dest] = nil
-                return .send(.router(.linkClosed(destinationHash: dest)))
+                switch reason {
+                case .noPath, .pathStale, .establishmentTimedOut:
+                    // PATH-shaped failure: our route to `dest` is wrong, not the peer. Clear the
+                    // router's belief that a usable path exists so `establish` parks in
+                    // `.awaitingPath` (requesting a fresh path) rather than emitting `requestLink`
+                    // against a route already proven dead.
+                    //
+                    // The park is bounded: `pathRequestTimer` plus the shared `establishAttempts`
+                    // budget cap the total saga, so this is a bounded terminus — which is why an
+                    // earlier un-bounded attempt (f0c4670, reverted e01f0ce) was unsafe and this
+                    // is not.
+                    //
+                    // Ordering: `pathLost` MUST reduce before `linkClosed`. We use `.run` with
+                    // sequential `await send(...)` rather than `.merge(.send(...), .send(...))`
+                    // because `.merge` of two `Just`-backed publishers runs them concurrently via
+                    // `Publishers.Merge`; the subscription order is implementation-defined and may
+                    // change across Combine versions. Sequential `await` is the only guarantee.
+                    // See LXMFRouter.Action.pathLost doc comment for the ordering invariant.
+                    return .run { send in
+                        await send(.router(.pathLost(destinationHash: dest)))
+                        await send(.router(.linkClosed(destinationHash: dest)))
+                    }
+                case .handshakeRejected:
+                    // PEER-shaped failure: the path demonstrably works (the peer replied), but
+                    // the handshake proof failed to validate. Requesting a fresh path would not
+                    // help — retry the link instead, on the bounded `establishAttempts` budget.
+                    return .send(.router(.linkClosed(destinationHash: dest)))
+                }
 
             case let .endpoint(.delegate(.linkDataReceived(linkID, data, packetHash))):
                 // On our served lxmf.propagation link this is an offer for the node, not a message for us.
