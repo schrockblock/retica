@@ -46,7 +46,20 @@ public struct LXMFRouter {
         /// `pendingDeliveries.attempts` bounds the retry-TIMER saga; a message sitting in
         /// `outboundQueue` is not armed with a timer until `linkEstablished` drains it, so without
         /// this counter `linkClosed -> establish -> requestLink -> linkFailed -> linkClosed` recurs
-        /// forever. Reset on `linkEstablished` — the one event that proves the destination is
+        /// forever.
+        ///
+        /// The reachable driver of that cycle is `TCPEndpoint.openLink` with no
+        /// `transport.learned[dest]` entry (TCPEndpoint.swift:149-151), which returns `linkFailed`
+        /// IMMEDIATELY — a hot, zero-delay spin whenever the router's `knownPaths` outlives
+        /// Transport's `learned` table.
+        ///
+        /// NOTE: an establishment TIMEOUT does not reach this counter at all. LinkSession emits
+        /// `.closed(.timedOut)` (LinkSession.swift:527-530), not `.establishmentFailed`, so it
+        /// arrives as `linkClosed(linkID:)` and dies at the `LXMFNode.swift:263` reverse-map —
+        /// `directLinks` is written only on `linkEstablished`. That route wedges the destination
+        /// at `.establishing` permanently instead; it is a separate, unfixed bug.
+        ///
+        /// Reset on `linkEstablished` — the one event that proves the destination is
         /// reachable again. Deliberately NOT reset on `learnedPath`; see that case for why a
         /// re-announce must not refresh the budget, and for the invariant tying this map to
         /// `knownPaths`.
