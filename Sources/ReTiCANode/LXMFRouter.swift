@@ -50,32 +50,40 @@ public struct LXMFRouter {
         ///
         /// Two drivers reach this counter, and only one of them repeats:
         ///
-        ///  • A LINK-shaped failure charges AT MOST ONE attempt per route. `establish` charges on
+        ///  • A LINK-shaped failure charges one attempt per route BELIEF. `establish` charges on
         ///    entry to its `knownPaths.contains` branch; whatever comes back then decides the rest.
-        ///    A PATH-shaped answer (`.noPath` / `.pathStale` from either endpoint's `openLink`, or
-        ///    an establishment `.timedOut`) is routed by `LXMFNode` through `.pathLostAndClosed`,
-        ///    which forgets the route, so the next `establish` takes the park branch and cannot
-        ///    charge again. Only `.handshakeRejected` — the peer answered, the route is fine —
-        ///    keeps the route and can therefore charge repeatedly.
+        ///    A PATH-shaped answer (`.noPath` from either endpoint's `openLink`, `.pathStale` from
+        ///    `BLEEndpoint.openLink`'s reachability gate, or an establishment `.timedOut`) is routed
+        ///    by `LXMFNode` through `.pathLostAndClosed`, which FORGETS the route — so the next
+        ///    `establish` takes the park branch and cannot charge again under that belief. Only
+        ///    `.handshakeRejected` — the peer answered, so the route is fine — keeps the route, and
+        ///    is therefore the one reason that charges repeatedly.
         ///  • `.pathRequestDeadline`: when `establish()` parks in `.awaitingPath` and the path
         ///    response never arrives, the park timer fires and increments this counter, re-emitting
         ///    `requestPath` until the budget is exhausted. The two establish branches therefore
         ///    share ONE budget — a destination cannot ping-pong between them to get a fresh allowance.
         ///
-        /// So the ordinary unreachable-peer timeline is: one link attempt, then the park spends the
-        /// remainder at `pathRequestWaitSeconds` each. Two shapes, both ending in `deliveryFailed`:
+        /// So the ordinary unreachable-peer timeline is: at most one link attempt, then the park
+        /// spends the remainder at `pathRequestWaitSeconds` intervals, ending in `deliveryFailed`.
+        /// A BLE stale binding skips the link delay entirely (`openLink` gates synchronously); a
+        /// silent peer pays one `LinkSession.establishmentTimeout` first.
         ///
-        ///  • BLE stale binding — `openLink` gates synchronously, so there is no link delay at all:
-        ///    `maxAttempts × pathRequestWaitSeconds` = 5 × 7s ≈ **35s**.
-        ///  • TCP/silent peer — one 15s establishment timeout first: 15s + 35s ≈ **50s**.
+        /// DELIBERATELY NOT STATED HERE: the wall-clock totals. This comment has been falsified
+        /// three times by multiplying these constants out, because any change to `maxAttempts`,
+        /// `pathRequestWaitSeconds`, `establishmentTimeout`, or the routing itself invalidates the
+        /// arithmetic while leaving the prose confidently wrong. The authoritative figures are the
+        /// clock advances in `establishmentTimeoutReachesRouterAndDoesNotWedgeDestination` and
+        /// `routerBoundsTheAwaitingPathPark` — those are executable and cannot go stale silently.
         ///
-        /// Both are SHORTER than the ≈75s this comment described before path-shaped failures were
-        /// routed into the park. That is the intended trade and it is not free: the deadline is now
-        /// tighter, so a peer whose reconnect-and-re-announce takes longer than ~35s is failed where
-        /// the old 5 × 15s cycle would still have caught it. Judged the better default because the
-        /// park actively solicits the path (`requestPath`) rather than retrying a route already
-        /// known to be wrong, and because a failed message is re-sendable while a burned budget was
-        /// not. Revisit `pathRequestWaitSeconds` before `maxAttempts` if that proves too tight.
+        /// The TRADE, which is durable and worth stating: routing path-shaped failures into the
+        /// park SHORTENS the deadline for both shapes relative to retrying links (the park interval
+        /// is well under the establishment timeout). A peer whose reconnect-and-re-announce is
+        /// slower than the park budget is now failed where a pure link-retry cycle would still have
+        /// caught it. Judged the better default because the park actively SOLICITS the path with
+        /// `requestPath` rather than retrying a route already known to be wrong, and because a
+        /// failed message is re-sendable whereas a burned budget was not. If it proves too tight,
+        /// raise `pathRequestWaitSeconds` before `maxAttempts` — the budget is shared, so raising
+        /// the count also lengthens every other saga that draws on it.
         ///
         /// Queued messages are reported at the ceiling as `deliveryFailed`; a PN SYNC has no message
         /// to fail, so it terminates silently — the flag is cleared but the app is not told. See the
@@ -277,10 +285,14 @@ public struct LXMFRouter {
                 // `requestPath` recovery. Accepted: distinguishing the two cases needs a
                 // budget-aware condition here.
                 //
-                // This branch became reachable with a non-nil budget once establishment was paced
-                // by the 15s timeout: the establishment saga now outlives the message retry saga it
-                // was started for (maxAttempts × 10s = 50s), so the pending delivery self-clears
-                // first and the final close arrives with nothing to do.
+                // Reachable with a NON-NIL budget whenever the establishment saga outlasts the work
+                // that started it, so the final close arrives with nothing to do. Do not re-derive
+                // that from saga durations — routing path-shaped failures into the park changed the
+                // relative lengths, and the previous version of this sentence kept a conclusion
+                // whose supporting arithmetic had been deleted. The durable statement is
+                // STRUCTURAL: a `.handshakeRejected` cycle charges repeatedly while the retry saga
+                // runs its own independent course, and an ordinary healthy close reaches here too.
+                // `routerStaleEstablishBudgetDoesNotTruncateTheNextMessage` drives it.
                 //
                 // The zero-delay cascade this comment used to describe is GONE: a `.pathStale`
                 // bounce from `BLEEndpoint.openLink` no longer re-enters `requestLink`, because

@@ -187,7 +187,10 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
 }
 
 /// The whole point of this slice: a BLE peer that drops and reconnects is deliverable again on
-/// the NEXT message, not after ~75s and a failed one. Drives the real chain — announce learned on
+/// the NEXT message, rather than after the full establishment budget and a failed one. (Before this
+/// slice that shape burned `maxAttempts` × the establishment timeout against a dead interface; the
+/// exact figure is deliberately not restated here, having gone stale three times — the clock
+/// advances below are the executable version.) Drives the real chain — announce learned on
 /// interface A, A disconnects, message queued (which trips the stale-path gate immediately),
 /// peer returns as interface B with a genuinely different InterfaceID (new HELLO token), B
 /// announces, path re-learned on B, router exits the awaitingPath park and opens a link on B.
