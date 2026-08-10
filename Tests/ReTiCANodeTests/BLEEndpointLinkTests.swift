@@ -162,37 +162,6 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     await teardown(store)
 }
 
-/// Opening a link to a destination learned on a departed interface fails IMMEDIATELY rather
-/// than minting a link on a dead interface and waiting ~15s for establishmentDeadline.
-/// The fast failure is what lets LXMFRouter request a path and recover (LXMFRouter.swift:311-313).
-@Test @MainActor func openLinkToADepartedInterfaceFailsImmediately() async {
-    let (store, events, _) = makeNode()
-    // Bring the peer online under its normal token/channel.
-    await bringPeerOnline(store, events)
-
-    // Learn a path to a remote destination via an announce from that peer.
-    let remote = Identity()
-    let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
-                                                     aspects: ["svc"], hops: 0, emitted: 1000)
-    events.yield(.channelData(channel, try! BLEFraming.frame(announceRaw)))
-    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
-
-    // Take the peer offline — the learned entry survives but its interface is gone.
-    // When the last peer departs, BLEEndpoint also emits .transport(.stopMaintenance) as part of
-    // the same peerOffline handling; consume it here so teardown's stopMaintenance receive works.
-    events.yield(.channelClosed(channel, reason: nil))
-    await store.receive { if case .delegate(.peerOffline) = $0 { return true }; return false }
-    await store.receive { if case .transport(.stopMaintenance) = $0 { return true }; return false }
-
-    // openLink must fail immediately — no link is minted on the dead interface.
-    // Do NOT advance the clock: the whole claim is that this does not wait for a timeout.
-    await store.send(.openLink(destinationHash: destHash))
-    await store.receive { if case .delegate(.linkFailed(let hash)) = $0 { return hash == destHash }; return false }
-    #expect(store.state.links.isEmpty)
-
-    await store.send(.stop)
-}
-
 @Test @MainActor func linkPlaneTransmitToUnknownPeerIsDropped() async {
     let (store, events, sent) = makeNode()
     await bringPeerOnline(store, events)

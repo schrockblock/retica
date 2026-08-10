@@ -166,10 +166,6 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
         identity: peerIdentity, appData: nil, ratchet: nil, interfaceID: initial.endpoint.interfaceID,
         hops: 1, nextHop: nil, announceEmitted: 0)
-    // openLink checks interface liveness, so the learned path's interface must be registered here:
-    // a learned path whose interface is absent is a state an endpoint never produces (an endpoint
-    // registers its interface before Transport sees any traffic).
-    initial.endpoint.transport.interfaces[initial.endpoint.interfaceID] = .tcp
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
         $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
