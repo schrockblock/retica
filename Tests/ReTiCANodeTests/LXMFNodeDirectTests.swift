@@ -184,6 +184,13 @@ import ComposableArchitecture
         if case .endpoint(.tcp(.interface(.send))) = a { return true }; return false
     }
 
+    // Interface bytes are HDLC-framed; deframe to recover the packet before inspecting its type.
+    func packetType(of framed: Data) -> PacketType? {
+        var deframer = HDLCDeframer()
+        guard let raw = deframer.ingest(framed).first else { return nil }
+        return Packet(raw: raw)?.packetType
+    }
+
     let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
     let (a, eventsA) = make("a", aIdentity, sentA)
     let (b, eventsB) = make("b", bIdentity, sentB)
@@ -202,21 +209,41 @@ import ComposableArchitecture
 
     // A sends a direct message to B. Because A has a learned path, openLink proceeds and
     // a LINKREQUEST goes out. B never replies — we are simulating a peer that does not answer.
+    // Rebuild the message with the same params to recover its deterministic hash.
+    let wedgedHash = LXMessage.create(
+        source: aIdentity, destinationHash: bDeliveryHash,
+        timestamp: 1700000000.5, title: Data("x".utf8), content: Data("y".utf8)).hash
     await a.send(.send(destinationHash: bDeliveryHash, title: Data("x".utf8), content: Data("y".utf8), method: .direct))
-    await a.receive(isInterfaceSend)                          // first LINKREQUEST out
+    await a.receive(isInterfaceSend)                          // LINKREQUEST #1 (establishAttempts = 1)
+    #expect(packetType(of: sentA.value.last!) == .linkRequest)
     // directLinks[bDeliveryHash] is now .establishing; message sits in outboundQueue with no timer.
 
-    // Advance past the establishment timeout (15 s). The timeout fires on the LinkSession.
+    // Each 15 s advance fires one establishment timeout.
     // BEFORE this fix: LinkSession emitted .closed(.timedOut) → linkClosed(linkID:) →
     //   LXMFNode reverse-map fails (directLinks written only on linkEstablished) →
-    //   destination stays .establishing forever; nothing more is sent.
+    //   destination stays .establishing forever; nothing more is sent, ever.
     // AFTER this fix: LinkSession emits .establishmentFailed → linkFailed(destinationHash:) →
-    //   router receives linkClosed(dest) → establish() is called → a second LINKREQUEST arrives.
-    await clock.advance(by: .seconds(15))
+    //   router receives linkClosed(dest) → establish() → the next LINKREQUEST.
+    //
+    // establish() allows attempts 1...maxAttempts(5) to emit requestLink, so timeouts 1-4 each
+    // produce another LINKREQUEST and the 5th exhausts the budget.
+    for attempt in 2...LXMFDelivery.maxAttempts {
+        await clock.advance(by: .seconds(15))
+        await a.receive(isInterfaceSend)                      // LINKREQUEST #attempt
+        #expect(packetType(of: sentA.value.last!) == .linkRequest,
+                "re-establishment \(attempt) should be a LINKREQUEST")
+    }
 
-    // Assert the OBSERVABLE consequence: a second LINKREQUEST goes out, proving the destination
-    // un-wedged from .establishing and re-establishment was attempted.
-    await a.receive(isInterfaceSend)                          // second LINKREQUEST — must arrive after fix
+    // The 5th timeout drives establish() past the budget: it gives up, drains outboundQueue and
+    // fails the message. This is the TERMINUS — the wedge does not merely un-stick, it reaches a
+    // bounded, reported outcome in maxAttempts × establishmentTimeout = 5 × 15 s = 75 s.
+    let failedHash = LockIsolated<Data?>(nil)
+    await clock.advance(by: .seconds(15))
+    await a.receive { action in
+        if case let .delegate(.deliveryFailed(hash)) = action { failedHash.setValue(hash); return true }
+        return false
+    }
+    #expect(failedHash.value == wedgedHash)
 
     await a.send(.endpoint(.stop)); await b.send(.endpoint(.stop))
 }

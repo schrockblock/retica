@@ -159,7 +159,8 @@ private func activeResponderStore(clock: TestClock<Duration>)
     // the in-flight timer effect at teardown (it's cancelled when the store is deallocated).
     // We advance the clock to fire it cleanly rather than leaving it dangling.
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
-    // If clock.advance woke the timer, the deadline+closed actions are silently consumed by
+    // If clock.advance woke the timer, the deadline + establishmentFailed actions (this is an
+    // INITIATOR, so the deadline emits .establishmentFailed, not .closed) are silently consumed by
     // exhaustivity=.off. If it did not (TCA 1.26 timing), the in-flight effect is silently
     // cancelled at store dealloc. Either way the test passes with .off exhaustivity.
     #expect(store.state.status == .pending || store.state.status == .closed)

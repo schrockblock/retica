@@ -533,9 +533,16 @@ public struct LinkSession {
                 // only on linkEstablished (LXMFNode.swift:256) — so the destination would wedge at
                 // .establishing forever with no timer, no retry and no deliveryFailed.
                 //
-                // A RESPONDER's timeout stays .closed: the peer opened a link to US, our
-                // destinationHash is our own served destination, and reporting linkFailed for it
-                // would tell the delivery layer that a peer it never contacted is unreachable.
+                // A RESPONDER's timeout stays .closed. For a responder `destinationHash` is our OWN
+                // served destination (LinkPlane.swift:89-91), not a remote peer, so `linkFailed` for
+                // it carries no useful reachability information — a timeout here says only that an
+                // inbound handshake stalled. `.closed` is the accurate description of that.
+                //
+                // This is NOT a claim that a responder never emits `.establishmentFailed` — it
+                // already does on a malformed handshake (`:235`, `:285`), and those are benign
+                // (LXMFNode.swift:267-269 clears an absent `directLinks` entry, then the router finds
+                // nothing pending or queued for that hash and returns `.none`). The point is
+                // narrower: the timeout path should not ADD another such instance for no gain.
                 if state.role == .initiator {
                     return .merge(.send(.delegate(.establishmentFailed)), cancelAll, cancelPending(&state))
                 }

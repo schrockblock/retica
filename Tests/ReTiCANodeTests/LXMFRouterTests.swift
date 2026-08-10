@@ -1175,6 +1175,39 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .on   // a stray requestMessageList would fail teardown
 }
 
+/// A sync whose PN link dies before it establishes must retry. An outstanding
+/// `pendingDownloadFromPN` is work in its own right: a bare `syncFromPropagationNode` queues no
+/// message and arms no retry timer, so if `linkClosed` does not re-establish for it, the sync is
+/// silently abandoned — the link un-wedges but nothing ever asks the PN for messages again.
+@Test @MainActor func routerSyncReEstablishesWhenPNLinkClosesWithNothingQueued() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.knownPaths.insert(pn)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+
+    // Drive to the precondition rather than seeding it: a sync request with no message send.
+    await store.send(.syncFromPropagationNode)
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    #expect(store.state.pendingDownloadFromPN == true)
+    // The gap this covers: nothing is pending or queued for the PN, so the old
+    // `hasPending || hasQueued` condition was false and linkClosed returned .none.
+    #expect(store.state.pendingDeliveries.isEmpty)
+    #expect(store.state.outboundQueue[pn] == nil)
+    #expect(store.state.propagationQueue[pn] == nil)
+
+    // The PN never answers; the establishment timeout arrives here as linkClosed for the PN hash.
+    await store.send(.linkClosed(destinationHash: pn))
+    await store.receive { action in
+        if case let .delegate(.requestLink(d)) = action { #expect(d == pn); return true }
+        return false
+    }
+    // The flag must survive so the sync actually happens once a link is finally established.
+    #expect(store.state.pendingDownloadFromPN == true)
+    #expect(store.state.directLinks[pn] == .establishing)
+}
+
 // MARK: - Resource-direct delivery confirmation
 
 /// Resource-direct confirmation: a resource-sized message sent over an active link records its hash in

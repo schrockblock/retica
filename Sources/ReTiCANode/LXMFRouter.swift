@@ -48,16 +48,18 @@ public struct LXMFRouter {
         /// this counter `linkClosed -> establish -> requestLink -> linkFailed -> linkClosed` recurs
         /// forever.
         ///
-        /// The reachable driver of that cycle is `TCPEndpoint.openLink` with no
-        /// `transport.learned[dest]` entry (TCPEndpoint.swift:149-151), which returns `linkFailed`
-        /// IMMEDIATELY — a hot, zero-delay spin whenever the router's `knownPaths` outlives
-        /// Transport's `learned` table.
+        /// Two distinct drivers reach this counter, at opposite ends of the timing range:
         ///
-        /// NOTE: an establishment TIMEOUT does not reach this counter at all. LinkSession emits
-        /// `.closed(.timedOut)` (LinkSession.swift:527-530), not `.establishmentFailed`, so it
-        /// arrives as `linkClosed(linkID:)` and dies at the `LXMFNode.swift:263` reverse-map —
-        /// `directLinks` is written only on `linkEstablished`. That route wedges the destination
-        /// at `.establishing` permanently instead; it is a separate, unfixed bug.
+        ///  • `TCPEndpoint.openLink` with no `transport.learned[dest]` entry
+        ///    (TCPEndpoint.swift:149-151) returns `linkFailed` IMMEDIATELY — a hot, zero-delay
+        ///    spin whenever the router's `knownPaths` outlives Transport's `learned` table.
+        ///  • An establishment TIMEOUT: an initiator's `LinkSession` emits `.establishmentFailed`
+        ///    (LinkSession.swift:527-542), which `LinkPlane` routes to `linkFailed(destinationHash:)`
+        ///    and `LXMFNode.swift:267` forwards here keyed by DESTINATION. That paces the cycle at
+        ///    the 15s establishment timeout rather than spinning.
+        ///
+        /// So the budget bounds both, and the slow path terminates in roughly
+        /// `maxAttempts × establishmentTimeout` = 5 × 15s ≈ 75s before `deliveryFailed`.
         ///
         /// Reset on `linkEstablished` — the one event that proves the destination is
         /// reachable again. Deliberately NOT reset on `learnedPath`; see that case for why a
@@ -316,7 +318,13 @@ public struct LXMFRouter {
                 }
                 let hasQueued = !(state.outboundQueue[dest]?.isEmpty ?? true)
                     || !(state.propagationQueue[dest]?.isEmpty ?? true)
-                if hasPending || hasQueued {
+                // An outstanding sync is work too. `pendingDownloadFromPN` is only cleared when
+                // `.linkEstablished` actually drains it into `requestMessageList` (:301-304), so if it
+                // is still set here the sync never happened — without this the PN link would un-wedge
+                // but never retry, since a bare `syncFromPropagationNode` queues no message and arms
+                // no timer. Bounded by `establish()`'s budget like any other destination.
+                let hasPendingSync = dest == state.outboundPropagationNode && state.pendingDownloadFromPN
+                if hasPending || hasQueued || hasPendingSync {
                     return establish(&state, dest)
                 }
                 return .none
