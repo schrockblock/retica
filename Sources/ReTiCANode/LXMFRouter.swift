@@ -46,8 +46,10 @@ public struct LXMFRouter {
         /// `pendingDeliveries.attempts` bounds the retry-TIMER saga; a message sitting in
         /// `outboundQueue` is not armed with a timer until `linkEstablished` drains it, so without
         /// this counter `linkClosed -> establish -> requestLink -> linkFailed -> linkClosed` recurs
-        /// forever. Reset whenever the situation genuinely changes: a link established, or a path
-        /// learned.
+        /// forever. Reset on `linkEstablished` — the one event that proves the destination is
+        /// reachable again. Deliberately NOT reset on `learnedPath`; see that case for why a
+        /// re-announce must not refresh the budget, and for the invariant tying this map to
+        /// `knownPaths`.
         public var establishAttempts: [Data: Int] = [:]
         public init() {}
     }
@@ -307,14 +309,18 @@ public struct LXMFRouter {
                 return .none
 
             case let .learnedPath(dest):
-                // Reset the establishment budget only on GENUINELY NEW path information.
-                // knownPaths is a bare Set with no epoch, so a periodic re-announce of an
-                // already-known path carries nothing new; resetting on it would let a live
-                // peer refresh the budget forever and re-open the unbounded cycle. After a
-                // ceiling trip knownPaths is cleared, so genuine recovery still resets.
-                if state.knownPaths.insert(dest).inserted {
-                    state.establishAttempts[dest] = nil
-                }
+                // Deliberately does NOT reset the establishment budget, and does not need to.
+                // Invariant: establishAttempts[dest] is non-nil only for destinations already
+                // in knownPaths (it is set solely in the `contains` branch of establish), and
+                // the ceiling clears both together. So a first-time learn always finds a nil
+                // budget already, and a re-announce of an ALREADY-KNOWN path must not reset —
+                // knownPaths is a bare Set with no epoch, so a live peer re-announcing on a
+                // timer would otherwise refresh the budget forever and re-open the unbounded
+                // cycle this counter exists to close.
+                //
+                // A future path-expiry that removes from knownPaths must clear
+                // establishAttempts alongside it, or that invariant breaks.
+                state.knownPaths.insert(dest)
                 if state.directLinks[dest] == .awaitingPath {
                     // Route through establish() so there is exactly ONE counted emitter of
                     // requestLink. Behaviour is unchanged (knownPaths now contains dest, so
