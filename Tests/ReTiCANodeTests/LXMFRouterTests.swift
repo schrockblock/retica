@@ -731,6 +731,78 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.pendingDeliveries[msg.hash] == nil)
 }
 
+/// A finished establishment saga must not leave its budget behind to truncate the NEXT delivery.
+///
+/// The message retry saga (maxAttempts × retryWaitSeconds = 50s) always finishes before the
+/// establishment saga (maxAttempts × establishmentTimeout = 75s), so the final `linkClosed` for a
+/// dead peer arrives with the pending delivery already self-cleared — i.e. with NO work. That is
+/// the one exit from the saga that does not run `giveUp`, so before this fix `establishAttempts`
+/// was stranded there permanently and the next message to that peer inherited a spent budget:
+/// it got a truncated allowance, or none at all, and `knownPaths` was discarded despite never
+/// having been falsified by that message's own attempts.
+@Test @MainActor func routerStaleEstablishBudgetDoesNotTruncateTheNextMessage() async {
+    let recipientHash = Identity().hash
+    let msg = makeMessage(source: Identity(), recipientIdentityHash: recipientHash, content: "first")
+    let msg2 = makeMessage(source: Identity(), recipientIdentityHash: recipientHash, content: "second")
+    #expect(msg.destinationHash == msg2.destinationHash)
+    let dest = msg.destinationHash
+    let linkID = Data(repeating: 0x01, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.directLinks[dest] = .active(linkID: linkID)
+    initial.knownPaths.insert(dest)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+
+    // Send over the live link: arms the retry saga (pendingDeliveries.attempts == 1).
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
+
+    // The peer dies. Burn the establishment budget to the ceiling WITHOUT tripping it: each
+    // linkClosed still sees the pending delivery, so each one re-establishes and counts.
+    for expected in 1...LXMFDelivery.maxAttempts {
+        await store.send(.linkClosed(destinationHash: dest))
+        await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+        #expect(store.state.establishAttempts[dest] == expected)
+    }
+
+    // Now the retry saga completes first (the real-world 50s-before-75s ordering). Each tick finds
+    // no active link so it only re-arms; the last one trips the cap and fails the message.
+    for _ in 1...LXMFDelivery.maxAttempts {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    }
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
+        return false
+    }
+    #expect(store.state.pendingDeliveries.isEmpty)          // work is gone
+    #expect(store.state.establishAttempts[dest] == LXMFDelivery.maxAttempts)   // budget fully spent
+
+    // The final establishment failure arrives with nothing left to do. This is the no-work exit —
+    // the saga is over, so the budget must end with it.
+    await store.send(.linkClosed(destinationHash: dest))
+    #expect(store.state.establishAttempts[dest] == nil)     // ← the fix
+    #expect(store.state.knownPaths.contains(dest))          // path never falsified, still believed
+
+    // A brand-new message to the same peer must get a REAL establishment attempt, not an instant
+    // give-up inherited from the previous saga.
+    await store.send(.send(message: msg2, desiredMethod: .direct))
+    await store.receive { action in
+        if case let .delegate(.requestLink(d)) = action { #expect(d == dest); return true }
+        return false
+    }
+    #expect(store.state.establishAttempts[dest] == 1)       // a full fresh budget
+    #expect(store.state.outboundQueue[dest]?.count == 1)    // queued, NOT failed
+    #expect(store.state.knownPaths.contains(dest))
+
+    // And no deliveryFailed rode along with that requestLink — absence, so flip-then-send.
+    store.exhaustivity = .on
+    await store.send(.offeredMessageList(transientIds: []))   // no-op send; forces the stray check
+    store.exhaustivity = .off
+}
+
 // MARK: - Bound link-establishment saga
 
 /// A queued direct message to a peer whose link never establishes gives up after maxAttempts

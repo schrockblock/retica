@@ -357,15 +357,30 @@ public struct LXMFRouter {
                 }
                 let hasQueued = !(state.outboundQueue[dest]?.isEmpty ?? true)
                     || !(state.propagationQueue[dest]?.isEmpty ?? true)
-                // An outstanding sync is work too. `pendingDownloadFromPN` is only cleared when
-                // `.linkEstablished` actually drains it into `requestMessageList` (:301-304), so if it
-                // is still set here the sync never happened — without this the PN link would un-wedge
+                // An outstanding sync is work too. `pendingDownloadFromPN` is only cleared when the
+                // `.linkEstablished` case actually drains it into `requestMessageList` (see that
+                // case; deliberately not a line number — this citation has drifted three times), so
+                // if it is still set here the sync never happened — without this the PN link would un-wedge
                 // but never retry, since a bare `syncFromPropagationNode` queues no message and arms
                 // no timer. Bounded by `establish()`'s budget like any other destination.
                 let hasPendingSync = dest == state.outboundPropagationNode && state.pendingDownloadFromPN
                 if hasPending || hasQueued || hasPendingSync {
                     return establish(&state, dest)
                 }
+                // No work left for this destination: the establishment saga is OVER, so its budget
+                // ends with it. `giveUp` is the only other clearer and it is reachable only while
+                // work still exists, so without this the counter is stranded at whatever it had
+                // reached — and the NEXT message to this peer inherits a spent budget, truncating
+                // or instantly failing a delivery that deserved a full allowance (and discarding a
+                // still-valid `knownPaths` entry on the way out).
+                //
+                // This branch became reachable with a non-nil budget once establishment was paced
+                // by the 15s timeout: the establishment saga (maxAttempts × 15s = 75s) now outlives
+                // the message retry saga it was started for (maxAttempts × 10s = 50s), so the
+                // pending delivery self-clears first and the final `linkClosed` arrives with
+                // nothing to do. Previously `openLink` failed immediately, burning every attempt in
+                // one synchronous cascade while the work was still present, so `giveUp` always ran.
+                state.establishAttempts[dest] = nil
                 return .none
 
             case let .learnedPath(dest):
