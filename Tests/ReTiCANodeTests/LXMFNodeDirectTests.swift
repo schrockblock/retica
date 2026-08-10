@@ -149,3 +149,74 @@ import ComposableArchitecture
 
     await a.send(.endpoint(.stop)); await b.send(.endpoint(.stop))
 }
+
+/// An establishment timeout must reach the router. Before this change, LinkSession emitted
+/// .closed(.timedOut) rather than .establishmentFailed, so it arrived as linkClosed(linkID:)
+/// and died at the LXMFNode reverse-map (directLinks is written only on linkEstablished) —
+/// leaving the destination pinned at .establishing forever, with the message parked in
+/// outboundQueue, no timer, no retry and no deliveryFailed.
+@Test @MainActor func establishmentTimeoutReachesRouterAndDoesNotWedgeDestination() async {
+    let clock = TestClock()
+    let aIdentity = Identity()
+    let bIdentity = Identity()
+    let bDeliveryHash = LXMessage.deliveryHash(identityHash: bIdentity.hash)
+
+    func make(_ host: String, _ identity: Identity, _ sent: LockIsolated<[Data]>)
+        -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let store = TestStore(initialState: LXMFNode.State(
+            identity: identity, endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false))
+        ) {
+            LXMFNode()
+        } withDependencies: {
+            $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
+                                             send: { d in sent.withValue { $0.append(d) } },
+                                             close: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        return (store, events.continuation)
+    }
+
+    func isInterfaceSend(_ a: LXMFNode.Action) -> Bool {
+        if case .endpoint(.tcp(.interface(.send))) = a { return true }; return false
+    }
+
+    let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
+    let (a, eventsA) = make("a", aIdentity, sentA)
+    let (b, eventsB) = make("b", bIdentity, sentB)
+
+    // Start both nodes and register delivery so B announces itself.
+    await a.send(.endpoint(.start)); eventsA.yield(.connected)
+    await b.send(.endpoint(.start)); eventsB.yield(.connected)
+
+    await a.send(.registerDelivery)
+    await a.receive(isInterfaceSend)                          // A's announce out
+    await b.send(.registerDelivery)
+    await b.receive(isInterfaceSend)                          // B's announce out
+    // Bridge B's announce to A so A learns B's path + identity (needed for openLink to proceed).
+    eventsA.yield(.data(sentB.value.last!))
+    await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
+
+    // A sends a direct message to B. Because A has a learned path, openLink proceeds and
+    // a LINKREQUEST goes out. B never replies — we are simulating a peer that does not answer.
+    await a.send(.send(destinationHash: bDeliveryHash, title: Data("x".utf8), content: Data("y".utf8), method: .direct))
+    await a.receive(isInterfaceSend)                          // first LINKREQUEST out
+    // directLinks[bDeliveryHash] is now .establishing; message sits in outboundQueue with no timer.
+
+    // Advance past the establishment timeout (15 s). The timeout fires on the LinkSession.
+    // BEFORE this fix: LinkSession emitted .closed(.timedOut) → linkClosed(linkID:) →
+    //   LXMFNode reverse-map fails (directLinks written only on linkEstablished) →
+    //   destination stays .establishing forever; nothing more is sent.
+    // AFTER this fix: LinkSession emits .establishmentFailed → linkFailed(destinationHash:) →
+    //   router receives linkClosed(dest) → establish() is called → a second LINKREQUEST arrives.
+    await clock.advance(by: .seconds(15))
+
+    // Assert the OBSERVABLE consequence: a second LINKREQUEST goes out, proving the destination
+    // un-wedged from .establishing and re-establishment was attempted.
+    await a.receive(isInterfaceSend)                          // second LINKREQUEST — must arrive after fix
+
+    await a.send(.endpoint(.stop)); await b.send(.endpoint(.stop))
+}

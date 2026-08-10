@@ -527,6 +527,18 @@ public struct LinkSession {
             case .establishmentDeadline:
                 guard state.status == .pending || state.status == .handshake else { return .none }
                 state.status = .closed
+                // An INITIATOR's establishment timeout is an establishment FAILURE, and must be
+                // delivered keyed by DESTINATION. Emitting .closed here instead surfaces as
+                // linkClosed(linkID:), which LXMFNode cannot reverse-map — directLinks is written
+                // only on linkEstablished (LXMFNode.swift:256) — so the destination would wedge at
+                // .establishing forever with no timer, no retry and no deliveryFailed.
+                //
+                // A RESPONDER's timeout stays .closed: the peer opened a link to US, our
+                // destinationHash is our own served destination, and reporting linkFailed for it
+                // would tell the delivery layer that a peer it never contacted is unreachable.
+                if state.role == .initiator {
+                    return .merge(.send(.delegate(.establishmentFailed)), cancelAll, cancelPending(&state))
+                }
                 return .merge(.send(.delegate(.closed(.timedOut))), cancelAll, cancelPending(&state))
 
             case .keepaliveDeadline:

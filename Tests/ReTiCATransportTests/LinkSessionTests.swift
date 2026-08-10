@@ -94,7 +94,9 @@ private func activeResponderStore(clock: TestClock<Duration>)
     #expect(store.state.linkID == Link.linkID(requestPacket: packet))
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
     await store.receive(.establishmentDeadline)
-    await store.receive(.delegate(.closed(.timedOut))) { $0.status = .closed }
+    // Initiators emit .establishmentFailed so LinkPlane routes the timeout to linkFailed(destinationHash:),
+    // giving the delivery layer a destination-keyed signal it can act on.
+    await store.receive(.delegate(.establishmentFailed)) { $0.status = .closed }
 }
 
 @Test @MainActor func responderAcceptRequestEmitsProofAndGoesHandshake() async {
@@ -124,6 +126,10 @@ private func activeResponderStore(clock: TestClock<Duration>)
     #expect(store.state.sessionKey.count == 64)
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
     await store.receive(.establishmentDeadline)
+    // Responders deliberately keep .closed(.timedOut) — not .establishmentFailed. The role gate
+    // in LinkSession.establishmentDeadline is intentional: a responder's destinationHash is our
+    // OWN served destination; emitting linkFailed for it would tell the delivery layer that a
+    // peer it never contacted is unreachable.
     await store.receive(.delegate(.closed(.timedOut))) { $0.status = .closed }
 }
 
@@ -405,7 +411,8 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     _ = await captureTransmit(store)                  // the LINKREQUEST
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
     await store.receive(.establishmentDeadline)
-    await store.receive(.delegate(.closed(.timedOut)))
+    // Initiators emit .establishmentFailed so the delivery layer receives a destination-keyed signal.
+    await store.receive(.delegate(.establishmentFailed))
     #expect(store.state.status == .closed)
 }
 
