@@ -48,25 +48,38 @@ public struct LXMFRouter {
         /// this counter `linkClosed -> establish -> requestLink -> linkFailed -> linkClosed` recurs
         /// forever.
         ///
-        /// Three distinct drivers reach this counter:
+        /// Two drivers reach this counter, and only one of them repeats:
         ///
-        ///  • `TCPEndpoint.openLink` with no `transport.learned[dest]` entry returns
-        ///    `linkFailed(reason: .noPath)` IMMEDIATELY — a hot, zero-delay spin whenever the
-        ///    router's `knownPaths` outlives Transport's `learned` table.
-        ///  • An establishment TIMEOUT: an initiator's `LinkSession.establishmentDeadline` emits
-        ///    `.establishmentFailed(.timedOut)`, which `LinkPlane` routes to
-        ///    `linkFailed(destinationHash:reason:)` and `LXMFNode`'s `linkFailed` handler forwards
-        ///    here keyed by DESTINATION. That paces the cycle at the 15s establishment timeout
-        ///    rather than spinning.
+        ///  • A LINK-shaped failure charges AT MOST ONE attempt per route. `establish` charges on
+        ///    entry to its `knownPaths.contains` branch; whatever comes back then decides the rest.
+        ///    A PATH-shaped answer (`.noPath` / `.pathStale` from either endpoint's `openLink`, or
+        ///    an establishment `.timedOut`) is routed by `LXMFNode` through `.pathLostAndClosed`,
+        ///    which forgets the route, so the next `establish` takes the park branch and cannot
+        ///    charge again. Only `.handshakeRejected` — the peer answered, the route is fine —
+        ///    keeps the route and can therefore charge repeatedly.
         ///  • `.pathRequestDeadline`: when `establish()` parks in `.awaitingPath` and the path
         ///    response never arrives, the park timer fires and increments this counter, re-emitting
         ///    `requestPath` until the budget is exhausted. The two establish branches therefore
         ///    share ONE budget — a destination cannot ping-pong between them to get a fresh allowance.
         ///
-        /// The slow path (establishment timeouts) reaches the give-up branch in roughly
-        /// `maxAttempts × establishmentTimeout` = 5 × 15s ≈ 75s. Queued messages are reported there
-        /// as `deliveryFailed`; a PN SYNC has no message to fail, so it terminates silently — the
-        /// flag is cleared but the app is not told. See the give-up branch.
+        /// So the ordinary unreachable-peer timeline is: one link attempt, then the park spends the
+        /// remainder at `pathRequestWaitSeconds` each. Two shapes, both ending in `deliveryFailed`:
+        ///
+        ///  • BLE stale binding — `openLink` gates synchronously, so there is no link delay at all:
+        ///    `maxAttempts × pathRequestWaitSeconds` = 5 × 7s ≈ **35s**.
+        ///  • TCP/silent peer — one 15s establishment timeout first: 15s + 35s ≈ **50s**.
+        ///
+        /// Both are SHORTER than the ≈75s this comment described before path-shaped failures were
+        /// routed into the park. That is the intended trade and it is not free: the deadline is now
+        /// tighter, so a peer whose reconnect-and-re-announce takes longer than ~35s is failed where
+        /// the old 5 × 15s cycle would still have caught it. Judged the better default because the
+        /// park actively solicits the path (`requestPath`) rather than retrying a route already
+        /// known to be wrong, and because a failed message is re-sendable while a burned budget was
+        /// not. Revisit `pathRequestWaitSeconds` before `maxAttempts` if that proves too tight.
+        ///
+        /// Queued messages are reported at the ceiling as `deliveryFailed`; a PN SYNC has no message
+        /// to fail, so it terminates silently — the flag is cleared but the app is not told. See the
+        /// give-up branch.
         ///
         /// Reset on `linkEstablished` — the one event that proves the destination is
         /// reachable again. Deliberately NOT reset on `learnedPath`; see that case for why a
@@ -99,28 +112,25 @@ public struct LXMFRouter {
         case linkEstablished(destinationHash: Data, linkID: Data)
         case linkClosed(destinationHash: Data)
         case learnedPath(destinationHash: Data)
-        /// Inverse of `learnedPath`: removes the destination from `knownPaths` so that `establish`
-        /// will take its `.awaitingPath` branch (request a fresh path) instead of emitting
-        /// `requestLink` against a route already known to be wrong.
+        /// `linkClosed`, preceded by the inverse of `learnedPath`: forget that a usable route to
+        /// `dest` exists, THEN close. Sent when a link failure was PATH-shaped — the route is
+        /// falsified, so re-establishing against it is wasted budget. `establish` consequently
+        /// takes its `.awaitingPath` branch and requests a fresh path.
         ///
-        /// **Ordering invariant**: `pathLost` MUST be reduced before any subsequent `linkClosed`
-        /// for the same destination. If `linkClosed` reduces first it calls `establish()`, which
-        /// reads `knownPaths` — still containing the stale entry at that point — and emits
-        /// `requestLink` instead of `requestPath`, producing exactly the bug this action fixes.
+        /// Deliberately ONE action rather than a `pathLost` + `linkClosed` pair. The pair had an
+        /// ordering requirement (clear before close, or `establish` reads the stale `knownPaths`
+        /// and emits `requestLink` anyway), and any gap between the two — a `.run` with two
+        /// `await send`s opens a MainActor suspension — is a window in which an inbound
+        /// `learnedPath` from a routine announce can re-insert the very entry just removed,
+        /// restoring the pre-fix behaviour non-deterministically. Fusing them removes the window
+        /// and the requirement together: there is no ordering left to get wrong.
         ///
-        /// The cost of getting this wrong is a SPENT BUDGET, not a stuck destination: reversed,
-        /// the stale `requestLink` bounces off `openLink` as `linkFailed(.noPath)` and the next
-        /// cycle does park — but `establish` has already charged one attempt from
-        /// `establishAttempts` on its `knownPaths.contains` branch, while the park branch charges
-        /// nothing. That is the observable difference, and it is what
-        /// `stalePathLinkFailureRequestsAPathInsteadOfRetryingTheLink` asserts; reversing the two
-        /// sends fails that test on the budget assertion (verified by mutation, not assumed).
-        ///
-        /// `LXMFNode`'s `linkFailed` handler enforces this by sequencing via `.run { send in
-        ///   await send(.router(.pathLost(...))); await send(.router(.linkClosed(...))) }` — the
-        /// sequential awaits guarantee `pathLost` is fully reduced before `linkClosed` is
-        /// dispatched.
-        case pathLost(destinationHash: Data)
+        /// The cost of getting the old ordering wrong was a SPENT BUDGET, not a stuck destination
+        /// — `establish` charges an attempt only on its `knownPaths.contains` branch, and the park
+        /// branch is free. `stalePathLinkFailureRequestsAPathInsteadOfRetryingTheLink` pins that
+        /// via `establishAttempts == nil`, and it remains the mutation catcher for this action:
+        /// drop the `knownPaths.remove` below and it fails.
+        case pathLostAndClosed(destinationHash: Data)
         case delivered(messageHash: Data)
         case resourceDeliveredOnLink(linkID: Data)
         case retryDue(messageHash: Data)
@@ -221,6 +231,63 @@ public struct LXMFRouter {
                 }
                 state.directLinks[dest] = .awaitingPath
                 return .merge(.send(.delegate(.requestPath(destinationHash: dest))), pathRequestTimer(dest))
+            }
+            /// The link to `dest` is gone. Drop it, and re-establish iff work remains. Shared by
+            /// `.linkClosed` and `.pathLostAndClosed` — the only difference between them is whether
+            /// `knownPaths` was cleared before this runs, which decides which branch `establish`
+            /// takes.
+            func closed(_ state: inout State, _ dest: Data) -> Effect<Action> {
+                if case let .active(linkID) = state.directLinks[dest] {
+                    state.linkResourceInFlight[linkID] = nil
+                }
+                state.directLinks[dest] = nil
+                let hasPending = state.pendingDeliveries.values.contains {
+                    switch $0.resend {
+                    case let .direct(d, _, _): return d == dest
+                    case let .propagated(d, _): return d == dest
+                    case .opportunistic: return false
+                    }
+                }
+                let hasQueued = !(state.outboundQueue[dest]?.isEmpty ?? true)
+                    || !(state.propagationQueue[dest]?.isEmpty ?? true)
+                // An outstanding sync is work too. `pendingDownloadFromPN` is only cleared when the
+                // `.linkEstablished` case actually drains it into `requestMessageList` (see that
+                // case; deliberately not a line number — this citation has drifted three times), so
+                // if it is still set here the sync never happened — without this the PN link would un-wedge
+                // but never retry, since a bare `syncFromPropagationNode` queues no message and arms
+                // no timer. Bounded by `establish()`'s budget like any other destination.
+                let hasPendingSync = dest == state.outboundPropagationNode && state.pendingDownloadFromPN
+                if hasPending || hasQueued || hasPendingSync {
+                    return establish(&state, dest)
+                }
+                // No work left for this destination: the establishment saga is OVER, so its budget
+                // ends with it. The other clearers are `.linkEstablished` (success) and `giveUp`
+                // (the ceiling) — on the FAILURE path `giveUp` is the only one, and it is reachable
+                // only while work still exists. So without this the counter is stranded at whatever
+                // it had reached, and the NEXT message to this peer inherits a spent budget,
+                // truncating or instantly failing a delivery that deserved a full allowance.
+                //
+                // `knownPaths` is deliberately NOT removed here. This is the ordinary healthy close,
+                // where the path is fine and discarding it would be wrong. A caller that KNOWS the
+                // route was falsified uses `.pathLostAndClosed` instead, which clears it first.
+                //
+                // That does mean a ceiling-stranded destination keeps a route five failed
+                // establishments argued against — the same evidence `giveUp` cites when it DOES
+                // discard — so the next message spends another full saga before reaching the
+                // `requestPath` recovery. Accepted: distinguishing the two cases needs a
+                // budget-aware condition here.
+                //
+                // This branch became reachable with a non-nil budget once establishment was paced
+                // by the 15s timeout: the establishment saga now outlives the message retry saga it
+                // was started for (maxAttempts × 10s = 50s), so the pending delivery self-clears
+                // first and the final close arrives with nothing to do.
+                //
+                // The zero-delay cascade this comment used to describe is GONE: a `.pathStale`
+                // bounce from `BLEEndpoint.openLink` no longer re-enters `requestLink`, because
+                // `LXMFNode` routes every path-shaped failure through `.pathLostAndClosed`, which
+                // parks instead. A stale binding now costs ONE attempt, not the whole budget.
+                state.establishAttempts[dest] = nil
+                return .none
             }
             switch action {
             case let .learnedIdentity(destinationHash, identity):
@@ -367,69 +434,15 @@ public struct LXMFRouter {
                 return .merge(effects)
 
             case let .linkClosed(dest):
-                if case let .active(linkID) = state.directLinks[dest] {
-                    state.linkResourceInFlight[linkID] = nil
-                }
-                state.directLinks[dest] = nil
-                let hasPending = state.pendingDeliveries.values.contains {
-                    switch $0.resend {
-                    case let .direct(d, _, _): return d == dest
-                    case let .propagated(d, _): return d == dest
-                    case .opportunistic: return false
-                    }
-                }
-                let hasQueued = !(state.outboundQueue[dest]?.isEmpty ?? true)
-                    || !(state.propagationQueue[dest]?.isEmpty ?? true)
-                // An outstanding sync is work too. `pendingDownloadFromPN` is only cleared when the
-                // `.linkEstablished` case actually drains it into `requestMessageList` (see that
-                // case; deliberately not a line number — this citation has drifted three times), so
-                // if it is still set here the sync never happened — without this the PN link would un-wedge
-                // but never retry, since a bare `syncFromPropagationNode` queues no message and arms
-                // no timer. Bounded by `establish()`'s budget like any other destination.
-                let hasPendingSync = dest == state.outboundPropagationNode && state.pendingDownloadFromPN
-                if hasPending || hasQueued || hasPendingSync {
-                    return establish(&state, dest)
-                }
-                // No work left for this destination: the establishment saga is OVER, so its budget
-                // ends with it. The other clearers are `.linkEstablished` (success) and `giveUp`
-                // (the ceiling) — on the FAILURE path `giveUp` is the only one, and it is reachable
-                // only while work still exists. So without this the counter is stranded at whatever
-                // it had reached, and the NEXT message to this peer inherits a spent budget,
-                // truncating or instantly failing a delivery that deserved a full allowance.
-                //
-                // `knownPaths` is deliberately NOT removed here. This is also the ordinary healthy
-                // close, where the path is fine and discarding it would be wrong. That does mean a
-                // ceiling-stranded destination keeps a route five failed establishments argued
-                // against — the same evidence `giveUp` cites when it DOES discard — so the next
-                // message spends another full saga before reaching the `requestPath` recovery.
-                // Accepted: distinguishing the two cases needs a budget-aware condition here.
-                //
-                // This branch became reachable with a non-nil budget once establishment was paced
-                // by the 15s timeout: the establishment saga (maxAttempts × 15s = 75s) now outlives
-                // the message retry saga it was started for (maxAttempts × 10s = 50s), so the
-                // pending delivery self-clears first and the final `linkClosed` arrives with
-                // nothing to do.
-                //
-                // The synchronous cascade is NOT purely historical: `BLEEndpoint.openLink` fails
-                // immediately with `.pathStale` when the learned entry names a departed interface,
-                // so a stale BLE binding again burns every attempt in one zero-delay cascade while
-                // the work is still present, and `giveUp` runs. It is bounded by `establishAttempts`
-                // — but it is fast. Routing `.pathStale` into the `.awaitingPath` park (rather than
-                // into another `requestLink`) is what tames it; that routing lives in `LXMFNode`'s
-                // `linkFailed` handler, not in this file.
-                state.establishAttempts[dest] = nil
-                return .none
+                return closed(&state, dest)
 
-            case let .pathLost(dest):
-                // Remove the stale path belief so the next `establish` call parks in
-                // `.awaitingPath` and requests a fresh path, rather than firing another
-                // `requestLink` against a route already known to be wrong.
-                // This case is always followed by `.linkClosed` (see the ordering invariant
-                // in the action doc comment); do not call `establish` here — `linkClosed` does
-                // that, and it will now take the `requestPath` branch because `knownPaths` no
-                // longer contains `dest`.
+            case let .pathLostAndClosed(dest):
+                // ONE reduction: forget the falsified route, then run the ordinary close. Because
+                // both happen in a single pass, `closed`'s call to `establish` is guaranteed to see
+                // the cleared `knownPaths` and take the park branch. Nothing can interleave between
+                // the two halves — which is the entire reason this is one action and not two.
                 state.knownPaths.remove(dest)
-                return .none
+                return closed(&state, dest)
 
             case let .learnedPath(dest):
                 // Deliberately does NOT reset the establishment budget.

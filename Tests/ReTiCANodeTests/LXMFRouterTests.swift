@@ -733,18 +733,23 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 
 /// A finished establishment saga must not leave its budget behind to truncate the NEXT delivery.
 ///
-/// The message retry saga (maxAttempts × retryWaitSeconds = 50s) always finishes before the
-/// establishment saga (maxAttempts × establishmentTimeout = 75s), so the final `linkClosed` for a
-/// dead peer arrives with the pending delivery already self-cleared — i.e. with NO work. That is
-/// the one exit from the saga that does not run `giveUp`, so before this fix `establishAttempts`
-/// was stranded there permanently and the next message to that peer inherited a spent budget.
+/// The message retry saga (maxAttempts × retryWaitSeconds = 50s) can finish before the
+/// establishment saga does, so the final `linkClosed` for a dead peer arrives with the pending
+/// delivery already self-cleared — i.e. with NO work. That is the one exit from the saga that does
+/// not run `giveUp`, so before this fix `establishAttempts` was stranded there permanently and the
+/// next message to that peer inherited a spent budget.
 ///
-/// NOTE ON PACING: under uniform 15s pacing that timeline strands the counter at `maxAttempts - 1`
-/// (increments at t=0/15/30/45, retry ceiling at t=50, the no-work close at t=60), so the next
-/// message gets ONE attempt rather than zero. This test drives the MAXIMAL strand — exactly
-/// `maxAttempts`, the zero-attempt worst case — via five synchronous closes. That is a legitimate
-/// drive, not a synthetic one: `TCPEndpoint.openLink` with no learned path returns `linkFailed`
-/// immediately (the hot-spin driver), so consecutive closes need not be 15s apart.
+/// NOTE ON THE DRIVE: this test sends five consecutive `linkClosed`s with the route still in
+/// `knownPaths`, driving the MAXIMAL strand — exactly `maxAttempts`, the zero-attempt worst case.
+/// The repeated-charge driver that makes this faithful is `.handshakeRejected`: it is the one
+/// LinkFailure that keeps the route (the peer answered, so the path demonstrably works) and is
+/// therefore forwarded by `LXMFNode` as a bare `linkClosed`, re-entering the charging branch of
+/// `establish` each time.
+///
+/// It is deliberately NOT the `.noPath` / `.pathStale` hot spin this note used to cite — that
+/// driver no longer exists at the composition. Path-shaped failures now arrive as
+/// `.pathLostAndClosed`, which clears `knownPaths` first, so they take the free park branch and
+/// cannot charge twice for one route. Driving them here would strand a budget of 1, not 5.
 @Test @MainActor func routerStaleEstablishBudgetDoesNotTruncateTheNextMessage() async {
     let recipientHash = Identity().hash
     let msg = makeMessage(source: Identity(), recipientIdentityHash: recipientHash, content: "first")

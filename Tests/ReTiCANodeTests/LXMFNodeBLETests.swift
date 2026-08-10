@@ -192,11 +192,18 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
 /// peer returns as interface B with a genuinely different InterfaceID (new HELLO token), B
 /// announces, path re-learned on B, router exits the awaitingPath park and opens a link on B.
 ///
-/// Absence assertion: `establishAttempts[dest]` must be nil after the .pathStale bounce —
-/// confirming no link-budget was spent. The `.awaitingPath` branch of `establish()` is free
-/// (it never touches `establishAttempts`); only the `knownPaths.contains` branch increments it.
-/// A stale-path retry that incorrectly burned a link attempt would leave `establishAttempts == 1`
-/// and this assertion would catch it.
+/// Budget assertion: `establishAttempts[dest] == 1` after the .pathStale bounce. ONE attempt is
+/// correct and is the whole point — the first `establish` legitimately charges it while
+/// `knownPaths` still holds the dest (that is the call that emits the `requestLink` which the gate
+/// then rejects); the park that follows is free, because only the `knownPaths.contains` branch of
+/// `establish` increments and the `.awaitingPath` branch never does. So the assertion pins "the
+/// stale binding costs exactly one attempt, not the whole budget" — the pre-fix cascade reached
+/// `maxAttempts` here.
+///
+/// It is NOT an ordering catcher: under a clear/close reversal this value is still 1. The ordering
+/// discriminator lives in `stalePathLinkFailureRequestsAPathInsteadOfRetryingTheLink`, where no
+/// attempt is charged at all because the failure is injected directly rather than following a
+/// genuine `requestLink`.
 ///
 /// Harness extension: added `peerTokenB`, `channel2`, `handle2` file-level constants and a
 /// parameterized `bringPeerOnlineWith` helper (the original `bringPeerOnline` now delegates to it).
@@ -249,7 +256,7 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     // ── Phase 3: send a direct message — hits the stale-path gate immediately ─────────────────
     // `establish` sees knownPaths.contains(dest) → emits requestLink → BLEEndpoint.openLink.
     // openLink: reachableLearned returns nil (interface gone) → linkFailed(.pathStale).
-    // LXMFNode.linkFailed(.pathStale): pathLost + linkClosed → establish sees no known path →
+    // LXMFNode.linkFailed(.pathStale): pathLostAndClosed → establish sees no known path →
     //   awaitingPath park + requestPath delegate.
     //
     // The gate makes the failure synchronous and zero-delay: no LINKREQUEST is ever transmitted.
@@ -268,7 +275,11 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     #expect(store.state.router.directLinks[bDeliveryHash] == .awaitingPath,
             "must be parked in awaitingPath — no live interface to open a link on")
     #expect(!store.state.router.knownPaths.contains(bDeliveryHash),
-            "pathLost must have cleared the stale route belief")
+            "pathLostAndClosed must have cleared the stale route belief")
+    // Exactly ONE attempt: charged by the establish() that emitted the requestLink the gate then
+    // rejected. The park that followed is free. Pre-fix, this bounce consumed the whole budget.
+    #expect(store.state.router.establishAttempts[bDeliveryHash] == 1,
+            "a stale binding must cost exactly one attempt, not the budget")
     // Corroborating assertion: no bytes reached the driver during Phase 3.
     //
     // The gate short-circuits openLink before any packet is emitted. Without the gate, openLink

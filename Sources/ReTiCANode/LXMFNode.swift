@@ -278,16 +278,13 @@ public struct LXMFNode {
                     // earlier un-bounded attempt (f0c4670, reverted e01f0ce) was unsafe and this
                     // is not.
                     //
-                    // Ordering: `pathLost` MUST reduce before `linkClosed`. We use `.run` with
-                    // sequential `await send(...)` rather than `.merge(.send(...), .send(...))`
-                    // because `.merge` of two `Just`-backed publishers runs them concurrently via
-                    // `Publishers.Merge`; the subscription order is implementation-defined and may
-                    // change across Combine versions. Sequential `await` is the only guarantee.
-                    // See LXMFRouter.Action.pathLost doc comment for the ordering invariant.
-                    return .run { send in
-                        await send(.router(.pathLost(destinationHash: dest)))
-                        await send(.router(.linkClosed(destinationHash: dest)))
-                    }
+                    // ONE action, deliberately. Clearing the route and closing the link must not be
+                    // separable: any gap between them is a window in which an inbound `learnedPath`
+                    // (a routine peer announce — see the `pathLearned` case above) re-inserts the
+                    // entry just removed, so the close re-establishes against the stale route after
+                    // all. A `.run` with two `await send`s opens exactly that window at its
+                    // MainActor suspension point. `.pathLostAndClosed` does both in one reduction.
+                    return .send(.router(.pathLostAndClosed(destinationHash: dest)))
                 case .handshakeRejected:
                     // PEER-shaped failure: the path demonstrably works (the peer replied), but
                     // the handshake proof failed to validate. Requesting a fresh path would not

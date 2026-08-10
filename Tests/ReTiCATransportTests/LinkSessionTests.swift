@@ -171,6 +171,68 @@ private func activeResponderStore(clock: TestClock<Duration>)
     #expect(store.state.status == .pending || store.state.status == .closed)
 }
 
+/// An initiator whose proof VALIDATES but whose session-key derivation fails must still report
+/// `.handshakeRejected`, not `.timedOut`.
+///
+/// This pins a genuinely live label that the tampered-proof test does not reach. That test fails
+/// at `validateProof`; this one gets past it and fails one step later, at the empty-session-key
+/// guard. Both are inside `case (.initiator, .pending, .proof, .linkRequestProof)`, so neither is
+/// covered by the responder role gate — the claim that the remaining unpinned labels are all
+/// "dead via the role gate" was false for this one, and mutating it to `.timedOut` left the whole
+/// suite green.
+///
+/// Why the label matters beyond bookkeeping: `LinkPlane` maps it to `LinkFailure.handshakeRejected`,
+/// which is the ONE reason `LXMFNode` answers by retrying the LINK rather than requesting a path
+/// (see `handshakeRejectedLinkFailureStillRetriesTheLinkNotAPath`). Mislabelled `.timedOut` it
+/// would be treated as path-shaped and would throw away a route that demonstrably works — the peer
+/// answered, which is exactly what reaching this code proves.
+///
+/// The drive: a proof carrying an all-zeros X25519 key, correctly signed. `validateProof` checks
+/// the signature and returns the key WITHOUT checking it is a usable curve point, so it succeeds;
+/// the subsequent ECDH then rejects the low-order point and `Link.sessionKey` returns empty.
+@Test @MainActor func initiatorEmptySessionKeyReportsHandshakeRejectedNotTimeout() async {
+    let clock = testClock()
+    let dest = Identity()
+    let store = TestStore(
+        initialState: LinkSession.State(initiatorTo: Identity(publicKey: dest.publicKey)!,
+                                        destinationHash: Data(repeating: 0x55, count: 16),
+                                        interfaceID: InterfaceID("i"))
+    ) { LinkSession() } withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
+    store.exhaustivity = .off
+
+    await store.send(.establish)
+    _ = await captureTransmit(store)
+    let linkID = store.state.linkID
+
+    // Hand-build the proof rather than using Link.buildProof, so the embedded X25519 key can be
+    // the degenerate all-zeros point while the signature over it stays valid.
+    let degeneratePub = Data(repeating: 0, count: Link.publicKeyHalf)
+    let destEd25519Pub = Data(dest.publicKey.suffix(Link.publicKeyHalf))
+    let signedData = linkID + degeneratePub + destEd25519Pub + Link.signallingBytes
+    let proof = dest.sign(signedData) + degeneratePub + Link.signallingBytes
+
+    // Precondition: the proof really does validate. If this ever returns nil the test would be
+    // re-testing the tampered-proof path (:271) instead of the empty-key path (:275).
+    #expect(Link.validateProof(proofData: proof, linkID: linkID, destinationIdentity: dest) != nil,
+            "proof must validate — otherwise this test no longer reaches the session-key guard")
+    // Precondition: derivation really does fail, which is what makes the guard fire.
+    #expect(Link.sessionKey(ephemeralPrivateX25519: Data((store.state.ephemeral.privateKey ?? Data()).prefix(32)),
+                            peerPublicX25519: degeneratePub, linkID: linkID).isEmpty,
+            "session key must be empty — otherwise the link would establish")
+
+    let proofPacket = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                             destinationType: .link, context: .linkRequestProof, contextFlag: false,
+                             hops: 0, destinationHash: linkID, transportId: nil, payload: proof)
+    await store.send(.received(try! proofPacket.packed()))
+    await store.receive(.delegate(.establishmentFailed(.handshakeRejected)))
+    #expect(store.state.status == .pending)                      // no transition on failure
+    #expect(store.state.sessionKey.isEmpty)                      // and no key was adopted
+
+    // Drain the still-running establishment timer, as initiatorRejectsTamperedProof does.
+    await clock.advance(by: .seconds(store.state.establishmentTimeout))
+    #expect(store.state.status == .pending || store.state.status == .closed)
+}
+
 @Test @MainActor func initiatorAndResponderReachActiveWithEqualSessionKey() async {
     let clock = testClock()
     let owner = Identity()                                  // responder owns this destination identity

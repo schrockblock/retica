@@ -160,8 +160,9 @@ import ComposableArchitecture
 /// Routing to a path request is cheaper than burning 5 × 15s against a dead route. The shared
 /// `establishAttempts` budget bounds the whole saga (path parks + link attempts together).
 ///
-/// Flow: 1 timeout → pathLost + linkClosed → establish → awaitingPath park → requestPath.
-/// Park timer fires (maxAttempts - 1) more times, then giveUp → deliveryFailed.
+/// Flow: 1 timeout → pathLostAndClosed → establish → awaitingPath park → requestPath.
+/// Park timer fires (maxAttempts - 1) more times, then giveUp → deliveryFailed. Total ≈ 50s
+/// (15s establishment timeout + 5 × pathRequestWaitSeconds), which this test's clock advances pin.
 @Test @MainActor func establishmentTimeoutReachesRouterAndDoesNotWedgeDestination() async {
     let clock = TestClock()
     let aIdentity = Identity()
@@ -217,13 +218,13 @@ import ComposableArchitecture
 
     // After 15s the link times out with .establishmentTimedOut.
     // Task 2 routing: .establishmentTimedOut is PATH-shaped →
-    //   pathLost (clear knownPaths) + linkClosed → establish() → .awaitingPath park + requestPath.
+    //   pathLostAndClosed (clear knownPaths, then close) → establish() → .awaitingPath + requestPath.
     // establishAttempts is still 1 (the awaitingPath branch of establish() does not increment it;
     // only pathRequestDeadline does, starting from the first park-timer fire).
     await clock.advance(by: .seconds(15))
     await a.receive { if case .router(.delegate(.requestPath)) = $0 { return true }; return false }
     #expect(a.state.router.directLinks[bDeliveryHash] == .awaitingPath)
-    #expect(!a.state.router.knownPaths.contains(bDeliveryHash), "path cleared by pathLost")
+    #expect(!a.state.router.knownPaths.contains(bDeliveryHash), "path cleared by pathLostAndClosed")
 
     // Each pathRequestWaitSeconds advance fires one pathRequestDeadline → re-request path.
     // pathRequestDeadline increments from 1: 1→2, 2→3, 3→4, 4→5 → requestPath (4 fires).
@@ -260,11 +261,15 @@ import ComposableArchitecture
 /// absence claim instead. Note carefully WHICH piece of state does the work:
 ///
 ///  • `requestPath` arriving, `knownPaths` cleared, and `directLinks[dest] == .awaitingPath` are
-///    all necessary but NOT sufficient — a reversed `pathLost`/`linkClosed` ordering reaches every
-///    one of them one cycle later, after `openLink` bounces `linkFailed(.noPath)` back. Those
-///    three assertions alone pass under the reversed mutation.
-///  • `establishAttempts[dest] == nil` is the discriminator: the reversed order spends a link
-///    attempt first (counter := 1) and only then parks. See the comment at that assertion.
+///    all necessary but NOT sufficient. A close that reaches `establish` before the route is
+///    forgotten still reaches every one of them, just one cycle later, after `openLink` bounces
+///    `linkFailed(.noPath)` back. Those three assertions alone passed under exactly that mutation.
+///  • `establishAttempts[dest] == nil` is the discriminator: clearing late spends a link attempt
+///    first (counter := 1) and only then parks. See the comment at that assertion.
+///
+/// That ordering is no longer separable — the clear and the close are one action,
+/// `pathLostAndClosed` — so the surviving mutation is dropping the clear, which this still
+/// catches on the same assertion.
 @Test @MainActor func stalePathLinkFailureRequestsAPathInsteadOfRetryingTheLink() async {
     let dest = LXMessage.deliveryHash(identityHash: Identity().hash)
 
@@ -294,9 +299,9 @@ import ComposableArchitecture
         }
         store.exhaustivity = .off
 
-        // Inject a path-shaped link failure. The fix:
-        //   1. pathLost(dest)  → knownPaths.remove(dest)
-        //   2. linkClosed(dest) → establish() sees no path → .awaitingPath + requestPath
+        // Inject a path-shaped link failure. The fix: a single .pathLostAndClosed(dest) that
+        // removes dest from knownPaths and then closes, so establish() sees no path and parks
+        // in .awaitingPath + requestPath.
         // Without the fix: knownPaths still contains dest → establish() → requestLink.
         await store.send(.endpoint(.delegate(.linkFailed(destinationHash: dest, reason: reason))))
 
@@ -309,23 +314,24 @@ import ComposableArchitecture
         // State confirms the routing: .awaitingPath means requestPath was emitted.
         // knownPaths must be cleared so the NEXT establish() also takes the path-request branch.
         #expect(!store.state.router.knownPaths.contains(dest),
-                "knownPaths must be cleared by pathLost for reason \(reason)")
+                "knownPaths must be cleared by pathLostAndClosed for reason \(reason)")
         #expect(store.state.router.directLinks[dest] == .awaitingPath,
                 "destination must be parked in .awaitingPath for reason \(reason)")
 
-        // THE ORDERING DISCRIMINATOR. `establish` increments `establishAttempts` ONLY on its
-        // `knownPaths.contains(dest)` branch (LXMFRouter.swift:200); the else-branch that parks
-        // in `.awaitingPath` returns requestPath + pathRequestTimer without touching the counter.
+        // THE DISCRIMINATOR. `establish` increments `establishAttempts` ONLY on its
+        // `knownPaths.contains(dest)` branch; the else-branch that parks in `.awaitingPath`
+        // returns requestPath + pathRequestTimer without touching the counter.
         //
-        // Under the CORRECT order (pathLost first) the very first `establish` sees an empty
-        // knownPaths, takes the else-branch, and spends NOTHING — the budget stays nil.
+        // With the clear in place, the very first `establish` sees an empty knownPaths, takes
+        // the else-branch, and spends NOTHING — the budget stays nil.
         //
-        // Under REVERSED order `linkClosed` reaches `establish` while the stale entry is still
-        // present, so it spends one link attempt (counter := 1) and emits requestLink; only the
-        // NEXT cycle — after `openLink` bounces back `linkFailed(.noPath)` — parks and produces
-        // requestPath. Both orders therefore end at `.awaitingPath` with knownPaths cleared, and
-        // both eventually emit requestPath. The difference is ENTIRELY in the budget, which is
-        // why the assertions above cannot pin the ordering and this one can.
+        // WITHOUT it (drop `knownPaths.remove` from `pathLostAndClosed`, or clear after closing
+        // rather than before), `establish` runs while the stale entry is still present, so it
+        // spends one link attempt (counter := 1) and emits requestLink; only the NEXT cycle —
+        // after `openLink` bounces back `linkFailed(.noPath)` — parks and produces
+        // requestPath. Both variants therefore end at `.awaitingPath` with knownPaths cleared,
+        // and both eventually emit requestPath. The difference is ENTIRELY in the budget, which
+        // is why the assertions above cannot pin this and this one can.
         #expect(store.state.router.establishAttempts[dest] == nil,
                 "no link attempt may be spent for reason \(reason) — the path branch is free")
 
