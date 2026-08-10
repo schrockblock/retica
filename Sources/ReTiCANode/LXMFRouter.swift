@@ -50,13 +50,14 @@ public struct LXMFRouter {
         ///
         /// Three distinct drivers reach this counter:
         ///
-        ///  • `TCPEndpoint.openLink` with no `transport.learned[dest]` entry
-        ///    (TCPEndpoint.swift:149-151) returns `linkFailed` IMMEDIATELY — a hot, zero-delay
-        ///    spin whenever the router's `knownPaths` outlives Transport's `learned` table.
-        ///  • An establishment TIMEOUT: an initiator's `LinkSession` emits `.establishmentFailed`
-        ///    (LinkSession.swift:546-547), which `LinkPlane` routes to `linkFailed(destinationHash:)`
-        ///    and `LXMFNode.swift:267` forwards here keyed by DESTINATION. That paces the cycle at
-        ///    the 15s establishment timeout rather than spinning.
+        ///  • `TCPEndpoint.openLink` with no `transport.learned[dest]` entry returns
+        ///    `linkFailed(reason: .noPath)` IMMEDIATELY — a hot, zero-delay spin whenever the
+        ///    router's `knownPaths` outlives Transport's `learned` table.
+        ///  • An establishment TIMEOUT: an initiator's `LinkSession.establishmentDeadline` emits
+        ///    `.establishmentFailed(.timedOut)`, which `LinkPlane` routes to
+        ///    `linkFailed(destinationHash:reason:)` and `LXMFNode`'s `linkFailed` handler forwards
+        ///    here keyed by DESTINATION. That paces the cycle at the 15s establishment timeout
+        ///    rather than spinning.
         ///  • `.pathRequestDeadline`: when `establish()` parks in `.awaitingPath` and the path
         ///    response never arrives, the park timer fires and increments this counter, re-emitting
         ///    `requestPath` until the budget is exhausted. The two establish branches therefore
@@ -392,7 +393,8 @@ public struct LXMFRouter {
                 // so a stale BLE binding again burns every attempt in one zero-delay cascade while
                 // the work is still present, and `giveUp` runs. It is bounded by `establishAttempts`
                 // — but it is fast. Routing `.pathStale` into the `.awaitingPath` park (rather than
-                // into another `requestLink`) is what tames it; see the `linkFailed` handler.
+                // into another `requestLink`) is what tames it; that routing lives in `LXMFNode`'s
+                // `linkFailed` handler, not in this file.
                 state.establishAttempts[dest] = nil
                 return .none
 

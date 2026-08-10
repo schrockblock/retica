@@ -218,7 +218,15 @@ public struct LinkPlane {
                 // Still remove the element either way — that is the leak-prevention half, and it must
                 // not become conditional on role.
                 guard session.role == .initiator else { return .none }
-                let reason: LinkFailure = kind == .timedOut ? .establishmentTimedOut : .handshakeRejected
+                // Exhaustive switch, deliberately not a ternary: a new EstablishmentFailure case must
+                // be a COMPILE error here, not a silent default into `.handshakeRejected` — that is
+                // the one PEER-shaped reason, and the only one the delivery layer does NOT answer
+                // with a path request. A mislabel there costs a full establishment budget.
+                let reason: LinkFailure
+                switch kind {
+                case .timedOut:          reason = .establishmentTimedOut
+                case .handshakeRejected: reason = .handshakeRejected
+                }
                 return .send(.delegate(.linkFailed(destinationHash: session.destinationHash, reason: reason)))
 
             case let .link(.element(elementID, .delegate(.resourceReceived(data)))):

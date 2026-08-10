@@ -545,7 +545,7 @@ public struct LinkSession {
                 // .establishing forever with no timer, no retry and no deliveryFailed.
                 //
                 // A RESPONDER's timeout stays .closed. For a responder `destinationHash` is our OWN
-                // served destination (LinkPlane.swift:89-91), not a remote peer, so `linkFailed` for
+                // served destination (`LinkPlane.acceptLinkRequest`), not a remote peer, so `linkFailed` for
                 // it carries no useful reachability information — a timeout here says only that an
                 // inbound handshake stalled. `.closed` is the accurate description of that.
                 //
