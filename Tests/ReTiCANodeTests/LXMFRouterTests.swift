@@ -782,6 +782,58 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.establishAttempts[dest] == nil)
 }
 
+/// After the ceiling fires — `knownPaths[dest]` is cleared — the NEXT `.send(.direct)` to that
+/// destination must ask for a fresh path (`.requestPath`) rather than retrying a link to a peer
+/// whose route has been empirically falsified. This is the recovery the reverted openLink
+/// fast-fail slice was aiming at: a path request refreshes `learned` with the live interface
+/// (Transport.swift:486-495 builds a FRESH announce), after which a link can be established
+/// normally.
+@Test @MainActor func routerRequestsPathOnTheNextSendAfterGivingUpOnLinks() async {
+    let recipientHash = Identity().hash
+    let msg = makeMessage(source: Identity(), recipientIdentityHash: recipientHash,
+                          content: "give-up-then-recover")
+    let msg2 = makeMessage(source: Identity(), recipientIdentityHash: recipientHash,
+                           content: "next-send-after-give-up")
+    #expect(msg.destinationHash == msg2.destinationHash)
+    let dest = msg.destinationHash
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(dest)   // path known → establish() takes the requestLink branch
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+
+    // Burn the whole establishment budget to the ceiling. That clears knownPaths — the path
+    // belief is empirically falsified.
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    for _ in 2...LXMFDelivery.maxAttempts {
+        await store.send(.linkClosed(destinationHash: dest))
+        await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    }
+    await store.send(.linkClosed(destinationHash: dest))
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
+        return false
+    }
+    // Ceiling confirmed: path is forgotten.
+    #expect(store.state.knownPaths.contains(dest) == false)
+    #expect(store.state.establishAttempts[dest] == nil)
+    #expect(store.state.outboundQueue[dest] == nil)
+
+    // The next send to the same destination must request a path, NOT a link.
+    await store.send(.send(message: msg2, desiredMethod: .direct))
+    await store.receive { action in
+        if case let .delegate(.requestPath(d)) = action { #expect(d == dest); return true }
+        return false
+    }
+    #expect(store.state.directLinks[dest] == .awaitingPath)
+    #expect(store.state.outboundQueue[dest]?.count == 1)
+    // No timers are in flight (queued sends arm no timers). Flip to .on so teardown
+    // catches a stray requestLink — under .off an absence assertion is vacuous.
+    store.exhaustivity = .on
+}
+
 /// A re-announce of an ALREADY-KNOWN path is not new information and must NOT refresh the budget.
 /// `Transport.shouldReplace` accepts any fresher announce, so a live peer re-announcing on its
 /// normal period reaches `.learnedPath` repeatedly; resetting on those would let it refresh the
