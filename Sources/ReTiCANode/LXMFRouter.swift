@@ -108,6 +108,14 @@ public struct LXMFRouter {
         /// reads `knownPaths` — still containing the stale entry at that point — and emits
         /// `requestLink` instead of `requestPath`, producing exactly the bug this action fixes.
         ///
+        /// The cost of getting this wrong is a SPENT BUDGET, not a stuck destination: reversed,
+        /// the stale `requestLink` bounces off `openLink` as `linkFailed(.noPath)` and the next
+        /// cycle does park — but `establish` has already charged one attempt from
+        /// `establishAttempts` on its `knownPaths.contains` branch, while the park branch charges
+        /// nothing. That is the observable difference, and it is what
+        /// `stalePathLinkFailureRequestsAPathInsteadOfRetryingTheLink` asserts; reversing the two
+        /// sends fails that test on the budget assertion (verified by mutation, not assumed).
+        ///
         /// `LXMFNode`'s `linkFailed` handler enforces this by sequencing via `.run { send in
         ///   await send(.router(.pathLost(...))); await send(.router(.linkClosed(...))) }` — the
         /// sequential awaits guarantee `pathLost` is fully reduced before `linkClosed` is
