@@ -16,6 +16,17 @@ public struct LinkSession {
     public enum Status: Equatable, Sendable { case pending, handshake, active, closed }
     public enum CloseReason: Equatable, Sendable { case initiatorClosed, destinationClosed, timedOut }
 
+    /// Why establishment failed. The distinction is load-bearing above: a timeout is evidence
+    /// about the PATH, a rejection is evidence about the PEER.
+    public enum EstablishmentFailure: Equatable, Sendable {
+        /// No LINKPROOF within `establishmentTimeout`. Usually means our PATH is wrong (peer moved,
+        /// relay gone, peer absent) rather than that the peer refused — the peer never spoke at all.
+        case timedOut
+        /// The peer ANSWERED but the handshake did not validate (bad proof, empty session key,
+        /// undecodable handshake data). The path demonstrably works; the problem is at the peer.
+        case handshakeRejected
+    }
+
     static let keepaliveByte: UInt8 = 0xFF
     static let keepaliveReplyByte: UInt8 = 0xFE
     static let resourceSDU = 464
@@ -142,7 +153,7 @@ public struct LinkSession {
         public enum Delegate: Equatable {
             case transmit(InterfaceID, Data)
             case established(linkID: Data, sessionKey: Data)
-            case establishmentFailed
+            case establishmentFailed(EstablishmentFailure)
             /// An inbound application data packet. `packetHash` is the 32-byte hash the sender
             /// records as its pending receipt — pass it back to `.provePacket` to prove the packet.
             /// (Mirrors the reference callback signature `LXMRouter.propagation_packet(data, packet)`,
@@ -232,7 +243,7 @@ public struct LinkSession {
                 let ourPriv = Data((state.ephemeral.privateKey ?? Data()).prefix(32))
                 let key = Link.sessionKey(ephemeralPrivateX25519: ourPriv,
                                           peerPublicX25519: peerPub, linkID: linkID)
-                guard !key.isEmpty else { return .send(.delegate(.establishmentFailed)) }
+                guard !key.isEmpty else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 state.linkID = linkID
                 state.peerX25519Pub = peerPub
                 state.sessionKey = key
@@ -257,11 +268,11 @@ public struct LinkSession {
                           let peerPub = Link.validateProof(proofData: packet.payload,
                                                            linkID: state.linkID,
                                                            destinationIdentity: destID)
-                    else { return .send(.delegate(.establishmentFailed)) }
+                    else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                     let ourPriv = Data((state.ephemeral.privateKey ?? Data()).prefix(32))
                     let key = Link.sessionKey(ephemeralPrivateX25519: ourPriv,
                                               peerPublicX25519: peerPub, linkID: state.linkID)
-                    guard !key.isEmpty else { return .send(.delegate(.establishmentFailed)) }
+                    guard !key.isEmpty else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                     state.peerX25519Pub = peerPub
                     state.sessionKey = key
                     state.status = .active
@@ -282,7 +293,7 @@ public struct LinkSession {
                 case (.responder, .handshake, .data, .linkRequestRTT):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
                           let rtt = MsgPack.decodeDouble(plain)
-                    else { return .send(.delegate(.establishmentFailed)) }
+                    else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                     state.rtt = rtt
                     state.status = .active
                     state.activatedAt = now
@@ -539,12 +550,13 @@ public struct LinkSession {
                 // inbound handshake stalled. `.closed` is the accurate description of that.
                 //
                 // This is NOT a claim that a responder never emits `.establishmentFailed` — it
-                // already does on a malformed handshake (`:235`, `:285`), and those are benign
-                // (LXMFNode.swift:267-269 clears an absent `directLinks` entry, then the router finds
-                // nothing pending or queued for that hash and returns `.none`). The point is
-                // narrower: the timeout path should not ADD another such instance for no gain.
+                // already does on a malformed handshake, carrying `.handshakeRejected`. Those are
+                // now suppressed at the plane: `LinkPlane` gates `linkFailed` on
+                // `role == .initiator`, because a responder's `destinationHash` is the destination
+                // WE serve and reporting it as unreachable would misinform the delivery layer.
+                // The point here is narrower: the timeout path should not ADD another such instance.
                 if state.role == .initiator {
-                    return .merge(.send(.delegate(.establishmentFailed)), cancelAll, cancelPending(&state))
+                    return .merge(.send(.delegate(.establishmentFailed(.timedOut))), cancelAll, cancelPending(&state))
                 }
                 return .merge(.send(.delegate(.closed(.timedOut))), cancelAll, cancelPending(&state))
 

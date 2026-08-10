@@ -96,7 +96,7 @@ private func activeResponderStore(clock: TestClock<Duration>)
     await store.receive(.establishmentDeadline)
     // Initiators emit .establishmentFailed so LinkPlane routes the timeout to linkFailed(destinationHash:),
     // giving the delivery layer a destination-keyed signal it can act on.
-    await store.receive(.delegate(.establishmentFailed)) { $0.status = .closed }
+    await store.receive(.delegate(.establishmentFailed(.timedOut))) { $0.status = .closed }
 }
 
 @Test @MainActor func responderAcceptRequestEmitsProofAndGoesHandshake() async {
@@ -157,7 +157,8 @@ private func activeResponderStore(clock: TestClock<Duration>)
                              destinationType: .link, context: .linkRequestProof, contextFlag: false,
                              hops: 0, destinationHash: linkID, transportId: nil, payload: proof)
     await store.send(.received(try! proofPacket.packed()))
-    await store.receive(.delegate(.establishmentFailed))
+    // The peer ANSWERED with a proof that failed to validate — peer-shaped, not path-shaped.
+    await store.receive(.delegate(.establishmentFailed(.handshakeRejected)))
     #expect(store.state.status == .pending)                      // no transition on failure
     // The establishment timer is still running. With exhaustivity=.off, TCA silently ignores
     // the in-flight timer effect at teardown (it's cancelled when the store is deallocated).
@@ -417,7 +418,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
     await store.receive(.establishmentDeadline)
     // Initiators emit .establishmentFailed so the delivery layer receives a destination-keyed signal.
-    await store.receive(.delegate(.establishmentFailed))
+    await store.receive(.delegate(.establishmentFailed(.timedOut)))
     #expect(store.state.status == .closed)
 }
 

@@ -6,14 +6,24 @@ import ReTiCATransport
 /// Why a link could not be opened. Distinguishes failures that mean "our PATH is wrong"
 /// (recoverable by requesting a fresh one) from "the PEER did not complete" (recoverable only
 /// by retrying the link). `LXMFNode` routes on this — see its `linkFailed` handler.
+///
+/// Three of the four are PATH-shaped: `.noPath`, `.pathStale` and `.establishmentTimedOut` all
+/// describe a route we cannot reach the peer over. Only `.handshakeRejected` is PEER-shaped —
+/// it is the one case where the peer demonstrably received our packets.
 public enum LinkFailure: Equatable, Sendable {
     /// No learned path at all for the destination.
     case noPath
     /// A learned path exists but names an interface that is gone (BLE peer reconnected with a
     /// new InterfaceID, interface removed). `Transport.reachableLearned` is the detector.
     case pathStale
-    /// A link was minted and the handshake did not complete (timeout, bad proof).
-    case establishmentFailed
+    /// A link was minted and no proof came back within the establishment timeout. Treated as
+    /// PATH-shaped: the peer never responded, so the most likely cause is that our route to it is
+    /// wrong. Requesting a fresh path is cheap and bounded; retrying the link against a dead route
+    /// costs the whole budget.
+    case establishmentTimedOut
+    /// The peer answered and the handshake failed to validate. PEER-shaped — a path request would
+    /// not help, because the path demonstrably works.
+    case handshakeRejected
 }
 
 /// The interface-agnostic link/resource/request plane: owns the live `LinkSession`s and the
@@ -199,10 +209,17 @@ public struct LinkPlane {
                 state.links.remove(id: elementID)
                 return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
 
-            case let .link(.element(elementID, .delegate(.establishmentFailed))):
-                guard let destHash = state.links[id: elementID]?.destinationHash else { return .none }
+            case let .link(.element(elementID, .delegate(.establishmentFailed(kind)))):
+                guard let session = state.links[id: elementID] else { return .none }
                 state.links.remove(id: elementID)
-                return .send(.delegate(.linkFailed(destinationHash: destHash, reason: .establishmentFailed)))
+                // Only an INITIATOR failure names a remote peer. A responder's destinationHash is the
+                // destination WE serve (set by `acceptLinkRequest` above), so reporting linkFailed for
+                // it would tell the delivery layer that a peer it never contacted is unreachable.
+                // Still remove the element either way — that is the leak-prevention half, and it must
+                // not become conditional on role.
+                guard session.role == .initiator else { return .none }
+                let reason: LinkFailure = kind == .timedOut ? .establishmentTimedOut : .handshakeRejected
+                return .send(.delegate(.linkFailed(destinationHash: session.destinationHash, reason: reason)))
 
             case let .link(.element(elementID, .delegate(.resourceReceived(data)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }

@@ -776,6 +776,26 @@ private func endpointWithActiveLink(
     return (store, elementID)
 }
 
+/// A store holding one INITIATOR link still in `.pending` — the shape that establishment
+/// failures actually arise from, and the one whose `destinationHash` names a REMOTE peer.
+private func endpointWithInitiatorLink(_ clock: TestClock<Duration>)
+    -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, UUID) {
+    var s = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+    let elementID = UUID(0)
+    let link = LinkSession.State(id: elementID, initiatorTo: Identity(),
+                                 destinationHash: Data(repeating: 0x03, count: 16),
+                                 interfaceID: InterfaceID("tcp"), relayNextHop: nil)
+    s.links.append(link)
+    let store = TestStore(initialState: s) { TCPEndpoint() } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    return (store, elementID)
+}
+
 private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) }
 
 @Test @MainActor func registerThenDeregisterMutatesRegistrations() async {
@@ -1305,18 +1325,49 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     #expect(store.state.links[id: elementID] == nil)           // removed
 }
 
-@Test @MainActor func establishmentFailedLinkIsRemovedFromEndpoint() async {
+/// A RESPONDER's establishmentFailed removes the element but must NOT surface `linkFailed`.
+///
+/// For a responder, `destinationHash` is the destination WE serve, not a remote peer, so a
+/// `linkFailed` for it would tell the delivery layer that a peer it never contacted is
+/// unreachable. The removal still happens — that half is leak prevention and is unconditional.
+///
+/// ABSENCE ASSERTION — flip-then-send, and the trailing `.off` flip comes AFTER a second send.
+/// Teardown reads exhaustivity at CALL time, so flipping back to `.off` before the test ends
+/// would tolerate the stray action and make this vacuous (verified: the role-gate mutation
+/// passed against exactly that shape). The second `store.send` while still `.on` is what forces
+/// the check — it fails with "Must handle 1 received action before sending an action" if the
+/// gate let a `linkFailed` through. `.closeLink` on an unknown linkID is the probe: `LinkPlane`
+/// guards on a matching link and returns `.none`, so it mutates nothing and starts no effect.
+@Test @MainActor func responderEstablishmentFailedRemovesLinkWithoutReportingLinkFailed() async {
     let clock = TestClock()
     let linkID = Data(repeating: 0xAB, count: 16)
     let (store, elementID) = endpointWithActiveLink(linkID: linkID, remoteIdentity: nil,
                                                     registrations: [:], responder: .testValue, clock)
-    let destHash = store.state.links[id: elementID]!.destinationHash
-    await store.send(.link(.element(id: elementID, action: .delegate(.establishmentFailed))))
-    await store.receive { action in
-        if case let .delegate(.linkFailed(dh, .establishmentFailed)) = action { return dh == destHash }
-        return false
+    #expect(store.state.links[id: elementID]?.role == .responder)   // the helper seeds a responder
+    store.exhaustivity = .on
+    await store.send(.link(.element(id: elementID, action: .delegate(.establishmentFailed(.timedOut))))) {
+        $0.links.remove(id: elementID)
     }
-    #expect(store.state.links[id: elementID] == nil)           // removed
+    #expect(store.state.links[id: elementID] == nil)           // removed regardless of role
+    await store.send(.closeLink(linkID: Data(repeating: 0xEE, count: 16)))   // probe: no-op
+    store.exhaustivity = .off
+}
+
+/// An INITIATOR's establishmentFailed names a REMOTE peer, so it does surface `linkFailed`,
+/// carrying the kind: a timeout is path-shaped, a rejected handshake is peer-shaped.
+@Test @MainActor func initiatorEstablishmentFailedReportsLinkFailedWithKind() async {
+    for (kind, expected) in [(LinkSession.EstablishmentFailure.timedOut, LinkFailure.establishmentTimedOut),
+                             (.handshakeRejected, .handshakeRejected)] {
+        let clock = TestClock()
+        let (store, elementID) = endpointWithInitiatorLink(clock)
+        let destHash = store.state.links[id: elementID]!.destinationHash
+        await store.send(.link(.element(id: elementID, action: .delegate(.establishmentFailed(kind)))))
+        await store.receive { action in
+            if case let .delegate(.linkFailed(dh, reason)) = action { return dh == destHash && reason == expected }
+            return false
+        }
+        #expect(store.state.links[id: elementID] == nil)       // removed
+    }
 }
 
 @Test @MainActor func enableRelaySetsTransportIdentity() async {

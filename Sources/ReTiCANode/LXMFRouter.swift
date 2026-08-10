@@ -385,8 +385,14 @@ public struct LXMFRouter {
                 // by the 15s timeout: the establishment saga (maxAttempts × 15s = 75s) now outlives
                 // the message retry saga it was started for (maxAttempts × 10s = 50s), so the
                 // pending delivery self-clears first and the final `linkClosed` arrives with
-                // nothing to do. Previously `openLink` failed immediately, burning every attempt in
-                // one synchronous cascade while the work was still present, so `giveUp` always ran.
+                // nothing to do.
+                //
+                // The synchronous cascade is NOT purely historical: `BLEEndpoint.openLink` fails
+                // immediately with `.pathStale` when the learned entry names a departed interface,
+                // so a stale BLE binding again burns every attempt in one zero-delay cascade while
+                // the work is still present, and `giveUp` runs. It is bounded by `establishAttempts`
+                // — but it is fast. Routing `.pathStale` into the `.awaitingPath` park (rather than
+                // into another `requestLink`) is what tames it; see the `linkFailed` handler.
                 state.establishAttempts[dest] = nil
                 return .none
 

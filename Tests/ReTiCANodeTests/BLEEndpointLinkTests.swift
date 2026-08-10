@@ -192,22 +192,47 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     // learned[destHash] still exists.
     events.yield(.channelClosed(channel, reason: nil))
     await store.receive { if case .delegate(.peerOffline) = $0 { return true }; return false }
+    // That was the last peer, so maintenance also stops. Drain it here, while exhaustivity is
+    // still .off, so the .on window below sees only what `.openLink` itself produces.
+    await store.receive { if case .transport(.stopMaintenance) = $0 { return true }; return false }
 
     // Sanity: learned entry survives (non-destructive by design), interface is gone.
     #expect(store.state.transport.learned[destHash] != nil)
     #expect(store.state.transport.interfaces[bleInterfaceID(peerToken)] == nil)
 
-    // openLink must fail immediately with .pathStale — no link minted.
+    // openLink must fail immediately with .pathStale — and NOTHING may be minted.
+    //
+    // Exhaustivity is flipped to .on for this send. Under .off a stray `.linkPlane(.openLink)`
+    // is silently drained and never applied, so `store.state.links` reads empty whether or not a
+    // link was minted — an `isEmpty` check there is vacuous. Under .on the mint surfaces as an
+    // unasserted received action and fails crisply with a diff against the expected delegate,
+    // instead of via a 1-second receive timeout.
+    store.exhaustivity = .on
     await store.send(.openLink(destinationHash: destHash))
-    await store.receive { action in
-        if case .delegate(.linkFailed(let hash, let reason)) = action {
-            return hash == destHash && reason == .pathStale
-        }
-        return false
-    }
+    await store.receive(.delegate(.linkFailed(destinationHash: destHash, reason: .pathStale)))
+    store.exhaustivity = .off
     #expect(store.state.links.isEmpty)
 
     await store.send(.stop)
+}
+
+/// Pins the LinkPlane→BLEEndpoint `linkFailed` forwarder: the reason must be carried through,
+/// not recomputed or hardcoded. `.handshakeRejected` is deliberately a reason BLE's own
+/// `openLink` can never produce, so a hardcoded forwarder cannot pass by coincidence.
+@Test @MainActor func bleForwardsLinkPlaneLinkFailedReasonUnchanged() async {
+    let (store, events, _) = makeNode()
+    await bringPeerOnline(store, events)
+
+    let destHash = Data(repeating: 0x77, count: 16)
+    for reason in [LinkFailure.handshakeRejected, .establishmentTimedOut, .noPath, .pathStale] {
+        await store.send(.linkPlane(.delegate(.linkFailed(destinationHash: destHash, reason: reason))))
+        await store.receive { action in
+            if case .delegate(.linkFailed(let h, let r)) = action { return h == destHash && r == reason }
+            return false
+        }
+    }
+
+    await teardown(store)
 }
 
 @Test @MainActor func linkPlaneTransmitToUnknownPeerIsDropped() async {
