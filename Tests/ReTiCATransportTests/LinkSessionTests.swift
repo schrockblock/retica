@@ -126,10 +126,14 @@ private func activeResponderStore(clock: TestClock<Duration>)
     #expect(store.state.sessionKey.count == 64)
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
     await store.receive(.establishmentDeadline)
-    // Responders deliberately keep .closed(.timedOut) — not .establishmentFailed. The role gate
-    // in LinkSession.establishmentDeadline is intentional: a responder's destinationHash is our
-    // OWN served destination; emitting linkFailed for it would tell the delivery layer that a
-    // peer it never contacted is unreachable.
+    // Responders deliberately keep .closed(.timedOut) — not .establishmentFailed. The role gate in
+    // LinkSession.establishmentDeadline is intentional: a responder's destinationHash is our OWN
+    // served destination, so linkFailed for it carries no reachability information — a timeout here
+    // says only that an inbound handshake stalled.
+    //
+    // Not a claim that responders never emit .establishmentFailed: they already do on a malformed
+    // handshake (LinkSession.swift:235, :285), and those are benign. The narrower point is that the
+    // timeout path should not add another such instance for no gain.
     await store.receive(.delegate(.closed(.timedOut))) { $0.status = .closed }
 }
 

@@ -1208,6 +1208,45 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.directLinks[pn] == .establishing)
 }
 
+/// A sync that exhausts the establishment budget must be explicitly TERMINATED, not left pending.
+/// `pendingDownloadFromPN` is otherwise cleared only when `.linkEstablished` drains it, so without a
+/// clear in the give-up branch an abandoned sync stays "outstanding" forever: every later
+/// `linkClosed(pn)` re-enters establish, and an unrelated future PN link (e.g. from a propagated
+/// send) resurrects it with a surprise `requestMessageList`.
+@Test @MainActor func routerSyncExhaustingBudgetClearsPendingDownloadFlag() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.knownPaths.insert(pn)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+
+    // Drive to the precondition rather than seeding it: a sync with nothing queued (attempt 1).
+    await store.send(.syncFromPropagationNode)
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    #expect(store.state.pendingDownloadFromPN == true)
+
+    // Burn the rest of the budget: each close re-establishes (attempts 2...maxAttempts).
+    for _ in 2...LXMFDelivery.maxAttempts {
+        await store.send(.linkClosed(destinationHash: pn))
+        await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+        #expect(store.state.pendingDownloadFromPN == true)   // still outstanding while retrying
+    }
+
+    // One more close pushes establish() past the ceiling → give up.
+    await store.send(.linkClosed(destinationHash: pn))
+    #expect(store.state.pendingDownloadFromPN == false)      // the sync has a terminus
+    #expect(store.state.knownPaths.contains(pn) == false)    // and the path is forgotten
+
+    // A later PN link must NOT resurrect the abandoned sync. Flipping to .on and then SENDING is
+    // what makes this an absence assertion — under .off a stray requestMessageList is swallowed.
+    store.exhaustivity = .on
+    await store.send(.linkEstablished(destinationHash: pn, linkID: linkID)) {
+        $0.directLinks[pn] = .active(linkID: linkID)
+    }
+}
+
 // MARK: - Resource-direct delivery confirmation
 
 /// Resource-direct confirmation: a resource-sized message sent over an active link records its hash in

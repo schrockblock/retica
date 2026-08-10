@@ -54,12 +54,14 @@ public struct LXMFRouter {
         ///    (TCPEndpoint.swift:149-151) returns `linkFailed` IMMEDIATELY — a hot, zero-delay
         ///    spin whenever the router's `knownPaths` outlives Transport's `learned` table.
         ///  • An establishment TIMEOUT: an initiator's `LinkSession` emits `.establishmentFailed`
-        ///    (LinkSession.swift:527-542), which `LinkPlane` routes to `linkFailed(destinationHash:)`
+        ///    (LinkSession.swift:546-547), which `LinkPlane` routes to `linkFailed(destinationHash:)`
         ///    and `LXMFNode.swift:267` forwards here keyed by DESTINATION. That paces the cycle at
         ///    the 15s establishment timeout rather than spinning.
         ///
-        /// So the budget bounds both, and the slow path terminates in roughly
-        /// `maxAttempts × establishmentTimeout` = 5 × 15s ≈ 75s before `deliveryFailed`.
+        /// So the budget bounds both, and the slow path reaches the give-up branch in roughly
+        /// `maxAttempts × establishmentTimeout` = 5 × 15s ≈ 75s. Queued messages are reported there
+        /// as `deliveryFailed`; a PN SYNC has no message to fail, so it terminates silently — the
+        /// flag is cleared but the app is not told. See the give-up branch.
         ///
         /// Reset on `linkEstablished` — the one event that proves the destination is
         /// reachable again. Deliberately NOT reset on `learnedPath`; see that case for why a
@@ -149,6 +151,15 @@ public struct LXMFRouter {
                         let propQueued = state.propagationQueue[dest] ?? []
                         state.outboundQueue[dest] = nil
                         state.propagationQueue[dest] = nil
+                        // An outstanding sync needs an explicit terminus too. Unlike the queues above
+                        // (drained here) and `pendingDeliveries` (self-clearing via the retry saga),
+                        // `pendingDownloadFromPN` is otherwise cleared ONLY when `.linkEstablished`
+                        // drains it (:301-304). Left set, it would (a) keep this destination
+                        // permanently "has work" so every later `linkClosed(pn)` re-enters establish,
+                        // and (b) let an unrelated future PN link resurrect the abandoned sync with a
+                        // surprise `requestMessageList`. Guarded on the PN: an unrelated destination
+                        // giving up says nothing about the sync.
+                        if dest == state.outboundPropagationNode { state.pendingDownloadFromPN = false }
                         var effects: [Effect<Action>] = queued.map {
                             .send(.delegate(.deliveryFailed(messageHash: $0.hash)))
                         }
