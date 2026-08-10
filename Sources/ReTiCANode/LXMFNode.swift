@@ -264,7 +264,7 @@ public struct LXMFNode {
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))
 
-            case let .endpoint(.delegate(.linkFailed(dest))):
+            case let .endpoint(.delegate(.linkFailed(dest, _))):
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))
 

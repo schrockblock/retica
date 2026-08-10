@@ -82,7 +82,7 @@ public struct TCPEndpoint {
             case linkEstablished(linkID: Data, destinationHash: Data)
             case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
-            case linkFailed(destinationHash: Data)
+            case linkFailed(destinationHash: Data, reason: LinkFailure)
             case resourceReceived(linkID: Data, data: Data)
             case resourceConcluded(linkID: Data, resourceHash: Data)
             case resourceFailed(linkID: Data, resourceHash: Data)
@@ -148,7 +148,7 @@ public struct TCPEndpoint {
 
             case let .openLink(destinationHash):
                 guard let learned = state.transport.learned[destinationHash] else {
-                    return .send(.delegate(.linkFailed(destinationHash: destinationHash)))
+                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .noPath)))
                 }
                 // Via a relay (learned nextHop != the destination) → HEADER_2 LINKREQUEST to the relay.
                 let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
@@ -172,8 +172,8 @@ public struct TCPEndpoint {
                 return .send(.delegate(.linkDataReceived(linkID: linkID, data: data, packetHash: packetHash)))
             case let .linkPlane(.delegate(.linkClosed(linkID, reason))):
                 return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
-            case let .linkPlane(.delegate(.linkFailed(destHash))):
-                return .send(.delegate(.linkFailed(destinationHash: destHash)))
+            case let .linkPlane(.delegate(.linkFailed(destHash, reason))):
+                return .send(.delegate(.linkFailed(destinationHash: destHash, reason: reason)))
             case let .linkPlane(.delegate(.resourceReceived(linkID, data))):
                 return .send(.delegate(.resourceReceived(linkID: linkID, data: data)))
             case let .linkPlane(.delegate(.resourceConcluded(linkID, hash))):

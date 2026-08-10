@@ -117,7 +117,7 @@ private let ifA = InterfaceID("iface-a")
     #expect(roundTrips(.delegate(.linkDataReceived(linkID: linkID, data: Data([0x00]),
                                                    packetHash: Data(repeating: 0x0D, count: 32)))))
     #expect(roundTrips(.delegate(.linkClosed(linkID: linkID, reason: .initiatorClosed))))
-    #expect(roundTrips(.delegate(.linkFailed(destinationHash: destHash))))
+    #expect(roundTrips(.delegate(.linkFailed(destinationHash: destHash, reason: .establishmentFailed))))
     #expect(roundTrips(.delegate(.resourceReceived(linkID: linkID, data: Data([0x11])))))
     #expect(roundTrips(.delegate(.resourceConcluded(linkID: linkID, resourceHash: Data(repeating: 0x07, count: 16)))))
     #expect(roundTrips(.delegate(.resourceFailed(linkID: linkID, resourceHash: Data(repeating: 0x08, count: 16)))))

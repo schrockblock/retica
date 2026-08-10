@@ -3,6 +3,19 @@ import ComposableArchitecture
 import ReTiCA
 import ReTiCATransport
 
+/// Why a link could not be opened. Distinguishes failures that mean "our PATH is wrong"
+/// (recoverable by requesting a fresh one) from "the PEER did not complete" (recoverable only
+/// by retrying the link). `LXMFNode` routes on this — see its `linkFailed` handler.
+public enum LinkFailure: Equatable, Sendable {
+    /// No learned path at all for the destination.
+    case noPath
+    /// A learned path exists but names an interface that is gone (BLE peer reconnected with a
+    /// new InterfaceID, interface removed). `Transport.reachableLearned` is the detector.
+    case pathStale
+    /// A link was minted and the handshake did not complete (timeout, bad proof).
+    case establishmentFailed
+}
+
 /// The interface-agnostic link/resource/request plane: owns the live `LinkSession`s and the
 /// request-handler registry, and surfaces link lifecycle + resource + request delegates.
 ///
@@ -55,7 +68,7 @@ public struct LinkPlane {
             case linkEstablished(linkID: Data, destinationHash: Data)
             case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
-            case linkFailed(destinationHash: Data)
+            case linkFailed(destinationHash: Data, reason: LinkFailure)
             case resourceReceived(linkID: Data, data: Data)
             case resourceConcluded(linkID: Data, resourceHash: Data)
             case resourceFailed(linkID: Data, resourceHash: Data)
@@ -189,7 +202,7 @@ public struct LinkPlane {
             case let .link(.element(elementID, .delegate(.establishmentFailed))):
                 guard let destHash = state.links[id: elementID]?.destinationHash else { return .none }
                 state.links.remove(id: elementID)
-                return .send(.delegate(.linkFailed(destinationHash: destHash)))
+                return .send(.delegate(.linkFailed(destinationHash: destHash, reason: .establishmentFailed)))
 
             case let .link(.element(elementID, .delegate(.resourceReceived(data)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }

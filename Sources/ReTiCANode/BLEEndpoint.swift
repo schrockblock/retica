@@ -87,7 +87,7 @@ public struct BLEEndpoint {
             case linkEstablished(linkID: Data, destinationHash: Data)
             case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
-            case linkFailed(destinationHash: Data)
+            case linkFailed(destinationHash: Data, reason: LinkFailure)
             case resourceReceived(linkID: Data, data: Data)
             case resourceConcluded(linkID: Data, resourceHash: Data)
             case resourceFailed(linkID: Data, resourceHash: Data)
@@ -187,7 +187,15 @@ public struct BLEEndpoint {
             // --- Public link actions → LinkPlane ---
             case let .openLink(destinationHash):
                 guard let learned = state.transport.learned[destinationHash] else {
-                    return .send(.delegate(.linkFailed(destinationHash: destinationHash)))
+                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .noPath)))
+                }
+                // A BLE peer that reconnects gets a NEW InterfaceID (derived from the HELLO session token),
+                // so a learned entry from before the reconnect names an interface that no longer exists.
+                // Minting a session on it produces a link whose every transmit fails with .sendFailed —
+                // which nothing consumes — leaving the 15s establishment deadline as the only exit.
+                // Transport.send already gates on this (Transport.swift:768); openLink must too.
+                guard state.transport.reachableLearned(destinationHash) != nil else {
+                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .pathStale)))
                 }
                 let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
                 // The learned entry records which BLE peer's interface the destination was heard on.
@@ -242,8 +250,8 @@ public struct BLEEndpoint {
                 return .send(.delegate(.linkDataReceived(linkID: linkID, data: data, packetHash: packetHash)))
             case let .linkPlane(.delegate(.linkClosed(linkID, reason))):
                 return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
-            case let .linkPlane(.delegate(.linkFailed(destHash))):
-                return .send(.delegate(.linkFailed(destinationHash: destHash)))
+            case let .linkPlane(.delegate(.linkFailed(destHash, reason))):
+                return .send(.delegate(.linkFailed(destinationHash: destHash, reason: reason)))
             case let .linkPlane(.delegate(.resourceReceived(linkID, data))):
                 return .send(.delegate(.resourceReceived(linkID: linkID, data: data)))
             case let .linkPlane(.delegate(.resourceConcluded(linkID, hash))):

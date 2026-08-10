@@ -156,10 +156,58 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
 
     let unknownDest = Data(repeating: 0x42, count: 16)
     await store.send(.openLink(destinationHash: unknownDest))
-    await store.receive { if case .delegate(.linkFailed(let hash)) = $0 { return hash == unknownDest }; return false }
+    await store.receive { if case .delegate(.linkFailed(let hash, .noPath)) = $0 { return hash == unknownDest }; return false }
     #expect(store.state.links.isEmpty)
 
     await teardown(store)
+}
+
+/// A BLE peer that reconnects gets a NEW InterfaceID by construction, so a learned entry from
+/// before the reconnect names an interface that is gone. Opening a link on it mints a session
+/// bound to a dead interface: every transmit yields .sendFailed (which nothing consumes), so the
+/// 15s establishment deadline is the only exit — ~75s across the budget, against a peer that is
+/// physically connected. Gate on reachableLearned instead, and say WHY it failed.
+@Test @MainActor func bleOpenLinkOnStaleInterfaceFailsImmediatelyAsPathStale() async {
+    // Drive: interface connects, announce learned on it, interface DISCONNECTS
+    // (so transport.interfaces loses the ID while transport.learned keeps the entry),
+    // then .openLink(dest).
+    // Assert: .delegate(.linkFailed(destinationHash: dest, reason: .pathStale)) immediately,
+    //         and NO .linkPlane(.openLink) — nothing was minted.
+    // Drive the disconnect through the real action; do not seed transport.interfaces.
+    let (store, events, _) = makeNode()
+    await bringPeerOnline(store, events)
+
+    // Learn a destination via a crafted announce on the peer's channel.
+    let remote = Identity()
+    let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
+                                                     aspects: ["svc"], hops: 0, emitted: 1000)
+    events.yield(.channelData(channel, try! BLEFraming.frame(announceRaw)))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+
+    // Transport has learned[destHash] = … with interfaceID = bleInterfaceID(peerToken).
+    #expect(store.state.transport.learned[destHash] != nil)
+
+    // Peer goes OFFLINE: interfaceDisconnected removes bleInterfaceID(peerToken) from
+    // transport.interfaces, so reachableLearned(destHash) will return nil even though
+    // learned[destHash] still exists.
+    events.yield(.channelClosed(channel, reason: nil))
+    await store.receive { if case .delegate(.peerOffline) = $0 { return true }; return false }
+
+    // Sanity: learned entry survives (non-destructive by design), interface is gone.
+    #expect(store.state.transport.learned[destHash] != nil)
+    #expect(store.state.transport.interfaces[bleInterfaceID(peerToken)] == nil)
+
+    // openLink must fail immediately with .pathStale — no link minted.
+    await store.send(.openLink(destinationHash: destHash))
+    await store.receive { action in
+        if case .delegate(.linkFailed(let hash, let reason)) = action {
+            return hash == destHash && reason == .pathStale
+        }
+        return false
+    }
+    #expect(store.state.links.isEmpty)
+
+    await store.send(.stop)
 }
 
 @Test @MainActor func linkPlaneTransmitToUnknownPeerIsDropped() async {

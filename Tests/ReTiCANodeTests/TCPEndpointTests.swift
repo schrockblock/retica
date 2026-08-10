@@ -200,7 +200,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
     await store.send(.openLink(destinationHash: Data(repeating: 0x44, count: 16)))
-    await store.receive(.delegate(.linkFailed(destinationHash: Data(repeating: 0x44, count: 16))))
+    await store.receive(.delegate(.linkFailed(destinationHash: Data(repeating: 0x44, count: 16), reason: .noPath)))
     #expect(store.state.links.isEmpty)
     await store.send(.disconnect)
     await store.receive(\.interface.disconnect)
@@ -1313,7 +1313,7 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     let destHash = store.state.links[id: elementID]!.destinationHash
     await store.send(.link(.element(id: elementID, action: .delegate(.establishmentFailed))))
     await store.receive { action in
-        if case let .delegate(.linkFailed(dh)) = action { return dh == destHash }
+        if case let .delegate(.linkFailed(dh, .establishmentFailed)) = action { return dh == destHash }
         return false
     }
     #expect(store.state.links[id: elementID] == nil)           // removed

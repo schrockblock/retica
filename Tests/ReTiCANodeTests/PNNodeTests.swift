@@ -348,6 +348,6 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     await store.send(.syncToPeer(destinationHash: peerDest, peeringCost: 0))
     await store.receive { if case .endpoint(.openLink(peerDest)) = $0 { return true }; return false }
     #expect(store.state.pendingSyncPeers[peerDest] == 0)
-    await store.send(.endpoint(.delegate(.linkFailed(destinationHash: peerDest))))
+    await store.send(.endpoint(.delegate(.linkFailed(destinationHash: peerDest, reason: .noPath))))
     #expect(store.state.pendingSyncPeers[peerDest] == nil)
 }

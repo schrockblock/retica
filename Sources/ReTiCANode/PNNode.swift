@@ -191,7 +191,7 @@ public struct PNNode {
                 clearLink(&state, linkID)
                 return .none
 
-            case let .endpoint(.delegate(.linkFailed(dest))):
+            case let .endpoint(.delegate(.linkFailed(dest, _))):
                 state.pendingSyncPeers[dest] = nil          // outbound openLink failed before a link existed
                 return .none
 
