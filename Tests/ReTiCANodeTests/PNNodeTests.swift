@@ -19,6 +19,35 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     return store
 }
 
+/// A propagation node MUST advertise the stamp cost it enforces. Reference clients treat an
+/// advertised 0 as "unavailable" (LXMRouter.py:428 — `if not target_propagation_cost`) and fail
+/// the send outright, so advertising 0 while enforcing 16 breaks every reference client.
+@Test @MainActor func pnNodeAdvertisesTheStampCostItEnforces() async {
+    let identity = Identity()
+    let enforced = 18                                     // deliberately not the default
+    let store = TestStore(
+        initialState: PNNode.State(identity: identity,
+                                   endpoint: TCPEndpoint.State(host: "h", port: 1, reconnectOnDrop: false),
+                                   minStampCost: enforced)
+    ) { PNNode() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    #expect(store.state.node.store.minStampCost == enforced)
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.registerPropagation)
+    await store.receive { action in
+        if case let .endpoint(.announce(_, appData)) = action { captured.setValue(appData); return true }
+        return false
+    }
+
+    let announced = PNAnnounce.parse(captured.value!)
+    #expect(announced?.targetStampCost == enforced)
+}
+
 /// registerPropagation registers the lxmf.propagation destination and announces valid PNAnnounce app-data.
 @Test @MainActor func pnNodeRegistersAndAnnounces() async {
     let store = makeStore(Identity())

@@ -75,8 +75,15 @@ public struct PNNode {
             case .registerPropagation:
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
                                           aspects: ["propagation"], identity: state.identity) else { return .none }
+                // Advertise exactly what `PropagationStore.ingest` enforces. A reference client
+                // reads this field and treats 0 as "cost unavailable" (LXMRouter.py:428 —
+                // `if not target_propagation_cost`), path-requests once, then FAILS the send. So
+                // advertising 0 while the store enforces 16 breaks every reference client, and any
+                // unstamped entry that did arrive would be silently skipped with no error returned.
+                // Read from the store rather than a mirrored copy: one source of truth, no drift.
                 let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: true,
-                                         perTransferLimit: 0, perSyncLimit: 0, targetStampCost: 0,
+                                         perTransferLimit: 0, perSyncLimit: 0,
+                                         targetStampCost: state.node.store.minStampCost,
                                          stampCostFlexibility: 0, peeringCost: state.peeringCost).packed
                 return .merge(.send(.endpoint(.registerLocalDestination(d))),
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
