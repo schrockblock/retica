@@ -236,21 +236,6 @@ public struct LinkSession {
                 // `.handshakeRejected` is the closest existing label: neither `EstablishmentFailure`
                 // case is a perfect fit (no handshake was attempted; the error is local), but
                 // `.timedOut` is actively misleading (it triggers a path request in `LXMFNode`).
-                // A callers who sees `.handshakeRejected` will retry the link — also wrong, but
-                // bounded by `maxAttempts`. A new case would be more honest but requires updating
-                // `LinkPlane`'s exhaustive switch; flag to author before adding one.
-                //
-                // Practically unreachable: `openLink` requires a `transport.learned` identity,
-                // which the parser always produces with exactly 16-byte hashes; `packed()` would
-                // only throw on a misconfigured caller. The fix is defensive.
-                // LEAK GUARD: `packed()` throws if `destinationHash` is not 16 bytes or the payload
-                // overflows MTU. Either way, `linkID` and `requestedAt` have already been written and
-                // no timer has been armed — bailing to `.none` would leave the element permanently
-                // unreachable and unreapable. Emit `establishmentFailed` so `LinkPlane` removes it.
-                //
-                // `.handshakeRejected` is the closest existing label: neither `EstablishmentFailure`
-                // case is a perfect fit (no handshake was attempted; the error is local), but
-                // `.timedOut` is actively misleading (it triggers a path request in `LXMFNode`).
                 // A caller who sees `.handshakeRejected` will retry the link — also wrong, but
                 // bounded by `maxAttempts`. A new case would be more honest but requires updating
                 // `LinkPlane`'s exhaustive switch; flag to author before adding one.
