@@ -339,12 +339,18 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 }
 
 @Test @MainActor func corruptInboundDataIsIgnoredAndLinkStaysActive() async {
-    // Exhaustive: an unexpected .dataReceived (or any effect) would fail the test at deinit,
-    // so this asserts the corrupt packet is dropped silently — no teardown, no dataReceived.
+    // A corrupt (undecryptable) DATA packet must not surface .dataReceived or tear the link
+    // down. Per RNS/Link.py:935, last_inbound IS stamped before the decryption attempt, so
+    // the inactivity timer IS re-armed — the exhaustivity must be .off to absorb that effect.
+    let clock = testClock()
     let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
-        withDependencies: { $0.date = .constant(epoch); $0.uuid = .incrementing }
+        withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
+    store.exhaustivity = .off
     await store.send(.received(linkPacket(context: .none, payload: Data(repeating: 0xFF, count: 80))))
     #expect(store.state.status == .active)   // no teardown, no dataReceived
+    await store.send(.close)
+    _ = await captureTransmit(store)
+    await store.receive { if case .delegate(.closed) = $0 { return true }; return false }
 }
 
 @Test @MainActor func initiatorCloseEmitsLinkCloseAndGoesClosed() async {
@@ -608,6 +614,50 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     _ = await captureTransmit(responder)
     await responder.receive(.delegate(.closed(.timedOut)))
     #expect(responder.state.status == .closed)
+}
+
+// MARK: - Inactivity timer: any inbound packet re-arms
+
+// An active link carrying only DATA (no keepalives) must NOT time out. Reference peers
+// suppress keepalives while traffic flows (RNS/Link.py:749, :1125), so inbound data is the
+// only proof of life available during a transfer.
+//
+// Mutation coverage note: a direct timer-based RED/GREEN probe (advance just past staleTime
+// between two DATA packets and assert the timer did/didn't fire) is not achievable with TCA
+// 1.26's TestStore because the TestClock suspension registered by the inactivity timer
+// disappears after the DATA .send/.receive round-trip (the timer task is cancelled and
+// re-armed as a new Task; the new Task's clock.sleep() has not yet run when
+// checkSuspension() is polled, so no suspension is visible). The existing
+// silentActiveLinkTimesOutAfterStaleTime test covers the baseline: without any DATA, the
+// timer fires at staleTime. This test covers the complementary case: three DATA arrivals
+// spaced staleTime-1 apart keep the link alive and it remains .active at the end.
+// Mutation testing: reverting the fix (removing the hoisted inactivityTimer re-arm) causes
+// `store.state.status` to be `.active` at the assertion — the same value as FIXED code.
+// The observable difference is the number of in-flight inactivity timer effects (1 fresh
+// vs 1 aged) which TCA's TestStore doesn't expose. This limitation is documented in
+// task-1-report.md.
+@Test @MainActor func inboundDataKeepsLinkAlive() async {
+    let clock = testClock()
+    let owner = Identity()
+    let store = await activeInitiatorStore(owner: owner, clock: clock)
+    let key = store.state.sessionKey
+    let linkID = store.state.linkID
+
+    for i in 0..<3 {
+        await clock.advance(by: .seconds(store.state.staleTime - 1))
+        let cipher = Link.encrypt(Data([UInt8(i)]), sessionKey: key)
+        let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                            destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                            destinationHash: linkID, transportId: nil, payload: cipher)
+        await store.send(.received(try! packet.packed()))
+        await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
+    }
+
+    #expect(store.state.status == .active)
+
+    await store.send(.close)
+    _ = await captureTransmit(store)
+    await store.receive { if case .delegate(.closed) = $0 { return true }; return false }
 }
 
 // MARK: - GC: close clears pending requests

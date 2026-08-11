@@ -327,6 +327,18 @@ public struct LinkSession {
                 guard let packet = Packet(raw: data), packet.destinationHash == state.linkID
                 else { return .none }
                 let now = date.now.timeIntervalSince1970
+                // Initiator's own keepalive echo arrives back on the same link and must NOT count
+                // as proof of life from the peer (RNS/Link.py:931 gates the entire receive block
+                // on this condition). Drop it before the inactivity re-arm logic.
+                if state.role == .initiator, packet.packetType == .data, packet.context == .keepalive,
+                   packet.payload == Data([LinkSession.keepaliveByte]) { return .none }
+                // Every other inbound packet (including ones that fail decryption) resets the
+                // inactivity clock (RNS/Link.py:935 stamps `last_inbound` before decryption).
+                // The re-arm is hoisted above the switch deliberately: re-arming per-branch is
+                // how the 60s mid-transfer teardown got in — DATA, RESOURCE, REQUEST, RESPONSE,
+                // and LINKIDENTIFY each silently omitted it. Adding a new context must not
+                // require remembering this.
+                func dispatch(_ state: inout State) -> Effect<Action> {
                 switch (state.role, state.status, packet.packetType, packet.context) {
                 case (.initiator, .pending, .proof, .linkRequestProof):
                     guard let destID = state.destinationIdentity,
@@ -473,6 +485,13 @@ public struct LinkSession {
                 default:
                     return .none
                 }
+                }
+                let effect = dispatch(&state)
+                // Re-arm only when the link is still active after dispatch: the LINKCLOSE branch
+                // sets .closed and must not have an inactivity timer re-armed behind it.
+                guard state.status == .active else { return effect }
+                state.lastInbound = now
+                return .merge(effect, inactivityTimer(state.staleTime))
 
             case let .sendResource(data):
                 guard state.status == .active else { return .none }
