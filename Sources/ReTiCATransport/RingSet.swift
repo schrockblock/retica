@@ -7,7 +7,9 @@ public struct RingSet: Equatable {
     private var order: [Data] = []
     private let capacity: Int
 
-    public init(capacity: Int = 1000) { self.capacity = capacity }
+    /// No default: every ring must state its size against the reference constant it mirrors.
+    /// A defaulted capacity is how `seenPacketHashes` silently ran at 1000 instead of 262144.
+    public init(capacity: Int) { self.capacity = capacity }
 
     @discardableResult
     public mutating func insert(_ item: Data) -> Bool {

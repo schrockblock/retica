@@ -3747,3 +3747,23 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     // when `.received` ran (not the "no registration ⇒ open" else branch).
     #expect(store.state.learned[destHash] != nil)
 }
+
+// The dedup ring must be large enough that ordinary relay traffic cannot flush a packet's
+// own echo out of memory. Reference holds 500k-1M (RNS Transport.py:177); we hold 262144.
+@Test func seenPacketRingIsSizedForRelayTraffic() {
+    #expect(Transport.seenPacketRingSize == 262_144)
+    var ring = RingSet(capacity: Transport.seenPacketRingSize)
+    let first = Data(repeating: 0x01, count: 32)
+    let insertedFirst = ring.insert(first)
+    #expect(insertedFirst)
+    // Push far more than the OLD 1000-entry default through the ring.
+    for i in 0..<5000 {
+        var h = Data(repeating: 0x00, count: 30)
+        h.append(UInt8(i >> 8)); h.append(UInt8(i & 0xFF))
+        _ = ring.insert(h)
+    }
+    // The original packet must still be remembered.
+    #expect(ring.contains(first))
+    let duplicateInsert = ring.insert(first)
+    #expect(!duplicateInsert)
+}

@@ -29,7 +29,7 @@ public struct Transport {
         public var learned: [Data: LearnedDestination] = [:]
         public var interfaces: [InterfaceID: InterfaceProfile] = [:]
         public var transportIdentity: Identity? = nil
-        var seenPacketHashes = RingSet()
+        var seenPacketHashes = RingSet(capacity: Transport.seenPacketRingSize)
         public var linkTable: [Data: LinkTableEntry] = [:]
         /// Per-destination ring of recently-seen announce random-blobs (the 10-byte announce
         /// random_hash). Replaces packetHash dedup for announces: a repeated blob is a replay
@@ -971,6 +971,12 @@ public struct Transport {
         Destination.hash(identityHash: nil, appName: "rnstransport", aspects: ["path", "request"])
 
     static let pathRequestTagRingSize = 32000      // RNS max_pr_tags (Transport.py:127)
+    /// Packet-hash dedup window. Reference `hashlist_maxsize` is 1_000_000 with a two-generation
+    /// flip keeping 500k-1M live (RNS Transport.py:177, 656-657), costing 16-32 MB. That is too
+    /// much for a background-eligible iOS app, so we hold 262144 (~8 MB of hashes) — 262x the
+    /// previous accidental 1000-entry default, and far beyond any realistic packet-to-echo
+    /// distance. DELIBERATE DIVERGENCE, not a port of the reference number.
+    static let seenPacketRingSize = 262_144
     /// Per-destination announce random-blob memory size (RNS Transport.MAX_RANDOM_BLOBS, Transport.py:98).
     static let announceBlobRingSize = 64
     /// RNS LOCAL_REBROADCASTS_MAX (Transport.py:77): total local re-broadcasts of one announce.
