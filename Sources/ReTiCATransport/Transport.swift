@@ -440,8 +440,15 @@ public struct Transport {
                     // Relay mode: instead of re-broadcasting now, HOLD this fresh announce and
                     // re-broadcast it once after a jittered delay in [0, PATHFINDER_RW) — RNS
                     // Transport.py:1925. Only schedule when there is somewhere to send it.
+                    // RNS Transport.py:1944 gates announce-table insertion on
+                    // `packet.context != PATH_RESPONSE`. A path response is a targeted answer to
+                    // one requester, not a network-wide advertisement — and because each carries a
+                    // fresh random_hash it defeats blob dedup, so re-broadcasting it makes one
+                    // path request flood proportionally to the number of relays. Adoption above
+                    // still happens; only the re-broadcast is suppressed.
                     let arrivalMode = state.interfaces[interfaceID]?.mode
-                    if let relayID = state.transportIdentity,
+                    if packet.context != .pathResponse,
+                       let relayID = state.transportIdentity,
                        Int(packet.hops) + 1 < Int(Packet.maxHops),
                        state.interfaces.contains(where: { $0.key != interfaceID
                            && Transport.mayRelayAnnounce(to: $0.value.mode, arrivalMode: arrivalMode) }) {

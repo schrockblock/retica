@@ -2679,6 +2679,48 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(requester.state.learned[destHash]?.nextHop == relay.hash)   // reachable via the relay
 }
 
+// MARK: - Task 2: path-response gate
+
+/// RNS Transport.py:1944 — a relay ADOPTS a path response into its path table but never
+/// re-broadcasts it. Re-broadcasting turns one path request into a network-wide flood because
+/// each path response carries a fresh random_hash that defeats blob dedup.
+@Test @MainActor func pathResponseIsAdoptedButNotRebroadcast() async {
+    let relay = Identity()
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+
+    // Two interfaces so a normal announce WOULD trigger a re-broadcast on the other interface.
+    await store.send(.interfaceConnected(InterfaceID("a")))
+    await store.send(.interfaceConnected(InterfaceID("b")))
+    await store.send(.setTransportIdentity(relay))
+
+    // Build a HEADER_2 path-response announce for a remote peer, arriving on interface "a".
+    let peer = Identity()
+    let destHash = Destination.hash(identityHash: peer.hash, appName: "test", aspects: ["pathresp"])
+    let nameHash = Destination.nameHash(appName: "test", aspects: ["pathresp"])
+    let randomHash = Announce.randomHash(now: 1, randomPrefix: Data(repeating: 0x01, count: 5))
+    let payload = Announce.buildPayload(identity: peer, destinationHash: destHash,
+                                        nameHash: nameHash, randomHash: randomHash,
+                                        appData: Data([0xAB]))
+    let response = Packet(headerType: .header2, packetType: .announce, transportType: .transport,
+                          destinationType: .single, context: .pathResponse, contextFlag: false,
+                          hops: 1, destinationHash: destHash,
+                          transportId: Data(repeating: 0x09, count: 16), payload: payload)
+    let responseRaw = try! response.packed()
+
+    await store.send(.received(InterfaceID("a"), responseRaw))
+    // Drain the pathLearned delegate (adoption still happens).
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    // Flip exhaustive ON last — any stray transmit (the re-broadcast bug) is an un-received
+    // delegate action that fails teardown.
+    store.exhaustivity = .on
+
+    // The path was learned...
+    #expect(store.state.learned[destHash] != nil)
+    // ...but nothing was queued for re-broadcast.
+    #expect(store.state.announceTable[destHash] == nil)
+}
+
 // MARK: - #4c-3b recursive path request re-broadcast
 
 /// An opt-in relay re-broadcasts an unknown-path request onto every interface except the arrival
