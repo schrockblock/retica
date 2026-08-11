@@ -233,12 +233,21 @@ public struct LinkSession {
                 // no timer has been armed — bailing to `.none` would leave the element permanently
                 // unreachable and unreapable. Emit `establishmentFailed` so `LinkPlane` removes it.
                 //
-                // `.handshakeRejected` is the closest existing label: neither `EstablishmentFailure`
-                // case is a perfect fit (no handshake was attempted; the error is local), but
-                // `.timedOut` is actively misleading (it triggers a path request in `LXMFNode`).
-                // A caller who sees `.handshakeRejected` will retry the link — also wrong, but
-                // bounded by `maxAttempts`. A new case would be more honest but requires updating
-                // `LinkPlane`'s exhaustive switch; flag to author before adding one.
+                // `.handshakeRejected` is a DELIBERATE approximation, adjudicated rather than
+                // defaulted to. No handshake was attempted — the failure is local packet assembly —
+                // so strictly none of the `EstablishmentFailure` cases fit. `.timedOut` would be
+                // actively harmful (it routes as path-shaped and solicits a path that cannot help).
+                // `.handshakeRejected` routes as peer-shaped, so the caller retries the link: also
+                // wrong in principle, but the OUTCOME is right — every retry fails identically and
+                // synchronously, so the destination reaches `giveUp` and the message reaches
+                // `deliveryFailed`, which is the correct terminal answer. The only cost is wasted
+                // attempts on a path that is unreachable through every public endpoint.
+                //
+                // REVISIT IF this becomes reachable — i.e. if any composition can hand `openLink`
+                // a non-16-byte destination hash, or an MTU shrinks enough for a LINKREQUEST to
+                // overflow. Then add a terminal `EstablishmentFailure` case that neither retries
+                // nor requests a path. `LinkPlane`'s mapping is an exhaustive switch precisely so
+                // that addition is a compile error and a deliberate routing decision.
                 //
                 // Practically unreachable: `openLink` requires a `transport.learned` identity,
                 // which the parser always produces with exactly 16-byte hashes; `packed()` would
