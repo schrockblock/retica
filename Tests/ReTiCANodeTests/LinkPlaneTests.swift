@@ -305,9 +305,12 @@ private let ifA = InterfaceID("iface-a")
 /// `.linkFailed` delegate must escape (a responder's `destinationHash` is the destination WE
 /// serve — reporting it as unreachable would misinform the delivery layer).
 ///
-/// No `.linkFailed` escape is verified structurally: `LinkPlane` gates `.linkFailed` on
-/// `session.role == .initiator`, and the spawned session is always `.responder` (set by
-/// `acceptLinkRequest`). The exhaustive stores below would catch stray actions at teardown.
+/// No `.linkFailed` escape is verified by teardown enforcement: `LinkPlane` gates `.linkFailed`
+/// on `session.role == .initiator`, and the spawned session is always `.responder` (set by
+/// `acceptLinkRequest`). The `store.exhaustivity = .on` at the end of each shape arms the TCA
+/// deinit check — deleting `LinkPlane`'s role gate causes the test to FAIL at teardown with an
+/// unhandled `.linkFailed` action. Those `.on` lines are not decoration; they are the only thing
+/// that pins the gate.
 @Test @MainActor func malformedInboundLinkRequestReapsItsElement() async {
     let owner = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: owner)!
@@ -374,6 +377,55 @@ private let ifA = InterfaceID("iface-a")
         #expect(store.state.links.isEmpty, "Shape 3 (wrong payload size): element must be reaped")
         store.exhaustivity = .on
     }
+}
+
+/// An initiator that cannot pack its LINKREQUEST must not leave a permanent element behind.
+///
+/// `LinkPlane.openLink` appends the session and dispatches `.establish`, which writes `linkID`
+/// and `requestedAt` before attempting `packet.packed()`. If `packed()` throws (because
+/// `destinationHash` is not 16 bytes), the original code returned `.none` — leaving the element
+/// both unreachable and unreapable, with no timer to drive reaping later.
+///
+/// The fix emits `.establishmentFailed(.handshakeRejected)`, which `LinkPlane` handles by
+/// removing the element and — because `session.role == .initiator` — forwarding a `linkFailed`
+/// delegate with reason `.handshakeRejected`.
+///
+/// The failure is driven honestly via `openLink` with an 8-byte `destinationHash`. That makes
+/// `Packet.packed()` throw `PacketError.malformed` (which the `guard let raw = try? …` catches),
+/// without seeding state directly. This is the same probe the Task 1 reviewer used to confirm
+/// the leak before the fix.
+///
+/// Note: `.handshakeRejected` is not a perfectly honest label (no handshake was attempted; the
+/// error is local). It is the closest existing `EstablishmentFailure` case — `.timedOut` would
+/// be worse because it triggers a path request. A new case would be more accurate but requires
+/// updating `LinkPlane`'s exhaustive switch; that is a separate decision flagged to the author.
+@Test @MainActor func initiatorThatCannotPackItsLinkRequestReapsItsElement() async {
+    let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    // An 8-byte destinationHash makes Packet.packed() throw PacketError.malformed.
+    // `.establish` writes `linkID` and `requestedAt` BEFORE the guard, so without the fix
+    // the element is stranded (no timer, no delegate, no removal path).
+    let shortHash = Data(repeating: 0xAB, count: 8)
+    await store.send(.openLink(initiatorTo: Identity(), destinationHash: shortHash,
+                               interfaceID: ifA, relayNextHop: nil))
+    // The session element is appended synchronously, so links.count == 1 here.
+    #expect(store.state.links.count == 1, "Element must be appended before establish fires")
+    // Drain: .establish runs synchronously within the send, emitting .establishmentFailed.
+    // LinkPlane removes the element and forwards .linkFailed(destinationHash:reason:).
+    await store.receive(
+        { if case .link(.element(_, .delegate(.establishmentFailed(.handshakeRejected)))) = $0 { return true }; return false }
+    )
+    #expect(store.state.links.isEmpty, "Element must be reaped after pack failure")
+    // The initiator role means LinkPlane also surfaces a .linkFailed delegate.
+    await store.receive(
+        { if case .delegate(.linkFailed(let dest, .handshakeRejected)) = $0 { return dest == shortHash }; return false }
+    )
+    // Flip to exhaustive for teardown: no stray actions should remain.
+    store.exhaustivity = .on
 }
 
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {

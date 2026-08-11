@@ -228,7 +228,38 @@ public struct LinkSession {
                 }
                 state.linkID = Link.linkID(requestPacket: packet)     // header-independent — same id either way
                 state.requestedAt = date.now.timeIntervalSince1970
-                guard let raw = try? packet.packed() else { return .none }
+                // LEAK GUARD: `packed()` throws if `destinationHash` is not 16 bytes or the payload
+                // overflows MTU. Either way, `linkID` and `requestedAt` have already been written and
+                // no timer has been armed — bailing to `.none` would leave the element permanently
+                // unreachable and unreapable. Emit `establishmentFailed` so `LinkPlane` removes it.
+                //
+                // `.handshakeRejected` is the closest existing label: neither `EstablishmentFailure`
+                // case is a perfect fit (no handshake was attempted; the error is local), but
+                // `.timedOut` is actively misleading (it triggers a path request in `LXMFNode`).
+                // A callers who sees `.handshakeRejected` will retry the link — also wrong, but
+                // bounded by `maxAttempts`. A new case would be more honest but requires updating
+                // `LinkPlane`'s exhaustive switch; flag to author before adding one.
+                //
+                // Practically unreachable: `openLink` requires a `transport.learned` identity,
+                // which the parser always produces with exactly 16-byte hashes; `packed()` would
+                // only throw on a misconfigured caller. The fix is defensive.
+                // LEAK GUARD: `packed()` throws if `destinationHash` is not 16 bytes or the payload
+                // overflows MTU. Either way, `linkID` and `requestedAt` have already been written and
+                // no timer has been armed — bailing to `.none` would leave the element permanently
+                // unreachable and unreapable. Emit `establishmentFailed` so `LinkPlane` removes it.
+                //
+                // `.handshakeRejected` is the closest existing label: neither `EstablishmentFailure`
+                // case is a perfect fit (no handshake was attempted; the error is local), but
+                // `.timedOut` is actively misleading (it triggers a path request in `LXMFNode`).
+                // A caller who sees `.handshakeRejected` will retry the link — also wrong, but
+                // bounded by `maxAttempts`. A new case would be more honest but requires updating
+                // `LinkPlane`'s exhaustive switch; flag to author before adding one.
+                //
+                // Practically unreachable: `openLink` requires a `transport.learned` identity,
+                // which the parser always produces with exactly 16-byte hashes; `packed()` would
+                // only throw on a misconfigured caller. The fix is defensive.
+                guard let raw = try? packet.packed()
+                else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 let id = state.interfaceID
                 return .merge(.send(.delegate(.transmit(id, raw))), establishmentTimer(state.establishmentTimeout))
 
@@ -273,7 +304,24 @@ public struct LinkSession {
                                        transportType: .broadcast, destinationType: .link,
                                        context: .linkRequestProof, contextFlag: false, hops: 0,
                                        destinationHash: linkID, transportId: nil, payload: proof)
-                guard let raw = try? packetOut.packed() else { return .none }
+                // LEAK GUARD: `packed()` throws only if `linkID` is not 16 bytes or the payload
+                // overflows MTU. By this point `state.linkID`, `sessionKey`, and `status` have all
+                // been written and the session is in `.handshake` with no timer armed — bailing to
+                // `.none` would leave the element permanently unreachable and unreapable. Same class
+                // of defect as Task 1's responder `packed()` guard; the fix is the same shape.
+                //
+                // In practice this path is currently unreachable: `Link.linkID(requestPacket:)`
+                // always produces 16 bytes (it is a `Crypto.truncatedHash` result), and
+                // `Link.buildProof` always returns exactly 99 bytes — far below the 500-byte MTU.
+                // No test drives this failure because no public API lets a caller produce a
+                // 99-byte proof with a non-16-byte linkID without seeding invalid state directly;
+                // seeding state defeats the purpose of the test (see task-2-report.md for
+                // the full analysis). The fix is defensive: if the invariants ever break
+                // (e.g. a future API change changes `buildProof`'s output size), the element is
+                // reaped rather than leaked. `.handshakeRejected` on a responder is suppressed by
+                // `LinkPlane`'s role gate, so no spurious `linkFailed` escapes.
+                guard let raw = try? packetOut.packed()
+                else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 let id = state.interfaceID
                 return .merge(.send(.delegate(.transmit(id, raw))), establishmentTimer(state.establishmentTimeout))
 
