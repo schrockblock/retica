@@ -228,8 +228,11 @@ public struct LinkSession {
                 }
                 state.linkID = Link.linkID(requestPacket: packet)     // header-independent — same id either way
                 state.requestedAt = date.now.timeIntervalSince1970
-                // LEAK GUARD: `packed()` throws if `destinationHash` is not 16 bytes or the payload
-                // overflows MTU. Either way, `linkID` and `requestedAt` have already been written and
+                // LEAK GUARD: `packed()` has THREE throws — a non-16-byte `destinationHash`, an MTU
+                // overflow, and (on the HEADER_2 relay branch directly above) a `transportId` that
+                // is nil or not 16 bytes. That third one is the mode specific to this branch and is
+                // the easiest to overlook. Whichever fires, `linkID` and `requestedAt` have already
+                // been written and
                 // no timer has been armed — bailing to `.none` would leave the element permanently
                 // unreachable and unreapable. Emit `establishmentFailed` so `LinkPlane` removes it.
                 //
@@ -243,11 +246,12 @@ public struct LinkSession {
                 // `deliveryFailed`, which is the correct terminal answer. The only cost is wasted
                 // attempts on a path that is unreachable through every public endpoint.
                 //
-                // REVISIT IF this becomes reachable — i.e. if any composition can hand `openLink`
-                // a non-16-byte destination hash, or an MTU shrinks enough for a LINKREQUEST to
-                // overflow. Then add a terminal `EstablishmentFailure` case that neither retries
-                // nor requests a path. `LinkPlane`'s mapping is an exhaustive switch precisely so
-                // that addition is a compile error and a deliberate routing decision.
+                // REVISIT IF this becomes reachable — i.e. if any composition can hand `openLink` a
+                // non-16-byte destination hash, a relay `nextHop` that is nil or not 16 bytes, or
+                // an MTU shrinks enough for a LINKREQUEST to overflow. Then add a terminal
+                // `EstablishmentFailure` case that neither retries nor requests a path.
+                // `LinkPlane`'s mapping is an exhaustive switch precisely so that addition is a
+                // compile error and a deliberate routing decision.
                 //
                 // Practically unreachable: `openLink` requires a `transport.learned` identity,
                 // which the parser always produces with exactly 16-byte hashes; `packed()` would
