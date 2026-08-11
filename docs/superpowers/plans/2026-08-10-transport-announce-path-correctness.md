@@ -42,6 +42,8 @@ Claude-Session: https://claude.ai/code/session_01AtkFmSeVgRBk3zwfDCqUwy
 
 **Sizing note:** reference's 500k–1M costs 16–32 MB. On iOS that is too much for a background-eligible app, so this plan uses **262 144** (~8 MB at 32 B/hash plus `Set`/array overhead — budget ~20 MB worst case). That is 262× the current window and comfortably exceeds any realistic packet-to-echo distance, while staying inside a mobile memory budget. Record the divergence in the comment; do not silently adopt the reference number.
 
+> **CORRECTION (whole-branch review, 2026-08-11):** this note took reference's *number* without reference's *structure*, and was wrong on both cost axes. `RingSet` as written was O(ring) per insert twice over — `order.removeFirst()` is an `Array.remove(at: 0)` memmove, and TCA's per-action `State` copy left both collections non-uniquely referenced so every new hash paid a full copy-on-write. Measured: **67–82 ms and ~44 MB per received packet** at 262 144, versus 142 µs at 1000. Reference affords 1 M only because it is O(1) on both paths (a plain `set` plus a generation flip that drops the old generation by reference, `Transport.py:656-658`). Resolution (human ruling): box `RingSet`'s storage in a `final class` with a circular buffer and 128-bit inline digests — O(1) per insert, ~12.1 MB at 262 144 — and keep the large window. See `Sources/ReTiCATransport/RingSet.swift`.
+
 - [ ] **Step 1: Write the failing test**
 
 Append to `Tests/ReTiCATransportTests/TransportTests.swift`:
@@ -130,7 +132,7 @@ git commit -m "fix: size the packet-dedup ring for relay traffic instead of the 
 
 ### Task 2: Do not re-broadcast path responses
 
-**Why:** Reference gates announce-table insertion on `packet.context != RNS.Packet.PATH_RESPONSE` (`Transport.py:1944`): a transport node **adopts** a path response into its path table but never re-broadcasts it. ReTiCA's relay block copies `context: packet.context` through with no such test (`Transport.swift:451`). Because each path response carries a fresh `random_hash`, every ReTiCA relay that hears one sees an unseen blob, passes `shouldReplace` on the newer timestamp, and schedules a network-wide re-broadcast — so one path request floods proportionally to the number of ReTiCA relays.
+**Why:** Reference gates announce-table insertion on `packet.context != RNS.Packet.PATH_RESPONSE` (`Transport.py:1945`): a transport node **adopts** a path response into its path table but never re-broadcasts it. ReTiCA's relay block copies `context: packet.context` through with no such test (`Transport.swift:451`). Because a *locally minted* path response carries a fresh `random_hash`, every ReTiCA relay that hears one sees an unseen blob, passes `shouldReplace` on the newer timestamp, and schedules a network-wide re-broadcast — so one path request floods proportionally to the number of ReTiCA relays. (A *relayed* path response replays the cached announce payload verbatim, so it carries the original `random_hash` and does die at the receiver's blob ring; the gate is what makes both cases safe.)
 
 **Files:**
 - Modify: `Sources/ReTiCATransport/Transport.swift:443-465`
@@ -143,7 +145,7 @@ git commit -m "fix: size the packet-dedup ring for relay traffic instead of the 
 - [ ] **Step 1: Write the failing test**
 
 ```swift
-// RNS Transport.py:1944 — a relay ADOPTS a path response into its path table but never
+// RNS Transport.py:1945 — a relay ADOPTS a path response into its path table but never
 // re-broadcasts it. Re-broadcasting turns one path request into a flood.
 @Test @MainActor func pathResponseIsAdoptedButNotRebroadcast() async {
     let relayID = Identity()
@@ -203,7 +205,7 @@ to:
 
 ```swift
                     let arrivalMode = state.interfaces[interfaceID]?.mode
-                    // RNS Transport.py:1944 gates announce-table insertion on
+                    // RNS Transport.py:1945 gates announce-table insertion on
                     // `packet.context != PATH_RESPONSE`. A path response is a targeted answer to
                     // one requester, not a network-wide advertisement — and because each carries a
                     // fresh random_hash it defeats blob dedup, so re-broadcasting it makes one

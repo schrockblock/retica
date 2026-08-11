@@ -26,11 +26,14 @@ public struct Transport {
     @ObservableState
     public struct State: Equatable {
         public var localDestinations: [Data: Destination] = [:]
-        /// App data most recently announced for each local destination, replayed in path
-        /// responses. Reference equivalent: `Destination.default_app_data` (RNS/Destination.py:193),
-        /// which `announce()` falls back to and which path responses therefore always carry
-        /// (RNS/Destination.py:283-304). Without this a path response — which is stamped NOW and so
-        /// wins `shouldReplace` — overwrites the requester's richer entry with nil.
+        /// App data most recently announced for each local destination, replayed in path responses
+        /// AND in any later announce that omits app data. Reference equivalent:
+        /// `Destination.default_app_data` (RNS/Destination.py:193), which `announce()` substitutes
+        /// whenever `app_data is None` (RNS/Destination.py:289-296) — so ordinary announces and
+        /// path responses always advertise the same thing. Without this a path response — which is
+        /// stamped NOW and so wins `shouldReplace` — overwrites the requester's richer entry with
+        /// nil. Written by `.announce`, cleared by `.registerLocalDestination`; see both for the
+        /// divergence from reference's explicit `set_default_app_data`.
         public var localAppData: [Data: Data] = [:]
         public var learned: [Data: LearnedDestination] = [:]
         public var interfaces: [InterfaceID: InterfaceProfile] = [:]
@@ -250,12 +253,19 @@ public struct Transport {
                               .cancel(id: CancelID.ingressRelease(id)))
 
             case let .registerLocalDestination(destination):
-                // Re-registering a destination resets its announced app data: the new registration
-                // has made no claim about it yet, and replaying a previous composition's app data
-                // would publish stale metadata.
-                if state.localDestinations[destination.hash] == nil {
-                    state.localAppData[destination.hash] = nil
-                }
+                // Registering a destination clears any app data stickily remembered for it. This is
+                // ReTiCA's `Destination.clear_default_app_data()` (RNS/Destination.py:688-692), and
+                // it is the ONLY clear path: `.announce` never erases (see there), so without this
+                // a composition that stopped advertising app data could keep replaying the previous
+                // one's forever, in both announces and path responses.
+                //
+                // Unconditional on purpose. The former `if localDestinations[hash] == nil` guard
+                // could never fire — nothing ever removes a `localDestinations` entry, so on a
+                // first registration `localAppData[hash]` is already nil, and on a re-registration
+                // the guard is false. Every in-repo caller registers and announces in one `.merge`
+                // (PNNode.swift:88, LXMFServiceNode.swift:127, LXMFNode.swift:91), and `.merge`
+                // delivers in order, so the clear always precedes the announce that repopulates it.
+                state.localAppData[destination.hash] = nil
                 state.localDestinations[destination.hash] = destination
                 return .none
 
@@ -452,12 +462,16 @@ public struct Transport {
                     // Relay mode: instead of re-broadcasting now, HOLD this fresh announce and
                     // re-broadcast it once after a jittered delay in [0, PATHFINDER_RW) — RNS
                     // Transport.py:1925. Only schedule when there is somewhere to send it.
-                    // RNS Transport.py:1944 gates announce-table insertion on
+                    // RNS Transport.py:1945 gates announce-table insertion on
                     // `packet.context != PATH_RESPONSE`. A path response is a targeted answer to
-                    // one requester, not a network-wide advertisement — and because each carries a
-                    // fresh random_hash it defeats blob dedup, so re-broadcasting it makes one
-                    // path request flood proportionally to the number of relays. Adoption above
-                    // still happens; only the re-broadcast is suppressed.
+                    // one requester, not a network-wide advertisement. Re-broadcasting it makes one
+                    // path request flood proportionally to the number of relays — and a LOCALLY
+                    // MINTED response (branch 1 below) mints a fresh random_hash, so it is an unseen
+                    // blob at every relay and the flood is not damped by blob dedup. (A RELAYED
+                    // response, branch 2, replays `cachedPayload` verbatim and so carries the
+                    // ORIGINAL announce's random_hash; that one does die at the receiver's blob ring
+                    // as a replay. The gate is what makes both cases safe.) Adoption above still
+                    // happens; only the re-broadcast is suppressed.
                     let arrivalMode = state.interfaces[interfaceID]?.mode
                     if packet.context != .pathResponse,
                        let relayID = state.transportIdentity,
@@ -820,15 +834,27 @@ public struct Transport {
                 guard let dest = state.localDestinations[destinationHash],
                       let identity = dest.identity, identity.privateKey != nil
                 else { return .none }
-                // Sticky app data: record a non-nil app data, but do NOT clear on nil — reference
-                // `default_app_data` is sticky until explicitly cleared (`clear_default_app_data()`),
-                // and an announce that omits app data falls back to it rather than erasing it.
+                // Sticky app data: record a non-nil app data, and fall back to it when a later
+                // announce omits one. Reference does that substitution for EVERY announce, ordinary
+                // and path-response alike, because both are the same function
+                // (RNS/Destination.py:289-296, inside announce() at :283-304). Without the fallback
+                // here, `announce(X)` then `announce(nil)` would put nil-app-data on the wire while
+                // path responses for the same destination still carried X — and since the later
+                // packet wins recency-first `shouldReplace`, that nil announce would erase the
+                // requester's `learned[dest].appData` through a different packet type.
+                //
+                // DIVERGENCE: reference's `default_app_data` is set EXPLICITLY, via
+                // `set_default_app_data()`; `announce(app_data=X)` does not write it. ReTiCA has no
+                // such setter, so it auto-captures the last non-nil announce instead. Clearing is
+                // likewise folded into `.registerLocalDestination` rather than exposed as a
+                // standalone `clear_default_app_data()` (RNS/Destination.py:688-692).
                 if let appData { state.localAppData[destinationHash] = appData }
+                let announcedAppData = appData ?? state.localAppData[destinationHash]
                 let now = UInt64(date.now.timeIntervalSince1970)
                 let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
                 let payload = Announce.buildPayload(identity: identity, destinationHash: destinationHash,
                                                     nameHash: dest.nameHash, randomHash: randomHash,
-                                                    ratchet: nil, appData: appData)
+                                                    ratchet: nil, appData: announcedAppData)
                 let packet = Packet.announce(from: dest, payload: payload)
                 guard let raw = try? packet.packed() else { return .none }
                 return .merge(state.interfaces.keys.map { .send(.delegate(.transmit($0, raw))) })
@@ -1004,10 +1030,22 @@ public struct Transport {
 
     static let pathRequestTagRingSize = 32000      // RNS max_pr_tags (Transport.py:127)
     /// Packet-hash dedup window. Reference `hashlist_maxsize` is 1_000_000 with a two-generation
-    /// flip keeping 500k-1M live (RNS Transport.py:177, 656-657), costing 16-32 MB. That is too
-    /// much for a background-eligible iOS app, so we hold 262144 (~8 MB of hashes) — 262x the
-    /// previous accidental 1000-entry default, and far beyond any realistic packet-to-echo
-    /// distance. DELIBERATE DIVERGENCE, not a port of the reference number.
+    /// flip keeping 500k-1M live (RNS Transport.py:177, 656-658); we hold 262144. DELIBERATE
+    /// DIVERGENCE, not a port of the reference number — a quarter of the reference floor, still
+    /// 262x the previous accidental 1000-entry default and far beyond any realistic
+    /// packet-to-echo distance.
+    ///
+    /// A window this size is only affordable because `RingSet` is boxed and O(1) (see its doc
+    /// comment). Reference affords 1 M for the same reason: a plain `set` plus a generation flip
+    /// that drops the old generation *by reference*, never shifting an array and never deep-copying
+    /// per packet. Taking the number without that structure inverts it — this constant at the
+    /// old value-typed `RingSet` cost 67-82 ms and ~44 MB per received packet.
+    ///
+    /// Cost here: O(1) per packet (two SipHash passes, one `Set` insert, one `Set` remove, one
+    /// array store — no allocation, no memmove, no CoW), and 48 bytes per remembered hash for a
+    /// ~12.1 MB steady state that is only reached after 262144 distinct packets. `RingSet`'s
+    /// two sibling rings — `pathRequestTagRingSize` (32000, ~1.5 MB) and `announceBlobRingSize`
+    /// (64, per destination) — are the same type and get the same O(1) behaviour for free.
     static let seenPacketRingSize = 262_144
     /// Per-destination announce random-blob memory size (RNS Transport.MAX_RANDOM_BLOBS, Transport.py:98).
     static let announceBlobRingSize = 64

@@ -339,13 +339,11 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let store = TestStore(initialState: Transport.State()) { Transport() }
     store.exhaustivity = .off
     await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
-    // Use exhaustivity on, but supply the expected state delta (seenPacketHashes insertion)
-    // so that any spurious delegate action is caught as unexpected.
+    // Exhaustivity on so any spurious delegate action is caught as unexpected. No state delta to
+    // supply: `seenPacketHashes` is reference-backed, so its insertion is invisible to TestStore
+    // diffing (see RingSet). Writing one here would assert nothing — it cannot fail.
     store.exhaustivity = .on
-    let expectedHash = Packet(raw: rawPacket)!.packetHash
-    await store.send(.received(InterfaceID("i1"), rawPacket)) {
-        $0.seenPacketHashes.insert(expectedHash)
-    }
+    await store.send(.received(InterfaceID("i1"), rawPacket))
     // No receive step here: kind mismatch drops the packet — no delegate action must be emitted.
 }
 
@@ -802,11 +800,10 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     await storeA.send(.setTransportIdentity(relay))
     let inboundA = makeHeader2DataPacket(transportId: relay.hash, destHash: destHash, hops: 1,
                                           payload: Data([0xAA]))
+    // No state delta to supply: `seenPacketHashes` is reference-backed, so its insertion is
+    // invisible to TestStore diffing (see RingSet). Exhaustivity catches a stray transmit.
     storeA.exhaustivity = .on
-    let expectedHashA = Packet(raw: inboundA)!.packetHash
-    await storeA.send(.received(InterfaceID("i0"), inboundA)) {
-        $0.seenPacketHashes.insert(expectedHashA)
-    }
+    await storeA.send(.received(InterfaceID("i0"), inboundA))
 
     // (b) Leaf mode (transportIdentity == nil), HEADER_2 packet with learned path → no transmit.
     // Even with a learned path, a leaf must not forward (requires relay mode).
@@ -824,10 +821,7 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     let inboundB = makeHeader2DataPacket(transportId: Data(repeating: 0xDE, count: 16),
                                           destHash: destHashB, hops: 1, payload: Data([0xBB]))
     storeB.exhaustivity = .on
-    let expectedHashB = Packet(raw: inboundB)!.packetHash
-    await storeB.send(.received(InterfaceID("i0"), inboundB)) {
-        $0.seenPacketHashes.insert(expectedHashB)
-    }
+    await storeB.send(.received(InterfaceID("i0"), inboundB))
     // No transmit: leaf mode with no transportIdentity must drop the relay block entirely.
 
     // (c) Hop limit: relay mode, transport_id == us, path known, but hops == maxHops-1 → no transmit.
@@ -846,10 +840,7 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     let inboundC = makeHeader2DataPacket(transportId: relay2.hash, destHash: destHashC, hops: maxHops,
                                           payload: Data([0xCC]))
     storeC.exhaustivity = .on
-    let expectedHashC = Packet(raw: inboundC)!.packetHash
-    await storeC.send(.received(InterfaceID("i0"), inboundC)) {
-        $0.seenPacketHashes.insert(expectedHashC)
-    }
+    await storeC.send(.received(InterfaceID("i0"), inboundC))
 }
 
 @Test @MainActor func localDestinationDataStillDeliveredInRelayMode() async {
@@ -2438,6 +2429,94 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     #expect(parsed?.appData == appData)
 }
 
+/// An announce that OMITS app data must fall back to the sticky value rather than putting nil on
+/// the wire. Reference substitutes `default_app_data` for every announce, ordinary and
+/// path-response alike, because both are one function (RNS/Destination.py:289-296). Without the
+/// fallback, `announce(X)` then `announce(nil)` advertises nil while path responses still carry X,
+/// and the newer nil announce wins `shouldReplace` on the requester — re-opening the very erasure
+/// the path-response fix closed, through a different packet type.
+@Test @MainActor func announceWithoutAppDataFallsBackToTheStickyValue() async {
+    let identity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "test",
+                           aspects: ["sticky"], identity: identity)!
+    let appData = Data([0xC0, 0xFF, 0xEE])
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    store.exhaustivity = .off
+
+    await store.send(.interfaceConnected(InterfaceID("a"), .default))
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.announce(destinationHash: dest.hash, appData: appData))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.localAppData[dest.hash] == appData)
+
+    // The sticky value must survive an announce that carries none — this also pins the `if let`
+    // on the write: making it unconditional would clear the entry here.
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.announce(destinationHash: dest.hash, appData: nil))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    #expect(store.state.localAppData[dest.hash] == appData)
+
+    let announced = Packet(raw: captured.value!)!
+    #expect(announced.packetType == .announce)
+    #expect(announced.context == .none)             // an ordinary announce, not a path response
+    let parsed = Announce.parse(payload: announced.payload, destinationHash: announced.destinationHash,
+                                contextFlagSet: announced.contextFlag)
+    #expect(parsed?.appData == appData)
+}
+
+/// Registering a destination clears its sticky app data — ReTiCA's `clear_default_app_data()`
+/// (RNS/Destination.py:688-692), and the only clear path there is, since `.announce` never erases.
+/// Both the announce and the path response must then advertise nothing.
+@Test @MainActor func registeringADestinationClearsItsStickyAppData() async {
+    let identity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "test",
+                           aspects: ["clear"], identity: identity)!
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    store.exhaustivity = .off
+
+    await store.send(.interfaceConnected(InterfaceID("a"), .default))
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.announce(destinationHash: dest.hash, appData: Data([0xDE, 0xAD])))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.localAppData[dest.hash] == Data([0xDE, 0xAD]))
+
+    // Re-register: the new registration has made no claim about app data yet.
+    await store.send(.registerLocalDestination(dest))
+    #expect(store.state.localAppData[dest.hash] == nil)
+
+    // The announce fallback now has nothing to fall back to...
+    let announced = LockIsolated<Data?>(nil)
+    await store.send(.announce(destinationHash: dest.hash, appData: nil))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { announced.setValue(raw); return true }
+        return false
+    }
+    let announcePacket = Packet(raw: announced.value!)!
+    #expect(Announce.parse(payload: announcePacket.payload,
+                           destinationHash: announcePacket.destinationHash,
+                           contextFlagSet: announcePacket.contextFlag)?.appData == nil)
+
+    // ...and neither does the path response.
+    let response = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("a"), makePathRequest(for: dest.hash)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { response.setValue(raw); return true }
+        return false
+    }
+    let responsePacket = Packet(raw: response.value!)!
+    #expect(responsePacket.context == .pathResponse)
+    #expect(Announce.parse(payload: responsePacket.payload,
+                           destinationHash: responsePacket.destinationHash,
+                           contextFlagSet: responsePacket.contextFlag)?.appData == nil)
+}
+
 /// A PATH_REQUEST for a destination we do not own is not answered.
 @Test @MainActor func pathRequestForNonLocalDestinationIsNotAnswered() async {
     let store = TestStore(initialState: Transport.State()) { Transport() }
@@ -2717,7 +2796,7 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
 
 // MARK: - Task 2: path-response gate
 
-/// RNS Transport.py:1944 — a relay ADOPTS a path response into its path table but never
+/// RNS Transport.py:1945 — a relay ADOPTS a path response into its path table but never
 /// re-broadcasts it. Re-broadcasting turns one path request into a network-wide flood because
 /// each path response carries a fresh random_hash that defeats blob dedup.
 @Test @MainActor func pathResponseIsAdoptedButNotRebroadcast() async {
@@ -3826,22 +3905,97 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     #expect(store.state.learned[destHash] != nil)
 }
 
-// The dedup ring must be large enough that ordinary relay traffic cannot flush a packet's
-// own echo out of memory. Reference holds 500k-1M (RNS Transport.py:177); we hold 262144.
-@Test func seenPacketRingIsSizedForRelayTraffic() {
-    #expect(Transport.seenPacketRingSize == 262_144)
-    var ring = RingSet(capacity: Transport.seenPacketRingSize)
-    let first = Data(repeating: 0x01, count: 32)
-    let insertedFirst = ring.insert(first)
-    #expect(insertedFirst)
-    // Push far more than the OLD 1000-entry default through the ring.
-    for i in 0..<5000 {
-        var h = Data(repeating: 0x00, count: 30)
-        h.append(UInt8(i >> 8)); h.append(UInt8(i & 0xFF))
-        _ = ring.insert(h)
+// MARK: - packet-dedup ring: production wiring, eviction, and cost
+
+/// A PLAIN local destination and DATA packets addressed to it: delivery is observable and
+/// `decrypt` is a passthrough, so thousands of packets can be driven through the reducer cheaply.
+/// (Link-addressed packets are routed BEFORE the dedup guard — see `identicalLinkPacketsBypassDedup`
+/// — so they cannot be used to exercise it.)
+private func makePlainDataPacket(to dest: Destination, payload: Data) -> Data {
+    try! Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                destinationType: .plain, context: .none, contextFlag: false, hops: 0,
+                destinationHash: dest.hash, transportId: nil, payload: payload).packed()
+}
+
+private func distinctPayload(_ i: Int) -> Data {
+    var p = Data([UInt8(i & 0xFF), UInt8((i >> 8) & 0xFF), UInt8((i >> 16) & 0xFF)])
+    p.append(Data(repeating: 0xA5, count: 8))
+    return p
+}
+
+/// The dedup ring the reducer ACTUALLY uses must be large enough that ordinary relay traffic
+/// cannot flush a packet's own echo out of memory. Reference holds 500k-1M (RNS Transport.py:177);
+/// we hold `Transport.seenPacketRingSize`. Driven through `.received` on the production
+/// `Transport.State`, so reverting the wiring at Transport.swift:38 to the old 1000-entry default
+/// fails this: packet #0 would be evicted and re-delivered.
+@Test @MainActor func seenPacketRingRemembersFarMoreThanTheOldDefault() async {
+    let dest = Destination(kind: .plain, direction: .in, appName: "app", aspects: ["ring"])!
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest))
+
+    let first = makePlainDataPacket(to: dest, payload: distinctPayload(0))
+    await store.send(.received(InterfaceID("i"), first))
+    // 1100 further DISTINCT packets — more than the old 1000-entry default, so a ring that size
+    // would have evicted `first` by the end of this loop.
+    for i in 1...1100 {
+        await store.send(.received(InterfaceID("i"), makePlainDataPacket(to: dest,
+                                                                        payload: distinctPayload(i))))
     }
-    // The original packet must still be remembered.
-    #expect(ring.contains(first))
-    let duplicateInsert = ring.insert(first)
-    #expect(!duplicateInsert)
+    // Nothing was evicted: all 1101 hashes are still held (production state, not a local ring).
+    #expect(store.state.seenPacketHashes.count == 1101)
+
+    // Drain the last delivery so the exhaustive flip below starts from an empty action queue.
+    await store.receive { if case .delegate(.received) = $0 { return true }; return false }
+    store.exhaustivity = .on
+    // Replaying packet #0 must emit nothing at all — teardown catches a stray delivery.
+    await store.send(.received(InterfaceID("i"), first))
+}
+
+/// The eviction path itself — the reason the ring is bounded, and the site of the old
+/// `order.removeFirst()` O(ring) memmove. Exercised at a SMALL injected capacity, following
+/// `blobRingEvictsOldestAfterCapacity`: filling 262144 entries through the reducer is not a test.
+@Test @MainActor func seenPacketRingEvictsOldestAndReDeliversIt() async {
+    let dest = Destination(kind: .plain, direction: .in, appName: "app", aspects: ["evict"])!
+    var initial = Transport.State()
+    initial.seenPacketHashes = RingSet(capacity: 2)
+    let store = TestStore(initialState: initial) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(dest))
+
+    let payloads = (0..<3).map { distinctPayload($0) }
+    let packets = payloads.map { makePlainDataPacket(to: dest, payload: $0) }
+    for (packet, payload) in zip(packets, payloads) {
+        await store.send(.received(InterfaceID("i"), packet))
+        await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: payload)))
+    }
+    #expect(store.state.seenPacketHashes.count == 2)     // bounded at the injected capacity
+
+    // #0 was evicted by #2, so replaying it is delivered a SECOND time.
+    await store.send(.received(InterfaceID("i"), packets[0]))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: payloads[0])))
+    // #2 is still remembered, so replaying it is suppressed. Flip exhaustivity LAST: teardown
+    // catches a stray delivery.
+    store.exhaustivity = .on
+    await store.send(.received(InterfaceID("i"), packets[2]))
+}
+
+/// Cost characteristic, pinned rather than left to a comment. Pushing two full capacities through
+/// a production-sized ring means every insert after the first `seenPacketRingSize` takes the
+/// eviction path; the whole loop must finish in seconds, because `RingSet` is O(1) per insert
+/// (circular buffer + boxed storage, no `removeFirst` memmove and no per-copy CoW).
+///
+/// For scale: the value-typed `RingSet` this replaced cost 67-82 ms per insert at this capacity
+/// under TCA's per-action `State` copy — this loop would have taken ~10 hours.
+@Test func ringSetInsertIsConstantTimeAtLargeCapacity() {
+    var ring = RingSet(capacity: Transport.seenPacketRingSize)
+    var item = Data(repeating: 0x5A, count: 32)
+    let started = Date()
+    for i in 0..<(2 * Transport.seenPacketRingSize) {
+        item.withUnsafeMutableBytes { $0.storeBytes(of: UInt64(i), toByteOffset: 0, as: UInt64.self) }
+        _ = ring.insert(item)
+    }
+    let elapsed = Date().timeIntervalSince(started)
+    #expect(ring.count == Transport.seenPacketRingSize)   // bounded: never grows past capacity
+    #expect(elapsed < 30)                                 // generous even for a debug build
 }
