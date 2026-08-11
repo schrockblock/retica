@@ -26,6 +26,12 @@ public struct Transport {
     @ObservableState
     public struct State: Equatable {
         public var localDestinations: [Data: Destination] = [:]
+        /// App data most recently announced for each local destination, replayed in path
+        /// responses. Reference equivalent: `Destination.default_app_data` (RNS/Destination.py:193),
+        /// which `announce()` falls back to and which path responses therefore always carry
+        /// (RNS/Destination.py:283-304). Without this a path response — which is stamped NOW and so
+        /// wins `shouldReplace` — overwrites the requester's richer entry with nil.
+        public var localAppData: [Data: Data] = [:]
         public var learned: [Data: LearnedDestination] = [:]
         public var interfaces: [InterfaceID: InterfaceProfile] = [:]
         public var transportIdentity: Identity? = nil
@@ -244,6 +250,12 @@ public struct Transport {
                               .cancel(id: CancelID.ingressRelease(id)))
 
             case let .registerLocalDestination(destination):
+                // Re-registering a destination resets its announced app data: the new registration
+                // has made no claim about it yet, and replaying a previous composition's app data
+                // would publish stale metadata.
+                if state.localDestinations[destination.hash] == nil {
+                    state.localAppData[destination.hash] = nil
+                }
                 state.localDestinations[destination.hash] = destination
                 return .none
 
@@ -494,9 +506,18 @@ public struct Transport {
                            let identity = dest.identity, identity.privateKey != nil {
                             let now = UInt64(date.now.timeIntervalSince1970)
                             let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
+                            // Replay the app data this destination last announced. A path response
+                            // is stamped NOW, so it always wins `shouldReplace` on the requester —
+                            // sending nil here would erase whatever richer entry the requester had
+                            // learned from a normal announce (display name, PN metadata, ...).
+                            //
+                            // `ratchet` stays nil: ReTiCA has no own-ratchet lifecycle at all (it
+                            // only honours a PEER's announced ratchet when encrypting), so there is
+                            // nothing truthful to put here. Revisit when ratchets land.
                             let respPayload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
                                                                     nameHash: dest.nameHash, randomHash: randomHash,
-                                                                    ratchet: nil, appData: nil)
+                                                                    ratchet: nil,
+                                                                    appData: state.localAppData[dest.hash])
                             let response = Packet.announce(from: dest, payload: respPayload, pathResponse: true)
                             guard let raw = try? response.packed() else { return .none }
                             return .send(.delegate(.transmit(interfaceID, raw)))
@@ -799,6 +820,10 @@ public struct Transport {
                 guard let dest = state.localDestinations[destinationHash],
                       let identity = dest.identity, identity.privateKey != nil
                 else { return .none }
+                // Sticky app data: record a non-nil app data, but do NOT clear on nil — reference
+                // `default_app_data` is sticky until explicitly cleared (`clear_default_app_data()`),
+                // and an announce that omits app data falls back to it rather than erasing it.
+                if let appData { state.localAppData[destinationHash] = appData }
                 let now = UInt64(date.now.timeIntervalSince1970)
                 let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
                 let payload = Announce.buildPayload(identity: identity, destinationHash: destinationHash,

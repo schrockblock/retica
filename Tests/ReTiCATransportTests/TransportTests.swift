@@ -2402,6 +2402,42 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     #expect(parsed?.identity.hash == identity.hash)
 }
 
+/// A path response must carry the destination's announced app data. Without it the response —
+/// which has a NEWER timestamp than the original announce — overwrites the requester's entry
+/// with nil, erasing display name / PN metadata (Destination.py:283-304).
+@Test @MainActor func localPathResponseCarriesAnnouncedAppData() async {
+    let identity = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "test",
+                           aspects: ["appdata"], identity: identity)!
+    let appData = Data([0xDE, 0xAD, 0xBE, 0xEF])
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    store.exhaustivity = .off
+
+    // Connect interface first so .announce has somewhere to transmit.
+    await store.send(.interfaceConnected(InterfaceID("a"), .default))
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.announce(destinationHash: dest.hash, appData: appData))
+    // drain the announce transmit so it doesn't interfere with the path-response capture
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+
+    // Send a PATH_REQUEST for our own destination.
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("a"), makePathRequest(for: dest.hash)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+
+    let responsePacket = Packet(raw: captured.value!)!
+    #expect(responsePacket.context == .pathResponse)
+    let parsed = Announce.parse(payload: responsePacket.payload,
+                                destinationHash: responsePacket.destinationHash,
+                                contextFlagSet: responsePacket.contextFlag)
+    #expect(parsed?.appData == appData)
+}
+
 /// A PATH_REQUEST for a destination we do not own is not answered.
 @Test @MainActor func pathRequestForNonLocalDestinationIsNotAnswered() async {
     let store = TestStore(initialState: Transport.State()) { Transport() }
