@@ -233,11 +233,30 @@ public struct LinkSession {
                 return .merge(.send(.delegate(.transmit(id, raw))), establishmentTimer(state.establishmentTimeout))
 
             case let .acceptRequest(data):
+                // Split into two guards with distinct semantics.
+                //
+                // INTERNAL invariants: reaching here in the wrong role/status, or with
+                // `owningIdentity` nil, means the action was misrouted — a bug on our side, not
+                // something a remote peer can trigger. Leave the element alone.
+                // (`owningIdentity` is set by `LinkPlane.acceptLinkRequest` from
+                // `localDestinations`; it is nil only if the session was misconfigured locally.)
                 guard state.role == .responder, state.status == .pending,
-                      let packet = Packet(raw: data), packet.packetType == .linkRequest,
-                      (packet.payload.count == 64 || packet.payload.count == 67),
                       let owner = state.owningIdentity
                 else { return .none }
+                // PEER-CONTROLLED validation: a malformed request is remotely triggerable. Any
+                // peer that has heard our announce can send wrong-sized payloads. If this guard
+                // fails we MUST reap the element — `LinkPlane` appended it before dispatching
+                // `.acceptRequest` and only removes elements on a delegate. Bailing to `.none`
+                // here would leak the element forever, and `routeLinkPacket` linear-scans
+                // `state.links` on every inbound packet.
+                //
+                // `.establishmentFailed(.handshakeRejected)` is the existing "over, cannot
+                // recover" signal. `LinkPlane` gates `linkFailed` on `role == .initiator`, so a
+                // responder emitting it removes the element without producing a spurious
+                // `linkFailed` for our own served destination.
+                guard let packet = Packet(raw: data), packet.packetType == .linkRequest,
+                      (packet.payload.count == 64 || packet.payload.count == 67)
+                else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 let linkID = Link.linkID(requestPacket: packet)
                 let peerPub = Data(packet.payload.prefix(32))
                 let ourPriv = Data((state.ephemeral.privateKey ?? Data()).prefix(32))

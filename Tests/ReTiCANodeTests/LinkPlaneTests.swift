@@ -288,6 +288,94 @@ private let ifA = InterfaceID("iface-a")
     #expect(store.state.links[id: session.id]?.transfers[id: xferID]?.interfaceID == ifNew)
 }
 
+// MARK: - Malformed inbound LINKREQUEST element-reaping tests
+
+/// A malformed inbound LINKREQUEST must not leave a permanent element behind. `LinkPlane`
+/// appends the session BEFORE dispatching `.acceptRequest`, and removal happens only on a
+/// delegate — so a guard that bails to `.none` leaks the element forever. Remotely triggerable:
+/// any peer that has heard our announce can send wrong-sized payloads and grow `state.links`
+/// without bound, which `routeLinkPacket` then linear-scans on every inbound packet.
+///
+/// Three malformed shapes are covered:
+///   1. Unparseable bytes (random garbage that is not a valid packet).
+///   2. A validly-packed packet whose `packetType` is not `.linkRequest`.
+///   3. A validly-packed `.linkRequest` with the wrong payload size (10 bytes, not 64/67).
+///
+/// In all three cases the element must be reaped (links is empty after draining) and NO
+/// `.linkFailed` delegate must escape (a responder's `destinationHash` is the destination WE
+/// serve — reporting it as unreachable would misinform the delivery layer).
+///
+/// No `.linkFailed` escape is verified structurally: `LinkPlane` gates `.linkFailed` on
+/// `session.role == .initiator`, and the spawned session is always `.responder` (set by
+/// `acceptLinkRequest`). The exhaustive stores below would catch stray actions at teardown.
+@Test @MainActor func malformedInboundLinkRequestReapsItsElement() async {
+    let owner = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: owner)!
+
+    // Shape 1: unparseable bytes.
+    do {
+        let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+            $0.uuid = .incrementing
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+        }
+        store.exhaustivity = .off
+        let garbage = Data(repeating: 0xFF, count: 10)
+        await store.send(.acceptLinkRequest(owner: owner, destinationHash: dest.hash,
+                                            interfaceID: ifA, data: garbage))
+        // Drain: must see .establishmentFailed from the session — LinkPlane reaps the element and
+        // the role gate suppresses any .linkFailed delegate (verified by exhaustivity ON below).
+        await store.receive(
+            { if case .link(.element(_, .delegate(.establishmentFailed(.handshakeRejected)))) = $0 { return true }; return false }
+        )
+        #expect(store.state.links.isEmpty, "Shape 1 (unparseable): element must be reaped")
+        // Flip to exhaustive for teardown: any stray .delegate(.linkFailed) would surface here.
+        store.exhaustivity = .on
+    }
+
+    // Shape 2: a validly-packed packet with the wrong packetType (not .linkRequest).
+    do {
+        let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+            $0.uuid = .incrementing
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+        }
+        store.exhaustivity = .off
+        let wrongType = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                               destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                               destinationHash: dest.hash, transportId: nil,
+                               payload: Data(repeating: 0x01, count: 67))
+        await store.send(.acceptLinkRequest(owner: owner, destinationHash: dest.hash,
+                                            interfaceID: ifA, data: try! wrongType.packed()))
+        await store.receive(
+            { if case .link(.element(_, .delegate(.establishmentFailed(.handshakeRejected)))) = $0 { return true }; return false }
+        )
+        #expect(store.state.links.isEmpty, "Shape 2 (wrong packetType): element must be reaped")
+        store.exhaustivity = .on
+    }
+
+    // Shape 3: a validly-packed .linkRequest with the wrong payload size (10 bytes, not 64/67).
+    do {
+        let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+            $0.uuid = .incrementing
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+        }
+        store.exhaustivity = .off
+        let wrongSize = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                               destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                               destinationHash: dest.hash, transportId: nil,
+                               payload: Data(repeating: 0xAB, count: 10))
+        await store.send(.acceptLinkRequest(owner: owner, destinationHash: dest.hash,
+                                            interfaceID: ifA, data: try! wrongSize.packed()))
+        await store.receive(
+            { if case .link(.element(_, .delegate(.establishmentFailed(.handshakeRejected)))) = $0 { return true }; return false }
+        )
+        #expect(store.state.links.isEmpty, "Shape 3 (wrong payload size): element must be reaped")
+        store.exhaustivity = .on
+    }
+}
+
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {
     let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
         $0.uuid = .incrementing
