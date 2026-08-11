@@ -230,4 +230,19 @@ git commit -m "refactor: read the PN stamp cost from the store, not a mirrored c
 - **Ordering:** Task 1 is independent and should land first — it is the actual interop fix. Task 2 is hardening and can be dropped if Step 1 finds external readers of `LXMFServiceNode.State.minStampCost`.
 - **Type consistency:** both tasks read `state.<node>.store.minStampCost`, where the property chain is `PropagationNode.State.store: PropagationStore` (`PropagationNode.swift:16`) → `PropagationStore.minStampCost: Int` (`PropagationStore.swift:41`). Both are `public var`, verified.
 - **Out of scope, deliberately:** `stampCostFlexibility` stays hardcoded to `0` in both nodes. Reference supports `propagation_stamp_cost_flexibility` and accepts `max(0, cost - flex)` (`LXMRouter.py:2242, 2401`), and also enforces a `PROPAGATION_COST_MIN = 13` floor (`:52, 137`). Neither is implemented; both belong with the wider stamp-enforcement work in §6 of the gap analysis, not here.
-- **Not fixed here:** `perTransferLimit: 0, perSyncLimit: 0` are also advertised by both nodes. Unlike stamp cost, 0 correctly means "no limit" to a reference peer (`LXMF.py:234-236`) and matches reality, since ReTiCA has no inbound transfer cap. That becomes a real gap only once §2.3's admission control lands.
+- ~~**Not fixed here:** `perTransferLimit: 0, perSyncLimit: 0` are also advertised by both nodes. Unlike stamp cost, 0 correctly means "no limit" to a reference peer (`LXMF.py:234-236`) and matches reality, since ReTiCA has no inbound transfer cap.~~
+
+  **CORRECTED 2026-08-11 — the above was wrong.** `LXMF.py:233-234` is only an `int()`-parseability check inside `pn_announce_data_is_valid`; it says nothing about the semantics of 0. The real consumer is `LXMPeer.py:370-373`:
+
+  ```python
+  if self.propagation_transfer_limit != None and lxm_transfer_size > (self.propagation_transfer_limit*1000):
+      self.remove_unhandled_message(transient_id)
+      self.add_handled_message(transient_id)
+      continue
+  ```
+
+  With limit 0, `0 != None` holds and `lxm_transfer_size > 0` always holds, so **every** message is dropped *and permanently marked handled* — never retried. `None` is the true no-limit sentinel (`LXMPeer.py:192, 194`) and can never arrive from the wire, because `pn_announce_data_is_valid` requires `int(data[3])` to succeed. Reference defaults advertise 256 / 10240 (`LXMRouter.py:55, 59`).
+
+  Effect: reference→ReTiCA **mesh sync** silently delivers nothing, forever, and is default-reachable (`AUTOPEER = True`, `AUTOPEER_MAXDEPTH = 4`, `LXMRouter.py:44-45`). Client `/get` downloads are unaffected — the client sends its own limit in the request body, which `LXMFServiceNode.swift:204-226` honours.
+
+  Note the fix is *not* simply "advertise 256": that is the same lie in the opposite direction until inbound transfer caps exist. Either advertise a large-but-real cap, or land the cap first. Tracked in the gap analysis as a follow-up alongside the `nodeState` divergence.

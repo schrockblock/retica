@@ -111,7 +111,7 @@ constants, with citations —
 carrying more than ~1000 packets between a packet and its echo re-forwards the echo. Reference costs
 16–32 MB for this; ReTiCA's costs 32 KB.
 
-### 1.5 `PNNode` advertises propagation stamp cost 0 while enforcing 16 **[verified]**
+### 1.5 `PNNode` advertises propagation stamp cost 0 while enforcing 16 — **FIXED 2026-08-11 (`8a56a25`, `08f1931`)**
 
 `PNNode.swift:79` announces `targetStampCost: 0`; the store it created enforces
 `LXMFPropagation.defaultPropagationStampCost` = 16 (`PNNode.swift:24`), silently skipping every
@@ -328,6 +328,26 @@ oversized packet then dies silently at `Packet.packed()`'s guard (`Packet.swift:
 
 ## 6. Interop hazards in the LXMF layer
 
+- **Advertising `perTransferLimit: 0` / `perSyncLimit: 0` silently kills mesh sync** — **CORRECTION
+  2026-08-11.** An earlier draft of this document claimed 0 safely means "no limit" to a reference
+  peer, citing `LXMF.py:234-236`. **That was wrong**, and the error propagated into a plan's
+  exclusion list before a whole-branch review caught it. Those lines are only an `int()`-parseability
+  check inside `pn_announce_data_is_valid`. The real consumer is `LXMPeer.py:370-373`: with limit 0,
+  `0 != None` holds and `lxm_transfer_size > 0` always holds, so every message is dropped **and
+  permanently marked handled** — never retried. `None` is the true no-limit sentinel
+  (`LXMPeer.py:192, 194`) and can never arrive from the wire. Reference defaults advertise 256 /
+  10240 (`LXMRouter.py:55, 59`). Both `LXMFServiceNode.swift:120` and `PNNode.swift:85` advertise 0,
+  so **reference→ReTiCA mesh sync silently delivers nothing, forever** — default-reachable via
+  `AUTOPEER = True` / `AUTOPEER_MAXDEPTH = 4` (`LXMRouter.py:44-45`). Client `/get` downloads are
+  unaffected (the client sends its own limit, honoured at `LXMFServiceNode.swift:204-226`). The fix
+  is not "advertise 256" — that is the same misstatement inverted until real inbound caps exist.
+- **`nodeState` never re-announced when node mode is turned off.** `.setNodeMode(false)`
+  (`LXMFServiceNode.swift:101-111`) clears bookkeeping and returns `.none`, so the last announce on
+  the network still carries `nodeState: true` (`:119`). Reference `disable_propagation()`
+  re-announces immediately (`LXMRouter.py:692-694` → `:338-345`) and peers act on it by unpeering
+  (`Handlers.py:98-99`). Peers keep syncing into a node that drops everything, and clients that
+  selected us as outbound PN keep uploading into a black hole. Cheap fix: emit an announce with
+  `nodeState: false`.
 - **No delivery-announce app data.** `LXMFNode.registerDelivery` announces `appData: nil`
   (`LXMFNode.swift:92`). Reference packs `msgpack([display_name, stamp_cost, [SF_COMPRESSION]])`
   (`LXMRouter.py:1034-1050`). Sideband/NomadNet therefore show a ReTiCA user as **unnamed**, and
