@@ -120,6 +120,36 @@ import ComposableArchitecture
     #expect(store.state.client.propagationDestinationHash == expected.hash)
 }
 
+/// The announced stamp cost must track the store's enforced cost even if only the store is mutated
+/// after construction. This is a regression guard against re-introducing a mirrored copy of minStampCost
+/// in LXMFServiceNode.State that can drift from the store's enforced value — the exact bug that
+/// PNNode had before Task 1 removed its mirror.
+@Test @MainActor func serviceNodeAnnouncesStoreEnforcedCostAfterMutation() async {
+    let identity = Identity()
+    var initial = LXMFServiceNode.State(identity: identity,
+                                        endpoint: TCPEndpoint.State(host: "h", port: 1),
+                                        minStampCost: 16)
+    initial.nodeModeEnabled = true
+    initial.pn.store.minStampCost = 21                    // mutate ONLY the store
+
+    let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.registerPropagation)
+    await store.receive { action in
+        if case let .client(.endpoint(.announce(_, appData))) = action { captured.setValue(appData); return true }
+        return false
+    }
+
+    #expect(PNAnnounce.parse(captured.value!)?.targetStampCost == 21)
+}
+
 /// A client's offer arriving on the served propagation link is ingested and surfaced for persistence.
 @MainActor @Test func serviceNodeIngestsOfferOnPropagationLink() async {
     let identity = Identity()

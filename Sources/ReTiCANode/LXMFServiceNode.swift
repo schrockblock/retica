@@ -23,8 +23,6 @@ public struct LXMFServiceNode {
         public var pn: PropagationNode.State
         /// While false, nothing is registered, ingested, or served.
         public var nodeModeEnabled: Bool = false
-        /// The stamp cost this node ENFORCES on inbound entries, and therefore also ADVERTISES.
-        public var minStampCost: Int
         /// linkID → the IDENTIFY'd remote client on that link. A `/get` without one is dropped.
         public var clientIdentities: [Data: Identity] = [:]
         /// client delivery hash → FIFO queue of in-flight /get requests. Clients can tear down and
@@ -41,7 +39,6 @@ public struct LXMFServiceNode {
                     minStampCost: Int = LXMFPropagation.defaultPropagationStampCost) {
             self.client = LXMFNode.State(identity: identity, endpoint: endpoint)
             self.pn = PropagationNode.State(storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
-            self.minStampCost = minStampCost
         }
 
         /// Convenience: run this node over TCP.
@@ -121,7 +118,10 @@ public struct LXMFServiceNode {
                 state.client.propagationDestinationHash = d.hash
                 let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: true,
                                          perTransferLimit: 0, perSyncLimit: 0,
-                                         targetStampCost: state.minStampCost,   // advertised == enforced
+                                         // Single source of truth: the value PropagationStore.ingest
+                                         // actually enforces. A mirrored copy is what let PNNode
+                                         // advertise 0 while enforcing 16.
+                                         targetStampCost: state.pn.store.minStampCost,
                                          stampCostFlexibility: 0, peeringCost: 0).packed
                 return .merge(
                     .send(.client(.endpoint(.registerLocalDestination(d)))),
@@ -149,9 +149,9 @@ public struct LXMFServiceNode {
                 // Unparseable containers: guard on parseContainer so a malformed wire payload neither
                 // proves nor ingests (reference LXMRouter.py:2262 except block skips the prove).
                 guard let (_, entries) = LXMFPropagation.parseContainer(data) else { return .none }
-                if state.minStampCost > 0 {
+                if state.pn.store.minStampCost > 0 {
                     let anyRejected = entries.contains {
-                        LXStamper.validatePnStamp(transientData: $0, targetCost: state.minStampCost) == nil
+                        LXStamper.validatePnStamp(transientData: $0, targetCost: state.pn.store.minStampCost) == nil
                     }
                     if anyRejected {
                         // Reference LXMRouter.py:2258-2260: send the error as a plain data packet, then teardown.
