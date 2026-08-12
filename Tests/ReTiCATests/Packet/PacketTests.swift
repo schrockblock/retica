@@ -78,6 +78,53 @@ import Foundation
     _ = try packet.packed() // frames within MTU
 }
 
+// MARK: - Ingress size ceiling
+
+/// `Packet.init?(raw:)` must reject any input that exceeds `Packet.mtu` (500 bytes).
+/// Reference RNS bounds this at the interface layer (`TCPInterface.check_frame_len`), not in
+/// `Packet.unpack`; the ReTiCA bound here is defence in depth — it prevents feeding oversized
+/// payloads to every downstream decoder even when delivered via a path that bypasses the HDLC
+/// deframer (BLE, L2CAP, link-layer data handlers).
+///
+/// The maximum legitimate packet is a HEADER_2 packed at exactly `Packet.mtu` (500 bytes):
+/// flags(1) + hops(1) + transport_id(16) + dest_hash(16) + context(1) + payload(465) = 500.
+/// IFAC is stripped upstream in `Transport.received` before `Packet.init?(raw:)` sees bytes,
+/// so the post-strip bound is `Packet.mtu` on all interfaces.
+///
+/// NOTE: this bound assumes `Packet.mtu = 500`. If MTU negotiation ever lands (`Link.swift:16-21`
+/// records the frozen signalling bytes), this guard must be widened to the negotiated value or
+/// it will incorrectly drop legitimate packets from peers with a higher negotiated MTU.
+@Test func inboundInitRejectsOversized() {
+    // Build a technically-parseable but over-MTU raw frame (501 bytes).
+    // flags=0x00 (HEADER_1, broadcast, single, data), hops=0.
+    var raw = Data([0x00, 0x00])               // flags, hops
+    raw.append(Data(repeating: 0x11, count: 16)) // destinationHash
+    raw.append(0x00)                             // context = .none
+    raw.append(Data(repeating: 0xAA, count: 482)) // payload → total 501 bytes
+    #expect(raw.count == 501)
+    #expect(Packet(raw: raw) == nil)
+}
+
+/// The largest legitimate inbound packet (HEADER_2, 500 bytes total post-IFAC-strip) must parse.
+@Test func inboundInitAcceptsLargestLegitimate() {
+    // HEADER_2: flags(1) + hops(1) + transport_id(16) + dest_hash(16) + context(1) + payload(465) = 500.
+    // flags for HEADER_2 = 0b0100_0000 = 0x40 (headerType2, broadcast, single, data).
+    var raw = Data([0x40, 0x00])               // flags (HEADER_2), hops
+    raw.append(Data(repeating: 0x22, count: 16)) // transport_id
+    raw.append(Data(repeating: 0x33, count: 16)) // destinationHash
+    raw.append(0x00)                             // context = .none
+    raw.append(Data(repeating: 0xBB, count: 465)) // payload → total 500 bytes
+    #expect(raw.count == 500)
+    let packet = Packet(raw: raw)
+    #expect(packet != nil)
+    if let p = packet {
+        #expect(p.headerType == .header2)
+        #expect(p.transportId == Data(repeating: 0x22, count: 16))
+        #expect(p.destinationHash == Data(repeating: 0x33, count: 16))
+        #expect(p.payload == Data(repeating: 0xBB, count: 465))
+    }
+}
+
 @Test func announceComposerSetsTypeAndRatchetFlag() {
     let id = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: [],

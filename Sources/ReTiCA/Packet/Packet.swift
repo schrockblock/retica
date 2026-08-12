@@ -68,6 +68,21 @@ public struct Packet: Equatable {
 
     public init?(raw rawInput: Data) {
         let raw = Data(rawInput) // normalize to 0-based indices
+        // Defence-in-depth ingress ceiling: no compliant peer emits a packet exceeding
+        // Packet.mtu (500). The primary bound lives at the interface layer (HDLC deframer,
+        // BLE framer), but callers such as ResourceTransfer and LinkSession receive bytes
+        // from link-layer handlers that bypass the deframer, so a second check here ensures
+        // no oversized payload reaches downstream decoders.
+        //
+        // NOTE on MTU negotiation: Link.signallingBytes is currently frozen at 500
+        // (Link.swift:16-21). If link MTU negotiation ever lands, packets from peers with a
+        // larger negotiated MTU will be incorrectly dropped here. This guard must be widened
+        // (or removed and re-implemented) before enabling MTU negotiation.
+        //
+        // Reference: RNS Packet.unpack has no equivalent check; the interface-layer bound is
+        // TCPInterface.check_frame_len (HW_MTU + ifac_size). We are not diverging from
+        // reference — IFAC is stripped upstream in Transport.received before this init runs.
+        guard raw.count <= Packet.mtu else { return nil }
         guard raw.count >= 2 else { return nil }
         let flags = raw[0]
         let hops = raw[1]

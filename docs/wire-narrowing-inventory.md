@@ -102,7 +102,7 @@ reading each site:
 | Site | Task | Actual shape | Conversions present? |
 |---|---|---|---|
 | `MsgPack.swift:92/128/153` | 3 | Unbounded parse recursion — **FIXED** (`maxParseDepth = 32`, depth threaded through `parse`/`parseMap`/`parseArray`). Gate does NOT cover it; `MsgPackDepthTests` is the sole regression guard. | none |
-| `Packet.swift:69-100` | 4 | Missing ingress MTU ceiling — `Packet.mtu` is enforced only on egress at `:65` | **none at all** in `Packet.init?(raw:)` |
+| `Packet.swift:69-100` | 4 | Missing ingress MTU ceiling — **FIXED** (`guard raw.count <= Packet.mtu` added at top of `init?(raw:)`). Reference RNS `Packet.unpack` has no equivalent check (interface-layer `check_frame_len` is the primary bound); this is defence in depth covering call sites that bypass the HDLC deframer. IFAC is stripped upstream in `Transport.received` before `Packet.init?(raw:)` sees bytes, so the 500-byte post-strip bound is correct for all interfaces. Commit: `8b867d6`. | none |
 | `PropagationStore.swift:75` | 5 | Expensive PoW validation ordered before cheap structural validation | none |
 
 Detecting these needs a different instrument — a fuzz/property harness over the decode entry
