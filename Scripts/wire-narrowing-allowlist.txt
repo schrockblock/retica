@@ -1,0 +1,134 @@
+# Reviewed fixed-width integer conversions in Sources/.
+#
+# Format:  <repo-relative file> | <occurrences> | <reason> | <expression>
+#
+# The expression comes LAST and is unrestricted, because Swift expressions contain `|`
+# (`UInt8(high << 4 | low)`). The first three fields must not contain a pipe.
+#
+# Every conversion Scripts/check-wire-narrowing.swift finds must appear here or the
+# check fails. Keying on the *expression text* rather than a line number means the
+# entry survives edits elsewhere in the file; the occurrence count means a SECOND
+# copy of the same expression is a new, unreviewed site and fails.
+#
+# A reason beginning with `OPEN` marks a site that is known-broken and not yet fixed.
+# Those print on every run and are ticked off (entry deleted) by the task that fixes
+# them. `--fail-on-open` turns them into errors — run that to assert the sweep is done.
+#
+# The human-readable record, with per-line detail this coarse format cannot carry,
+# is docs/wire-narrowing-inventory.md. Read that before editing this file.
+#
+# Platform floor is iOS 17 / macOS 13 / macCatalyst 17 (Package.swift:6-10) — all
+# 64-bit. "Int is 64-bit" is therefore load-bearing in several reasons below.
+
+# ---------------------------------------------------------------------------
+# OPEN — confirmed traps, owned by the wire-input-trap-sweep plan. Do not bless.
+# ---------------------------------------------------------------------------
+Sources/ReTiCA/Support/MsgPack.swift | 1 | OPEN Task 2 — wire UInt64 msgpack map key narrowed to Int with no bound. Eleven attacker bytes abort the process; reachable from unauthenticated opportunistic LXMF. | Int(key)
+Sources/ReTiCA/Support/MsgPack.swift | 1 | OPEN Task 2 constraint — Int -> UInt64 on an IntPair key traps for a NEGATIVE key. Unreachable from the wire today only because Int(key) traps first. If Task 2 fixes :146 by TRUNCATING, a wire key >= 2^63 becomes negative and LXMessage.unpack's re-encode (LXMessage.swift:108) trips this instead. Task 2 must reject or clamp, never truncate. | UInt64(p.key)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — wire UInt64 narrowed inside the validity predicate itself. A 21-byte app-data blob aborts. | Int(timebase)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(transfer)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(sync)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(cost)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(flex)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(peer)
+Sources/ReTiCANode/LXMFServiceNode.swift | 1 | OPEN Task 6 — Double -> Int. The `raw >= Double(Int.max)` ternary on the same line covers +inf and the large-positive range but NOT NaN (NaN >= x is false) and NOT the large-negative range. A float64 NaN on a /get aborts. | Int(raw)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | OPEN Task 8 — wire UInt64 narrowed, then multiplied by hashmapMaxLen*mapHashLength. Traps twice. The contiguity check recorded as its guard is on the NEXT line and evaluates after. | Int(chunkIndex)
+
+# ---------------------------------------------------------------------------
+# Reviewed safe — widening conversions the lexical check cannot distinguish
+# ---------------------------------------------------------------------------
+Sources/ReTiCA/Crypto/PKCS7.swift | 2 | Widening: `n` is the UInt8 from `data.last`, so 0...255. Always fits Int. | Int(n)
+Sources/ReTiCA/Support/MsgPack.swift | 2 | Widening UInt8 -> Int. | Int(b[i + 1])
+Sources/ReTiCA/Support/MsgPack.swift | 1 | Widening UInt8 -> UInt64 (Data.reduce element). | UInt64($1)
+Sources/ReTiCA/Support/MsgPack.swift | 1 | Widening UInt8 -> UInt64. | UInt64(b[i + $1])
+Sources/ReTiCA/Support/MsgPack.swift | 1 | Widening UInt8 -> UInt64. | UInt64(b[i + 1])
+Sources/ReTiCA/Support/MsgPack.swift | 1 | Identity: `be` already returns UInt64. | UInt64(be(b, i + 1, 2))
+Sources/ReTiCA/Support/MsgPack.swift | 1 | Widening UInt8 -> UInt64. | UInt64(tag)
+Sources/ReTiCA/Resource/ResourceAdvertisement.swift | 1 | Widening UInt8 -> UInt64. | UInt64(flags)
+Sources/ReTiCAInterfaces/BLESupport.swift | 1 | Widening UInt8 -> Int. | Int(buffer[buffer.startIndex])
+Sources/ReTiCAInterfaces/BLESupport.swift | 1 | Widening UInt8 -> Int. | Int(buffer[buffer.startIndex + 1])
+Sources/ReTiCAInterfaces/FCBDriverAdapter.swift | 1 | Widening UInt8 -> UInt16. | UInt16(psmData[psmData.startIndex])
+Sources/ReTiCAInterfaces/FCBDriverAdapter.swift | 1 | Widening UInt8 -> UInt16. | UInt16(psmData[psmData.startIndex + 1])
+Sources/ReTiCATransport/Bzip2.swift | 3 | Widening UInt32 -> Int (Int is 64-bit on every supported platform). | Int(destLen)
+Sources/ReTiCATransport/RingSet.swift | 1 | Identity: Hasher.finalize() returns Int, which is Int64 on every supported platform. | Int64(lo.finalize())
+Sources/ReTiCATransport/RingSet.swift | 1 | Identity: as Int64(lo.finalize()). | Int64(hi.finalize())
+Sources/ReTiCATransport/Transport.swift | 5 | Widening UInt8 -> Int (Packet.hops is UInt8). | Int(packet.hops)
+Sources/ReTiCATransport/Transport.swift | 1 | Widening UInt8 -> Int. | Int(entry.hops)
+Sources/ReTiCATransport/Transport.swift | 6 | Widening UInt8 -> Int; Packet.maxHops is a UInt8 constant. | Int(Packet.maxHops)
+Sources/ReTiCATransport/Transport.swift | 1 | Widening UInt8 -> UInt64 (Data.reduce element). | UInt64($1)
+
+# ---------------------------------------------------------------------------
+# Reviewed safe — the argument is masked or range-bounded by its own expression
+# ---------------------------------------------------------------------------
+Sources/ReTiCA/Crypto/HKDF.swift | 1 | `& 0xFF` bounds the value to 0...255 inside the argument, before the conversion. | UInt8((i + 1) & 0xFF)
+Sources/ReTiCA/Crypto/PKCS7.swift | 1 | `n = blockSize - (data.count % blockSize)`, so 1...16. | UInt8(n)
+Sources/ReTiCA/Destination/Announce.swift | 1 | `& 0xFF` bounds to 0...255 inside the argument. | UInt8((now >> UInt64(shift)) & 0xFF)
+Sources/ReTiCA/Destination/Announce.swift | 1 | `shift` iterates stride(from: 32, through: 0, by: -8), so 0/8/16/24/32 — never negative. | UInt64(shift)
+Sources/ReTiCA/LXMF/LXStamper.swift | 1 | `n` iterates 0..<expandRounds; a negative expandRounds traps at Range construction first, so n >= 0 here. | UInt64(n)
+Sources/ReTiCA/Support/Data+Hex.swift | 1 | Both operands come from Character.hexDigitValue, so 0...15 each; the combination is 0...255. | UInt8(high << 4 | low)
+Sources/ReTiCA/Support/MsgPack.swift | 2 | `& 0x0F` bounds to 0...15. | Int(tag & 0x0F)
+Sources/ReTiCA/Support/MsgPack.swift | 1 | `& 0x1F` bounds to 0...31. | Int(tag & 0x1F)
+Sources/ReTiCA/Support/MsgPack.swift | 4 | `be(_,_,2)` accumulates exactly 2 bytes, so 0...65535. | Int(be(b, i + 1, 2))
+Sources/ReTiCA/Support/MsgPack.swift | 3 | `be(_,_,4)` accumulates exactly 4 bytes, so 0...4294967295 — fits a 64-bit Int. WOULD trap on a 32-bit platform; the iOS 17 / macOS 13 floor excludes those. These counts are unbounded-length inputs, a different exposure owned by Tasks 3 and 4, not a trap. | Int(be(b, i + 1, 4))
+Sources/ReTiCAInterfaces/BLEDriver.swift | 1 | `& 0xff` bounds to 0...255. | UInt8($0 & 0xff)
+Sources/ReTiCATransport/RandomBytesDependency.swift | 1 | `& 0xff` bounds to 0...255. | UInt8($0 & 0xff)
+Sources/ReTiCAInterfaces/FCBDriverAdapter.swift | 1 | `& 0xFF` bounds to 0...255. | UInt8(psm & 0xFF)
+Sources/ReTiCAInterfaces/FCBDriverAdapter.swift | 1 | `psm` is UInt16, so `psm >> 8` is 0...255. | UInt8(psm >> 8)
+
+# ---------------------------------------------------------------------------
+# Reviewed safe — compile-time constants
+# ---------------------------------------------------------------------------
+Sources/ReTiCAInterfaces/BLEInterface.swift | 1 | BLEHello.length is the constant 20 (BLESupport.swift:59). | UInt8(BLEHello.length)
+Sources/ReTiCANode/LXMFServiceNode.swift | 1 | Positive compile-time constant. | UInt64(Int.max / 1000)
+Sources/ReTiCA/Resource/ResourceAdvertisement.swift | 1 | Positive compile-time constant. | UInt64(Resource.maxAdvertisedTransferSize)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant. | UInt64(Int.max)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant. | UInt64(LinkSession.maxEfficientSize)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant. | UInt64(Resource.autoCompressMaxSize)
+
+# ---------------------------------------------------------------------------
+# Reviewed safe — non-negative collection counts converted upward
+# ---------------------------------------------------------------------------
+Sources/ReTiCATransport/LinkSession.swift | 1 | Collection count: never negative. | UInt64(segments.count)
+Sources/ReTiCATransport/LinkSession.swift | 2 | Collection count: never negative. | UInt64(data.count)
+Sources/ReTiCATransport/LinkSession.swift | 1 | Collection count: never negative. | UInt64(acc.parts.count)
+Sources/ReTiCATransport/ResourceTransfer.swift | 2 | Collection count: never negative. | UInt64(chunks.count)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Collection count: never negative. | UInt64(data.count)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Collection count: never negative. | UInt64(stream.count)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | `chunk = (li + 1) / Resource.hashmapMaxLen` where `li` is an Array.firstIndex result, so >= 0. | UInt64(chunk)
+
+# ---------------------------------------------------------------------------
+# Reviewed safe — a named guard that provably evaluates BEFORE the conversion.
+# The guard is named and its position stated for every entry here, because the
+# predecessor's ledger recorded one site as guarded by a check on the NEXT line.
+# ---------------------------------------------------------------------------
+Sources/ReTiCA/Support/MsgPack.swift | 2 | encodeUInt :39 and :40 — each sits in the consequent of `if u <= 0x7F` / `if u <= 0xFF` on the same line. The condition evaluates first. | UInt8(u)
+Sources/ReTiCA/Support/MsgPack.swift | 1 | encodeUInt :41 — consequent of `if u <= 0xFFFF` on the same line. | UInt16(u)
+Sources/ReTiCA/Support/MsgPack.swift | 1 | encodeUInt :42 — consequent of `if u <= 0xFFFF_FFFF` on the same line. | UInt32(u)
+Sources/ReTiCAInterfaces/BLESupport.swift | 1 | BLEFraming.frame :19 — guarded by `packet.count <= maxFrameLength` (1196) at :16, three lines EARLIER, which throws. 1196 >> 8 == 4. | UInt8(packet.count >> 8)
+Sources/ReTiCAInterfaces/BLESupport.swift | 1 | BLEFraming.frame :19 — same :16 guard, and `& 0xFF` bounds it independently. | UInt8(packet.count & 0xFF)
+Sources/ReTiCANode/LXMFServiceNode.swift | 1 | :216 — ternary condition `kb > UInt64(Int.max / 1000)` evaluates before the else-branch. The following `* 1000` also cannot overflow, since (Int.max / 1000) * 1000 <= Int.max. | Int(kb)
+Sources/ReTiCATransport/Bzip2.swift | 1 | :37 — guarded by `expectedSize <= Resource.autoCompressMaxSize` (64 MiB) at :34, THREE LINES EARLIER, which returns nil. `bufSize = max(expectedSize, 1)` then lies in 1...64 MiB. Predecessor fix 95e8739/4b4526d; evaluation order re-verified. | UInt32(bufSize)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :397 — guarded by `adv.dataSize <= UInt64(Resource.autoCompressMaxSize)` at :393, which fails the transfer. Predecessor fix 4b4526d, non-split branch; order re-verified. | Int(adv.dataSize)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :389 — the clamp is inside the argument, so it cannot be bypassed. Predecessor fix 4b4526d, split branch. | Int(min(adv.dataSize, UInt64(LinkSession.maxEfficientSize)))
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :220 — type invariant, not a local guard. State.expectedParts is assigned at exactly three sites: :75 UInt64(chunks.count), :115 literal 0, :263 min(adv.numberOfParts, UInt64(Int.max)). All three are <= Int.max. Predecessor fix 4b4526d. NOTE: the field is `public var`, so a host could break the invariant; it holds against wire input. | Int(s.expectedParts)
+Sources/ReTiCATransport/ResourceTransfer.swift | 3 | :365/:371/:372 — same three-assignment-site invariant as Int(s.expectedParts). | Int(state.expectedParts)
+
+# ---------------------------------------------------------------------------
+# Reviewed — cannot trap on wire input, but CAN trap on a hostile host/dependency.
+# Recorded rather than fixed: none is remotely triggerable, so none belongs to this
+# plan. See docs/wire-narrowing-inventory.md for the escalation conditions.
+# ---------------------------------------------------------------------------
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :30 — Int -> UInt64 traps if the field is negative. Producers are PNNode.swift:84 and LXMFServiceNode.swift:119, both Int(date.now.timeIntervalSince1970); negative only if the `date` dependency is set before 1970. Not attacker-controlled. Task 7 must not fix parse by truncating, or a wire value could reach here negative. | UInt64(timebase)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :32 — as UInt64(timebase); host-set field. | UInt64(perTransferLimit)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :33 — as UInt64(timebase); host-set field. | UInt64(perSyncLimit)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); sourced from PropagationStore.minStampCost. | UInt64(targetStampCost)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); host-set field. | UInt64(stampCostFlexibility)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); host-set field. | UInt64(peeringCost)
+Sources/ReTiCANode/LXMFServiceNode.swift | 1 | :119 — Double -> Int on the TCA `date` dependency. Traps for NaN or a date outside roughly +/- 2.9e11 years. Clock, not wire. | Int(date.now.timeIntervalSince1970)
+Sources/ReTiCANode/PNNode.swift | 1 | :84 — as LXMFServiceNode:119. | Int(date.now.timeIntervalSince1970)
+Sources/ReTiCATransport/Transport.swift | 2 | :542 and :878 — Double -> UInt64 on the `date` dependency. Traps for NaN, and additionally for ANY pre-1970 date because the destination is unsigned. Clock, not wire. | UInt64(date.now.timeIntervalSince1970)
+Sources/ReTiCA/Support/MsgPack.swift | 5 | Encoder. :49/:58/:78 sit in `else if n <= 0xFFFF` branches and are guarded. :64 and :70 are the map32 gap the plan lists as out of scope — the `n <= 15 ? ... : UInt16(n)` ternary has no upper bound, so a host-built map with more than 65535 pairs traps. Not reachable from the wire: the DECODER has no map32 (0xDF) branch either, so a decoded map is capped at 65535 pairs. | UInt16(n)
+Sources/ReTiCA/Support/MsgPack.swift | 3 | Encoder :50/:59/:79 — the final `else` branches have no upper bound, so encoding a bin/str/array of more than 4294967295 elements traps. Host-side only; requires a >4 GiB in-memory value. | UInt32(n)
+Sources/ReTiCA/Support/MsgPack.swift | 6 | Encoder :48/:56/:57/:64/:70/:77 — every one is in the consequent of a preceding size test (n <= 0xFF, n <= 31, n <= 15) evaluated first. | UInt8(n)
+Sources/ReTiCATransport/Bzip2.swift | 1 | compress :10 — egress. `data` is our own outbound payload; traps only if the host compresses roughly 4 GiB in one call. | UInt32(data.count + data.count / 100 + 600)
+Sources/ReTiCATransport/Bzip2.swift | 2 | :20 is egress (as :10). :46 is the RECEIVED compressed payload, so it is wire-derived — but reaching UInt32.max means an attacker actually transferred 4 GiB, which exhausts memory in Resource.assemble long before this line. Bounded by admission control, which the plan lists as out of scope. | UInt32(data.count)
