@@ -4,6 +4,35 @@ import Foundation
 public enum MsgPack {
     static let float64Tag: UInt8 = 0xCB
 
+    /// Maximum MessagePack container nesting depth accepted by `parse`.
+    ///
+    /// **Justification (protocol depth survey):**
+    /// The deepest structure defined by the Reticulum / LXMF protocol stack is an LXMessage
+    /// payload: `array([double, bin, bin, intMap([IntPair])])` where `intMap` values can be any
+    /// MsgPackValue — depth 3 for scalar field values. No other protocol structure exceeds 2
+    /// (PNAnnounce: outer array → costs array / metadata map). ResourceAdvertisement is flat
+    /// (depth 1 — a map whose values are all scalars). Link request/response are depth 2 (array
+    /// wrapping a data element).
+    ///
+    /// **Headroom:**
+    /// - Above deepest known structure (3): 29 levels of headroom for application data in
+    ///   `LXMessage.fields` values (telemetry, coordinates, attachments), which ReTiCA does not
+    ///   define and cannot bound.
+    /// - Below stack exhaustion: the bomb test crashes at ~431 depth on a 512 KiB background
+    ///   thread stack in a debug build, and at ~10 000 depth in a release build. 32 is
+    ///   substantially below both; a 32-deep legitimate payload is never near the stack limit.
+    ///
+    /// **Reference divergence:** Python's `umsgpack` (RNS/vendor/umsgpack.py) imposes NO
+    /// explicit depth limit — it is equally recursive but survives via CPython's catchable
+    /// `RecursionError`. A native Swift port has no such safety net; stack exhaustion is
+    /// uncatchable and crashes the process (SIGBUS/SIGILL). We deliberately diverge from the
+    /// reference to add this guard.
+    ///
+    /// **Detection gap:** `Scripts/check-wire-narrowing.swift` covers narrowing-conversion
+    /// defects only; unbounded recursion is a different shape and is INVISIBLE to it.
+    /// The `MsgPackDepthTests` suite is the **sole** regression guard for this defect.
+    public static let maxParseDepth = 32
+
     /// Encode a `Double` as MessagePack float64: `0xCB ‖ big-endian IEEE-754 bits` (9 bytes).
     public static func encode(_ value: Double) -> Data {
         var data = Data([float64Tag])
@@ -89,8 +118,8 @@ public enum MsgPack {
         guard let (v, next) = parse(b, 0), next == b.count else { return nil }
         return v
     }
-    private static func parse(_ b: [UInt8], _ i: Int) -> (MsgPackValue, Int)? {
-        guard i < b.count else { return nil }
+    private static func parse(_ b: [UInt8], _ i: Int, _ depth: Int = 0) -> (MsgPackValue, Int)? {
+        guard depth <= maxParseDepth, i < b.count else { return nil }
         let tag = b[i]
         switch tag {
         case 0x00...0x7F: return (.uint(UInt64(tag)), i + 1)
@@ -109,11 +138,11 @@ public enum MsgPack {
         case 0xD9: guard i + 1 < b.count else { return nil }; return str(b, i + 2, Int(b[i + 1]))
         case 0xDA: guard i + 2 < b.count else { return nil }; return str(b, i + 3, Int(be(b, i + 1, 2)))
         case 0xDB: guard i + 4 < b.count else { return nil }; return str(b, i + 5, Int(be(b, i + 1, 4)))
-        case 0x80...0x8F: return parseMap(b, i + 1, Int(tag & 0x0F))
-        case 0xDE: guard i + 2 < b.count else { return nil }; return parseMap(b, i + 3, Int(be(b, i + 1, 2)))
-        case 0x90...0x9F: return parseArray(b, i + 1, Int(tag & 0x0F))
-        case 0xDC: guard i + 2 < b.count else { return nil }; return parseArray(b, i + 3, Int(be(b, i + 1, 2)))
-        case 0xDD: guard i + 4 < b.count else { return nil }; return parseArray(b, i + 5, Int(be(b, i + 1, 4)))
+        case 0x80...0x8F: return parseMap(b, i + 1, Int(tag & 0x0F), depth)
+        case 0xDE: guard i + 2 < b.count else { return nil }; return parseMap(b, i + 3, Int(be(b, i + 1, 2)), depth)
+        case 0x90...0x9F: return parseArray(b, i + 1, Int(tag & 0x0F), depth)
+        case 0xDC: guard i + 2 < b.count else { return nil }; return parseArray(b, i + 3, Int(be(b, i + 1, 2)), depth)
+        case 0xDD: guard i + 4 < b.count else { return nil }; return parseArray(b, i + 5, Int(be(b, i + 1, 4)), depth)
         default: return nil
         }
     }
@@ -125,16 +154,16 @@ public enum MsgPack {
         guard start + n <= b.count, let s = String(bytes: b[start..<start + n], encoding: .utf8) else { return nil }
         return (.string(s), start + n)
     }
-    private static func parseMap(_ b: [UInt8], _ start: Int, _ count: Int) -> (MsgPackValue, Int)? {
+    private static func parseMap(_ b: [UInt8], _ start: Int, _ count: Int, _ depth: Int) -> (MsgPackValue, Int)? {
         if count == 0 { return (.map([]), start) }
-        guard let (firstKey, _) = parse(b, start) else { return nil }   // peek to pick key type
+        guard let (firstKey, _) = parse(b, start, depth + 1) else { return nil }   // peek to pick key type
         var i = start
         switch firstKey {
         case .string:
             var pairs: [MsgPackValue.Pair] = []
             for _ in 0..<count {
-                guard let (kv, ni) = parse(b, i), case let .string(key) = kv,
-                      let (vv, ni2) = parse(b, ni) else { return nil }
+                guard let (kv, ni) = parse(b, i, depth + 1), case let .string(key) = kv,
+                      let (vv, ni2) = parse(b, ni, depth + 1) else { return nil }
                 pairs.append(.init(key, vv)); i = ni2
             }
             return (.map(pairs), i)
@@ -148,9 +177,9 @@ public enum MsgPack {
                 // Rejection is the correct semantic: a key outside the representable
                 // range is malformed input. This sets the precedent for Task 7
                 // (PNAnnounce.swift), which has the same shape.
-                guard let (kv, ni) = parse(b, i), case let .uint(key) = kv,
+                guard let (kv, ni) = parse(b, i, depth + 1), case let .uint(key) = kv,
                       let intKey = Int(exactly: key),
-                      let (vv, ni2) = parse(b, ni) else { return nil }
+                      let (vv, ni2) = parse(b, ni, depth + 1) else { return nil }
                 pairs.append(.init(intKey, vv)); i = ni2
             }
             return (.intMap(pairs), i)
@@ -158,10 +187,10 @@ public enum MsgPack {
             return nil
         }
     }
-    private static func parseArray(_ b: [UInt8], _ start: Int, _ count: Int) -> (MsgPackValue, Int)? {
+    private static func parseArray(_ b: [UInt8], _ start: Int, _ count: Int, _ depth: Int) -> (MsgPackValue, Int)? {
         var i = start; var items: [MsgPackValue] = []
         for _ in 0..<count {
-            guard let (v, ni) = parse(b, i) else { return nil }
+            guard let (v, ni) = parse(b, i, depth + 1) else { return nil }
             items.append(v); i = ni
         }
         return (.array(items), i)

@@ -101,7 +101,7 @@ reading each site:
 
 | Site | Task | Actual shape | Conversions present? |
 |---|---|---|---|
-| `MsgPack.swift:92/128/153` | 3 | Unbounded parse recursion | none |
+| `MsgPack.swift:92/128/153` | 3 | Unbounded parse recursion — **FIXED** (`maxParseDepth = 32`, depth threaded through `parse`/`parseMap`/`parseArray`). Gate does NOT cover it; `MsgPackDepthTests` is the sole regression guard. | none |
 | `Packet.swift:69-100` | 4 | Missing ingress MTU ceiling — `Packet.mtu` is enforced only on egress at `:65` | **none at all** in `Packet.init?(raw:)` |
 | `PropagationStore.swift:75` | 5 | Expensive PoW validation ordered before cheap structural validation | none |
 
