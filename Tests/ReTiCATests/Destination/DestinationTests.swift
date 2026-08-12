@@ -56,6 +56,25 @@ import Foundation
     #expect(dest.decrypt(dest.encrypt(pt)) == pt)
 }
 
+// A GROUP destination whose key Token cannot use must not be constructible — otherwise
+// encrypt() falls through and emits CLEARTEXT (Destination.swift:78), where reference raises
+// (RNS/Destination.py:620).
+@Test func groupDestinationRejectsUnusableKey() {
+    for badLength in [0, 15, 16, 24, 33, 63, 65] {
+        let d = Destination(kind: .group, direction: .in, appName: "t", aspects: ["g"],
+                            groupKey: Data(repeating: 0x11, count: badLength))
+        #expect(d == nil, "group key of \(badLength) bytes must be rejected")
+    }
+    for goodLength in [32, 64] {
+        let d = Destination(kind: .group, direction: .in, appName: "t", aspects: ["g"],
+                            groupKey: Data(repeating: 0x11, count: goodLength))
+        #expect(d != nil)
+        // And it must actually encrypt, not pass through.
+        let plaintext = Data([0xDE, 0xAD])
+        #expect(d!.encrypt(plaintext) != plaintext)
+    }
+}
+
 @Test func plainDestinationIsPassthrough() {
     let dest = Destination(kind: .plain, direction: .out, appName: "app", aspects: [],
                            identity: nil, groupKey: nil)!
