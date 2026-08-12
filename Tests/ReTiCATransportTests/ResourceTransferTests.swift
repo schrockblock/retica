@@ -916,3 +916,27 @@ private func driveTransferToTerminalStatus(sender senderState: ResourceTransfer.
     #expect(s.advertisement!.dataSize == whole)           // whole size, not this segment's
     #expect(s.advertisement!.isSplit == true)             // l > 1
 }
+
+/// `LinkSession.sendResponse` does NOT split: it hands the whole payload to ONE `ResourceTransfer`
+/// (only `sendResource` splits at maxEfficientSize). Reference splits EVERY resource in
+/// `Resource.__init__` (RNS/Resource.py:274-310), which is what lets it bound an advertisement's
+/// `t` at MAX_EFFICIENT_SIZE*3 (RNS/Resource.py:1366). Adopting that bound here made our own
+/// receiver reject our own sender: a propagation-node mailbox download is served as one un-split
+/// response resource, so its `t` legitimately exceeds it. This is the seam — a response-shaped
+/// advertisement built by the very initializer `sendResponse` uses must survive `unpack`.
+@Test func largeUnsplitResponseAdvertisementSurvivesUnpack() {
+    // Above the reference bound (1_048_575 * 3 == 3_145_725) and incompressible, so the encrypted
+    // stream — and therefore `t` — really is this large rather than being shrunk by bzip2.
+    let payload = incompressibleData(count: 4 * 1024 * 1024)
+    let sender = ResourceTransfer.State(
+        sending: payload, linkID: linkID, sessionKey: key, interfaceID: InterfaceID("s"),
+        prefix: prefix, randomHash: r, sdu: LinkSession.resourceSDU,
+        requestID: Data(repeating: 0x5A, count: 16), isResponse: true)
+    let adv = sender.advertisement!
+    #expect(adv.isResponse == true)
+    #expect(adv.isSplit == false)                          // one resource, no segments
+    #expect(adv.transferSize > 1_048_575 * 3)              // above the reference bound
+    let round = ResourceAdvertisement.unpack(adv.pack())
+    #expect(round != nil)
+    if let round { #expect(round.transferSize == adv.transferSize) }
+}

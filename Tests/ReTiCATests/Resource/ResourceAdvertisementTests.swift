@@ -65,6 +65,22 @@ private func sampleAdvertisement() -> ResourceAdvertisement {
     #expect(ResourceAdvertisement.unpack(atCeiling.pack()) != nil)
 }
 
+/// Reference can afford `MAX_EFFICIENT_SIZE*3` because `Resource.__init__` splits EVERY resource
+/// at MAX_EFFICIENT_SIZE (RNS/Resource.py:274-310). ReTiCA does not split requests/responses —
+/// `LinkSession.sendResponse` hands the whole payload to one `ResourceTransfer` — so a propagation
+/// -node mailbox download (`LXMFServiceNode` default store limit: 32 MiB) legitimately advertises a
+/// `t` many times the reference bound. Adopting reference's number made our own receiver reject
+/// our own senders.
+@Test func advertisementUnpackAcceptsPropagationScaleTransferSize() {
+    // A 32 MiB mailbox download — the default per-node propagation store limit, i.e. the largest
+    // response `LXMFServiceNode` can legitimately serve in one un-split resource.
+    var adv = sampleAdvertisement()
+    adv.transferSize = 32 * 1024 * 1024
+    let round = ResourceAdvertisement.unpack(adv.pack())
+    #expect(round != nil)
+    if let round { #expect(round.transferSize == 32 * 1024 * 1024) }
+}
+
 /// `d` is deliberately NOT bounded at unpack: for a split resource it is legitimately the whole
 /// object's size, which exceeds any per-transfer bound. The decompress call site is therefore what
 /// must survive an absurd `d` — it must not convert to `Int` before clamping.

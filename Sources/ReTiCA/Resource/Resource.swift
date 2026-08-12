@@ -12,10 +12,32 @@ public enum Resource {
     /// Reference `AUTO_COMPRESS_MAX_SIZE` (RNS/Resource.py:124) — the largest payload reference
     /// will auto-compress, and the ceiling it enforces when decompressing (RNS/Resource.py:360).
     public static let autoCompressMaxSize = 64 * 1024 * 1024
-    /// Reference rejects an advertisement declaring more than MAX_EFFICIENT_SIZE*3
-    /// (RNS/Resource.py:1366). An advertisement is attacker-controlled, so this bound is what
-    /// stops a declared size becoming an allocation.
-    public static let maxAdvertisedTransferSize = 1_048_575 * 3
+    /// Ceiling on an advertisement's declared transfer size (`t`).
+    ///
+    /// Reference rejects `t > MAX_EFFICIENT_SIZE*3` (RNS/Resource.py:1366). It can afford that
+    /// tight a bound ONLY because `Resource.__init__` splits EVERY resource at MAX_EFFICIENT_SIZE
+    /// (RNS/Resource.py:274-310, reached from Link.py:506/846/852), so no reference advertisement
+    /// ever legitimately exceeds it. ReTiCA does not split requests or responses:
+    /// `LinkSession.sendRequest`/`sendResponse` hand the whole payload to ONE `ResourceTransfer`
+    /// (only `sendResource` segments). A propagation-node mailbox download is therefore served as a
+    /// single un-split resource whose `t` is the whole mailbox — up to
+    /// `LXMFServiceNode.State.defaultStorageLimitBytes` (32 MiB) — so importing reference's number
+    /// made our own receiver reject our own sender.
+    ///
+    /// The base is corrected rather than the shape: reference bounds `t` at (largest legitimate
+    /// single-resource payload) * 3, with the *3 covering encryption/compression expansion. For us
+    /// that payload is bounded by `autoCompressMaxSize` — the reference AUTO_COMPRESS_MAX_SIZE that
+    /// already gates the receive path's decompression buffer — not by MAX_EFFICIENT_SIZE.
+    ///
+    /// Safe to loosen: `t` drives NO allocation on the receive path (nothing reads
+    /// `transferSize` after unpack). The allocation-bearing wire values are guarded independently
+    /// and those guards are untouched — `n` is clamped at accept, `d` is gated against
+    /// `autoCompressMaxSize` on the non-split branch, and `Bzip2.decompress` carries its own
+    /// `expectedSize` ceiling. This stays a sanity bound, not the load-bearing defence.
+    ///
+    /// The reference-faithful fix is to split requests/responses like `sendResource` already does;
+    /// that is a planned task, and when it lands this can return to `maxEfficientSize * 3`.
+    public static let maxAdvertisedTransferSize = autoCompressMaxSize * 3
 
     /// Resource hash: `full_hash(data ‖ r)` over the original (pre-encryption) data.
     public static func resourceHash(data: Data, randomHash: Data) -> Data {

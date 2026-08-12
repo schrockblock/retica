@@ -51,9 +51,12 @@ public struct ResourceAdvertisement: Equatable {
               let h = bin("h"), let r = bin("r"), let o = bin("o"),
               let i = uint("i"), let l = uint("l"), let f = uint("f"), let m = bin("m")
         else { return nil }
-        // Mirror RNS/Resource.py:1366: reject advertisements declaring more than MAX_EFFICIENT_SIZE*3.
-        // An advertisement is attacker-controlled; this bound prevents a declared size from becoming
-        // an allocation via the decompression path.
+        // Magnitude gate on the declared transfer size, in the spirit of RNS/Resource.py:1366 but
+        // NOT at reference's number: reference can bound `t` at MAX_EFFICIENT_SIZE*3 only because it
+        // splits every resource (RNS/Resource.py:274-310) and we do not split requests/responses, so
+        // that bound would make our own receiver reject our own propagation-node downloads. See
+        // `Resource.maxAdvertisedTransferSize` for the full reasoning and for why loosening it is
+        // safe (the allocation-bearing values are `n` and `d`, guarded separately).
         guard t <= UInt64(Resource.maxAdvertisedTransferSize) else { return nil }
         let q: Data?
         switch dict["q"] {
