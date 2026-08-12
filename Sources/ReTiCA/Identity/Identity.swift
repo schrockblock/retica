@@ -42,13 +42,34 @@ public struct Identity: Equatable, Sendable {
         guard publicKey.count == Identity.keySize else { return nil }
         let encPub = publicKey.prefix(Identity.halfKey)
         let sigPub = publicKey.suffix(Identity.halfKey)
-        guard (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: encPub)) != nil,
+        guard let encKey = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: encPub),
               (try? Curve25519.Signing.PublicKey(rawRepresentation: sigPub)) != nil
         else { return nil }
+        // CryptoKit accepts a low-order point at PublicKey(rawRepresentation:) but throws at key
+        // agreement — so constructibility is NOT sufficient. A peer can announce such a key with a
+        // valid Ed25519 signature and a matching destination hash (neither check touches the X25519
+        // key), and the force-try in encrypt() would abort the process on the first send.
+        // Reject it at the boundary instead, so every Identity that exists is safe to encrypt to.
+        //
+        // isUsableX25519PublicKey(_:) is defined here (not in Task 2) so there is exactly one
+        // implementation and Task 2 can call it without editing this file.
+        //
+        // Cost: one X25519 op per construction. Announce validation already does an Ed25519 verify
+        // of the same order, and announce ingest is ingress-rate-limited, so this adds no new
+        // CPU-amplification surface.
+        guard Identity.isUsableX25519PublicKey(encKey) else { return nil }
         x25519Public = Data(encPub)
         ed25519Public = Data(sigPub)
         x25519Private = nil
         ed25519Private = nil
+    }
+
+    /// Returns true iff `key` can actually perform a key agreement.
+    ///
+    /// CryptoKit accepts low-order Curve25519 points at `PublicKey(rawRepresentation:)` but throws
+    /// at `sharedSecretFromKeyAgreement`. This trial agreement is the only reliable gate.
+    static func isUsableX25519PublicKey(_ key: Curve25519.KeyAgreement.PublicKey) -> Bool {
+        (try? Curve25519.KeyAgreement.PrivateKey().sharedSecretFromKeyAgreement(with: key)) != nil
     }
 
     // MARK: Accessors
@@ -78,6 +99,10 @@ public struct Identity: Equatable, Sendable {
             rawRepresentation: ephemeralPrivateKey)
         let targetPub = try! Curve25519.KeyAgreement.PublicKey(
             rawRepresentation: ratchet ?? x25519Public)
+        // INVARIANT: every Identity is agreement-safe by construction — init?(publicKey:) performs
+        // a trial key agreement and returns nil for low-order points. This try! is genuinely
+        // unreachable for x25519Public. Do NOT change it to return plaintext on failure — that
+        // would convert a crash into a silent confidentiality failure, which is far worse.
         let shared = try! ephemeral.sharedSecretFromKeyAgreement(with: targetPub)
         let sharedData = shared.withUnsafeBytes { Data($0) }
         let derived = Crypto.hkdf(length: Identity.derivedKeyLength,

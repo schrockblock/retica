@@ -96,3 +96,18 @@ import CryptoKit
     // With enforcement, a non-matching ratchet set must return nil (no static fallback):
     #expect(id.decrypt(ct, ratchets: [wrongRatchet], enforceRatchets: true) == nil)
 }
+
+// CryptoKit accepts a low-order Curve25519 point at PublicKey(rawRepresentation:) and only
+// throws at key agreement. Identity must reject such a key at construction, or the force-try
+// in encrypt() aborts the process on the first send to that peer.
+@Test func identityRejectsLowOrderX25519PublicKey() {
+    let sig = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+    // Canonical low-order points: all-zero, and 0x01 followed by zeros.
+    for lowOrder in [Data(repeating: 0x00, count: 32),
+                     Data([0x01]) + Data(repeating: 0x00, count: 31)] {
+        #expect(Identity(publicKey: lowOrder + sig) == nil)
+    }
+    // A genuine key still constructs.
+    let good = Identity()
+    #expect(Identity(publicKey: good.publicKey) != nil)
+}
