@@ -44,3 +44,19 @@ private func sampleAdvertisement() -> ResourceAdvertisement {
     // A map missing a required key (only "t") must be rejected.
     #expect(ResourceAdvertisement.unpack(MsgPack.encode(.map([.init("t", .uint(1))]))) == nil)
 }
+
+// Reference rejects adv.t > MAX_EFFICIENT_SIZE*3 at unpack (RNS/Resource.py:1366).
+// We mirror that: an advertisement declaring a transfer size above maxAdvertisedTransferSize is hostile.
+@Test func advertisementUnpackRejectsOversizedTransferSize() {
+    // Build a structurally-valid advertisement with a hostile transferSize.
+    var adv = sampleAdvertisement()
+    adv.transferSize = UInt64(Resource.maxAdvertisedTransferSize) + 1
+    #expect(ResourceAdvertisement.unpack(adv.pack()) == nil)
+}
+
+@Test func advertisementUnpackAcceptsLegitimateTransferSize() {
+    // A transfer size right at the ceiling must still be accepted.
+    var adv = sampleAdvertisement()
+    adv.transferSize = UInt64(Resource.maxAdvertisedTransferSize)
+    #expect(ResourceAdvertisement.unpack(adv.pack()) != nil)
+}

@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import ReTiCA
 @testable import ReTiCATransport
 
 @Suite struct Bzip2Tests {
@@ -24,5 +25,17 @@ import Foundation
 
     @Test func decompressRejectsGarbage() {
         #expect(Bzip2.decompress(Data([0x00, 0x01, 0x02, 0x03]), expectedSize: 10) == nil)
+    }
+
+    // `expectedSize` is attacker-controlled; sizes above UInt32.max used to TRAP before this fix.
+    // A size above AUTO_COMPRESS_MAX_SIZE must return nil, never trap and never allocate.
+    @Test func decompressRejectsAbsurdExpectedSize() throws {
+        let compressed = try #require(Bzip2.compress(Data(repeating: 0x41, count: 1024)))
+        // Above UInt32.max: old code unconditionally trapped here.
+        #expect(Bzip2.decompress(compressed, expectedSize: Int(UInt32.max) + 1) == nil)
+        // Above AUTO_COMPRESS_MAX_SIZE ceiling: must also be nil.
+        #expect(Bzip2.decompress(compressed, expectedSize: Resource.autoCompressMaxSize + 1) == nil)
+        // A legitimate size still round-trips.
+        #expect(Bzip2.decompress(compressed, expectedSize: 1024)?.count == 1024)
     }
 }

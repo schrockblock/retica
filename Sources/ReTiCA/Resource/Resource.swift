@@ -9,6 +9,14 @@ public enum Resource {
     /// Map hashes that fit in one advertisement / HMU chunk: floor((Link.MDU 431 - 134) / 4) = 74.
     public static let hashmapMaxLen = 74
 
+    /// Reference `AUTO_COMPRESS_MAX_SIZE` (RNS/Resource.py:124) — the largest payload reference
+    /// will auto-compress, and the ceiling it enforces when decompressing (RNS/Resource.py:360).
+    public static let autoCompressMaxSize = 64 * 1024 * 1024
+    /// Reference rejects an advertisement declaring more than MAX_EFFICIENT_SIZE*3
+    /// (RNS/Resource.py:1366). An advertisement is attacker-controlled, so this bound is what
+    /// stops a declared size becoming an allocation.
+    public static let maxAdvertisedTransferSize = 1_048_575 * 3
+
     /// Resource hash: `full_hash(data ‖ r)` over the original (pre-encryption) data.
     public static func resourceHash(data: Data, randomHash: Data) -> Data {
         Crypto.fullHash(data + randomHash)

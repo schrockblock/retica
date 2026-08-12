@@ -51,6 +51,10 @@ public struct ResourceAdvertisement: Equatable {
               let h = bin("h"), let r = bin("r"), let o = bin("o"),
               let i = uint("i"), let l = uint("l"), let f = uint("f"), let m = bin("m")
         else { return nil }
+        // Mirror RNS/Resource.py:1366: reject advertisements declaring more than MAX_EFFICIENT_SIZE*3.
+        // An advertisement is attacker-controlled; this bound prevents a declared size from becoming
+        // an allocation via the decompression path.
+        guard t <= UInt64(Resource.maxAdvertisedTransferSize) else { return nil }
         let q: Data?
         switch dict["q"] {
         case .some(.bin(let x)): q = x

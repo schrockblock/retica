@@ -374,7 +374,13 @@ public struct ResourceTransfer {
                     }
                     let out: Data
                     if adv.isCompressed {
-                        guard let decompressed = Bzip2.decompress(payload, expectedSize: Int(adv.dataSize))
+                        // For a split resource, adv.dataSize is the whole object's uncompressed size,
+                        // not this segment's. Each segment is at most maxEfficientSize bytes uncompressed,
+                        // so cap to that. For a non-split resource adv.dataSize is already the segment size.
+                        let segmentExpectedSize = adv.isSplit
+                            ? min(Int(adv.dataSize), LinkSession.maxEfficientSize)
+                            : Int(adv.dataSize)
+                        guard let decompressed = Bzip2.decompress(payload, expectedSize: segmentExpectedSize)
                         else {
                             state.status = .failed
                             return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
