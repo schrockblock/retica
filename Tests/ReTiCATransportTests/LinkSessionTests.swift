@@ -341,16 +341,23 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 @Test @MainActor func corruptInboundDataIsIgnoredAndLinkStaysActive() async {
     // A corrupt (undecryptable) DATA packet must not surface .dataReceived or tear the link
     // down. Per RNS/Link.py:935, last_inbound IS stamped before the decryption attempt, so
-    // the inactivity timer IS re-armed — the exhaustivity must be .off to absorb that effect.
+    // the inactivity timer IS re-armed — the corrupt send must run under .off to absorb that
+    // persistent timer effect, which an exhaustive store rejects at teardown.
     let clock = testClock()
     let store = TestStore(initialState: activeState(role: .responder)) { LinkSession() }
         withDependencies: { $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing }
     store.exhaustivity = .off
     await store.send(.received(linkPacket(context: .none, payload: Data(repeating: 0xFF, count: 80))))
-    #expect(store.state.status == .active)   // no teardown, no dataReceived
-    await store.send(.close)
+    #expect(store.state.status == .active)   // no teardown
+    // "no .dataReceived" is the other half of the claim, and .off alone will NOT prove it:
+    // send() under .off(showSkippedAssertions: false) clears `receivedActions`
+    // (TestStore.swift:921-928), so a stray .dataReceived would vanish silently. Flip to .on
+    // BEFORE the close — the close cancels the inactivity timer, so nothing is left in flight
+    // and teardown is free to catch the stray.
+    store.exhaustivity = .on
+    await store.send(.close) { $0.status = .closed }
     _ = await captureTransmit(store)
-    await store.receive { if case .delegate(.closed) = $0 { return true }; return false }
+    await store.receive(.delegate(.closed(.destinationClosed)))
 }
 
 @Test @MainActor func initiatorCloseEmitsLinkCloseAndGoesClosed() async {
@@ -516,16 +523,84 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     #expect(Packet(raw: close)!.context == .linkClose)
 }
 
-@Test @MainActor func activeInitiatorEmitsKeepaliveEveryInterval() async {
+// The inactivity watchdog measures INBOUND silence, so nothing we do locally may disarm it —
+// least of all sending data, which is exactly when a hung peer most needs detecting.
+//
+// This is a regression probe for an eager `Effect.cancel` binding. `.cancel(id:)` performs its
+// cancellation at CONSTRUCTION (see the comment on `cancelAll()` in LinkSession.swift), so while
+// `cancelAll` was bound as a `let` at the top of the reducer it tore down the inactivity timer on
+// EVERY action — here, on the `.delegate(.transmit)` echo of our own `.send` — and the link then
+// never timed out at all. The hoisted re-arm in `.received` hides this from any inbound-driven
+// test, because inbound packets rebuild the timer they just destroyed; an OUTBOUND action is the
+// cheapest way to observe a cancel with no re-arm behind it.
+@Test @MainActor func outboundSendDoesNotDisarmTheInactivityTimer() async {
     let clock = TestClock()
-    let store = await activeInitiatorStore(owner: Identity(), clock: clock)   // now starts a keepalive timer
-    await clock.advance(by: .seconds(store.state.keepaliveInterval))
-    await store.receive(.keepaliveDeadline)
-    let ka = await captureTransmit(store)
-    let packet = Packet(raw: ka)!
-    #expect(packet.context == .keepalive)
-    #expect(packet.payload == Data([0xFF]))                    // unencrypted sentinel
-    #expect(packet.destinationHash == store.state.linkID)
+    let store = await activeResponderStore(clock: clock)
+    await store.send(.send(Data("payload".utf8)))
+    _ = await captureTransmit(store)
+    await clock.advance(by: .seconds(store.state.staleTime))
+    await store.receive(.inactivityDeadline)
+    _ = await captureTransmit(store)                          // LINKCLOSE teardown
+    await store.receive(.delegate(.closed(.timedOut)))
+    #expect(store.state.status == .closed)
+}
+
+// The same regression probe on the ESTABLISHMENT timer, where the consequence is worse: a hung
+// handshake that never fires its deadline never reaches .closed, and `LinkPlane` only reaps
+// elements on a delegate — so the session leaks and `routeLinkPacket` linear-scans it forever.
+// The stray packet is addressed to a DIFFERENT link, so it takes the earliest possible exit from
+// `.received`; if merely REACHING the reducer can cancel a timer, this is the cheapest proof.
+@Test @MainActor func strayPacketDoesNotDisarmTheEstablishmentTimer() async {
+    let clock = TestClock()
+    let store = TestStore(
+        initialState: LinkSession.State(initiatorTo: Identity(publicKey: Identity().publicKey)!,
+                                        destinationHash: Data(repeating: 0x55, count: 16),
+                                        interfaceID: InterfaceID("i"))
+    ) { LinkSession() } withDependencies: {
+        $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.establish)
+    _ = await captureTransmit(store)                          // the LINKREQUEST
+    let stray = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                       destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                       destinationHash: Data(repeating: 0x11, count: 16), transportId: nil,
+                       payload: Data([0x00]))
+    await store.send(.received(try! stray.packed()))          // not our link → ignored
+    await clock.advance(by: .seconds(store.state.establishmentTimeout))
+    await store.receive(.establishmentDeadline)
+    await store.receive(.delegate(.establishmentFailed(.timedOut)))
+    #expect(store.state.status == .closed)
+}
+
+@Test @MainActor func activeInitiatorEmitsKeepaliveEveryInterval() async {
+    // THREE consecutive intervals, not one. The keepalive effect is a `while true` loop, and a
+    // single tick fires even when the loop is torn down by the very `.keepaliveDeadline` it just
+    // emitted — which is precisely what the eager `cancelAll` binding did (see the comment on
+    // `cancelAll()` in LinkSession.swift). Only repetition proves the loop survives its own output.
+    let clock = TestClock()
+    let store = await activeInitiatorStore(owner: Identity(), clock: clock)   // arms the keepalive loop
+    let interval = store.state.keepaliveInterval
+    let linkID = store.state.linkID
+
+    for _ in 0..<3 {
+        await clock.advance(by: .seconds(interval))
+        await store.receive(.keepaliveDeadline)
+        let ka = await captureTransmit(store)
+        let packet = Packet(raw: ka)!
+        #expect(packet.context == .keepalive)
+        #expect(packet.payload == Data([0xFF]))                    // unencrypted sentinel
+        #expect(packet.destinationHash == linkID)
+        // A live peer answers 0xFE (RNS/Link.py:1125). Feeding it back is what keeps the
+        // INITIATOR's own inactivity timer (staleTime = 2 × interval) from tearing the link down
+        // at t=60, mid-test: an outbound keepalive is not proof of life, only the reply is.
+        let pong = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                          destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                          destinationHash: linkID, transportId: nil, payload: Data([0xFE]))
+        await store.send(.received(try! pong.packed()))
+        #expect(store.state.status == .active)
+    }
+
     // Clean up (cancels the keepalive + inactivity timers).
     await store.send(.close); _ = await captureTransmit(store)
     await store.receive(.delegate(.closed(.initiatorClosed)))
@@ -562,11 +637,13 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     //   (b) a responder whose inactivity is periodically reset stays .active;
     //   (c) once pings stop, the responder's inactivity expires → .closed(.timedOut).
     //
-    // TCA 1.26 limitation: `TestStore.receive { predicate }` takes a synchronous path when
-    // inFlightEffects is empty, which makes capturing a second consecutive keepalive transmit
-    // unreliable with a `while true` loop effect. To work around this, the test uses ONE
-    // verified keepalive cycle for the initiator and demonstrates "kept alive" via the
-    // responder's independent inactivity-reset mechanism.
+    // This test deliberately covers only ONE initiator keepalive cycle and then pivots to the
+    // responder's inactivity-reset mechanism, because its subject is the responder's teardown.
+    // A previous version of this comment blamed a "TCA 1.26 limitation" for the single cycle,
+    // claiming consecutive keepalives could not be captured from a `while true` loop effect.
+    // That was wrong: the loop really was dying after one tick, because the eager `cancelAll`
+    // binding cancelled it (see `cancelAll()` in LinkSession.swift). Repeated keepalives are
+    // now asserted directly by activeInitiatorEmitsKeepaliveEveryInterval.
 
     let owner = Identity()
     let initiatorClock = TestClock()
@@ -622,42 +699,59 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 // suppress keepalives while traffic flows (RNS/Link.py:749, :1125), so inbound data is the
 // only proof of life available during a transfer.
 //
-// Mutation coverage note: a direct timer-based RED/GREEN probe (advance just past staleTime
-// between two DATA packets and assert the timer did/didn't fire) is not achievable with TCA
-// 1.26's TestStore because the TestClock suspension registered by the inactivity timer
-// disappears after the DATA .send/.receive round-trip (the timer task is cancelled and
-// re-armed as a new Task; the new Task's clock.sleep() has not yet run when
-// checkSuspension() is polled, so no suspension is visible). The existing
-// silentActiveLinkTimesOutAfterStaleTime test covers the baseline: without any DATA, the
-// timer fires at staleTime. This test covers the complementary case: three DATA arrivals
-// spaced staleTime-1 apart keep the link alive and it remains .active at the end.
-// Mutation testing: reverting the fix (removing the hoisted inactivityTimer re-arm) causes
-// `store.state.status` to be `.active` at the assertion — the same value as FIXED code.
-// The observable difference is the number of in-flight inactivity timer effects (1 fresh
-// vs 1 aged) which TCA's TestStore doesn't expose. This limitation is documented in
-// task-1-report.md.
+// This probes the timer directly and therefore BITES both halves of the claim. A RESPONDER is
+// used deliberately: it arms no keepalive loop of its own, so the inactivity timer is the only
+// thing consuming the clock and every observation is unambiguous. `keepaliveInterval` is 30 s so
+// `staleTime` is 60 s, and every advance below is derived from that and nothing else:
+//
+//   t=59  (staleTime - 1)  DATA #1, comfortably inside the original t=60 deadline → re-arm to 119.
+//   t=61  (+2)             past the ORIGINAL deadline. DATA #2 is sent here under EXHAUSTIVE
+//                          exhaustivity, which is the actual probe: if the deadline had NOT moved,
+//                          the t=60 teardown is sitting unhandled in `receivedActions` and
+//                          `send` fails with "Must handle 3 received actions before sending an
+//                          action". Re-arms to 121.
+//   t=122 (+staleTime+1)   past the RE-ARMED deadline → `.inactivityDeadline` must arrive. This is
+//                          the half that proves the re-arm produced a LIVE timer rather than one
+//                          that something else immediately cancelled.
+//
+// Do NOT replace the exhaustivity probe with `#expect(store.state.status == .active)` after the
+// advance. Measured: `TestStore` does not fold an effect-emitted action into `store.state` until
+// something drains it, so immediately after `clock.advance(by: staleTime + 1)` on an untouched
+// active link the status still reads `.active` even though the teardown is already queued. Any
+// liveness assertion of that shape is vacuous.
 @Test @MainActor func inboundDataKeepsLinkAlive() async {
     let clock = testClock()
-    let owner = Identity()
-    let store = await activeInitiatorStore(owner: owner, clock: clock)
+    let store = await activeResponderStore(clock: clock)
+    let stale = store.state.staleTime
     let key = store.state.sessionKey
     let linkID = store.state.linkID
-
-    for i in 0..<3 {
-        await clock.advance(by: .seconds(store.state.staleTime - 1))
-        let cipher = Link.encrypt(Data([UInt8(i)]), sessionKey: key)
-        let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
-                            destinationType: .link, context: .none, contextFlag: false, hops: 0,
-                            destinationHash: linkID, transportId: nil, payload: cipher)
-        await store.send(.received(try! packet.packed()))
-        await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
+    func dataPacket(_ body: String) -> Data {
+        let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                       destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                       destinationHash: linkID, transportId: nil,
+                       payload: Link.encrypt(Data(body.utf8), sessionKey: key))
+        return try! p.packed()
     }
 
-    #expect(store.state.status == .active)
+    // t = staleTime - 1 — inside the original deadline.
+    await clock.advance(by: .seconds(stale - 1))
+    await store.send(.received(dataPacket("one")))
+    await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
 
-    await store.send(.close)
-    _ = await captureTransmit(store)
-    await store.receive { if case .delegate(.closed) = $0 { return true }; return false }
+    // t = staleTime + 1 — past the ORIGINAL deadline. Exhaustive from here: the next `send` is the
+    // assertion that no teardown happened at t=60. (`lastInbound` is unchanged — the `date`
+    // dependency is a constant — so neither `send` needs a state-mutation closure.)
+    store.exhaustivity = .on
+    await clock.advance(by: .seconds(2))
+    await store.send(.received(dataPacket("two")))
+    await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
+
+    // t = 2*staleTime + 2 — past the RE-ARMED deadline. Now the timer must actually fire.
+    await clock.advance(by: .seconds(stale + 1))
+    await store.receive(.inactivityDeadline) { $0.status = .closed }
+    let close = await captureTransmit(store)
+    await store.receive(.delegate(.closed(.timedOut)))
+    #expect(Packet(raw: close)!.context == .linkClose)
 }
 
 // MARK: - GC: close clears pending requests

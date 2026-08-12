@@ -195,9 +195,34 @@ public struct LinkSession {
                 .run { send in while true { try await clock.sleep(for: .seconds(t)); await send(.keepaliveDeadline) } }
                     .cancellable(id: CancelID.keepalive, cancelInFlight: true)
             }
-            let cancelAll = Effect<Action>.merge(.cancel(id: CancelID.establishment),
-                                                 .cancel(id: CancelID.keepalive),
-                                                 .cancel(id: CancelID.inactivity))
+            // MUST be a function, NOT a `let`. `Effect.cancel(id:)` is EAGER: it is built with
+            // `.publisher { ... }`, whose closure runs at CONSTRUCTION
+            // (ComposableArchitecture/Effects/Publisher.swift:8-10 —
+            // `Self(operation: .publisher(createPublisher().eraseToAnyPublisher()))`), and that
+            // closure performs `_cancellationCancellables.withValue { $0.cancel(id:path:) }`
+            // (ComposableArchitecture/Effects/Cancellation.swift:106-117). Swift evaluates all
+            // three `.merge` arguments eagerly, so binding this as a `let` at the top of the
+            // `Reduce` closure cancelled establishment + keepalive + inactivity on EVERY action,
+            // whether or not the branch returned it. Three consequences, each reproduced by
+            // re-introducing the `let` and watching a named test go red:
+            //   • the keepalive `while true` loop was cancelled by the very `.keepaliveDeadline`
+            //     it had just emitted, so an initiator sent exactly ONE keepalive per link
+            //     (activeInitiatorEmitsKeepaliveEveryInterval);
+            //   • any action arriving mid-handshake killed the establishment timer, so the
+            //     session hung in `.pending` with no deadline — never `.closed`, so never reaped
+            //     (strayPacketDoesNotDisarmTheEstablishmentTimer);
+            //   • any action with no re-arm behind it killed the inactivity timer — notably the
+            //     `.delegate(.transmit)` echo of our own `.send` — so links never timed out
+            //     (outboundSendDoesNotDisarmTheInactivityTimer).
+            // Note what was NOT broken, since it misleads: inbound packets kept working, because
+            // the re-arm hoisted into `.received` re-registers the timer the same action had just
+            // destroyed. Only an action that cancels WITHOUT re-arming is observable.
+            // Do NOT "simplify" this back to a stored property.
+            func cancelAll() -> Effect<Action> {
+                .merge(.cancel(id: CancelID.establishment),
+                       .cancel(id: CancelID.keepalive),
+                       .cancel(id: CancelID.inactivity))
+            }
             func cancelPending(_ state: inout State) -> Effect<Action> {
                 let cancels = state.pendingRequests.map { Effect<Action>.cancel(id: CancelID.request($0)) }
                 state.pendingRequests.removeAll()
@@ -389,7 +414,7 @@ public struct LinkSession {
                     else { return .none }
                     state.status = .closed
                     let reason: CloseReason = state.role == .initiator ? .destinationClosed : .initiatorClosed
-                    return .merge(.send(.delegate(.closed(reason))), cancelAll, cancelPending(&state))
+                    return .merge(.send(.delegate(.closed(reason))), cancelAll(), cancelPending(&state))
 
                 case (.responder, .active, .data, .keepalive):
                     state.lastInbound = now
@@ -401,7 +426,9 @@ public struct LinkSession {
                     return .merge(effects)
 
                 case (.initiator, .active, .data, .keepalive):
-                    guard packet.payload != Data([LinkSession.keepaliveByte]) else { return .none } // ignore own 0xFF loopback
+                    // Our own 0xFF loopback is already dropped by the `keepaliveByte` early return
+                    // at the top of `.received`, before `dispatch` is entered at all, so anything
+                    // reaching here is the peer's 0xFE reply. One copy of that policy, not two.
                     state.lastInbound = now
                     return inactivityTimer(state.staleTime)                                          // 0xFE reply resets inactivity
 
@@ -615,9 +642,9 @@ public struct LinkSession {
                 let closedAction = Action.delegate(.closed(reason))
                 let pending = cancelPending(&state)
                 guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
-                    return .merge(.send(closedAction), cancelAll, pending)
+                    return .merge(.send(closedAction), cancelAll(), pending)
                 }
-                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll, pending)
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll(), pending)
 
             case .establishmentDeadline:
                 guard state.status == .pending || state.status == .handshake else { return .none }
@@ -640,9 +667,9 @@ public struct LinkSession {
                 // WE serve and reporting it as unreachable would misinform the delivery layer.
                 // The point here is narrower: the timeout path should not ADD another such instance.
                 if state.role == .initiator {
-                    return .merge(.send(.delegate(.establishmentFailed(.timedOut))), cancelAll, cancelPending(&state))
+                    return .merge(.send(.delegate(.establishmentFailed(.timedOut))), cancelAll(), cancelPending(&state))
                 }
-                return .merge(.send(.delegate(.closed(.timedOut))), cancelAll, cancelPending(&state))
+                return .merge(.send(.delegate(.closed(.timedOut))), cancelAll(), cancelPending(&state))
 
             case .keepaliveDeadline:
                 guard state.status == .active, state.role == .initiator else { return .none }
@@ -657,9 +684,9 @@ public struct LinkSession {
                 let closedAction = Action.delegate(.closed(.timedOut))
                 let pending = cancelPending(&state)
                 guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
-                    return .merge(.send(closedAction), cancelAll, pending)
+                    return .merge(.send(closedAction), cancelAll(), pending)
                 }
-                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll, pending)
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll(), pending)
 
             case let .requestDeadline(requestID):
                 guard state.pendingRequests.contains(requestID) else { return .none }
