@@ -394,6 +394,19 @@ oversized packet then dies silently at `Packet.packed()`'s guard (`Packet.swift:
   receive. Inbound metadata resources are delivered with the prefix still attached — silently, since
   the hash covers it too. `Link.py:897-912` uses `has_metadata` as the discriminator for file
   responses, so rncp / Nomad Network file downloads fail to msgpack-decode and are dropped.
+- **ReTiCA cannot send a request or response larger than ~3 MB to a reference peer.** Found
+  2026-08-12 while fixing a gate this analysis's own hardening plan introduced. Reference splits
+  **every** resource in `Resource.__init__` (`Resource.py:274-310`, reached from `Link.py:506`,
+  `:846`, `:852`), so its receiver can safely enforce `adv.t > MAX_EFFICIENT_SIZE*3`
+  (`Resource.py:1366`). ReTiCA does not split: `LinkSession.sendRequest` and `sendResponse` have
+  only two branches — inline under `requestMDU`, else **one un-split** `ResourceTransfer`. The
+  `maxEfficientSize` splitting loop is reachable only via `.sendResource`. A 4 MiB incompressible
+  response provably yields `isSplit == false` and `t > 3_145_725`, and the real propagation-node
+  chain (`deliverMessages` → `sendResponseOverLink` → `LinkPlane` → `sendResponse`) ships an
+  entire mailbox — default limit 32 MiB — in a single response. A reference receiver rejects that
+  advertisement outright. Raising our own gate (done, `302becf`) fixes ReTiCA↔ReTiCA only; the
+  interop half closes only when request/response splitting lands. **Tracked as out-of-scope in
+  `2026-08-12-wire-input-trap-sweep.md`.**
 - **No proof recovery via cache request.** `PacketContext.cacheRequest = 0x08` is declared
   (`PacketConstants.swift:25`) and never handled. A reference sender that loses a `RESOURCE_PRF`
   issues a `CACHE_REQUEST` (`Resource.py:655-661`); ReTiCA ignores it, so the sender burns all 3
