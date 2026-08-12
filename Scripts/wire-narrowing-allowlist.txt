@@ -23,7 +23,6 @@
 # ---------------------------------------------------------------------------
 # OPEN — confirmed traps, owned by the wire-input-trap-sweep plan. Do not bless.
 # ---------------------------------------------------------------------------
-Sources/ReTiCA/Support/MsgPack.swift | 1 | Task 2 FIXED (reject). parseMap now uses Int(exactly: key) and returns nil if key > Int.max. Every IntPair.key produced by the decoder is therefore in 0...Int.max; a hostile host could still create a negative IntPair.key directly, but that is not wire-reachable. Remote-abort closed. | UInt64(p.key)
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — wire UInt64 narrowed inside the validity predicate itself. A 21-byte app-data blob aborts. | Int(timebase)
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(transfer)
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(sync)
@@ -100,6 +99,7 @@ Sources/ReTiCATransport/ResourceTransfer.swift | 1 | `chunk = (li + 1) / Resourc
 # The guard is named and its position stated for every entry here, because the
 # predecessor's ledger recorded one site as guarded by a check on the NEXT line.
 # ---------------------------------------------------------------------------
+Sources/ReTiCA/Support/MsgPack.swift | 1 | encodeIntMap :71 — Task 2 FIXED (eb244c3) by rejection at the DECODER. parseMap now uses Int(exactly: key) and returns nil for key > Int.max, so every IntPair.key the decoder produces is in 0...Int.max and this conversion cannot see a negative. REMOTE GUARD: the guard is at :146, not on this line, so per the "remote guards are the fragile class" note, deleting it would not change this expression and the gate would NOT re-flag this site. A hostile host can still construct a negative IntPair.key directly; that is a programming error, not wire-reachable. | UInt64(p.key)
 Sources/ReTiCA/Support/MsgPack.swift | 2 | encodeUInt :39 and :40 — each sits in the consequent of `if u <= 0x7F` / `if u <= 0xFF` on the same line. The condition evaluates first. | UInt8(u)
 Sources/ReTiCA/Support/MsgPack.swift | 1 | encodeUInt :41 — consequent of `if u <= 0xFFFF` on the same line. | UInt16(u)
 Sources/ReTiCA/Support/MsgPack.swift | 1 | encodeUInt :42 — consequent of `if u <= 0xFFFF_FFFF` on the same line. | UInt32(u)

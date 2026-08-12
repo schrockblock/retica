@@ -92,6 +92,21 @@ import Foundation
         // This would trap for a negative key; Int.max is fine.
         #expect(unpacked.validateSignature(source: source) == true)
     }
+
+    // The stamped branch. With a 5th payload element present, unpack takes the
+    // LXMessage.swift:108 path — payloadBytes re-packs payload[:4] to recompute the hash.
+    // That is the third and last site that re-encodes decoded fields through
+    // encodeIntMap → UInt64(p.key) at :71, so exercise it explicitly.
+    let stampBytes = Data(repeating: 0xAB, count: 32)
+    let unpackedStamped = LXMessage.unpack(msg.withStamp(stampBytes).packed)
+    #expect(unpackedStamped != nil)
+    if let unpackedStamped {
+        #expect(unpackedStamped.stamp == stampBytes)
+        #expect(unpackedStamped.fields.first?.key == Int.max)
+        // The hash comes out of the :108 re-encode path and excludes the stamp, so it must
+        // equal the unstamped message's hash — proof that :108 ran and did not trap.
+        #expect(unpackedStamped.hash == msg.hash)
+    }
 }
 
 @Test func opportunisticPayloadStripsLeadingDestinationHash() {

@@ -31,6 +31,42 @@ import Foundation
     }
 }
 
+/// The realistic attack shape. `ResourceAdvertisement.unpack` (ResourceAdvertisement.swift:45)
+/// calls `MsgPack.decodeValue` FIRST and only then checks `case let .map(pairs)?` — so a hostile
+/// `intMap` nested anywhere inside an otherwise well-formed advertisement is walked by the parser
+/// before any shape validation runs. Validating the top-level shape does not protect the parse.
+///
+/// The guard at MsgPack.swift:146 lives inside `parseMap`, and every path to `parseMap` goes
+/// through `parse`, so it fires at any depth. These tests prove that rather than arguing it.
+@Test func msgPackIntMapAboveIntMaxIsRejectedWhenNestedInArray() {
+    // fixarray1 [ fixmap1 { uint64(UInt64.max): 0 } ]
+    let payload = Data([0x91, 0x81, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
+    #expect(MsgPack.decodeValue(payload) == nil,
+            "a hostile intMap key nested in an array must be rejected, not trap")
+}
+
+/// Deeper still — nested two levels down, to show the guard is not depth-one only.
+@Test func msgPackIntMapAboveIntMaxIsRejectedWhenDeeplyNested() {
+    // fixarray1 [ fixarray1 [ fixmap1 { uint64(UInt64.max): 0 } ] ]
+    let payload = Data([0x91, 0x91, 0x81, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
+    #expect(MsgPack.decodeValue(payload) == nil,
+            "depth does not bypass the key guard")
+}
+
+/// Advertisement-shaped: a well-formed string-keyed outer map (what `ResourceAdvertisement.unpack`
+/// expects) whose value carries the hostile `intMap`. Driven through both `MsgPack.decodeValue`
+/// and `ResourceAdvertisement.unpack` — the latter is the actual unauthenticated entry point, and
+/// it must return nil rather than abort.
+@Test func advertisementShapedPayloadWithHostileNestedIntMapIsRejected() {
+    // fixmap1 { "t": fixmap1 { uint64(UInt64.max): 0 } }
+    let hostileIntMap: [UInt8] = [0x81, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]
+    let payload = Data([0x81, 0xA1, 0x74] + hostileIntMap)
+    #expect(MsgPack.decodeValue(payload) == nil,
+            "the parser must reject before ResourceAdvertisement's shape check ever runs")
+    #expect(ResourceAdvertisement.unpack(payload) == nil,
+            "the unauthenticated advertisement entry point must not abort")
+}
+
 @Test func msgPackIntMapRoundTrips() throws {
     let v = MsgPackValue.intMap([.init(0x0C, .bin(Data([0xAA, 0xBB]))), .init(0x0F, .uint(2))])
     let encoded = MsgPack.encode(v)
