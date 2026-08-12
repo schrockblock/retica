@@ -68,6 +68,21 @@ public struct PropagationStore: Equatable {
             let tid: Data
             let destData: Data
             if minStampCost > 0 {
+                // Cheap pre-filter: compute transient_id without PoW and reject duplicates before
+                // spending any effort. transient_id = full_hash(stampless_core), where the core is
+                // lxmfData with the trailing 32-byte stamp stripped (matching validatePnStamp).
+                // Entries too short to carry a stamp (≤ stampSize bytes) are skipped here — they
+                // would be rejected by validatePnStamp regardless.
+                //
+                // NOTE: this ordering defect (expensive PoW before cheap dedup) is NOT detectable
+                // by Scripts/check-wire-narrowing.swift — it is a work-ordering issue, not a
+                // narrowing conversion. PropagationStoreTests.duplicateIngestBypasesPoW is the
+                // sole regression guard. See docs/wire-narrowing-inventory.md § Task 5.
+                guard lxmfData.count > LXStamper.stampSize else { continue }
+                let preflightCore = Data(lxmfData.dropLast(LXStamper.stampSize))
+                let preflightTid = LXMFPropagation.transientId(lxmfData: preflightCore)
+                if stored[preflightTid] != nil { continue }   // duplicate: skip before PoW
+
                 // Require a valid PN stamp at or above minStampCost. validatePnStamp strips the trailing
                 // 32-byte stamp and returns transient_id = full_hash(stampless_entry) — the canonical dedup
                 // key matching the sender (LXMFPropagation.pack) and peer re-sync. Entries with an absent

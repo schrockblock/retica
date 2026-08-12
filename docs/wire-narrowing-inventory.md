@@ -102,8 +102,8 @@ reading each site:
 | Site | Task | Actual shape | Conversions present? |
 |---|---|---|---|
 | `MsgPack.swift:92/128/153` | 3 | Unbounded parse recursion — **FIXED** (`maxParseDepth = 32`, depth threaded through `parse`/`parseMap`/`parseArray`). Gate does NOT cover it; `MsgPackDepthTests` is the sole regression guard. | none |
-| `Packet.swift:69-100` | 4 | Missing ingress MTU ceiling — **FIXED** (`guard raw.count <= Packet.mtu` added at top of `init?(raw:)`). Reference RNS `Packet.unpack` has no equivalent check (interface-layer `check_frame_len` is the primary bound); this is defence in depth covering call sites that bypass the HDLC deframer. IFAC is stripped upstream in `Transport.received` before `Packet.init?(raw:)` sees bytes, so the 500-byte post-strip bound is correct for all interfaces. Commit: `8b867d6`. | none |
-| `PropagationStore.swift:75` | 5 | Expensive PoW validation ordered before cheap structural validation | none |
+| `Packet.swift:69-100` | 4 | Missing ingress MTU ceiling — **FIXED** (`guard raw.count <= Packet.mtu` added at top of `init?(raw:)`). Reference RNS `Packet.unpack` has no equivalent check (interface-layer `check_frame_len` is the primary bound), so lacking one was not a divergence. The guard is load-bearing at the primary inbound decode `Transport.swift:339`, where the deframers admit 262144 (TCP) / 1196 (BLE) — far above the 500-byte MTU. IFAC is stripped upstream in `Transport.received` before `Packet.init?(raw:)` sees bytes, so the 500-byte post-strip bound is correct for all interfaces. Commit: `e64f0e0`. | none |
+| `PropagationStore.swift:ingest` | 5 | Expensive PoW validation ordered before cheap dedup check — **FIXED**: cheap `transient_id` dedup now runs before `LXStamper.validatePnStamp`. Gate does NOT cover it; `PropagationStoreTests.duplicateIngestBypasesPoW` is the sole regression guard. See commit for SHA. | none |
 
 Detecting these needs a different instrument — a fuzz/property harness over the decode entry
 points — which is out of scope for this plan. What the gate *does* give Tasks 3-5 is the
