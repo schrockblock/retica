@@ -49,23 +49,50 @@ public enum HDLC {
 }
 
 /// Streaming HDLC deframer. Accumulates bytes and yields complete, unescaped frames longer
-/// than `minFrameSize`, mirroring the reference read loop (shared-FLAG framing).
+/// than `minFrameSize` and no larger than `maxFrameSize`, mirroring the reference read loop
+/// (shared-FLAG framing).
+///
+/// The three buffer-management guards mirror `TCPInterface.py:337, 408, 411`:
+/// - No FLAG present → clear the buffer entirely (`:411`).
+/// - Opening FLAG but no closing FLAG and buffer exceeds `maxFrameSize * 2` → clear (`:408`).
+/// - Assembled frame longer than `maxFrameSize` → drop without delivering (`:337`).
+///
+/// `maxFrameSize` defaults to 262 144, matching `InterfaceProfile.tcp.hwMTU`. This is a runaway
+/// guard, not a policy: a caller on a smaller medium (e.g. BLE at 1 196 B) should pass its own.
 public struct HDLCDeframer: Equatable {
     private var buffer: [UInt8] = []
     private let minFrameSize: Int
+    private let maxFrameSize: Int
 
-    public init(minFrameSize: Int = HDLC.minFrameSize) {
+    /// Exposed for bound tests only — do not use this in production code.
+    public var bufferedByteCount: Int { buffer.count }
+
+    public init(minFrameSize: Int = HDLC.minFrameSize, maxFrameSize: Int = 262_144) {
         self.minFrameSize = minFrameSize
+        self.maxFrameSize = maxFrameSize
     }
 
     public mutating func ingest(_ bytes: Data) -> [Data] {
         buffer.append(contentsOf: bytes)
         var frames: [Data] = []
         while true {
-            guard let start = buffer.firstIndex(of: HDLC.flag) else { break }
-            guard let end = buffer[(start + 1)...].firstIndex(of: HDLC.flag) else { break }
+            // No FLAG anywhere: clear the buffer entirely (TCPInterface.py:411).
+            guard let start = buffer.firstIndex(of: HDLC.flag) else {
+                buffer = []
+                break
+            }
+            // Opening FLAG found but no closing FLAG yet.
+            guard let end = buffer[(start + 1)...].firstIndex(of: HDLC.flag) else {
+                // If the buffer has grown beyond the runaway threshold, discard it
+                // (TCPInterface.py:408). The stream is unrecoverable at this point.
+                if buffer.count > maxFrameSize * 2 { buffer = [] }
+                break
+            }
             let frame = HDLC.unescape(Data(buffer[(start + 1)..<end]))
-            if frame.count > minFrameSize { frames.append(frame) }
+            // Reject frames outside [minFrameSize+1 … maxFrameSize] (TCPInterface.py:337).
+            if frame.count > minFrameSize && frame.count <= maxFrameSize {
+                frames.append(frame)
+            }
             buffer = Array(buffer[end...]) // keep the closing FLAG as the next opening FLAG
         }
         return frames

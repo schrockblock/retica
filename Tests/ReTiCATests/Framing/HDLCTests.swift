@@ -62,3 +62,41 @@ import Foundation
     var d3 = HDLCDeframer()
     #expect(d3.ingest(HDLC.frame(ok)) == [ok])
 }
+
+// A peer that never sends a FLAG must not grow the deframer without bound.
+@Test func deframerDiscardsRunawayInputWithNoFlag() {
+    var d = HDLCDeframer(maxFrameSize: 1024)
+    for _ in 0..<64 {
+        #expect(d.ingest(Data(repeating: 0x41, count: 1024)).isEmpty)
+    }
+    #expect(d.bufferedByteCount <= 1024 * 2)
+}
+
+// An opening FLAG with no closing FLAG must also be bounded.
+@Test func deframerDiscardsUnterminatedFrame() {
+    var d = HDLCDeframer(maxFrameSize: 1024)
+    _ = d.ingest(Data([HDLC.flag]))
+    for _ in 0..<64 {
+        #expect(d.ingest(Data(repeating: 0x41, count: 1024)).isEmpty)
+    }
+    #expect(d.bufferedByteCount <= 1024 * 2)
+}
+
+// A legitimate frame still round-trips after a runaway reset.
+@Test func deframerRecoversAfterDiscard() {
+    var d = HDLCDeframer(maxFrameSize: 1024)
+    _ = d.ingest(Data(repeating: 0x41, count: 4096))
+    let payload = Data(repeating: 0x5A, count: 40)
+    #expect(d.ingest(HDLC.frame(payload)) == [payload])
+}
+
+// A terminated frame that exceeds maxFrameSize is rejected (mirrors check_frame_len > HW_MTU).
+@Test func deframerRejectsOversizedFrame() {
+    var d = HDLCDeframer(minFrameSize: 19, maxFrameSize: 100)
+    let big = Data(repeating: 0xBB, count: 101)
+    #expect(d.ingest(HDLC.frame(big)).isEmpty)
+    // A frame at exactly maxFrameSize is accepted.
+    let ok = Data(repeating: 0xCC, count: 100)
+    var d2 = HDLCDeframer(minFrameSize: 19, maxFrameSize: 100)
+    #expect(d2.ingest(HDLC.frame(ok)) == [ok])
+}
