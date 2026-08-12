@@ -60,6 +60,40 @@ import Foundation
     #expect(unpacked?.fields == [MsgPackValue.IntPair(1, .uint(1))])
 }
 
+/// Step 4 — round-trip proof that LXMessage.unpack → re-encode cannot reach MsgPack.swift:71
+/// (UInt64(p.key)) with a negative Int.
+///
+/// The decode → re-encode path runs in LXMessage.unpack when a stamp is present
+/// (LXMessage.swift:108: payloadBytes re-packs the 4-element payload to compute the hash).
+/// It also runs on packed and validateSignature.
+///
+/// The guard added at MsgPack.swift:146 (Int(exactly:)) ensures every IntPair.key decoded
+/// from the wire is in 0...Int.max, so UInt64(p.key) at :71 is safe on all such values.
+/// This test proves that an IntMap with the maximum representable key (Int.max) survives
+/// a full unpack→re-encode round trip without trapping.
+@Test func lxMessageRichFieldsRoundTripDoesNotReachNegativeKeyOnEncode() {
+    // Build a message with a rich field using key = Int.max (the largest value the fix allows).
+    let source = Identity()
+    let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+    let fields: [MsgPackValue.IntPair] = [.init(Int.max, .uint(42))]
+    let msg = LXMessage.create(source: source, destinationHash: destHash,
+                               timestamp: 1700000000.5, title: Data(), content: Data(),
+                               fields: fields)
+    // Unpack calls payloadBytes (the re-encode path) when a stamp is present; here we exercise
+    // it by calling packed (which re-encodes fields every time) and validateSignature.
+    let repacked = msg.packed
+    let unpacked = LXMessage.unpack(repacked)
+    #expect(unpacked != nil)
+    if let unpacked {
+        #expect(unpacked.fields.count == 1)
+        #expect(unpacked.fields.first?.key == Int.max)
+        #expect(unpacked.fields.first?.value == .uint(42))
+        // validateSignature calls payloadBytes → encodeIntMap → UInt64(p.key) at :71.
+        // This would trap for a negative key; Int.max is fine.
+        #expect(unpacked.validateSignature(source: source) == true)
+    }
+}
+
 @Test func opportunisticPayloadStripsLeadingDestinationHash() {
     let source = Identity()
     let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)

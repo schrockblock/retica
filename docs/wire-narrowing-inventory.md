@@ -18,9 +18,9 @@ The durable key is *file + expression text*, which is what the allowlist matches
 
 | | |
 |---|---|
-| Conversions found in `Sources/` | **118** across **81** distinct file+expression groups, in 56 files |
-| Reviewed safe | 108 findings / 71 groups |
-| **Known-open (confirmed traps)** | **10 findings / 10 groups** — Tasks 2, 6, 7, 8 |
+| Conversions found in `Sources/` | **117** across **80** distinct file+expression groups, in 56 files |
+| Reviewed safe | 109 findings / 72 groups |
+| **Known-open (confirmed traps)** | **8 findings / 8 groups** — Tasks 6, 7, 8 |
 | Defects in this plan that are *not* conversions | 3 — Tasks 3, 4, 5 (see [Not detectable by this check](#not-detectable-by-this-check)) |
 
 Run the gate:
@@ -41,20 +41,15 @@ Tick a box when the owning task lands, **and delete the matching `OPEN` line fro
 `Scripts/wire-narrowing-allowlist.txt`**. The gate's stale-entry check will tell you if you
 forget one; `--fail-on-open` will tell you if any remain.
 
-- [ ] **`Sources/ReTiCA/Support/MsgPack.swift:146`** — `Int(key)` — **Task 2**
-  Source: `key` is the raw `UInt64` of a msgpack map key, straight off the wire.
-  Guarded: **no.** Eleven attacker bytes abort the process. Reachable from ~15 decode sites
-  including unauthenticated opportunistic LXMF. The `.map`/`.intMap` check at
-  `ResourceAdvertisement.swift:45` runs *after* `decodeValue` has walked the whole tree, so a
-  hostile `intMap` nested anywhere inside an otherwise well-formed advertisement reaches here.
+- [x] **`Sources/ReTiCA/Support/MsgPack.swift:146`** — `Int(key)` — **Task 2 FIXED**
+  Fixed by rejection: `Int(exactly: key)` with `return nil` if the key exceeds `Int.max`.
+  Commit: TBD (recorded after commit).
 
-- [ ] **`Sources/ReTiCA/Support/MsgPack.swift:71`** — `UInt64(p.key)` — **Task 2 constraint**
-  Source: `MsgPackValue.IntPair.key`, an `Int`. **New finding — see below.**
-  Guarded: **no**, but not currently reachable from the wire, because `:146` traps first.
-  It becomes reachable the moment Task 2 fixes `:146` by *truncating*: a wire key ≥ 2^63 would
-  become a negative `Int`, and `LXMessage.unpack` re-encodes decoded fields at
-  `LXMessage.swift:108` (and again at `:119` when validating the signature), hitting this line.
-  **Task 2 must reject or clamp, never truncate**, or it moves the crash instead of fixing it.
+- [x] **`Sources/ReTiCA/Support/MsgPack.swift:71`** — `UInt64(p.key)` — **Task 2 constraint CLOSED**
+  This site is now safe: the `Int(exactly:)` guard at decode time guarantees every wire-decoded
+  `IntPair.key` is in `0...Int.max`. A hostile host could construct a negative `IntPair.key`
+  directly, but that is not wire-reachable — same category as `PNAnnounce.packed`. Allowlist
+  entry updated from OPEN to reviewed-safe.
 
 - [ ] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:56`** — `Int(timebase)` — **Task 7**
 - [ ] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:57`** — `Int(transfer)` — **Task 7**

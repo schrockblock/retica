@@ -23,8 +23,7 @@
 # ---------------------------------------------------------------------------
 # OPEN — confirmed traps, owned by the wire-input-trap-sweep plan. Do not bless.
 # ---------------------------------------------------------------------------
-Sources/ReTiCA/Support/MsgPack.swift | 1 | OPEN Task 2 — wire UInt64 msgpack map key narrowed to Int with no bound. Eleven attacker bytes abort the process; reachable from unauthenticated opportunistic LXMF. | Int(key)
-Sources/ReTiCA/Support/MsgPack.swift | 1 | OPEN Task 2 constraint — Int -> UInt64 on an IntPair key traps for a NEGATIVE key. Unreachable from the wire today only because Int(key) traps first. If Task 2 fixes :146 by TRUNCATING, a wire key >= 2^63 becomes negative and LXMessage.unpack's re-encode (LXMessage.swift:108) trips this instead. Task 2 must reject or clamp, never truncate. | UInt64(p.key)
+Sources/ReTiCA/Support/MsgPack.swift | 1 | Task 2 FIXED (reject). parseMap now uses Int(exactly: key) and returns nil if key > Int.max. Every IntPair.key produced by the decoder is therefore in 0...Int.max; a hostile host could still create a negative IntPair.key directly, but that is not wire-reachable. Remote-abort closed. | UInt64(p.key)
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — wire UInt64 narrowed inside the validity predicate itself. A 21-byte app-data blob aborts. | Int(timebase)
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(transfer)
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(sync)
