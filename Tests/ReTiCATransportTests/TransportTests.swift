@@ -451,7 +451,8 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000,
     store.exhaustivity = .off
     await store.send(.received(InterfaceID("i0"), raw))
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
-    #expect(store.state.announceCache[destHash] == expectedPayload)
+    #expect(store.state.announceCache[destHash]?.payload == expectedPayload)
+    #expect(store.state.announceCache[destHash]?.contextFlag == false)   // this announce has no ratchet
 }
 
 @Test @MainActor func relayRebroadcastsAnnounceWithHeader2AndOurTransportId() async {
@@ -2679,6 +2680,63 @@ private func makeRelayPathRequest(for destHash: Data, requestorTransportId: Data
     #expect(resp.destinationHash == destHash)
     #expect(resp.hops == 3)                       // learned hops (2) + 1
     #expect(resp.payload == cachedPayload)        // verbatim → signature intact
+}
+
+/// A HEADER_1 announce that CARRIES a ratchet: the 32 ratchet bytes sit in the payload and the
+/// context flag is set to say so.
+private func makeRatchetAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000,
+                                       ratchet: Data) -> (Data, Data) {
+    let identity = Identity()
+    let nameHash = Destination.nameHash(appName: "relay", aspects: ["svc"])
+    let destHash = Destination.hash(identityHash: identity.hash, appName: "relay", aspects: ["svc"])
+    let randomHash = Announce.randomHash(now: emitted, randomPrefix: Data(repeating: 0xA5, count: 5))
+    let payload = Announce.buildPayload(identity: identity, destinationHash: destHash,
+                                        nameHash: nameHash, randomHash: randomHash, ratchet: ratchet)
+    let packet = Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: true, hops: hops,
+                        destinationHash: destHash, transportId: nil, payload: payload)
+    return (try! packet.packed(), destHash)
+}
+
+/// The relay replays the cached announce's BYTES verbatim, so the path response must carry the
+/// ORIGINAL announce's context flag — the flag is a field-layout declaration about those bytes,
+/// not a statement about what we parsed out of them. A low-order ratchet is dropped at parse
+/// (`learned[dest].ratchet == nil`) while its 32 bytes stay in the payload; deriving the flag from
+/// parsed state emits contextFlag=false over a ratchet-carrying payload, and the receiver then
+/// parses with ratchetLen=0 and misaligns the signature and app-data fields.
+@Test @MainActor func relayPathResponseCarriesCachedAnnouncesContextFlag() async {
+    let relay = Identity()
+    // Canonical low-order X25519 point: CryptoKit constructs it but cannot agree with it, so
+    // Announce.parse keeps the announce and drops the ratchet.
+    let lowOrder = Data(repeating: 0x00, count: 32)
+    let (announceRaw, destHash) = makeRatchetAnnouncePacket(hops: 2, ratchet: lowOrder)
+    let cachedPayload = Packet(raw: announceRaw)!.payload
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("i0")))
+    await store.send(.setTransportIdentity(relay))
+    await store.send(.received(InterfaceID("i0"), announceRaw))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    // Precondition: the ratchet was dropped, so parsed state disagrees with the cached bytes.
+    #expect(store.state.learned[destHash]?.ratchet == nil)
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("i0"), makePathRequest(for: destHash)))
+    await store.receive { action in
+        if case let .delegate(.transmit(ifID, raw)) = action, ifID == InterfaceID("i0") {
+            captured.setValue(raw); return true
+        }
+        return false
+    }
+    let resp = Packet(raw: captured.value!)!
+    #expect(resp.payload == cachedPayload)        // verbatim bytes, ratchet included
+    #expect(resp.contextFlag == true)             // ... so the flag must say the ratchet is there
+    // And the response must actually re-parse: with the wrong flag the signature field is read
+    // 32 bytes early and validation fails.
+    #expect(Announce.parse(payload: resp.payload, destinationHash: destHash,
+                           contextFlagSet: resp.contextFlag) != nil)
 }
 
 /// A non-relay (transportIdentity == nil) never answers from cache — that is the relay-only path.

@@ -45,10 +45,30 @@ public struct Transport {
         /// (RNS Transport.py:1824 `not random_blob in random_blobs`). Bounded to
         /// `announceBlobRingSize` per destination (RNS MAX_RANDOM_BLOBS).
         public var announceBlobs: [Data: RingSet] = [:]
-        /// destHash → the announce payload (carries the destination's valid signature)
-        /// for the currently-learned path. Enables a relay to re-emit a cached announce as
-        /// a path response (RNS get_cached_packet, Transport.py:2973). GC'd with the path.
-        public var announceCache: [Data: Data] = [:]
+        /// A cached announce, kept whole so a relay can re-emit it verbatim.
+        ///
+        /// The context flag is stored ALONGSIDE the payload rather than re-derived when the
+        /// response is minted, because for an announce the flag is a field-layout declaration
+        /// about these exact bytes ("a 32-byte ratchet sits between random_hash and signature"),
+        /// not a fact about our parsed view of them. The two can disagree: `Announce.parse` drops
+        /// a ratchet that cannot perform key agreement while the bytes stay in the payload, so
+        /// `learned[dest].ratchet == nil` does NOT imply the payload is ratchet-free. Deriving the
+        /// flag from parsed state emitted `contextFlag: false` over a ratchet-carrying payload and
+        /// the receiver then parsed with `ratchetLen = 0`, misaligning signature and app data.
+        public struct CachedAnnounce: Equatable, Sendable {
+            public var payload: Data
+            public var contextFlag: Bool
+            public init(payload: Data, contextFlag: Bool) {
+                self.payload = payload
+                self.contextFlag = contextFlag
+            }
+        }
+        /// destHash → the announce payload (carries the destination's valid signature) and its
+        /// context flag, for the currently-learned path. Enables a relay to re-emit a cached
+        /// announce as a path response (RNS get_cached_packet, Transport.py:2973) — reference
+        /// caches the whole PACKET and re-sends it, so the flag rides along there too. GC'd with
+        /// the path.
+        public var announceCache: [Data: CachedAnnounce] = [:]
 
         /// unique_tag (destHash ‖ tag) ring for PATH_REQUEST dedup — a duplicate tagged request is
         /// ignored rather than re-answered (RNS discovery_pr_tags, Transport.py:2924-2934). Bounded
@@ -455,7 +475,8 @@ public struct Transport {
                     // Update the path only if this fresh announce improves it (unchanged logic).
                     if Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate) {
                         state.learned[packet.destinationHash] = candidate
-                        state.announceCache[packet.destinationHash] = packet.payload
+                        state.announceCache[packet.destinationHash] = State.CachedAnnounce(
+                            payload: packet.payload, contextFlag: packet.contextFlag)
                         effects.append(.send(.delegate(.pathLearned(
                             destinationHash: packet.destinationHash, hops: packet.hops))))
                     }
@@ -541,7 +562,7 @@ public struct Transport {
                         // HEADER_2 pathResponse so the requester learns the destination via us.
                         // RNS Transport.py:2972-3033 (get_cached_packet + rebroadcast as path response).
                         if let relayID = state.transportIdentity,
-                           let cachedPayload = state.announceCache[requested],
+                           let cached = state.announceCache[requested],
                            let entry = state.learned[requested],
                            Int(entry.hops) + 1 < Int(Packet.maxHops) {
                             // Loop guard: a relay requester carries its transport_id (48-byte payload).
@@ -550,11 +571,15 @@ public struct Transport {
                             let requestorTransportId: Data? = packet.payload.count > 32
                                 ? Data(packet.payload.dropFirst(16).prefix(16)) : nil
                             guard requestorTransportId != entry.nextHop else { return .none }
+                            // The flag comes from the CACHE, not from `entry.ratchet`. The payload is
+                            // the original announce's bytes, so the flag must describe those bytes:
+                            // `Announce.parse` drops a ratchet it cannot key-agree with, leaving the
+                            // 32 bytes in the payload but `entry.ratchet == nil`. See CachedAnnounce.
                             let response = Packet(
                                 headerType: .header2, packetType: .announce, transportType: .transport,
                                 destinationType: .single, context: .pathResponse,
-                                contextFlag: entry.ratchet != nil, hops: entry.hops + 1,
-                                destinationHash: requested, transportId: relayID.hash, payload: cachedPayload)
+                                contextFlag: cached.contextFlag, hops: entry.hops + 1,
+                                destinationHash: requested, transportId: relayID.hash, payload: cached.payload)
                             guard let raw = try? response.packed() else { return .none }
                             return .send(.delegate(.transmit(interfaceID, raw)))
                         }
