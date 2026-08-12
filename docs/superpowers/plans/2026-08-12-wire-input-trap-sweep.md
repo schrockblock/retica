@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Platform floor: the plan's predecessor asserted iOS 16 / macOS 13, but the review observed `Package.swift` declares `.iOS(.v17)`. **Task 1 must resolve which is correct** and the rest of the plan follows that answer. Do not change the floor as a side effect.
+- Platform floor: **iOS 17 / macOS 13 / macCatalyst 17**, as declared in `Package.swift:6-10`. Earlier plans in this repo asserted an iOS 16 floor; that was stale and is now resolved — `Package.swift` is authoritative and raising to 17+ is sanctioned. Do not lower it, and do not treat an iOS-16-era API restriction as binding.
 - `ReTiCA` core has zero third-party dependencies. `ReTiCATransport` is interface-agnostic.
 - Wire compatibility with Python-RNS 1.4.1/1.4.2 is mandatory. **Every task here changes only what we ACCEPT.** The predecessor violated this once (`Transport.swift:556`) and the per-task gate missed it — so each task must explicitly diff-check for changes to emitted bytes and say so in its report.
 - Reference Python: `/Users/ell/development/python/Reticulum/RNS`.
@@ -41,7 +41,7 @@ Claude-Session: https://claude.ai/code/session_01AtkFmSeVgRBk3zwfDCqUwy
 **Deliverables:**
 - An inventory of every narrowing conversion applied to a wire-derived value across `Sources/` — `Int(...)`, `Int32(...)`, `UInt32(...)`, `UInt16(...)`, `UInt8(...)` — committed as a checklist so later tasks can tick sites off and the residue is visible.
 - A CI-runnable check that fails on a bare narrowing conversion of a wire-derived value. Preferred form: a script that greps `Sources/` and allowlists reviewed sites, since the package has no linter today and adding SwiftLint is a dependency decision outside this plan's scope. If you judge SwiftLint worth proposing, say so in the report — do not add it unilaterally.
-- Resolve the platform-floor discrepancy: `Package.swift` says `.iOS(.v17)`; several plan documents assert iOS 16 / macOS 13. Report which is authoritative. Do not change it.
+(The platform-floor discrepancy earlier flagged here is **already resolved** — `Package.swift` at iOS 17 / macOS 13 / macCatalyst 17 is authoritative. No action needed.)
 
 - [ ] **Step 1:** Produce the inventory. Include `file:line`, the expression, the source of the value, and whether it is currently guarded — and for "guarded", name the guard and confirm it evaluates *before* the conversion.
 - [ ] **Step 2:** Write the check script and confirm it flags all ten known sites (the three the predecessor fixed plus the seven below).

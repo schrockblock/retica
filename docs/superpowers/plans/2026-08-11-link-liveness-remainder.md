@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Platform floor iOS 16 / macOS 13 (package-wide; do not raise).
+- Platform floor **iOS 17 / macOS 13 / macCatalyst 17**, per `Package.swift:6-10` (authoritative; earlier plans' "iOS 16" was stale). Do not lower it.
 - `ReTiCATransport` is interface-agnostic — no Network.framework, no CoreBluetooth.
 - Wire compatibility with Python-RNS 1.4.1/1.4.2 is mandatory. These tasks change **when** packets are emitted, never their bytes.
 - Tests use `swift-testing` (`import Testing`, `@Test @MainActor func …`, `#expect`), not XCTest.
