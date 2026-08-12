@@ -97,6 +97,21 @@ import CryptoKit
     #expect(id.decrypt(ct, ratchets: [wrongRatchet], enforceRatchets: true) == nil)
 }
 
+// Reference checks enforcement OUTSIDE the `if ratchets:` block (RNS/Identity.py:880), so a
+// ratchet-enforcing destination with NO ratchets loaded drops the packet. Ours fell through to
+// the static key and decrypted — the opposite of enforcement.
+@Test func enforceRatchetsFailsClosedWithNoRatchets() {
+    let id = Identity()
+    let pub = Identity(publicKey: id.publicKey)!
+    let ciphertext = pub.encrypt(Data([0x01, 0x02, 0x03]))
+
+    // Baseline: without enforcement the static key decrypts.
+    #expect(id.decrypt(ciphertext) == Data([0x01, 0x02, 0x03]))
+    // With enforcement and no ratchets, it must NOT decrypt.
+    #expect(id.decrypt(ciphertext, ratchets: nil, enforceRatchets: true) == nil)
+    #expect(id.decrypt(ciphertext, ratchets: [], enforceRatchets: true) == nil)
+}
+
 // CryptoKit accepts a low-order Curve25519 point at PublicKey(rawRepresentation:) and only
 // throws at key agreement. Identity must reject such a key at construction, or the force-try
 // in encrypt() aborts the process on the first send to that peer.

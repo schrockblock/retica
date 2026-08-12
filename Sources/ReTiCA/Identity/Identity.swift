@@ -134,8 +134,13 @@ public struct Identity: Equatable, Sendable {
                     return pt
                 }
             }
-            if enforceRatchets { return nil }
         }
+
+        // Reference (RNS/Identity.py:880): enforcement fires whenever no ratchet produced a
+        // plaintext — including the ratchets == nil case — before falling through to the static
+        // key. The check must live OUTSIDE the `if let ratchets` block or ratchets:nil bypasses
+        // it entirely and decrypts via the static key, the opposite of enforcement.
+        if enforceRatchets { return nil }
 
         guard let staticPriv = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: x),
               let shared = try? staticPriv.sharedSecretFromKeyAgreement(with: peerPub)
