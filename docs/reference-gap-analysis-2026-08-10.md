@@ -65,8 +65,36 @@ So a ReTiCA **initiator downloading** gets no `0xFE`, and a ReTiCA **responder r
 gets no `0xFF`. Either way `staleTime` = `keepaliveInterval * 2` = **60 s** (`LinkSession.swift:73, 78`)
 fires and `.inactivityDeadline` (`:634-643`) sends LINKCLOSE mid-flight.
 
-**Impact:** any link-borne transfer over 60 s dies, in both roles. Sits directly on the LXMF
-propagation-node download path. Latent so far only because observed transfers finish inside 60 s.
+**Impact as originally written:** "any link-borne transfer over 60 s dies, in both roles."
+
+> **CORRECTED 2026-08-11 — the symptom above is INVERTED, and the real defect was larger.**
+> Fixed in `61566a2` (hoist) + `86ee622` (root cause).
+>
+> The missing re-arms were real, but links were **not** being torn down at 60 s — they were
+> **never timing out at all**. `LinkSession` built `cancelAll` as a `let` at the top of every
+> reduce, and `Effect.cancel(id:)` cancels at *construction*
+> (`Effects/Publisher.swift:8-10` invokes `createPublisher()` immediately;
+> `Effects/Cancellation.swift:106-117` cancels inside it). So every action cancelled the
+> establishment, keepalive and inactivity timers.
+>
+> The precise mechanism, measured: `.run` effects register their cancellable only when the Task
+> body starts, whereas `Effect.send(_:)` is a synchronous `.publisher(Just(...))`. A timer armed
+> in a return value therefore survives every action delivered by that return value's own sibling
+> sends, and dies at the next **externally-driven** action. The trigger set is *every* action
+> other than an active-link `.received` — on an initiator that includes `.keepaliveDeadline`
+> itself, so an initiator lost its keepalive loop **and** its inactivity watchdog at t=30.
+>
+> Consequences that were live in shipped code: the initiator emitted **exactly one keepalive per
+> link, ever**; a stray packet mid-handshake left the link hung in `.pending`, unreapable; and no
+> link ever timed out. The entire 56-test `LinkSession` suite passed before and after the fix —
+> every timer test either drove the link with inbound traffic (which re-armed behind the cancel)
+> or observed a single tick.
+>
+> Two lessons recorded rather than buried: a wrong *explanation* was baked into a test-file
+> comment as "a TCA 1.26 limitation" and had to be removed twice; and `#expect(store.state.x ==
+> …)` after a bare `clock.advance` asserts nothing, because `TestStore` does not fold
+> effect-emitted actions into `state` until drained — which is what made the first fix's test
+> vacuous.
 
 ### 1.2 A local path response wipes the requester's app data and ratchet **[verified]**
 
