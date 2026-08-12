@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Reticulum announce payload construction and validation. Only the pure parse/verify
 /// logic lives here; the "remember" side effects (known-destination and ratchet tables)
@@ -47,15 +48,29 @@ public struct Announce {
         let publicKey = payload.subdata(in: idx..<idx + keySize); idx += keySize
         let nameHash = payload.subdata(in: idx..<idx + nameHashLength); idx += nameHashLength
         let randomHash = payload.subdata(in: idx..<idx + randomHashLength); idx += randomHashLength
+        // wireRatchet: the 32 bytes on the wire (or Data() when absent) — used verbatim in the
+        // signed-data reconstruction so the signature verifies against what the sender signed.
+        // ratchet: the value we actually store — nil if the ratchet is not agreement-safe (see below).
+        var wireRatchet = Data()
         var ratchet: Data? = nil
         if contextFlagSet {
-            ratchet = payload.subdata(in: idx..<idx + ratchetSize); idx += ratchetSize
+            let rawRatchet = payload.subdata(in: idx..<idx + ratchetSize); idx += ratchetSize
+            wireRatchet = rawRatchet
+            // Only store the ratchet if it can actually perform key agreement. CryptoKit accepts
+            // low-order X25519 points at PublicKey(rawRepresentation:) but throws at agreement,
+            // which is force-unwrapped in Identity.encrypt — a process abort. Drop the ratchet
+            // and keep the announce: the peer is still reachable via its static key, exactly as
+            // for peers that announce no ratchet at all.
+            if let pub = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: rawRatchet),
+               Identity.isUsableX25519PublicKey(pub) {
+                ratchet = rawRatchet
+            }
         }
         let signature = payload.subdata(in: idx..<idx + signatureLength); idx += signatureLength
         let appData: Data? = idx < payload.count ? payload.subdata(in: idx..<payload.count) : nil
 
         guard let identity = Identity(publicKey: publicKey) else { return nil }
-        var signedData = destinationHash + publicKey + nameHash + randomHash + (ratchet ?? Data())
+        var signedData = destinationHash + publicKey + nameHash + randomHash + wireRatchet
         if let appData { signedData += appData }
         guard identity.validate(signature: signature, message: signedData) else { return nil }
 

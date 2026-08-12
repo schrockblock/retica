@@ -66,6 +66,28 @@ private func announceDestHash(_ id: Identity, nameHash: Data) -> Data {
     #expect(rh.suffix(5) == Data([0x01, 0x02, 0x03, 0x04, 0x05])) // 5-byte big-endian time
 }
 
+// A low-order X25519 point is accepted by CryptoKit at PublicKey construction but throws at key
+// agreement, which is force-unwrapped in Identity.encrypt — a process abort. The announce is
+// still accepted (the peer is reachable via its static key) but the ratchet must be dropped.
+@Test func parseLowOrderRatchetDropsRatchetKeepsAnnounce() {
+    let id = Identity()
+    let nameHash = Destination.nameHash(appName: "app", aspects: [])
+    let destHash = announceDestHash(id, nameHash: nameHash)
+    let randomHash = Announce.randomHash(now: 42, randomPrefix: Data(repeating: 0xBB, count: 5))
+    // Canonical low-order X25519 points that CryptoKit accepts but cannot agree with.
+    for lowOrderRatchet in [Data(repeating: 0x00, count: 32),
+                             Data([0x01]) + Data(repeating: 0x00, count: 31)] {
+        let payload = Announce.buildPayload(identity: id, destinationHash: destHash,
+                                            nameHash: nameHash, randomHash: randomHash,
+                                            ratchet: lowOrderRatchet)
+        let parsed = Announce.parse(payload: payload, destinationHash: destHash, contextFlagSet: true)
+        // Announce must succeed — the peer is reachable via its static key.
+        #expect(parsed != nil)
+        // The low-order ratchet must be silently dropped rather than stored.
+        #expect(parsed?.ratchet == nil)
+    }
+}
+
 @Test func parseRejectsForgedDestinationHashWithValidSignature() {
     let id = Identity()
     let nameHash = Destination.nameHash(appName: "app", aspects: [])

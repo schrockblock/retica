@@ -99,10 +99,14 @@ public struct Identity: Equatable, Sendable {
             rawRepresentation: ephemeralPrivateKey)
         let targetPub = try! Curve25519.KeyAgreement.PublicKey(
             rawRepresentation: ratchet ?? x25519Public)
-        // INVARIANT: every Identity is agreement-safe by construction — init?(publicKey:) performs
-        // a trial key agreement and returns nil for low-order points. This try! is genuinely
-        // unreachable for x25519Public. Do NOT change it to return plaintext on failure — that
-        // would convert a crash into a silent confidentiality failure, which is far worse.
+        // INVARIANT: targetPub is guaranteed agreement-safe by two boundaries:
+        //   • x25519Public — Identity.init?(publicKey:) performs a trial key agreement and returns
+        //     nil for low-order points, so every Identity that exists carries a usable static key.
+        //   • ratchet — Announce.parse validates each announced ratchet with the same trial
+        //     agreement and drops it (keeping the announce) if unusable. No unvalidated ratchet
+        //     bytes can reach this call site.
+        // This try! is genuinely unreachable. Do NOT change it to return plaintext on failure —
+        // that would convert a crash into a silent confidentiality failure, which is far worse.
         let shared = try! ephemeral.sharedSecretFromKeyAgreement(with: targetPub)
         let sharedData = shared.withUnsafeBytes { Data($0) }
         let derived = Crypto.hkdf(length: Identity.derivedKeyLength,
