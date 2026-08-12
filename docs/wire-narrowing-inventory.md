@@ -43,7 +43,7 @@ forget one; `--fail-on-open` will tell you if any remain.
 
 - [x] **`Sources/ReTiCA/Support/MsgPack.swift:146`** — `Int(key)` — **Task 2 FIXED**
   Fixed by rejection: `Int(exactly: key)` with `return nil` if the key exceeds `Int.max`.
-  Commit: TBD (recorded after commit).
+  Commit: `eb244c3`.
 
 - [x] **`Sources/ReTiCA/Support/MsgPack.swift:71`** — `UInt64(p.key)` — **Task 2 constraint CLOSED**
   This site is now safe: the `Int(exactly:)` guard at decode time guarantees every wire-decoded
