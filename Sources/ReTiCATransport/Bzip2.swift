@@ -26,13 +26,14 @@ enum Bzip2 {
 
     static func decompress(_ data: Data, expectedSize: Int) -> Data? {
         guard !data.isEmpty else { return expectedSize == 0 ? Data() : nil }
-        // `expectedSize` is attacker-controlled (it comes from a RESOURCE_ADV's `d` field), so it
-        // is a claim, not a fact. Above UInt32.max the old `UInt32(...)` conversion TRAPPED before
-        // allocating; between 1-4 GiB it allocated for real. Reference clamps to
-        // AUTO_COMPRESS_MAX_SIZE and checks decompressor.eof (RNS/Resource.py:360, 690-696).
-        // expectedSize == 0 is legitimate (compressed empty payload); only the over-large case is hostile.
-        guard expectedSize >= 0, expectedSize <= Resource.autoCompressMaxSize else { return nil }
-        let bufSize = max(expectedSize, 1)   // libbzip2 requires a non-null dest pointer
+        // `expectedSize` derives from a RESOURCE_ADV's `d` field, so it is a claim, not a fact.
+        // Above UInt32.max the old `UInt32(...)` conversion TRAPPED before allocating; between
+        // 1-4 GiB it allocated for real. Reference clamps to AUTO_COMPRESS_MAX_SIZE and checks
+        // decompressor.eof (RNS/Resource.py:360, 690-696). This is the LAST line of defence, not
+        // the only one: a caller that writes `Int(someWireUInt64)` traps before we are ever called.
+        guard expectedSize <= Resource.autoCompressMaxSize else { return nil }
+        // 0 is legitimate (a compressed empty payload); libbzip2 needs a non-null dest pointer.
+        let bufSize = max(expectedSize, 1)
         var destLen = UInt32(bufSize)
         var dest = [UInt8](repeating: 0, count: bufSize)
         var src = [UInt8](repeating: 0, count: data.count)

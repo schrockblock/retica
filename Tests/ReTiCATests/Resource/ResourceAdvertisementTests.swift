@@ -55,8 +55,21 @@ private func sampleAdvertisement() -> ResourceAdvertisement {
 }
 
 @Test func advertisementUnpackAcceptsLegitimateTransferSize() {
-    // A transfer size right at the ceiling must still be accepted.
+    // Both ends of the accepted range: zero and exactly the ceiling.
+    var atZero = sampleAdvertisement()
+    atZero.transferSize = 0
+    #expect(ResourceAdvertisement.unpack(atZero.pack()) != nil)
+
+    var atCeiling = sampleAdvertisement()
+    atCeiling.transferSize = UInt64(Resource.maxAdvertisedTransferSize)
+    #expect(ResourceAdvertisement.unpack(atCeiling.pack()) != nil)
+}
+
+/// `d` is deliberately NOT bounded at unpack: for a split resource it is legitimately the whole
+/// object's size, which exceeds any per-transfer bound. The decompress call site is therefore what
+/// must survive an absurd `d` — it must not convert to `Int` before clamping.
+@Test func advertisementUnpackLeavesDataSizeUnbounded() {
     var adv = sampleAdvertisement()
-    adv.transferSize = UInt64(Resource.maxAdvertisedTransferSize)
-    #expect(ResourceAdvertisement.unpack(adv.pack()) != nil)
+    adv.dataSize = UInt64(Int.max) + 1
+    #expect(ResourceAdvertisement.unpack(adv.pack())?.dataSize == UInt64(Int.max) + 1)
 }

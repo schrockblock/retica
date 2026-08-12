@@ -257,7 +257,10 @@ public struct ResourceTransfer {
                 else { return .none }
                 state.resourceHash = adv.hash
                 state.randomHash = adv.randomHash
-                state.expectedParts = adv.numberOfParts
+                // `n` is a raw UInt64 off the wire and unpack's magnitude gate bounds only `t`.
+                // Every downstream use is `Int(state.expectedParts)`, which TRAPS above Int.max —
+                // clamp once here so no use site can. Identity for any legitimate part count.
+                state.expectedParts = min(adv.numberOfParts, UInt64(Int.max))
                 state.advertisement = adv
                 state.knownHashmap = Data(adv.hashmap)
                 state.hashmapHeight = adv.hashmap.count / Resource.mapHashLength
@@ -374,12 +377,25 @@ public struct ResourceTransfer {
                     }
                     let out: Data
                     if adv.isCompressed {
-                        // For a split resource, adv.dataSize is the whole object's uncompressed size,
-                        // not this segment's. Each segment is at most maxEfficientSize bytes uncompressed,
-                        // so cap to that. For a non-split resource adv.dataSize is already the segment size.
-                        let segmentExpectedSize = adv.isSplit
-                            ? min(Int(adv.dataSize), LinkSession.maxEfficientSize)
-                            : Int(adv.dataSize)
+                        // `adv.dataSize` (`d`) is a raw UInt64 off the wire, and unpack's magnitude gate
+                        // bounds only `t` — so a plain `Int(adv.dataSize)` here would TRAP above Int.max,
+                        // before Bzip2.decompress's own ceiling could ever reject it. Stay in UInt64 until
+                        // the value is provably small.
+                        let segmentExpectedSize: Int
+                        if adv.isSplit {
+                            // `d` is the WHOLE object's size for a split resource, and legitimately
+                            // exceeds one segment. This segment holds at most maxEfficientSize bytes
+                            // uncompressed, so that — not `d` — is what bounds the buffer.
+                            segmentExpectedSize = Int(min(adv.dataSize, UInt64(LinkSession.maxEfficientSize)))
+                        } else {
+                            // `d` is this segment's own size. Above the auto-compress ceiling it is not
+                            // a resource we could have produced, so fail rather than clamp-and-truncate.
+                            guard adv.dataSize <= UInt64(Resource.autoCompressMaxSize) else {
+                                state.status = .failed
+                                return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                            }
+                            segmentExpectedSize = Int(adv.dataSize)
+                        }
                         guard let decompressed = Bzip2.decompress(payload, expectedSize: segmentExpectedSize)
                         else {
                             state.status = .failed

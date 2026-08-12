@@ -760,6 +760,90 @@ private func driveTransferToReceived(sender senderState: ResourceTransfer.State,
     #expect(recovered == original)
 }
 
+/// Like `driveTransferToReceived`, but stops at whichever terminal status the receiver reaches so
+/// a hostile advertisement can be asserted to FAIL rather than being assumed to complete.
+@MainActor
+private func driveTransferToTerminalStatus(sender senderState: ResourceTransfer.State) async
+    -> ResourceTransfer.Status {
+    let sStore = TestStore(initialState: senderState) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = TestClock<Duration>() }
+    sStore.exhaustivity = .off
+    let rStore = TestStore(initialState: receiverState()) { ResourceTransfer() }
+        withDependencies: { $0.continuousClock = TestClock<Duration>() }
+    rStore.exhaustivity = .off
+
+    await sStore.send(.advertise)
+    let adv = (await captureTransmits(sStore, count: 1))[0]
+    await rStore.send(.accept(adv))
+    var req = (await captureTransmits(rStore, count: 1))[0]
+
+    var guardCount = 0
+    func settled() -> Bool { rStore.state.status == .complete || rStore.state.status == .failed }
+    while !settled() && guardCount < 400 {
+        guardCount += 1
+        let n = expectedSenderTransmits(req)
+        await sStore.send(.received(req))
+        let outs = await captureTransmits(sStore, count: n)
+        for frame in outs { await rStore.send(.received(frame)) }
+        if settled() { break }
+        req = (await captureTransmits(rStore, count: 1))[0]
+    }
+    let status = rStore.state.status
+    // Cancel both sides so no watchdog is left in flight at teardown.
+    await sStore.send(.cancel)
+    await rStore.send(.cancel)
+    return status
+}
+
+/// A hostile advertisement can declare a legitimate `t` — passing `ResourceAdvertisement.unpack`'s
+/// magnitude gate, which bounds only `t` — while declaring `d` above `Int.max`. The decompress call
+/// site used to convert that with a plain `Int(adv.dataSize)`, which TRAPS on the conversion before
+/// `Bzip2.decompress`'s ceiling can reject it. The transfer must fail cleanly instead of crashing.
+@Test @MainActor func receiverRejectsCompressedAdvertisementDeclaringDataSizeAboveIntMax() async {
+    let original = Data(String(repeating: "reticulum compresses this well ", count: 30).utf8)
+    var sender = ResourceTransfer.State(sending: original, linkID: linkID, sessionKey: key,
+        interfaceID: InterfaceID("i"), prefix: prefix, randomHash: r, sdu: 64)
+    #expect(sender.advertisement!.isCompressed == true)          // must take the decompress path
+    #expect(sender.advertisement!.isSplit == false)              // non-split branch
+    // Only `d` is hostile; `t` stays small so the advertisement still unpacks.
+    sender.advertisement!.dataSize = UInt64(Int.max) + 1
+    #expect(sender.advertisement!.transferSize <= UInt64(Resource.maxAdvertisedTransferSize))
+
+    #expect(await driveTransferToTerminalStatus(sender: sender) == .failed)
+}
+
+/// The split branch clamps rather than rejects (for a split resource `d` is legitimately larger than
+/// one segment), so it needs its own proof that the clamp happens in UInt64 and never converts first.
+@Test @MainActor func receiverRejectsSplitAdvertisementDeclaringDataSizeAboveIntMax() async {
+    let original = Data(String(repeating: "reticulum compresses this well ", count: 30).utf8)
+    var sender = ResourceTransfer.State(sending: original, linkID: linkID, sessionKey: key,
+        interfaceID: InterfaceID("i"), prefix: prefix, randomHash: r, sdu: 64,
+        segmentIndex: 1, totalSegments: 2, originalHash: nil,
+        totalDataSize: UInt64(Int.max) + 1)
+    #expect(sender.advertisement!.isCompressed == true)
+    #expect(sender.advertisement!.isSplit == true)               // split branch
+    #expect(sender.advertisement!.dataSize == UInt64(Int.max) + 1)
+
+    // Clamped to maxEfficientSize, the buffer is too small for this segment's real output, so the
+    // transfer fails — but it must FAIL, not trap on an Int conversion.
+    let status = await driveTransferToTerminalStatus(sender: sender)
+    #expect(status == .complete || status == .failed)            // terminal, not a crash
+}
+
+/// `n` (numberOfParts) is the same shape as `d`: a raw wire UInt64 that every downstream use
+/// converts with `Int(...)`. An absurd `n` must not trap when the advertisement is accepted.
+@Test @MainActor func receiverAcceptsAdvertisementWithAbsurdPartCountWithoutTrapping() async {
+    let data = incompressibleData(count: 160)
+    var sender = senderState(data)
+    sender.advertisement!.numberOfParts = UInt64(Int.max) + 1
+
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+    await store.send(.accept(advertisementPacket(sender)))       // used to trap inside requestNextWindow
+    #expect(store.state.expectedParts <= UInt64(Int.max))        // clamped at the assignment
+    await store.send(.cancel)
+}
+
 /// Drives a COMPRESSED resource through the HMU (hashmap-update) path by ensuring the
 /// bzip2-compressed stream still spans MORE THAN 74 parts at sdu=8, forcing a hashmap-update
 /// round. The payload is 3000 bytes of the repeating 0x00..0xFF byte pattern: bzip2 shrinks
