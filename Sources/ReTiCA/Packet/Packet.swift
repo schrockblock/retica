@@ -68,11 +68,20 @@ public struct Packet: Equatable {
 
     public init?(raw rawInput: Data) {
         let raw = Data(rawInput) // normalize to 0-based indices
-        // Defence-in-depth ingress ceiling: no compliant peer emits a packet exceeding
-        // Packet.mtu (500). The primary bound lives at the interface layer (HDLC deframer,
-        // BLE framer), but callers such as ResourceTransfer and LinkSession receive bytes
-        // from link-layer handlers that bypass the deframer, so a second check here ensures
-        // no oversized payload reaches downstream decoders.
+        // Ingress size ceiling: no compliant peer emits a packet exceeding Packet.mtu (500),
+        // so anything larger is malformed and is rejected before it reaches any decoder.
+        //
+        // The load-bearing caller is the primary inbound decode in Transport.received
+        // (Transport.swift:339). The interface deframers admit far more than the protocol
+        // MTU — HDLCDeframer defaults to 262144 (InterfaceProfile.tcp.hwMTU) and
+        // BLEFrameBuffer caps at 1196 — so without this guard a ~262 KB frame parses into a
+        // Packet whose payload then feeds every downstream decoder and allocator.
+        //
+        // The remaining Packet(raw:) callers do not depend on this guard. Recorded so it is
+        // neither mistaken for dead code nor re-justified wrongly: LinkSession (:311, :352)
+        // and ResourceTransfer (:253, :275) parse bytes routed from Transport.received that
+        // have therefore already passed this check; BLEEndpoint (:162, :241) is on the
+        // OUTBOUND transmit path, where packed() has already enforced the same bound.
         //
         // NOTE on MTU negotiation: Link.signallingBytes is currently frozen at 500
         // (Link.swift:16-21). If link MTU negotiation ever lands, packets from peers with a

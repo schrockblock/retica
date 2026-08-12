@@ -82,9 +82,10 @@ import Foundation
 
 /// `Packet.init?(raw:)` must reject any input that exceeds `Packet.mtu` (500 bytes).
 /// Reference RNS bounds this at the interface layer (`TCPInterface.check_frame_len`), not in
-/// `Packet.unpack`; the ReTiCA bound here is defence in depth — it prevents feeding oversized
-/// payloads to every downstream decoder even when delivered via a path that bypasses the HDLC
-/// deframer (BLE, L2CAP, link-layer data handlers).
+/// `Packet.unpack`. The ReTiCA bound matters at the primary inbound decode in
+/// `Transport.received` (`Transport.swift:339`), because the interface deframers admit far more
+/// than the protocol MTU — `HDLCDeframer` defaults to 262144 and `BLEFrameBuffer` caps at 1196 —
+/// so an oversized frame would otherwise parse and feed every downstream decoder.
 ///
 /// The maximum legitimate packet is a HEADER_2 packed at exactly `Packet.mtu` (500 bytes):
 /// flags(1) + hops(1) + transport_id(16) + dest_hash(16) + context(1) + payload(465) = 500.
