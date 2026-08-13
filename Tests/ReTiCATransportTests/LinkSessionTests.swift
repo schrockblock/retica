@@ -902,3 +902,38 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     #expect(store.state.linkID == Link.linkID(requestPacket: p))
     await clock.advance(by: .seconds(store.state.establishmentTimeout))    // quiesce the establishment timer
 }
+
+/// `lastData` must advance ONLY on successfully-decrypted non-keepalive traffic. Task 4 evicts
+/// on it, so if a keepalive or an undecryptable packet advanced it, an attacker could hold its
+/// link at the head of the eviction order with garbage and the cap would evict legitimate links
+/// instead. RNS stamps last_data BEFORE decrypting; we deliberately do not.
+@Test @MainActor func lastDataAdvancesOnlyOnDecryptedNonKeepaliveTraffic() async {
+    let clock = testClock()
+    let store = await activeResponderStore(clock: clock)
+    let established = store.state.lastData
+
+    // 1. A plaintext keepalive must NOT advance lastData.
+    let ka = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                    destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                    destinationHash: store.state.linkID, transportId: nil,
+                    payload: Data([0xFF]))
+    await store.send(.received(try! ka.packed()))
+    #expect(store.state.lastData == established)
+
+    // 2. An UNDECRYPTABLE non-keepalive packet must NOT advance lastData either.
+    let garbage = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                         destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: store.state.linkID, transportId: nil,
+                         payload: Data(repeating: 0x00, count: 48))
+    await store.send(.received(try! garbage.packed()))
+    #expect(store.state.lastData == established)
+
+    // 3. Real decrypted application data DOES advance it.
+    let cipher = Link.encrypt(Data([0x01, 0x02, 0x03]), sessionKey: store.state.sessionKey)
+    let dataPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                            destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                            destinationHash: store.state.linkID, transportId: nil, payload: cipher)
+    await store.send(.received(try! dataPacket.packed()))
+    await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
+    #expect(store.state.lastData != established)
+}

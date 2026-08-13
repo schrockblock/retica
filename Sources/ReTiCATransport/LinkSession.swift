@@ -50,6 +50,15 @@ public struct LinkSession {
         public var rtt: Double?
         public var activatedAt: Double?
         public var lastInbound: Double?
+        /// Last time an AUTHENTICATED non-keepalive packet arrived — i.e. one that actually
+        /// decrypted under the session key. `LinkPlane` evicts responder links in order of this
+        /// clock, so it must not be advanceable by an unauthenticated peer.
+        ///
+        /// RNS keeps the same keepalive-vs-data distinction (`if packet.context != KEEPALIVE:
+        /// self.last_data = self.last_inbound`) but stamps it BEFORE it decrypts. We deliberately
+        /// diverge: without the decryption requirement, an attacker advances this with garbage and
+        /// the eviction policy protects exactly the wrong links.
+        public var lastData: Double?
         public var remoteIdentity: Identity?
         public var pendingRequests: Set<Data>
         public var transfers: IdentifiedArrayOf<ResourceTransfer.State> = []
@@ -92,6 +101,7 @@ public struct LinkSession {
             self.rtt = nil
             self.activatedAt = nil
             self.lastInbound = nil
+            self.lastData = nil
             self.remoteIdentity = nil
             self.pendingRequests = []
             self.establishmentTimeout = establishmentTimeout
@@ -118,6 +128,7 @@ public struct LinkSession {
             self.rtt = nil
             self.activatedAt = nil
             self.lastInbound = nil
+            self.lastData = nil
             self.remoteIdentity = nil
             self.pendingRequests = []
             self.establishmentTimeout = establishmentTimeout
@@ -363,6 +374,17 @@ public struct LinkSession {
                 // how the 60s mid-transfer teardown got in — DATA, RESOURCE, REQUEST, RESPONSE,
                 // and LINKIDENTIFY each silently omitted it. Adding a new context must not
                 // require remembering this.
+                // ONE copy of the "did this packet authenticate" policy. Every branch that
+                // decrypts must go through this helper rather than calling `Link.decrypt`
+                // directly, so that adding a new decrypting context cannot silently forget to
+                // advance `lastData`. (The same reasoning as hoisting the inactivity re-arm
+                // below: per-branch bookkeeping is how the mid-transfer teardown bug got in.)
+                var sawAuthenticatedData = false
+                func authDecrypt(_ payload: Data, _ key: Data) -> Data? {
+                    guard let plain = Link.decrypt(payload, sessionKey: key) else { return nil }
+                    sawAuthenticatedData = true
+                    return plain
+                }
                 func dispatch(_ state: inout State) -> Effect<Action> {
                 switch (state.role, state.status, packet.packetType, packet.context) {
                 case (.initiator, .pending, .proof, .linkRequestProof):
@@ -415,12 +437,12 @@ public struct LinkSession {
                                   .cancel(id: CancelID.establishment), inactivityTimer(state.staleTime))
 
                 case (_, .active, .data, .none):
-                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey)
+                    guard let plain = authDecrypt(packet.payload, state.sessionKey)
                     else { return .none }   // corrupt/foreign data is ignored, link stays active
                     return .send(.delegate(.dataReceived(data: plain, packetHash: packet.packetHash)))
 
                 case (_, .active, .data, .linkClose):
-                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                    guard let plain = authDecrypt(packet.payload, state.sessionKey),
                           plain == state.linkID
                     else { return .none }
                     state.status = .closed
@@ -444,7 +466,7 @@ public struct LinkSession {
                     return inactivityTimer(state.staleTime)                                          // 0xFE reply resets inactivity
 
                 case (_, .active, .data, .resourceAdvertisement):
-                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                    guard let plain = authDecrypt(packet.payload, state.sessionKey),
                           let adv = ResourceAdvertisement.unpack(plain) else { return .none }
                     if state.transfers.contains(where: { $0.resourceHash == adv.hash }) { return .none }
                     // A response-Resource is only ours if its request_id is currently pending.
@@ -476,7 +498,7 @@ public struct LinkSession {
                     })
 
                 case (_, .active, .data, .response):
-                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                    guard let plain = authDecrypt(packet.payload, state.sessionKey),
                           case let .array(items)? = MsgPack.decodeValue(Data(plain)), items.count == 2,
                           case let .bin(requestID) = items[0],
                           state.pendingRequests.contains(requestID)
@@ -488,7 +510,7 @@ public struct LinkSession {
 
                 case (_, .active, .data, .linkIdentify):
                     guard state.role == .responder,
-                          let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey)
+                          let plain = authDecrypt(packet.payload, state.sessionKey)
                     else { return .none }
                     let p = Data(plain)
                     guard p.count == 128,
@@ -501,7 +523,7 @@ public struct LinkSession {
 
                 case (_, .active, .data, .request):
                     let requestID = packet.truncatedHash
-                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                    guard let plain = authDecrypt(packet.payload, state.sessionKey),
                           case let .array(items)? = MsgPack.decodeValue(Data(plain)), items.count == 3,
                           case let .bin(pathHash) = items[1]
                     else { return .none }
@@ -529,6 +551,7 @@ public struct LinkSession {
                 // sets .closed and must not have an inactivity timer re-armed behind it.
                 guard state.status == .active else { return effect }
                 state.lastInbound = now
+                if sawAuthenticatedData { state.lastData = now }
                 return .merge(effect, inactivityTimer(state.staleTime))
 
             case let .sendResource(data):
