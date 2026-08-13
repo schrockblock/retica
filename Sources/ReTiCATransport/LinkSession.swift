@@ -393,9 +393,20 @@ public struct LinkSession {
                     return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(established), extra)
 
                 case (.responder, .handshake, .data, .linkRequestRTT):
+                    // UNAUTHENTICATED INPUT: link packets are routed by cleartext linkID ahead of
+                    // Transport's seenPacketHashes dedup, and linkID rides unencrypted in every link
+                    // packet header — so any observer can inject a packet that lands here. Reaping
+                    // on a decrypt failure would let ONE injected packet silently kill a legitimate
+                    // establishment (LinkPlane removes the element on .establishmentFailed, and
+                    // suppresses linkFailed for responders, so the death is invisible).
+                    //
+                    // Ignore it instead and let `establishmentDeadline` decide. Same policy as the
+                    // (_, .active, .data, .none) branch below: corrupt/foreign data is ignored and
+                    // the element stays alive. The establishment timer is already armed, so the
+                    // element is still reapable — the §1b invariant holds.
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
                           let rtt = MsgPack.decodeDouble(plain)
-                    else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
+                    else { return .none }
                     state.rtt = rtt
                     state.status = .active
                     state.activatedAt = now

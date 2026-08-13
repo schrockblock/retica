@@ -834,6 +834,52 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     await clock.advance(by: .seconds(store.state.establishmentTimeout))    // quiesce the establishment timer
 }
 
+/// F6: an RTT we cannot decrypt is UNAUTHENTICATED input — link packets route by cleartext
+/// linkID ahead of Transport's dedup, so anyone can inject one. Reaping on it would let a
+/// single injected packet silently kill a legitimate establishment. The element must survive
+/// and still establish when the real RTT arrives.
+@Test @MainActor func garbageRTTDoesNotReapTheResponderElement() async {
+    let clock = testClock()
+    let owner = Identity()
+    let initEph = Identity()
+    let destHash = Data(repeating: 0x77, count: 16)
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: destHash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    let store = TestStore(
+        initialState: LinkSession.State(responderFor: owner, destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"))
+    ) { LinkSession() } withDependencies: {
+        $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    await store.send(.acceptRequest(try! request.packed()))
+    _ = await captureTransmit(store)                                   // LRPROOF
+    #expect(store.state.status == .handshake)
+
+    // Inject a garbage RTT at the (publicly derivable) linkID.
+    let garbage = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                         destinationType: .link, context: .linkRequestRTT, contextFlag: false,
+                         hops: 0, destinationHash: store.state.linkID, transportId: nil,
+                         payload: Data(repeating: 0x00, count: 48))
+    await store.send(.received(try! garbage.packed()))
+
+    // The element must NOT have been reaped and must still be mid-handshake.
+    #expect(store.state.status == .handshake)
+
+    // The legitimate RTT still completes the handshake.
+    let rttCipher = Link.encrypt(MsgPack.encode(0.0), sessionKey: store.state.sessionKey)
+    let rttPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                           destinationType: .link, context: .linkRequestRTT, contextFlag: false,
+                           hops: 0, destinationHash: store.state.linkID, transportId: nil,
+                           payload: rttCipher)
+    await store.send(.received(try! rttPacket.packed()))
+    await store.receive { if case .delegate(.established) = $0 { return true }; return false }
+    #expect(store.state.status == .active)
+}
+
 @Test @MainActor func initiatorDirectBuildsHeader1LinkRequest() async {
     // relayNextHop == nil → HEADER_1 as before.
     let clock = TestClock<Duration>()
