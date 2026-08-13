@@ -139,7 +139,10 @@ public struct LinkSession {
     public enum Action: Equatable {
         case establish
         case acceptRequest(Data)
-        case received(Data)
+        /// `arrivalInterface` is the interface the packet actually arrived on. `nil` means the
+        /// caller did not specify one — the session will not re-home. Defaulted so that callers
+        /// testing session logic (rather than routing) need not thread it through.
+        case received(Data, arrivalInterface: InterfaceID? = nil)
         case send(Data)
         case identify(Identity)
         case close
@@ -180,6 +183,8 @@ public struct LinkSession {
             case requestReceived(requestID: Data, pathHash: Data, data: Data)
             case packetDelivered(token: Data)
             case packetDeliveryFailed(token: Data)
+            /// The session rebound to a new interface. `LinkPlane` re-homes in-flight transfers.
+            case rehomed(InterfaceID)
         }
     }
 
@@ -359,7 +364,7 @@ public struct LinkSession {
                 let id = state.interfaceID
                 return .merge(.send(.delegate(.transmit(id, raw))), establishmentTimer(state.establishmentTimeout))
 
-            case let .received(data):
+            case let .received(data, arrivalInterface):
                 guard let packet = Packet(raw: data), packet.destinationHash == state.linkID
                 else { return .none }
                 let now = date.now.timeIntervalSince1970
@@ -551,8 +556,25 @@ public struct LinkSession {
                 // sets .closed and must not have an inactivity timer re-armed behind it.
                 guard state.status == .active else { return effect }
                 state.lastInbound = now
-                if sawAuthenticatedData { state.lastData = now }
-                return .merge(effect, inactivityTimer(state.staleTime))
+                var extra: [Effect<Action>] = []
+                if sawAuthenticatedData {
+                    state.lastData = now
+                    // RE-HOME, gated on authentication. A BLE peer that reconnects gets a new
+                    // InterfaceID by construction, so the binding taken at creation goes stale and
+                    // outbound would fire at a dead interface. But re-homing on UNAUTHENTICATED
+                    // input is link theft: linkID is public and link packets bypass Transport's
+                    // dedup, so anyone could redirect a legitimate peer's traffic to themselves.
+                    // Only a packet that decrypted proves the sender holds the session key.
+                    //
+                    // The idle-BLE-reconnect case, where the only inbound traffic is plaintext
+                    // keepalives, is covered by the one-shot permission a LOCAL interface
+                    // disconnect grants (see `rehomePermitted`).
+                    if let arrival = arrivalInterface, arrival != state.interfaceID {
+                        state.interfaceID = arrival
+                        extra.append(.send(.delegate(.rehomed(arrival))))
+                    }
+                }
+                return .merge([effect, inactivityTimer(state.staleTime)] + extra)
 
             case let .sendResource(data):
                 guard state.status == .active else { return .none }

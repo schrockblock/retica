@@ -240,7 +240,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.receive(\.transport.received)
     await store.receive(\.transport.delegate.linkPacket)
     await store.receive { action in
-        if case let .link(.element(_, .received(d))) = action { routed.setValue(d == (try! linkPacket.packed())); return true }
+        if case let .link(.element(_, .received(d, _))) = action { routed.setValue(d == (try! linkPacket.packed())); return true }
         return false
     }
     #expect(routed.value == true)

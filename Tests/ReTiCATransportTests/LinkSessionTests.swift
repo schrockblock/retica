@@ -986,3 +986,31 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
     #expect(store.state.lastData == 400.0)                              // advanced to t3
 }
+
+/// An authenticated packet from a new interface re-homes the link. A plaintext keepalive from a
+/// new interface must NOT — that is the link-theft vector: linkID is public and link packets
+/// bypass Transport's dedup, so an unauthenticated peer could otherwise redirect a legitimate
+/// peer's traffic to itself.
+@Test @MainActor func onlyAuthenticatedTrafficReHomesTheSession() async {
+    let clock = testClock()
+    let store = await activeResponderStore(clock: clock)
+    let original = store.state.interfaceID
+    let attacker = InterfaceID("attacker")
+
+    // Plaintext keepalive from a NEW interface: must not move the link.
+    let ka = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                    destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                    destinationHash: store.state.linkID, transportId: nil, payload: Data([0xFF]))
+    await store.send(.received(try! ka.packed(), arrivalInterface: attacker))
+    #expect(store.state.interfaceID == original)
+
+    // Authenticated data from a new interface: DOES move the link.
+    let peer = InterfaceID("peer-reconnected")
+    let cipher = Link.encrypt(Data([0x09]), sessionKey: store.state.sessionKey)
+    let dataPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                            destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                            destinationHash: store.state.linkID, transportId: nil, payload: cipher)
+    await store.send(.received(try! dataPacket.packed(), arrivalInterface: peer))
+    await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
+    #expect(store.state.interfaceID == peer)
+}
