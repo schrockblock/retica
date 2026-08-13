@@ -39,18 +39,42 @@ public struct LinkPlane {
     public struct State: Equatable {
         public var links: IdentifiedArrayOf<LinkSession.State> = []
         public var registrations: [Data: RequestRegistration] = [:]
-        /// Upper bound on concurrently-held RESPONDER links. `nil` disables the cap; `0` means
-        /// zero, NOT unlimited (same rule `PropagationNode` documents for its transfer limit).
+        /// Upper bound on concurrently-held ESTABLISHED responder links — those that reached
+        /// `.active`, i.e. whose peer completed a handshake and therefore demonstrably holds the
+        /// session key. `nil` disables the cap; `0` means zero, NOT unlimited (same rule
+        /// `PropagationNode` documents for its transfer limit).
+        ///
+        /// Enforced at PROMOTION, in the `.delegate(.established)` handler — never in
+        /// `acceptLinkRequest`. Unauthenticated input must not be able to spend this budget; it
+        /// spends `maxIncompleteResponderLinks` instead.
         ///
         /// Only responder links are capped. Initiator links are ours; capping them would let an
         /// inbound flood evict our own outbound links and turn the cap into a DoS amplifier.
         public var maxResponderLinks: Int?
+        /// Upper bound on concurrently-held responder links that have NOT reached `.active`.
+        /// `nil` disables the bound; `0` means zero, NOT unlimited.
+        ///
+        /// This is the only budget an unauthenticated LINKREQUEST can spend, and it is deliberately
+        /// a separate and much smaller one than `maxResponderLinks`. The two populations have
+        /// nothing in common: a half-open element is minted for anyone who can put bytes on the
+        /// wire and is held for at most one `establishmentTimeout`, whereas an `.active` responder
+        /// link cost its peer a completed handshake and may live indefinitely.
+        ///
+        /// Sizing. A legitimate handshake occupies a slot for about one round trip, not for the
+        /// whole establishment timeout, so even a busy propagation node holds far fewer half-open
+        /// elements at once than this allows. Keeping the bound well below `maxResponderLinks`
+        /// means the worst a flood can do is deny NEW inbound establishment for the length of an
+        /// establishment timeout; it can neither consume the plane nor touch a link that is
+        /// already up.
+        public var maxIncompleteResponderLinks: Int?
         public init(links: IdentifiedArrayOf<LinkSession.State> = [],
                     registrations: [Data: RequestRegistration] = [:],
-                    maxResponderLinks: Int? = 256) {
+                    maxResponderLinks: Int? = 256,
+                    maxIncompleteResponderLinks: Int? = 32) {
             self.links = links
             self.registrations = registrations
             self.maxResponderLinks = maxResponderLinks
+            self.maxIncompleteResponderLinks = maxIncompleteResponderLinks
         }
     }
 
@@ -138,63 +162,44 @@ public struct LinkPlane {
                 guard let requestPacket = Packet(raw: data) else { return .none }
                 let requestLinkID = Link.linkID(requestPacket: requestPacket)
                 guard !state.links.contains(where: { $0.linkID == requestLinkID }) else { return .none }
-                // CAP. Opening a link is unauthenticated by protocol design: an attacker supplies
-                // the LINKREQUEST, completes a genuine handshake with its own ephemeral, and then
-                // holds a valid session key — so it can keep an element alive with perfectly
-                // AUTHENTICATED keepalives forever. No authentication gate can bound this; only
-                // resource policy can.
+                // CAP THE HALF-OPEN POPULATION, AND ONLY THAT. This branch runs on bytes anyone
+                // can put on the wire — opening a link is unauthenticated by protocol design — so
+                // the only budget it may spend is the INCOMPLETE one. An unauthenticated request
+                // must never displace a link whose peer completed a handshake.
                 //
-                // Evict on `lastData`, never on `lastInbound`: keepalives advance `lastInbound`,
-                // so an LRU over it would preserve an attacker's keepalive-fed link and evict a
-                // quiet legitimate one. `lastData` only advances on traffic that decrypted.
+                // It used to. Until this guard replaced it, the `maxResponderLinks` cap was
+                // enforced HERE and paid for by evicting an `.active` responder. That was
+                // exploitable, not merely unfair: a LINKREQUEST whose 64-byte payload is random
+                // bytes is viable all the way to `.handshake`. `Link.sessionKey` succeeds on such a
+                // payload — the ALL-ZEROS key is the one that fails, because CryptoKit rejects that
+                // point, and choosing it is what made the original F14 probe look mild. A
+                // `.handshake` element is not evictable, so each junk request evicted an
+                // authenticated link on
+                // its way in and then parked in the slot it had just freed. A burst the size of
+                // the cap flushed every established responder link and left the plane refusing
+                // everything behind it, for an attacker holding no key at all. The eviction now
+                // happens at PROMOTION — see the `.delegate(.established)` handler below, which
+                // runs only after a peer has demonstrated it holds the session key.
                 //
-                // Also skip links with in-flight transfers. Resource SEGMENT contexts
-                // forward raw bytes to ResourceTransfer children that decrypt internally,
-                // so they never advance `lastData` — only `.resourceAdvertisement` does, at
-                // transfer start. Without this filter a link receiving a large resource
-                // would look idle and be evicted mid-transfer.
+                // REFUSE rather than evict when this budget is full. Nothing here is evictable in
+                // the first place: `LinkSession.close` guards on `status == .active`, so `.close`
+                // to a `.pending`/`.handshake` element is a silent no-op, and appending regardless
+                // would grow `links` without bound in exactly the flood this bound exists to stop.
+                // Refusing strands nothing — every incomplete element leaves on its own
+                // establishment deadline.
                 //
-                // This filter is a TRADE-OFF, not pure protection. `LinkSession`'s
-                // `.resourceAdvertisement` branch appends to `transfers` on a valid advertisement
-                // alone, so a peer holding an active link (which it may have, by protocol design)
-                // can advertise a resource, never send a segment, and become eviction-immune —
-                // re-advertising outruns `ResourceTransfer`'s receiver watchdog. With `cap` such
-                // links, every inbound LINKREQUEST from anyone is refused.
-                //
-                // We accept that: it is the same availability-for-memory trade the cap already
-                // makes, and cheaper than throwing away demonstrably busy legitimate transfers.
-                // But note the asymmetry with the `.handshake` case below — that one self-clears
-                // on the establishment deadline, whereas this one does NOT clear without the
-                // advertiser's cooperation. Bounding transfers per link is the real fix.
-                //
-                // Evict via `.close` so the element leaves through the normal
-                // `.delegate(.closed)` path that removes it and reaps its transfers. A bare
-                // `state.links.remove` here would strand `LXMFRouter.linkResourceInFlight`.
-                var evictions: [Effect<Action>] = []
-                if let cap = state.maxResponderLinks {
-                    let responders = state.links.filter { $0.role == .responder }
-                    if responders.count >= cap {
-                        // Only an .active element is evictable: `LinkSession.close` guards on
-                        // `status == .active`, so `.close` to a .pending/.handshake element is a
-                        // silent no-op. If we appended anyway, a flood of INCOMPLETE handshakes
-                        // would grow `links` without bound — precisely the attack this cap exists
-                        // to stop. So when nothing is evictable, REFUSE the new request. Incomplete
-                        // elements are not stranded: each leaves on its own establishment deadline.
-                        let evictable = responders
-                            .filter { $0.status == .active && $0.transfers.isEmpty }
-                            .sorted { ($0.lastData ?? $0.activatedAt ?? 0) < ($1.lastData ?? $1.activatedAt ?? 0) }
-                            .prefix(responders.count - cap + 1)
-                        guard !evictable.isEmpty else { return .none }
-                        for victim in evictable {
-                            evictions.append(.send(.link(.element(id: victim.id, action: .close))))
-                        }
-                    }
+                // Residual availability cost, accepted: a flood fills the half-open budget and new
+                // inbound links are refused until those elements time out. Links that are already
+                // up are untouched, which is the property the old shape did not have.
+                if let incompleteCap = state.maxIncompleteResponderLinks {
+                    let incomplete = state.links.filter { $0.role == .responder && $0.status != .active }
+                    guard incomplete.count < incompleteCap else { return .none }
                 }
                 let newID = uuid()
                 state.links.append(LinkSession.State(id: newID, responderFor: owner,
                                                      destinationHash: destinationHash,
                                                      interfaceID: interfaceID))
-                return .merge(evictions + [.send(.link(.element(id: newID, action: .acceptRequest(data))))])
+                return .send(.link(.element(id: newID, action: .acceptRequest(data))))
 
             case let .routeLinkPacket(linkID, arrivalInterface, data):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
@@ -205,6 +210,18 @@ public struct LinkPlane {
                                             action: .received(data, arrivalInterface: arrivalInterface))))
 
             case let .interfaceDisconnected(interfaceID):
+                // DELIBERATELY NOT FILTERED BY ROLE, and the consequence is real: after a local
+                // disconnect, one unauthenticated packet from any interface re-homes one of OUR
+                // OWN outbound links just as readily as an inbound one (F10 in the handoff).
+                //
+                // Restricting the grant to responders would not fix that — it would only trade it
+                // for a worse failure. Our initiator links go stale on exactly the same event: a
+                // BLE peer reconnects under a new token, so the `InterfaceID` we bound at creation
+                // is dead. An initiator link's peer is the responder, which never initiates
+                // keepalives (it only replies to ours, which would be going to the dead
+                // interface), and if the peer is mid-transfer to us the segments it sends never
+                // set `sawAuthenticatedData` — see the `.rehomed` handler below. Without the grant
+                // those links recover only by timing out, aborting the transfer with them.
                 for id in state.links.ids where state.links[id: id]?.interfaceID == interfaceID {
                     state.links[id: id]?.rehomePermitted = true
                 }
@@ -256,8 +273,64 @@ public struct LinkPlane {
                 return .send(.delegate(.transmit(txID, raw)))
 
             case let .link(.element(elementID, .delegate(.established(linkID, _)))):
-                guard let destHash = state.links[id: elementID]?.destinationHash else { return .none }
-                return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))
+                guard let promoted = state.links[id: elementID] else { return .none }
+                let established = Effect<Action>
+                    .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: promoted.destinationHash)))
+                // EVICT HERE, NOT AT THE REQUEST. This action is emitted only after a handshake
+                // completed — a responder reaches it by decrypting the peer's LRRTT under the
+                // session key — so the party whose arrival costs an existing link a slot has
+                // demonstrably paid for one. `acceptLinkRequest` deliberately evicts nothing.
+                //
+                // Responder promotions only. An initiator promotion does not change the responder
+                // population, and initiator links are ours: an inbound flood must never be able to
+                // make us close a link we opened.
+                guard promoted.role == .responder, let cap = state.maxResponderLinks else { return established }
+                let active = state.links.filter { $0.role == .responder && $0.status == .active }
+                guard active.count > cap else { return established }
+                // Evict on `lastData`, never on `lastInbound`: keepalives advance `lastInbound`,
+                // so an LRU over it would preserve an attacker's keepalive-fed link and evict a
+                // quiet legitimate one. `lastData` only advances on traffic that decrypted.
+                //
+                // Also skip links with in-flight transfers. Resource SEGMENT contexts forward raw
+                // bytes to `ResourceTransfer` children that decrypt internally, so they never
+                // advance `lastData` — only `.resourceAdvertisement` does, at transfer start.
+                // Without this filter a link receiving a large resource would look idle and be
+                // evicted mid-transfer.
+                //
+                // That filter is a TRADE-OFF, not pure protection. `LinkSession`'s
+                // `.resourceAdvertisement` branch appends to `transfers` on a valid advertisement
+                // alone, so a peer holding an active link (which it may have, by protocol design)
+                // can advertise a resource, never send a segment, and become eviction-immune —
+                // re-advertising outruns `ResourceTransfer`'s receiver watchdog. We accept it: it
+                // is cheaper than throwing away demonstrably busy legitimate transfers, and
+                // bounding transfers per link is the real fix.
+                //
+                // The element being promoted is excluded by id, not left to the comparator. It has
+                // just stamped `lastData`, so a real clock would never choose it — but under a
+                // constant clock every key ties and `sorted` is not documented to be stable, so
+                // relying on the key would make "the newcomer cannot evict itself" an accident.
+                //
+                // Evict via `.close` so the element leaves through the normal `.delegate(.closed)`
+                // path that removes it and reaps its transfers. A bare `state.links.remove` here
+                // would strand `LXMFRouter.linkResourceInFlight`.
+                let evictable = active
+                    .filter { $0.id != elementID && $0.transfers.isEmpty }
+                    .sorted { ($0.lastData ?? $0.activatedAt ?? 0) < ($1.lastData ?? $1.activatedAt ?? 0) }
+                    .prefix(active.count - cap)
+                // Nothing evictable: REFUSE the promotion by closing the link that just arrived,
+                // rather than letting the active population climb past the cap. Every candidate is
+                // an authenticated peer, so preferring the incumbents is the same
+                // availability-for-memory trade the plane already makes — and the alternative is
+                // unbounded growth, since a peer can make itself un-evictable by advertising.
+                // `linkEstablished` still goes out ahead of the close: consumers key their link
+                // bookkeeping on it, and a link that closes immediately after establishing is a
+                // sequence they already handle.
+                guard !evictable.isEmpty else {
+                    return .merge(established, .send(.link(.element(id: elementID, action: .close))))
+                }
+                return .merge([established] + evictable.map {
+                    .send(.link(.element(id: $0.id, action: .close)))
+                })
 
             case let .link(.element(elementID, .delegate(.dataReceived(data, packetHash)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
@@ -340,16 +413,27 @@ public struct LinkPlane {
                 // reconnects would keep firing parts, hashmap updates, proofs and cancels at the
                 // dead interface.
                 //
-                // Note the limit on when that actually gets repaired today: `LinkSession` sets
-                // `sawAuthenticatedData` only inside its `authDecrypt` helper, and the resource
-                // SEGMENT branches (`.resource`, `.resourceRequest`, `.resourceHashmapUpdate`,
-                // `.resourceProof`, and the two cancels) forward raw bytes to `ResourceTransfer`
-                // children that decrypt internally — they never call it. Only
-                // `.resourceAdvertisement`, at transfer START, does. So an in-flight transfer's
-                // OWN inbound traffic cannot trigger the re-home this handler repairs; some other
-                // authenticated packet on the link has to arrive first. The scenario above is
-                // therefore motivation for keeping transfer bindings consistent WHEN a re-home
-                // happens, not a claim that a mid-transfer reconnect self-heals.
+                // When a transfer's OWN traffic can trigger that repair depends on which half of
+                // `LinkSession`'s re-home gate is available, and the two halves differ:
+                //
+                // • On the AUTHENTICATION half alone, it cannot. `LinkSession` sets
+                //   `sawAuthenticatedData` only inside its `authDecrypt` helper, and the resource
+                //   SEGMENT branches (`.resource`, `.resourceRequest`, `.resourceHashmapUpdate`,
+                //   `.resourceProof`, and the two cancels) forward raw bytes to `ResourceTransfer`
+                //   children that decrypt internally — they never call it. Only
+                //   `.resourceAdvertisement`, at transfer START, does. So with no grant
+                //   outstanding, some other authenticated packet on the link has to arrive first.
+                //
+                // • On the LOCAL-DISCONNECT half it can, and that is the mid-transfer BLE
+                //   reconnect case this handler exists for. `interfaceDisconnected` above sets
+                //   `rehomePermitted` on every link bound to the departing interface, and
+                //   `LinkSession` re-homes on `sawAuthenticatedData || rehomePermitted`. A bare
+                //   resource SEGMENT arriving from the reconnected peer's new interface therefore
+                //   spends the grant and re-homes both the session and — via this handler — its
+                //   in-flight transfers. That path DOES self-heal.
+                //
+                // Which also means the grant, not authentication, is what a bystander spends to
+                // redirect a transfer mid-flight; see F10 in the handoff.
                 for tid in state.links[id: elementID]?.transfers.ids ?? [] {
                     state.links[id: elementID]?.transfers[id: tid]?.interfaceID = interfaceID
                 }
