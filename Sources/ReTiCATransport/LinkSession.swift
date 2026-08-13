@@ -616,14 +616,22 @@ public struct LinkSession {
                 // this residual has a WEAKER prerequisite than the replay residual above: that one
                 // needs a captured authenticated packet, this one needs only an observed `linkID`.
                 //
-                // It is bounded: at most ONE re-home per local disconnect (the permission is
+                // It is bounded to at most ONE re-home per local disconnect: the permission is
                 // consumed on first use below, so a disconnect does not permanently downgrade this
-                // element to unauthenticated re-homing), and only while the element survives — the
-                // inactivity watchdog (`staleTime`) reaps an unrefreshed link into
-                // `.closed(.timedOut)`. Closing it properly needs the same thing the replay
-                // residual needs: authenticated proof of liveness on the link, which does not
-                // exist in the link path today. Accepted deliberately: without it a reconnected
-                // BLE peer is stranded on a dead interface with no recovery short of link timeout.
+                // element to unauthenticated re-homing.
+                //
+                // It is NOT usefully bounded by the inactivity watchdog, and an earlier version of
+                // this comment claimed it was. The re-arm below `dispatch` fires for ANY packet
+                // whose `destinationHash` matches `linkID` while the link is `.active` — including
+                // one that fails to decrypt and one whose context has no branch at all — so the
+                // party that spent the grant refreshes `staleTime` with junk for as long as it
+                // likes. Nothing clears `rehomePermitted` except the re-home that spends it, so the
+                // grant does not expire on its own either.
+                //
+                // Closing it properly needs the same thing the replay residual needs: authenticated
+                // proof of liveness on the link, which does not exist in the link path today.
+                // Accepted deliberately: without it a reconnected BLE peer is stranded on a dead
+                // interface with no recovery short of link timeout.
                 //
                 // The `arrival != state.interfaceID` guard is load-bearing in BOTH branches: an
                 // ordinary same-interface packet would otherwise burn the one-shot permission

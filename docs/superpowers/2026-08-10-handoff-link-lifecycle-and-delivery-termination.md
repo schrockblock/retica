@@ -6,6 +6,15 @@
 (`holdArmsDeferredReleaseTimerNotImmediateFireDuringFlood`, pre-existing, `TransportTests`).
 Re-confirmed on the revision pass below — count and known issue both still exact.
 
+> **Updated 2026-08-13** by the "unauthenticated input cannot pin, steal or kill a
+> link element" slice (`4ef3a21..034a4c9`) and the sweep that closed it. Suite is
+> now 824, same one known issue. **F1, F2 and F6 are CLOSED** — read their entries
+> for what "closed" actually means, because F1's is bounded by resource policy and
+> not by authentication. **F9–F16 are new**, in §3a. §5 gained the precise TCA
+> mechanism behind its own rules, and §6 gained the defect shape that produced two
+> of that slice's three worst holes. The branch-by-branch table those came out of
+> is `docs/superpowers/2026-08-13-unauthenticated-link-element-sweep.md`.
+
 **Revised 2026-08-10, after an independent verification pass** that re-derived
 every claim below from the code rather than from this document. Most held. What
 changed:
@@ -129,26 +138,74 @@ overclaiming, that mattered enough to fix.
 The attacker's price went from "1 packet, retained forever" to "2 packets,
 retained forever plus upkeep." Real improvement; not closure.
 
+**Update 2026-08-13.** Both bullets are now CLOSED — the first by a cap, the
+second by dedupe — but read F1 before reading "closed" as "authenticated". The
+element COUNT is bounded; who holds the elements is not, and cannot be. And the
+section's own framing still understates one thing: element retention is not a
+keepalive property at all. ANY link-addressed packet extends an `.active` link,
+including one that fails to decrypt (F16). This section named the branch it had
+found rather than the property it was describing — the same error §7 records.
+
 ---
 
 ## 3. Open items
 
 **IDs are stable; the numbering is NOT the priority order.** F1–F5 keep their
 original IDs because plans and working notes reference them. F6–F8 were added on
-the revision pass. Current priority:
+the revision pass. **F9–F16 were added on 2026-08-13** by the
+unauthenticated-input slice and the sweep that closed it — see
+`docs/superpowers/2026-08-13-unauthenticated-link-element-sweep.md` for the full
+branch-by-branch table those came out of.
 
-1. **F6** — one injected packet kills a legitimate inbound establishment. Cheapest
-   trigger of anything here, and it needs no replay.
-2. **F1** — and note its consequence is worse than "holds an element open": the
-   same primitive re-homes the link, see F1's link-theft paragraph.
-3. **F2** — correctness half (duplicate elements) before resource half.
-4. **F7** — a real unbounded leak, in the router rather than the link plane.
-5. **F8**, then F3/F4/F5.
+**F1, F2 and F6 are CLOSED** by `4ef3a21..034a4c9`. See their entries.
 
-F1, F2 and F6 share one root cause — **unauthenticated input drives link-element
-lifecycle** — and one fix surface. Take them together (§7).
+Current priority:
 
-### F1 — unauthenticated keepalives hold a link element open forever ⚠️ high value
+1. **F13** — a reflected LINKREQUEST makes us forward our OWN link's traffic to
+   the attacker. One packet. The only item here that redirects a legitimate
+   peer's traffic rather than merely denying service. Gated on relay mode.
+2. **F12** — one injected packet kills a legitimate OUTBOUND establishment and
+   mislabels the failure PEER-shaped, so the delivery layer burns its whole
+   budget retrying the same path. The initiator-side mirror of the CLOSED F6.
+3. **F15** — one injected packet aborts every sender transfer on a link, and the
+   same branch makes two of our own concurrent transfers destroy each other with
+   no attacker present.
+4. **F11** — advertise-and-stall pins a link against eviction and then refuses
+   every inbound LINKREQUEST. Does not self-clear.
+5. **F7** — a real unbounded leak, in the router rather than the link plane.
+6. **F14**, then **F16**, then **F9**/**F10** (the two accepted residuals of the
+   re-home fix — deliberate, pinned by tests, listed so a future fix confronts
+   them rather than deleting them).
+7. **F8**, then F3/F4/F5.
+
+F12, F13, F14, F15 and F16 share the root cause F1/F2/F6 shared —
+**unauthenticated input drives link-element lifecycle** — but NOT one fix
+surface: they are in four different files and three different element
+populations. Do not plan them as one slice on the strength of the shared cause.
+
+### F1 — unauthenticated keepalives hold a link element open forever — ✅ CLOSED (bounded, not authenticated)
+
+**CLOSED by `4ef3a21..034a4c9`**, and read the qualification before trusting the
+word. What closed it is `LinkPlane.State.maxResponderLinks` (default 256) with
+eviction ordered by `lastData`, a clock only successfully-decrypted non-keepalive
+traffic advances (`7169c73`, `39d44bc`, `b384ed6`). The link-theft half was closed
+separately by moving the re-home decision into `LinkSession` behind an
+authentication gate (`5414b0b`).
+
+**This is a RESOURCE-POLICY bound, not an authentication one, and it cannot be
+anything else.** Opening a link is unauthenticated by protocol design: an
+attacker supplies the LINKREQUEST, completes a genuine handshake with its own
+ephemeral, and then holds a valid session key — so it keeps an element alive with
+perfectly AUTHENTICATED keepalives forever. No gate bounds that. The element
+count is bounded; the identity of who holds the elements is not.
+
+**And the cap is refusable-into.** F11 shows a peer can make its own link
+eviction-immune and, at the cap, cause every inbound LINKREQUEST from anyone to
+be refused. F14 shows the cap evicts before it validates. The bound holds on
+`links.count`; the availability guarantee does not.
+
+The original text follows, because its mechanism description is still accurate
+and F9/F10/F16 are corrections to it rather than replacements.
 
 **Where:** `LinkSession`, the `(.responder, .active, .data, .keepalive)` and
 `(.initiator, .active, .data, .keepalive)` branches.
@@ -206,7 +263,22 @@ moving the decision up into `LinkPlane`, is the reference-aligned option.
 authenticated packet, and cap or rate-limit responder link creation per
 interface. Note the two gates live in different files — see §7.
 
-### F2 — replayed LINKREQUEST: resource cost AND a correctness bug
+### F2 — replayed LINKREQUEST: resource cost AND a correctness bug — ✅ CLOSED
+
+**CLOSED by `7dc7e55`**: `LinkPlane.acceptLinkRequest` now dedupes by `linkID`
+before doing any crypto, so a duplicate costs one `Packet(raw:)` parse and one
+`truncatedHash` instead of a keypair generation, a DH, an HKDF and an Ed25519
+signature with our long-term destination key. This also collapses the
+non-adversarial multipath duplicates the original entry argued were the stronger
+reason to dedupe.
+
+The sweep probed the one ordering concern the fix raises — the guard reads a
+`linkID` that is written only by the deferred `.acceptRequest` child action, so
+two requests queued together might both pass it. They do not: two identical
+requests driven back-to-back through a real `Store` with no awaiting produced one
+element. TCA drains the child before the second action is reduced.
+
+The original text follows.
 
 **Where:** `LinkPlane.acceptLinkRequest`.
 
@@ -343,10 +415,20 @@ endpoint path, so it is fine.)
   a message that propagated fine at ~20s is marked failed when the opportunistic
   leg times out at ~50s.
 
-### F6 — one injected packet kills a legitimate inbound establishment ⚠️ top priority
+### F6 — one injected packet kills a legitimate inbound establishment — ✅ CLOSED
 
-**Added on the revision pass. Cheapest trigger of anything in this document — one
-packet, no replay, no timing race.**
+**CLOSED by `331843a`**: `(.responder, .handshake, .data, .linkRequestRTT)` now
+returns `.none` on a decrypt/decode failure and lets `establishmentDeadline`
+decide, instead of emitting `.establishmentFailed(.handshakeRejected)`. The
+element stays reapable because the establishment timer is already armed, so the
+§1b invariant still holds.
+
+**The same defect is still live on the INITIATOR side — see F12.** Fixing the
+responder branch and not its mirror is the exact shape §6 warns about, and it
+survived the whole slice because the slice was framed around inbound
+establishment.
+
+The original text follows.
 
 **Where:** `LinkSession.received`, case
 `(.responder, .handshake, .data, .linkRequestRTT)`.
@@ -415,6 +497,243 @@ does not cancel, and the asymmetry is a trap for a future edit to that guard.
 
 ---
 
+## 3a. Added 2026-08-13 — the unauthenticated-input slice and its sweep
+
+**F9, F10 and F11 are ACCEPTED RESIDUALS of the slice**, not defects it missed:
+each was found during execution, priced, and deliberately left. **F12–F16 are
+defects the sweep found.** All eight are pinned by something executable or by a
+probe recorded in
+`docs/superpowers/2026-08-13-unauthenticated-link-element-sweep.md`.
+
+### F9 — link traffic has no per-packet replay rejection, anywhere in the link path
+
+**Where:** `Transport.received` (the `destinationType == .link` return sits ABOVE
+`seenPacketHashes.insert`) and `LinkSession.received` (no inbound hash set at all
+— every `packetHash` use there is keyed by OUTBOUND hash, for proofs).
+
+The Transport half is deliberate and correct in isolation: byte-identical
+keepalives share a packet hash and must not be deduped, and a retried link
+request should still reach us. Pinned by `identicalLinkPacketsBypassDedup`.
+The consequence is not confined to keepalives — **EVERY inbound link context is
+replayable.**
+
+**Why it matters for this slice specifically.** Task 5's re-home gate establishes
+that a packet ORIGINATED from a holder of the session key. It does NOT establish
+that the party which just sent it holds one. So an attacker that captures ONE
+authenticated data packet replays those exact bytes from its own interface and
+still re-homes the link. The fix NARROWED link theft from "observe a cleartext
+linkID" to "capture any one ciphertext"; it did not close it. Probe-proven during
+Task 5 and pinned by
+`replayedAuthenticatedLinkPacketIsProcessedAgainAndMovesTheBinding`.
+
+**Second-order consequence, from the sweep:** `LinkSession`'s
+`.resourceAdvertisement` same-hash dedup is over LIVE transfers only, so once a
+stalled transfer is reaped, replaying the SAME captured advertisement re-creates
+it. One captured advertisement, replayed on a cycle, keeps `transfers` permanently
+non-empty — which is F11's eviction immunity, without ever holding the session
+key. (Both halves verified by reading; the composition was not separately probed.)
+
+Closing F9 needs per-packet replay rejection on the link, which does not exist
+anywhere in the link path today, and which has to be designed around the
+keepalive exemption that put the Transport dispatch above the dedup in the first
+place.
+
+### F10 — the local-disconnect re-home grant is claimable by anyone
+
+**Where:** `LinkPlane.interfaceDisconnected` sets `rehomePermitted`;
+`LinkSession.received`'s re-home block consumes it.
+
+The TRIGGER is unforgeable — a remote attacker cannot cause a local interface to
+disconnect. The CONSUMPTION is not authenticated at all. Once `rehomePermitted`
+is set, the first link-addressed packet from ANY interface other than the stored
+one re-homes the link with no authentication whatsoever; the reducer sees only
+`arrivalInterface` and cannot distinguish the reconnecting peer from a bystander.
+
+**Reachable, not theoretical.** `BLEEndpoint.State.peerInterfaces` is a
+multi-peer map, BLEEndpoint routes EVERY peer's link packets into
+`LinkPlane.routeLinkPacket` tagged with that peer's `InterfaceID`, and `linkID`
+is cleartext. A second connected peer that has merely OBSERVED one link packet
+can claim the grant ahead of the returning peer, which is then stranded. Note the
+prerequisite is WEAKER than F9's: F9 needs a captured authenticated packet, this
+needs only an observed `linkID`. Pinned by
+`theReHomeGrantIsSpentByWhicheverInterfaceSpeaksFirst`.
+
+**INHERENT to the chosen design** (authenticate, or spend a local-disconnect
+grant), which was chosen over closing every link on a local disconnect — that
+alternative aborts in-flight transfers on every reconnect and is worse.
+
+**Correction to how this was first written, including in the production comment:**
+it was described as bounded "to the window before the inactivity watchdog reaps
+the element." That bound does not hold against an attacker — see F16, the same
+party refreshes the watchdog with junk. Bounded to one re-home per disconnect;
+not otherwise bounded. Nothing clears `rehomePermitted` except the re-home that
+spends it, so the grant does not expire either.
+
+### F11 — advertise-and-stall pins a link against eviction
+
+**Where:** `LinkSession.received`'s `(_, .active, .data, .resourceAdvertisement)`
+branch, and `LinkPlane.acceptLinkRequest`'s `evictable` filter.
+
+The branch appends to `state.transfers` after decrypt, unpack and a SAME-hash
+dedup only, so DISTINCT-hash advertisements append without bound (probe: 25
+advertisements → 25 transfers). The eviction filter skips any link whose
+`transfers` is non-empty — deliberately, because resource SEGMENT contexts
+forward raw bytes to `ResourceTransfer` children that decrypt internally and so
+never advance `lastData`, which would make a link receiving a large resource look
+maximally idle exactly when evicting it is most wasteful.
+
+Composed: a peer holding an active link advertises, never sends a segment, and
+becomes eviction-immune; re-advertising outruns `ResourceTransfer`'s receiver
+watchdog. Holding the cap that way makes every inbound LINKREQUEST from anyone be
+refused. This is the same class of unauthenticated-input resource exhaustion the
+slice exists to close, and unlike the `.handshake` variant — where elements leave
+on their own establishment deadline — it does NOT self-clear without the
+advertiser's cooperation. Pinned by
+`distinctAdvertisementsGrowTransfersAndPinTheLinkAgainstEviction`.
+
+The durable fix is a per-link bound on `transfers`. That is its own slice: it has
+to decide what happens to the transfer it displaces.
+
+### F12 — one injected packet kills a legitimate OUTBOUND establishment ⚠️
+
+**Where:** `LinkSession.received`, case
+`(.initiator, .pending, .proof, .linkRequestProof)`.
+
+**The initiator-side mirror of the now-CLOSED F6, still live.** A failed
+`Link.validateProof` emits `.establishmentFailed(.handshakeRejected)`;
+`LinkPlane` removes the element and, because the role IS `.initiator`, reports
+`linkFailed(destinationHash:reason: .handshakeRejected)` upward.
+
+Reaching it needs only the cleartext `linkID`, which any observer of our outbound
+LINKREQUEST computes exactly — `Link.linkID` hashes `Packet.hashablePart`, every
+byte of which is on the wire. Probe: one 99-byte garbage `.proof` packet →
+`linkFailed(.handshakeRejected)` and `links.count == 0`.
+
+**The mislabel is the expensive half.** `.handshakeRejected` is the one
+PEER-shaped `LinkFailure`, and it is the only one the delivery layer does NOT
+answer with a path request — `LXMFNode` retries the link on the same path. So one
+packet per attempt burns the entire `establishAttempts` budget against a path
+that was never the problem, terminating in `deliveryFailed`.
+
+The fix is Task 1's, applied to this branch: ignore an unvalidatable proof and let
+`establishmentDeadline` decide. The element is reapable throughout — the
+establishment timer is already armed.
+
+### F13 — a reflected LINKREQUEST makes us forward our own link's traffic to the attacker ⚠️ top priority
+
+**Where:** `Transport.received`, the `case .linkRequest:` relay branch (CREATE)
+and the `destinationType == .link` + `linkTable` hit branch (shadow + EXTEND).
+
+`Packet.hashablePart` excludes `headerType`, `transportType`, `transportId` and
+`hops`. So an attacker takes our own HEADER_1 LINKREQUEST off the wire and
+re-emits it to us as HEADER_2 naming us as relay — and `Link.linkID` yields **our
+own link's `linkID`, identically**. Every precondition on the relay branch holds
+for that reflected copy: we are relaying, `transportId` is our hash, the
+destination is remote, and we have a learned path to it (we must — that is why we
+opened the link). `seenPacketHashes` does not stop the first one: we never insert
+our OWN outbound packet hashes.
+
+Result: `linkTable[ourLinkID]` exists, and the `destinationType == .link` block
+runs FIRST and returns unconditionally — so `.delegate(.linkPacket(...))` is never
+emitted for that `linkID` again. **Probe-proven end to end:** after the
+reflection, the genuine LRPROOF arriving from the peer was NOT delivered locally;
+it was transmitted to the attacker's interface.
+
+Consequences, in order of severity: the attacker receives the legitimate peer's
+link traffic; our own element never sees its proof and dies at
+`.establishmentFailed(.timedOut)`, which `LXMFNode` treats as PATH-shaped and so
+DISCARDS a perfectly good path; and run against an already-`.active` link the same
+reflection blackholes all inbound link traffic until the inactivity watchdog
+closes it.
+
+Root defect: `linkTable` is keyed by `linkID` alone, `Transport` never checks
+whether that `linkID` belongs to a LOCAL link, and the relay lookup is ordered
+ahead of local delivery.
+
+**Two more `linkTable` facts from the same probes.** Entries are created without
+bound (probe: 20 unauthenticated relayed LINKREQUESTs → 20 entries; there is no
+cap on `linkTable`), and `refreshedAt = date.now` is stamped on ANY matching link
+packet with no decryption anywhere, so an entry survives `maintenanceTick`'s
+`linkTableExpiry` GC forever on unauthenticated junk (probe: refreshed at
+t=100000, survives the tick). There is no other DESTROY path — only that expiry
+and `setTransportIdentity(nil)`.
+
+**Gated on relay mode.** All of it requires `transportIdentity != nil`, set only
+via `TCPEndpoint.enableRelay` / `BLEEndpoint.enableRelay`, neither of which has an
+in-repo caller. Latent for relay deployments rather than live in anything that
+ships today — but enabling relay is a one-line integrator decision.
+
+### F14 — the responder cap evicts before it validates
+
+**Where:** `LinkPlane.acceptLinkRequest`.
+
+The eviction effects are appended before the new element is minted, and the
+request itself is never checked for viability first. Probe: at the cap, a
+LINKREQUEST carrying an all-zeros X25519 key (a well-formed 64-byte payload that
+passes the size guard and dies at `LinkSession.acceptRequest`'s empty-session-key
+guard) evicted a legitimate `.active` responder link and then self-destructed,
+leaving the freed slot unused.
+
+The cheapest unviable request is even simpler — a wrong-size payload, caught by
+the `64 || 67` guard. Either way a legitimate link dies for a request that was
+never going to become one.
+
+Not a leak and not unbounded: the count settles back below the cap, so the
+availability harm is one legitimate link per refill rather than a flush. Fix by
+validating enough of the request to know it can become an element before
+committing an eviction.
+
+### F15 — an unauthenticated RESOURCE_PRF destroys every sender transfer on a link ⚠️
+
+**Where:** `LinkSession.received`'s `(_, .active, .proof, .resourceProof)` /
+`(_, .active, .data, .resourceProof)` raw-forwarding group, and
+`ResourceTransfer.received`'s `(.sender, .proof, .resourceProof)` branch.
+
+Resource proofs are sent UNENCRYPTED (`linkPacket(.proof, .resourceProof, proof)`,
+no `Link.encrypt`), and `Resource.validateProof` is a plaintext equality check:
+64 bytes whose trailing 32 must equal `expectedProof`. The branch has no status
+guard and no check that the proof names THIS transfer, and a non-matching value
+takes the `else` — `status = .failed`, `.delegate(.failed)`. `LinkSession` fans
+the raw bytes out to EVERY element of `state.transfers`.
+
+Probe: one 64-byte junk `.proof` packet at the cleartext `linkID` produced a
+`resourceFailed` delegate and removed the transfer. `LinkSession`'s
+`.transfer(… .delegate(.failed))` handler also cancels and fails a pending
+request, and nils `segmentedSend` — aborting a whole multi-segment send at
+segment 1 of N.
+
+**The non-adversarial trigger is the stronger argument.** With two concurrent
+sender transfers on one link, the genuine proof for A destroys B, because the
+branch never checks that the proof belongs to this transfer — even though
+`Resource.proofData` puts the resource hash in the proof's first 32 bytes and
+`validateProof` ignores them.
+
+### F16 — the inactivity re-arm fires for ANY link-addressed packet
+
+**Where:** `LinkSession.received`, the hoisted block below `dispatch`.
+
+Every `guard … else { return .none }` inside `dispatch` returns from `dispatch`,
+not from the reducer. Control always reaches `guard state.status == .active`,
+`state.lastInbound = now` and `inactivityTimer(state.staleTime)`. So while a link
+is `.active`, ANY packet bearing the cleartext `linkID` extends its life: a failed
+decrypt, an unhandled context, an 8-byte junk payload. Probe: eight rounds of
+`0.9 × staleTime` fed nothing but undecryptable `.cacheRequest` packets left the
+link `.active`; a full `staleTime` of silence closed it.
+
+**This corrects F1 and F10.** F1 attributes life extension to "the keepalive
+branches"; those branches are redundant with this and removing them would change
+nothing. F10 was described as bounded by the watchdog; it is not, because the
+party spending the grant refreshes the watchdog itself.
+
+The hoisting is deliberate and was the fix for a real bug — per-branch re-arming
+is how a 60s mid-transfer teardown got in, and the comment above it says so. So
+this is a design tension, not an oversight: the re-arm must stay hoisted AND must
+not be free. Any fix has to keep working for RNS's plaintext keepalives, which is
+the constraint that makes the obvious answer ("re-arm only on
+`sawAuthenticatedData`") wrong.
+
+---
+
 ## 4. Conventions established this session — please keep them
 
 **Cite symbols, not line numbers,** for same-repo cross-file references. Line
@@ -472,6 +791,54 @@ proven vacuous twice this month.
 
 **Do not seed the state you claim to prove.**
 
+### The mechanism behind both of those — stated precisely, 2026-08-13
+
+Found while writing Task 7, re-derived from the vendored source under
+`.build/checkouts/swift-composable-architecture` before being recorded here. An
+earlier statement of it was half-right and would have misled, so this is the
+version to trust. Three facts, in the order they execute:
+
+1. **`TestReducer._reduce` updates `self.state` ONLY for `.send`-origin actions.**
+   Its `switch action.origin` has exactly two arms: `.send` runs the reducer and
+   then assigns `self.state = state`; `.receive` runs the reducer and appends to
+   `receivedActions` **without touching `self.state`**. `TestStore.state` returns
+   `self.reducer.state`. So `store.state` is blind to any effect-emitted action
+   that has not been drained — that is the mechanism behind the "invisible until
+   drained" rule above, not a separate quirk.
+
+2. **`TestStore.send` checks `!self.reducer.receivedActions.isEmpty`
+   UNCONDITIONALLY, BEFORE the exhaustivity switch**, and routes the resulting
+   "Must handle N received actions before sending an action" message through
+   `reportIssueHelper` — which reads `self.exhaustivity` **at call time**:
+   - `.on` → `reportIssue` → a real failure;
+   - `.off(showSkippedAssertions: false)` (**the default**) → the message is
+     **DROPPED ENTIRELY**;
+   - `.off(showSkippedAssertions: true)` → wrapped in `withExpectedIssue`, so it
+     is emitted as an EXPECTED, visible, non-failing issue.
+
+3. **ONLY THEN does the switch clear the queue.** `.on` breaks;
+   `.off(showSkippedAssertions: false)` does a bare `receivedActions = []`;
+   `.off(showSkippedAssertions: true)` calls `skipReceivedActions(strict: false)`,
+   which also ADVANCES `reducer.state` to the last received action's state before
+   clearing.
+
+**So the exhaustivity-gated report is what SILENCES a stray action; the clearing
+is what makes it UNRECOVERABLE afterwards.** They are two separate steps and
+conflating them is what produced the earlier half-right statement.
+
+**Corollary — `receive(predicate)` under `.off` is queue-clearing too.** Its
+non-exhaustive path does `while let first = receivedActions.first,
+!predicate(first.action) { removeFirst(); reducer.state = first.state }` and
+reports the discarded actions through the same `reportIssueHelper`. So every
+non-matching action ahead of the match is silently dropped under the default
+`.off`. `captureTransmit`-style helpers therefore consume the queue, and a test
+that relies on a later assertion "catching" an earlier stray will not.
+
+**Fix pattern: keep `.on` ACROSS the boundary where silence must be proven** —
+flip before the send whose effects you are making a claim about, and flip back
+only after the observation. A `.on` flip placed after the queue has already been
+cleared proves nothing.
+
 ---
 
 ## 6. Process notes for whoever continues
@@ -502,6 +869,35 @@ committed and reported green.
 CORRECT `.on` rule in one file while I wrote the opposite into another and
 propagated that one. Nothing forces two entries to be read side by side.
 
+**A test whose NAME claims two properties while its assertions cover only one —
+added 2026-08-13.** This shape produced two of the three worst holes in the
+unauthenticated-input slice. It is more dangerous than an obviously weak test,
+because the name is what a reviewer reads and the name is accurate about INTENT.
+The unasserted half is reliably the one an attacker or a plausible refactor
+reaches, because the asserted half is usually the one that was easy to observe.
+
+Two instances, both caught late:
+
+- `replayedLinkRequestMintsExactlyOneElementAndOneProof` asserted the element
+  count and NOT the proof. A dedupe that recognised the duplicate but
+  re-dispatched `.acceptRequest` to the existing element keeps `links.count` at 1
+  while still paying the keypair generation, DH, HKDF and Ed25519 signature the
+  guard exists to avoid, and putting a second LRPROOF on the wire per replay —
+  i.e. it restores the crypto amplification the slice exists to close. That
+  refactor passed all 821 tests. The proof half was vacuous because the emission
+  is invisible under `.off` (see §5), so asserting it required a deliberate `.on`
+  window; that is why it was skipped.
+- The plaintext-keepalive interop guard's "part 2" was described in its own
+  doc comment and never written. Part 1 proved the keepalive REFRESHED the
+  timer; part 2 was supposed to prove the timer was still ARMED. A change that
+  cancelled the inactivity timer on a keepalive without re-arming it sails
+  through part 1 — no deadline is queued — while leaving the link immortal, the
+  opposite failure from the one the test is named for.
+
+**The check:** for every `and` in a test name, point at the assertion that fails
+if only that half breaks. If the answer is "the other assertion would probably
+catch it", it will not. Both halves above were reachable by a one-line change.
+
 **Verify the HANDOFF, not just the code — added by the revision pass.** This
 document was written by the same process that §6 says produced ten wrong property
 claims in one session, and it inherited the same failure mode. A verification
@@ -523,7 +919,25 @@ most likely to be built on an assumption nobody has priced.
 
 ---
 
-## 7. Suggested next slice
+## 7. Next slice
+
+> **DONE 2026-08-13 — `4ef3a21..034a4c9`.** All four numbered steps below were
+> taken. Step 1 was split: the inactivity-refresh half was NOT gated (it would
+> break RNS interop and bounds nothing — see F1), and the re-homing half was
+> gated on authentication, decided inside `LinkSession` with the arrival
+> interface threaded through `Action.received`, plus a one-shot grant from a local
+> interface disconnect. Step 2 chose dedupe-by-`linkID` AND a cap. Step 3 landed
+> first, as suggested. Step 4 landed as the cap rather than as ingress control.
+>
+> **What to do next is now the §3 priority list, not this section.** The top three
+> are F13, F12 and F15 — all found by the sweep, none of them in this repo's plan
+> until it was written. In particular: F12 is this section's step 3 applied to the
+> INITIATOR branch, which nobody noticed was a mirror until the sweep enumerated
+> both. If you take one lesson from §7 into the next plan, take that one — the
+> plan named the branch it had found, not the property it wanted.
+>
+> The original text follows unchanged, because §6 says to keep the record of what
+> was believed at planning time.
 
 **Take F1 + F2 + F6 together as "unauthenticated input cannot pin, steal, or kill
 a link element."** They share one root cause — link elements are created, kept

@@ -948,6 +948,210 @@ private func acceptAndActivateResponder(_ store: TestStore<LinkPlane.State, Link
     #expect(store.state.links[id: session.id]?.rehomePermitted == false)
 }
 
+// MARK: - Characterization tests for the three residuals accepted by this slice (Task 8)
+//
+// These pin DELIBERATE CURRENT BEHAVIOUR, not desired behaviour. Each one exists so that the
+// residual is carried by an executable assertion rather than by a comment: two commits in this
+// slice turned on a comment surviving an edit, and one residual was lost when a comment block
+// was deleted. If you are here because one of these went red, you have most likely FIXED the
+// residual — read the referenced handoff item, then delete or invert the test deliberately.
+//
+// Handoff: docs/superpowers/2026-08-10-handoff-link-lifecycle-and-delivery-termination.md
+// Sweep:   docs/superpowers/2026-08-13-unauthenticated-link-element-sweep.md
+
+/// **F9 — link traffic has no per-packet replay rejection, anywhere in the link path.**
+///
+/// `Transport` dispatches `.delegate(.linkPacket(...))` before `seenPacketHashes.insert(...)`
+/// (deliberately — byte-identical keepalives share a packet hash and must not be deduped), and
+/// `LinkSession` keeps no inbound packet-hash set of its own: every `packetHash` use there is
+/// keyed by OUTBOUND hash, for proofs. So the same ciphertext decrypts, and is acted on, however
+/// many times it arrives and from wherever.
+///
+/// This test pins the consequence that bounds Task 5's re-home gate. That gate establishes that a
+/// packet ORIGINATED from a holder of the session key — not that the party which just sent it
+/// holds one. Replaying captured bytes therefore still moves the binding: the vector was narrowed
+/// from "observe a cleartext linkID" to "capture one authenticated packet", not closed.
+///
+/// The second delivery is the load-bearing half. An end-state-only assertion on `interfaceID`
+/// would also pass if the plane re-homed on the FIRST packet and merely failed to move back, so
+/// the test asserts that the replayed bytes are processed as a fresh packet each time.
+@Test @MainActor func replayedAuthenticatedLinkPacketIsProcessedAgainAndMovesTheBinding() async {
+    let ifOriginal = InterfaceID("original")
+    let ifReplay = InterfaceID("replay")
+    let destHash = Data(repeating: 0x61, count: 16)
+    let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    let session = await activeResponderInPlane(store, owner: Identity(),
+                                               destHash: destHash, interfaceID: ifOriginal)
+    // ONE authenticated packet. Every later send reuses these exact bytes — nothing is re-encrypted,
+    // so this is a capture-and-replay, not a second legitimate transmission.
+    let raw = authenticatedPacket(linkID: session.linkID, sessionKey: session.sessionKey,
+                                  body: Data([0x10, 0x11]))
+
+    await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: ifOriginal, data: raw))
+    await store.receive { if case .delegate(.linkDataReceived) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == ifOriginal)
+
+    // Same bytes, different interface. Currently: delivered AGAIN, and the link re-homes.
+    await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: ifReplay, data: raw))
+    await store.receive { if case .delegate(.linkDataReceived) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == ifReplay,
+            "no inbound replay rejection exists on the link path, so replayed bytes still re-home")
+
+    // And again, back the other way: replay is not a one-shot. A dedup that remembered only the
+    // most recent packet would pass the step above and fail here.
+    await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: ifOriginal, data: raw))
+    await store.receive { if case .delegate(.linkDataReceived) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == ifOriginal)
+}
+
+/// **F10 — the local-disconnect re-home grant is spent by whichever interface speaks first.**
+///
+/// `LinkPlane.interfaceDisconnected` sets `rehomePermitted` on every link bound to the departing
+/// interface, and `LinkSession`'s re-home block consumes it on the first link-addressed packet
+/// from any interface other than the stored one. The TRIGGER is unforgeable — a remote attacker
+/// cannot cause a local interface to disconnect — but the CONSUMPTION is not authenticated at all:
+/// the reducer sees only `arrivalInterface`, so it cannot tell the reconnecting peer from anyone
+/// else. `BLEEndpoint.State.peerInterfaces` is a multi-peer map and every peer's link packets reach
+/// `routeLinkPacket` tagged with that peer's `InterfaceID`, so a second connected peer that has
+/// merely observed the cleartext `linkID` is in a position to claim the grant first.
+///
+/// This is inherent to the chosen design (authenticate, or spend a local-disconnect grant). The
+/// alternative considered — closing every link on a local disconnect — aborts in-flight transfers
+/// on every reconnect, which is worse. It is bounded to one re-home per disconnect. It is NOT
+/// usefully bounded by the inactivity watchdog: the re-arm below `dispatch` fires for ANY packet
+/// bearing the cleartext linkID while the link is `.active`, so the same party that spends the
+/// grant can hold the element open indefinitely with undecryptable junk (see F16 in the handoff).
+/// Nothing clears `rehomePermitted` except the re-home that spends it, so the grant does not
+/// expire either.
+///
+/// `localDisconnectGrantsExactlyOneUnauthenticatedReHome` already pins the one-shot property when
+/// the RIGHT party spends it. What is pinned here is who may spend it, and that the party the
+/// grant was issued for is then stranded.
+@Test @MainActor func theReHomeGrantIsSpentByWhicheverInterfaceSpeaksFirst() async {
+    let dead = InterfaceID("dead")
+    let firstToSpeak = InterfaceID("first-to-speak")
+    let returningPeer = InterfaceID("returning-peer")
+    let linkID = Data(repeating: 0x62, count: 16)
+    var session = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000F1")!,
+                                    responderFor: Identity(),
+                                    destinationHash: Data(repeating: 0x07, count: 16),
+                                    interfaceID: dead)
+    session.linkID = linkID
+    session.status = .active
+
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [session])
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    let keepalive = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                           destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                           destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+    let kaRaw = try! keepalive.packed()
+
+    await store.send(.interfaceDisconnected(dead))
+    #expect(store.state.links[id: session.id]?.rehomePermitted == true)
+
+    // The grant was issued so a reconnecting peer could recover. It is claimed by whoever sends
+    // the first off-path link packet — no authentication is required or checked.
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: firstToSpeak, data: kaRaw))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == firstToSpeak)
+    #expect(store.state.links[id: session.id]?.rehomePermitted == false)
+
+    // The party the grant was meant for now cannot recover: with the one-shot spent, its own
+    // unauthenticated keepalive no longer moves the binding.
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: returningPeer, data: kaRaw))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == firstToSpeak,
+            "the grant is one-shot and is not reserved for the peer it was issued for")
+}
+
+/// Builds an encrypted RESOURCE_ADV link packet for `linkID` announcing `resourceHash`.
+/// Constructed directly rather than driven out of a sender `ResourceTransfer`, because what
+/// matters here is only that `ResourceAdvertisement.unpack` accepts it and that the hash differs
+/// between calls.
+private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: Data) -> Data {
+    let adv = ResourceAdvertisement(
+        transferSize: 512, dataSize: 512, numberOfParts: 2,
+        hash: resourceHash, randomHash: Data(repeating: 0x01, count: 32),
+        originalHash: resourceHash, segmentIndex: 1, totalSegments: 1,
+        requestID: nil, flags: 0x01, hashmap: Data(repeating: 0x02, count: 8))
+    let cipher = Link.encrypt(adv.pack(), sessionKey: sessionKey)
+    let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .link, context: .resourceAdvertisement, contextFlag: false,
+                        hops: 0, destinationHash: linkID, transportId: nil, payload: cipher)
+    return try! packet.packed()
+}
+
+/// **F11 — advertise-and-stall pins a link against eviction, and refuses everyone else in.**
+///
+/// `LinkSession`'s `(_, .active, .data, .resourceAdvertisement)` branch appends to
+/// `state.transfers` after decrypt, unpack and a SAME-hash dedup only, so DISTINCT-hash
+/// advertisements append without bound. `LinkPlane`'s eviction filter skips any link whose
+/// `transfers` is non-empty — deliberately, because resource SEGMENT contexts forward raw bytes to
+/// `ResourceTransfer` children that decrypt internally and so never advance `lastData`, which would
+/// otherwise make a link receiving a large resource look maximally idle.
+///
+/// The combination is the residual: a peer holding an active link — which it may have, since
+/// opening one is unauthenticated by protocol design — advertises and never sends a segment. It
+/// becomes eviction-immune, and once it holds the cap every inbound LINKREQUEST from anyone is
+/// refused. Unlike the `.handshake` variant of the same shape, this does NOT self-clear: the
+/// `.handshake` elements leave on their own establishment deadline, whereas re-advertising outruns
+/// `ResourceTransfer`'s receiver watchdog with the advertiser's cooperation alone.
+///
+/// The durable fix is a per-link bound on `transfers`, which is its own slice — it has to choose
+/// what to do with the transfer it displaces.
+///
+/// Both halves are asserted because they fail independently: a per-link transfer bound would break
+/// the first, and dropping the `transfers.isEmpty` filter from `evictable` would break the second.
+@Test @MainActor func distinctAdvertisementsGrowTransfersAndPinTheLinkAgainstEviction() async {
+    let owner = Identity()
+    let destHash = Data(repeating: 0x63, count: 16)
+    let iface = InterfaceID("advertiser")
+    let store = TestStore(
+        initialState: LinkPlane.State(maxResponderLinks: 1)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    let session = await activeResponderInPlane(store, owner: owner,
+                                               destHash: destHash, interfaceID: iface)
+
+    // Three advertisements with DISTINCT hashes. The same-hash dedup does not apply, and nothing
+    // bounds the append, so each one adds an element.
+    for i: UInt8 in 1 ... 3 {
+        let adv = advertisementPacket(linkID: session.linkID, sessionKey: session.sessionKey,
+                                      resourceHash: Data(repeating: i, count: 32))
+        await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: iface, data: adv))
+        await store.receive { if case .link(.element(_, .received)) = $0 { return true }; return false }
+    }
+    #expect(store.state.links[id: session.id]?.transfers.count == 3,
+            "distinct-hash advertisements append without bound; only same-hash repeats are deduped")
+
+    // No segment is ever sent. The link is now at the cap and eviction-immune, so a third party's
+    // well-formed LINKREQUEST is refused: no element is minted for it and the advertiser survives.
+    await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                        interfaceID: InterfaceID("newcomer"),
+                                        data: freshLinkRequest(destHash: destHash)))
+    #expect(store.state.links.count == 1, "the newcomer is refused: nothing was evictable")
+    #expect(store.state.links[id: session.id]?.status == .active,
+            "a stalled advertiser is never chosen as an eviction victim")
+}
+
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {
     let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
         $0.uuid = .incrementing
