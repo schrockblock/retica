@@ -39,10 +39,18 @@ public struct LinkPlane {
     public struct State: Equatable {
         public var links: IdentifiedArrayOf<LinkSession.State> = []
         public var registrations: [Data: RequestRegistration] = [:]
+        /// Upper bound on concurrently-held RESPONDER links. `nil` disables the cap; `0` means
+        /// zero, NOT unlimited (same rule `PropagationNode` documents for its transfer limit).
+        ///
+        /// Only responder links are capped. Initiator links are ours; capping them would let an
+        /// inbound flood evict our own outbound links and turn the cap into a DoS amplifier.
+        public var maxResponderLinks: Int?
         public init(links: IdentifiedArrayOf<LinkSession.State> = [],
-                    registrations: [Data: RequestRegistration] = [:]) {
+                    registrations: [Data: RequestRegistration] = [:],
+                    maxResponderLinks: Int? = 256) {
             self.links = links
             self.registrations = registrations
+            self.maxResponderLinks = maxResponderLinks
         }
     }
 
@@ -126,11 +134,63 @@ public struct LinkPlane {
                 guard let requestPacket = Packet(raw: data) else { return .none }
                 let requestLinkID = Link.linkID(requestPacket: requestPacket)
                 guard !state.links.contains(where: { $0.linkID == requestLinkID }) else { return .none }
+                // CAP. Opening a link is unauthenticated by protocol design: an attacker supplies
+                // the LINKREQUEST, completes a genuine handshake with its own ephemeral, and then
+                // holds a valid session key — so it can keep an element alive with perfectly
+                // AUTHENTICATED keepalives forever. No authentication gate can bound this; only
+                // resource policy can.
+                //
+                // Evict on `lastData`, never on `lastInbound`: keepalives advance `lastInbound`,
+                // so an LRU over it would preserve an attacker's keepalive-fed link and evict a
+                // quiet legitimate one. `lastData` only advances on traffic that decrypted.
+                //
+                // Also skip links with in-flight transfers. Resource SEGMENT contexts
+                // forward raw bytes to ResourceTransfer children that decrypt internally,
+                // so they never advance `lastData` — only `.resourceAdvertisement` does, at
+                // transfer start. Without this filter a link receiving a large resource
+                // would look idle and be evicted mid-transfer.
+                //
+                // This filter is a TRADE-OFF, not pure protection. `LinkSession`'s
+                // `.resourceAdvertisement` branch appends to `transfers` on a valid advertisement
+                // alone, so a peer holding an active link (which it may have, by protocol design)
+                // can advertise a resource, never send a segment, and become eviction-immune —
+                // re-advertising outruns `ResourceTransfer`'s receiver watchdog. With `cap` such
+                // links, every inbound LINKREQUEST from anyone is refused.
+                //
+                // We accept that: it is the same availability-for-memory trade the cap already
+                // makes, and cheaper than throwing away demonstrably busy legitimate transfers.
+                // But note the asymmetry with the `.handshake` case below — that one self-clears
+                // on the establishment deadline, whereas this one does NOT clear without the
+                // advertiser's cooperation. Bounding transfers per link is the real fix.
+                //
+                // Evict via `.close` so the element leaves through the normal
+                // `.delegate(.closed)` path that removes it and reaps its transfers. A bare
+                // `state.links.remove` here would strand `LXMFRouter.linkResourceInFlight`.
+                var evictions: [Effect<Action>] = []
+                if let cap = state.maxResponderLinks {
+                    let responders = state.links.filter { $0.role == .responder }
+                    if responders.count >= cap {
+                        // Only an .active element is evictable: `LinkSession.close` guards on
+                        // `status == .active`, so `.close` to a .pending/.handshake element is a
+                        // silent no-op. If we appended anyway, a flood of INCOMPLETE handshakes
+                        // would grow `links` without bound — precisely the attack this cap exists
+                        // to stop. So when nothing is evictable, REFUSE the new request. Incomplete
+                        // elements are not stranded: each leaves on its own establishment deadline.
+                        let evictable = responders
+                            .filter { $0.status == .active && $0.transfers.isEmpty }
+                            .sorted { ($0.lastData ?? $0.activatedAt ?? 0) < ($1.lastData ?? $1.activatedAt ?? 0) }
+                            .prefix(responders.count - cap + 1)
+                        guard !evictable.isEmpty else { return .none }
+                        for victim in evictable {
+                            evictions.append(.send(.link(.element(id: victim.id, action: .close))))
+                        }
+                    }
+                }
                 let newID = uuid()
                 state.links.append(LinkSession.State(id: newID, responderFor: owner,
                                                      destinationHash: destinationHash,
                                                      interfaceID: interfaceID))
-                return .send(.link(.element(id: newID, action: .acceptRequest(data))))
+                return .merge(evictions + [.send(.link(.element(id: newID, action: .acceptRequest(data))))])
 
             case let .routeLinkPacket(linkID, arrivalInterface, data):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }

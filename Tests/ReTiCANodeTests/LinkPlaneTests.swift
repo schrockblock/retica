@@ -474,6 +474,327 @@ private let ifA = InterfaceID("iface-a")
     store.exhaustivity = .on
 }
 
+// MARK: - Responder link cap tests (Task 4: F1)
+
+/// Helper: a well-formed LINKREQUEST with a fresh ephemeral (hence a fresh linkID).
+private func freshLinkRequest(destHash: Data) -> Data {
+    let packet = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                        destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                        destinationHash: destHash, transportId: nil,
+                        payload: Identity().publicKey + Link.signallingBytes)
+    return try! packet.packed()
+}
+
+/// Drive one NEW responder element all the way to `.active` through the plane's real entry
+/// points, and return its element id.
+///
+/// This matters because a responder activates only via `(.responder, .handshake, .data,
+/// .linkRequestRTT)`. A test that merely floods `acceptLinkRequest` leaves every element in
+/// `.handshake`, where nothing is evictable — so the cap binds by REFUSAL and the eviction path
+/// never runs. Feeding the LRRTT back through `routeLinkPacket` (which is how Transport delivers
+/// it) is what makes eviction reachable at all.
+@MainActor
+private func acceptAndActivateResponder(_ store: TestStore<LinkPlane.State, LinkPlane.Action>,
+                                        owner: Identity, destHash: Data,
+                                        iface: InterfaceID) async -> UUID {
+    await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                        interfaceID: iface, data: freshLinkRequest(destHash: destHash)))
+    // `.acceptRequest` is an effect; it must drain before `linkID`/`sessionKey` are populated.
+    await store.receive { if case .link(.element(_, .acceptRequest)) = $0 { return true }; return false }
+    let element = store.state.links.last!
+    // The initiator's RTT reply, encrypted under the session key the handshake just derived.
+    let rttCipher = Link.encrypt(MsgPack.encode(0.0), sessionKey: element.sessionKey)
+    let rtt = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                     destinationType: .link, context: .linkRequestRTT, contextFlag: false, hops: 0,
+                     destinationHash: element.linkID, transportId: nil, payload: rttCipher)
+    await store.send(.routeLinkPacket(linkID: element.linkID, arrivalInterface: iface,
+                                      data: try! rtt.packed()))
+    await store.receive { if case .link(.element(_, .received)) = $0 { return true }; return false }
+    #expect(store.state.links[id: element.id]?.status == .active,
+            "helper must actually reach .active, or the eviction path stays unreachable")
+    return element.id
+}
+
+/// END-TO-END eviction: a link is actually chosen, closed, and REMOVED, and the responder count
+/// settles back at the cap.
+///
+/// Every other cap test drives elements that never reach `.active`, so the cap binds by refusal
+/// and `for victim in evictable` never executes. This is the only test in which it does — a
+/// `fatalError` inside that loop traps here and nowhere else.
+@Test @MainActor func evictionClosesTheOldestResponderAndCountSettlesAtTheCap() async {
+    let owner = Identity()
+    let destHash = Data(repeating: 0x51, count: 16)
+    let iface = InterfaceID("i")
+    let cap = 2
+    // A mutable clock box so each activation lands at a distinct `activatedAt`; under a constant
+    // date every stamp is 0 and "oldest" would be decided by sort stability, not by the key.
+    let seconds = LockIsolated(0.0)
+    let store = TestStore(
+        initialState: LinkPlane.State(maxResponderLinks: cap)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .init { Date(timeIntervalSince1970: seconds.value) }
+    }
+    store.exhaustivity = .off
+
+    // Two ACTIVE responders. `older` activates first, so it carries the smaller sort key —
+    // neither ever carries data, so the key falls back to `activatedAt`.
+    seconds.setValue(100)
+    let older = await acceptAndActivateResponder(store, owner: owner, destHash: destHash, iface: iface)
+    seconds.setValue(200)
+    let newer = await acceptAndActivateResponder(store, owner: owner, destHash: destHash, iface: iface)
+    #expect(store.state.links.filter { $0.role == .responder }.count == cap)
+
+    // At the cap with something evictable, the next request must EVICT rather than refuse.
+    seconds.setValue(300)
+    await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                        interfaceID: iface, data: freshLinkRequest(destHash: destHash)))
+    await store.receive { action in
+        if case let .link(.element(id, .close)) = action { return id == older }
+        return false
+    }
+    // Eviction must REMOVE, not merely mark: the element leaves through the `.closed` delegate,
+    // which is the path that also reaps its transfers.
+    await store.receive { if case .link(.element(_, .delegate(.closed))) = $0 { return true }; return false }
+    #expect(store.state.links[id: older] == nil, "the victim must be removed, not just marked")
+    #expect(store.state.links[id: newer]?.status == .active, "the newer responder must be spared")
+    #expect(store.state.links.filter { $0.role == .responder }.count == cap,
+            "responder count settles back at the cap after the eviction")
+}
+
+/// F1: responder links are capped. An attacker completes real handshakes and holds elements
+/// forever, so authentication cannot bound this — only resource policy can.
+@Test @MainActor func responderLinksAreCappedAndInitiatorLinksAreNeverEvicted() async {
+    let owner = Identity()
+    let destHash = Data(repeating: 0x31, count: 16)
+    let cap = 3
+    let store = TestStore(
+        initialState: LinkPlane.State(maxResponderLinks: cap)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    // One of OUR outbound links. It must survive any amount of inbound pressure.
+    await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash,
+                               interfaceID: InterfaceID("i"), relayNextHop: nil))
+    let initiatorCount = { store.state.links.filter { $0.role == .initiator }.count }
+    #expect(initiatorCount() == 1)
+
+    // Flood well past the cap with distinct, well-formed requests.
+    for _ in 0 ..< (cap * 4) {
+        await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                            interfaceID: InterfaceID("i"),
+                                            data: freshLinkRequest(destHash: destHash)))
+    }
+
+    let responders = store.state.links.filter { $0.role == .responder }
+    #expect(responders.count <= cap)
+    // The DoS-amplifier trap: the flood must never cost us our own outbound link.
+    #expect(initiatorCount() == 1)
+}
+
+/// The cap must bound the ATTACK, not just orderly usage. An attacker floods LINKREQUESTs and
+/// never completes a handshake, so every element sits in .handshake — where `LinkSession.close`
+/// is a no-op. If the plane appended regardless, `links` would grow without bound in exactly the
+/// case the cap exists to stop.
+@Test @MainActor func floodOfIncompleteHandshakesCannotGrowLinksWithoutBound() async {
+    let owner = Identity()
+    let destHash = Data(repeating: 0x32, count: 16)
+    let cap = 4
+    let store = TestStore(
+        initialState: LinkPlane.State(maxResponderLinks: cap)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    // Every request is well-formed and distinct, but none is ever completed with an RTT,
+    // so every element stays in .handshake and none is evictable.
+    for _ in 0 ..< (cap * 10) {
+        await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                            interfaceID: InterfaceID("i"),
+                                            data: freshLinkRequest(destHash: destHash)))
+    }
+    #expect(store.state.links.count <= cap)
+}
+
+/// The eviction ORDER is the load-bearing half of the cap. An attacker keeps `lastInbound`
+/// fresh with keepalives for free; only `lastData` reflects traffic it could not forge. If
+/// eviction ever sorts on `lastInbound`, this test must fail — the attacker's link would
+/// survive and the quiet legitimate link would be evicted.
+///
+/// This test seeds state deliberately — the property under test is the *ordering comparator*,
+/// not reachability, and constructing the two clock skews through real traffic would take more
+/// machinery than it proves. A future reader should NOT "fix" this into the reachability style.
+@Test @MainActor func evictionPrefersLinksWithNoAuthenticatedTrafficEvenIfRecentlyPinged() async {
+    let destHash = Data(repeating: 0x41, count: 16)
+    // attacker: pinged very recently (high lastInbound) but never carried data (nil lastData).
+    var attacker = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!,
+                                     responderFor: Identity(), destinationHash: destHash,
+                                     interfaceID: InterfaceID("i"))
+    attacker.linkID = Data(repeating: 0xA1, count: 16)
+    attacker.status = .active
+    attacker.activatedAt = 0
+    attacker.lastInbound = 1_000
+    attacker.lastData = nil
+
+    // legitimate: quiet lately (low lastInbound) but carried real data (lastData set).
+    var legit = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!,
+                                  responderFor: Identity(), destinationHash: destHash,
+                                  interfaceID: InterfaceID("i"))
+    legit.linkID = Data(repeating: 0xB1, count: 16)
+    legit.status = .active
+    legit.activatedAt = 0
+    legit.lastInbound = 10
+    legit.lastData = 500
+
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [attacker, legit], maxResponderLinks: 2)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    await store.send(.acceptLinkRequest(owner: Identity(), destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"),
+                                        data: freshLinkRequest(destHash: destHash)))
+    // The attacker's link is the victim; the legitimate one is closed on neither count.
+    await store.receive { action in
+        if case let .link(.element(id, .close)) = action { return id == attacker.id }
+        return false
+    }
+    // Assert the SPARED party too. Under `.off`, `receive(predicate)` skips non-matching actions
+    // — so matching the attacker's `.close` alone does not prove `legit` escaped one of its own.
+    // `.close` sets `status = .closed` synchronously, so a spared element is still `.active`
+    // whether or not its removal has drained.
+    #expect(store.state.links[id: legit.id]?.status == .active,
+            "the link that carried real data must be spared")
+}
+
+/// An inbound flood must never evict one of OUR OWN outbound links. Only responder links are
+/// counted and eviction-eligible; dropping the `role == .responder` filter turns the cap into a
+/// DoS amplifier, because an attacker can then make us close the links we initiated.
+///
+/// Seeded deliberately: the property under test is the ROLE FILTER, not reachability. The
+/// initiator here is given the OLDEST sort key of all three elements, so if the role filter is
+/// removed it becomes the first element the comparator picks — which is exactly the trap.
+@Test @MainActor func evictionNeverChoosesAnInitiatorEvenWhenItIsTheOldest() async {
+    let destHash = Data(repeating: 0x42, count: 16)
+    // Our own outbound link, older than every responder.
+    var ours = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000C1")!,
+                                 initiatorTo: Identity(), destinationHash: destHash,
+                                 interfaceID: InterfaceID("i"))
+    ours.linkID = Data(repeating: 0xC1, count: 16)
+    ours.status = .active
+    ours.activatedAt = 0
+    ours.lastData = 0
+
+    // A responder with a strictly NEWER sort key, so the role filter is the only thing that can
+    // stop the initiator being chosen ahead of it.
+    var theirs = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000C2")!,
+                                   responderFor: Identity(), destinationHash: destHash,
+                                   interfaceID: InterfaceID("i"))
+    theirs.linkID = Data(repeating: 0xC2, count: 16)
+    theirs.status = .active
+    theirs.activatedAt = 0
+    theirs.lastData = 500
+
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [ours, theirs], maxResponderLinks: 1)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    await store.send(.acceptLinkRequest(owner: Identity(), destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"),
+                                        data: freshLinkRequest(destHash: destHash)))
+    // The responder is the victim...
+    await store.receive { action in
+        if case let .link(.element(id, .close)) = action { return id == theirs.id }
+        return false
+    }
+    // ...and our own outbound link is untouched. This is the assertion that dies if the
+    // `role == .responder` filter is dropped: the initiator would be closed first, on the
+    // strength of its older key.
+    #expect(store.state.links[id: ours.id]?.status == .active,
+            "an inbound flood must never close one of our own outbound links")
+}
+
+/// A link with an IN-FLIGHT RESOURCE TRANSFER must never be evicted, even when it holds the
+/// oldest sort key of any candidate.
+///
+/// Resource SEGMENT contexts (`.resource`, `.resourceHashmapUpdate`, and friends) forward raw
+/// bytes to `ResourceTransfer` children that decrypt internally, so they never advance
+/// `lastData` — only `.resourceAdvertisement` does, at transfer START. A link midway through a
+/// large transfer therefore looks maximally IDLE to a `lastData`-only comparator, which is
+/// precisely when evicting it is most wasteful.
+///
+/// Seeded deliberately: the property under test is the `transfers.isEmpty` filter outranking the
+/// sort key, not reachability.
+@Test @MainActor func evictionSkipsALinkWithAnInFlightTransferEvenWhenItIsTheOldest() async {
+    let destHash = Data(repeating: 0x43, count: 16)
+    let busyLinkID = Data(repeating: 0xD1, count: 16)
+    // Mid-transfer: the OLDEST key of the two, so only the transfers filter can spare it.
+    var busy = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000D1")!,
+                                 responderFor: Identity(), destinationHash: destHash,
+                                 interfaceID: InterfaceID("i"))
+    busy.linkID = busyLinkID
+    busy.status = .active
+    busy.activatedAt = 0
+    busy.lastData = 0
+    busy.transfers.append(ResourceTransfer.State(
+        sending: Data(repeating: 0xAB, count: 64),
+        linkID: busyLinkID,
+        sessionKey: Data(repeating: 0x00, count: 32),
+        interfaceID: InterfaceID("i"),
+        prefix: Data(repeating: 0x00, count: 16),
+        randomHash: Data(repeating: 0x01, count: 32),
+        sdu: 464,
+        id: UUID(uuidString: "00000000-0000-0000-0000-0000000000DD")!
+    ))
+
+    // Idle but strictly NEWER: this is the correct victim.
+    var quiet = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000D2")!,
+                                  responderFor: Identity(), destinationHash: destHash,
+                                  interfaceID: InterfaceID("i"))
+    quiet.linkID = Data(repeating: 0xD2, count: 16)
+    quiet.status = .active
+    quiet.activatedAt = 0
+    quiet.lastData = 500
+
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [busy, quiet], maxResponderLinks: 2)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    await store.send(.acceptLinkRequest(owner: Identity(), destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"),
+                                        data: freshLinkRequest(destHash: destHash)))
+    // The idle link is evicted despite having the NEWER key — the transfers filter outranks
+    // the comparator.
+    await store.receive { action in
+        if case let .link(.element(id, .close)) = action { return id == quiet.id }
+        return false
+    }
+    #expect(store.state.links[id: busy.id]?.status == .active,
+            "a link with an in-flight transfer must never be evicted mid-transfer")
+}
+
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {
     let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
         $0.uuid = .incrementing
