@@ -347,3 +347,54 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
 
     await teardown(store)
 }
+
+/// BLE peerOffline must fan out `.interfaceDisconnected` to `LinkPlane`, granting links bound to
+/// that interface one unauthenticated re-home. This pins the production wiring: if the
+/// `.linkPlane(.interfaceDisconnected(id))` fan-out is removed from the `peerOffline` handler,
+/// `rehomePermitted` stays false — the mechanism exists in `LinkPlane` but is never triggered
+/// from the real endpoint.
+///
+/// The setup drives a real LINKREQUEST from the peer's channel so the link is created via the
+/// normal code path rather than seeded state. This guarantees it is bound to
+/// `bleInterfaceID(peerToken)`, the same interface the disconnect will signal.
+@Test @MainActor func blePeerOfflineSetsRehomePermittedOnLinksForThatInterface() async {
+    let (store, events, _) = makeNode()
+    await bringPeerOnline(store, events)
+
+    // Feed a real LINKREQUEST from the peer so an inbound responder link is created on peerToken's
+    // BLE interface. (No need to complete the handshake — the test only cares about interfaceID
+    // and rehomePermitted, both of which are set at creation time.)
+    let owner = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["rehome-test"],
+                           identity: owner)!
+    await store.send(.registerLocalDestination(dest))
+
+    let initEph = Identity()
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: dest.hash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    events.yield(.channelData(channel, try! BLEFraming.frame(try! request.packed())))
+    // Drain the LRPROOF so the link element is fully created before we read state.
+    await store.receive { if case .ble(.send) = $0 { return true }; return false }
+
+    guard let element = store.state.linkPlane.links.first(where: { $0.interfaceID == bleInterfaceID(peerToken) }) else {
+        Issue.record("Expected a responder link bound to peerToken's interface")
+        return
+    }
+    let elementID = element.id
+
+    // Before disconnect: rehomePermitted must be false.
+    #expect(store.state.linkPlane.links[id: elementID]?.rehomePermitted == false)
+
+    // Peer goes offline. This must fan out .interfaceDisconnected to LinkPlane.
+    events.yield(.channelClosed(channel, reason: nil))
+    await store.receive { if case .delegate(.peerOffline) = $0 { return true }; return false }
+
+    // After disconnect: rehomePermitted must be true for the link bound to that interface.
+    // If the fan-out is missing, rehomePermitted stays false and this assertion fails.
+    #expect(store.state.linkPlane.links[id: elementID]?.rehomePermitted == true,
+            "peerOffline must fan-out interfaceDisconnected to LinkPlane so rehomePermitted is set")
+
+    await store.send(.stop)
+}

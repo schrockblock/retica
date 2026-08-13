@@ -111,6 +111,9 @@ private let ifA = InterfaceID("iface-a")
     #expect(roundTrips(.registerRequestHandler(path: "svc/echo", policy: .all)))
     #expect(roundTrips(.deregisterRequestHandler(path: "svc/echo")))
 
+    // .interfaceDisconnected — NOT aliased; rides .linkPlane(...)
+    #expect(roundTrips(.interfaceDisconnected(InterfaceID("gone"))))
+
     // .delegate — NOT aliased; rides .linkPlane(...)
     #expect(roundTrips(.delegate(.transmit(ifaceID, Data([0xFF])))))
     #expect(roundTrips(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash))))
@@ -827,6 +830,56 @@ private func acceptAndActivateResponder(_ store: TestStore<LinkPlane.State, Link
     }
     #expect(store.state.links[id: busy.id]?.status == .active,
             "a link with an in-flight transfer must never be evicted mid-transfer")
+}
+
+// MARK: - Unauthenticated re-home permission (Task 6)
+
+/// A LOCAL interface disconnect grants ONE unauthenticated re-home, so an idle BLE link whose
+/// peer reconnects is not stranded on a dead interface. An attacker cannot forge a local
+/// disconnect. The permission is one-shot: a second unauthenticated move must not follow.
+@Test @MainActor func localDisconnectGrantsExactlyOneUnauthenticatedReHome() async {
+    let dead = InterfaceID("dead")
+    let reconnected = InterfaceID("reconnected")
+    let attacker = InterfaceID("attacker")
+    let linkID = Data(repeating: 0x51, count: 16)
+    var session = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000C1")!,
+                                    responderFor: Identity(),
+                                    destinationHash: Data(repeating: 0x05, count: 16),
+                                    interfaceID: dead)
+    session.linkID = linkID
+    session.status = .active
+
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [session])
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    let keepalive = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                           destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                           destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+    let kaRaw = try! keepalive.packed()
+
+    // Without a disconnect, an unauthenticated keepalive must not move the link.
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: attacker, data: kaRaw))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == dead)
+
+    // A local disconnect grants the permission; the next keepalive re-homes.
+    await store.send(.interfaceDisconnected(dead))
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: reconnected, data: kaRaw))
+    // The re-home and the keepalive reply both emit effects; drain the transmit delegate so the
+    // state update from the child reducer is visible before we read interfaceID.
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == reconnected)
+
+    // One-shot: a further unauthenticated keepalive from elsewhere must NOT move it again.
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: attacker, data: kaRaw))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == reconnected)
 }
 
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {

@@ -135,6 +135,7 @@ public struct BLEEndpoint {
                 state.peerInterfaces[id] = nil
                 var effects: [Effect<Action>] = [
                     .send(.transport(.interfaceDisconnected(id))),
+                    .send(.linkPlane(.interfaceDisconnected(id))),
                     .send(.delegate(.peerOffline(token))),
                 ]
                 if state.peerInterfaces.isEmpty { effects.append(.send(.transport(.stopMaintenance))) }

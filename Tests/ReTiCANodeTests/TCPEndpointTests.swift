@@ -1802,3 +1802,58 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     await store.send(.disconnect)
     await store.receive(\.interface.disconnect)
 }
+
+/// TCP disconnected must fan out `.interfaceDisconnected` to `LinkPlane`, granting links on that
+/// interface one unauthenticated re-home. This pins the production wiring: if the
+/// `.linkPlane(.interfaceDisconnected(id))` fan-out is removed from the `disconnected` handler,
+/// `rehomePermitted` stays false — the mechanism exists in `LinkPlane` but is never triggered
+/// from the real endpoint.
+///
+/// The setup drives a real LINKREQUEST through the TCP data path so the link is created on
+/// the endpoint's fixed `interfaceID` — the same interface the disconnect will signal.
+@Test @MainActor func tcpDisconnectedSetsRehomePermittedOnLinksForThatInterface() async {
+    let owner = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["rehome-test"],
+                           identity: owner)!
+    let (store, events) = makeStore()
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.connect)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+
+    // Feed a real LINKREQUEST to our local destination over the TCP interface. This creates a
+    // responder link bound to the endpoint's fixed InterfaceID.
+    let initEph = Identity()
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: dest.hash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    events.yield(.data(HDLC.frame(try! request.packed())))
+    await store.receive(\.transport.received)
+    await store.receive(\.transport.delegate.linkRequest)
+    // Drain the LRPROOF transmit so the responder element is fully created.
+    await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
+
+    guard let element = store.state.linkPlane.links.first(where: { $0.interfaceID == store.state.interfaceID }) else {
+        Issue.record("Expected a responder link bound to the TCP interfaceID")
+        return
+    }
+    let elementID = element.id
+
+    // Before disconnect: rehomePermitted must be false.
+    #expect(store.state.linkPlane.links[id: elementID]?.rehomePermitted == false)
+
+    // TCP interface disconnects. This must fan out .interfaceDisconnected to LinkPlane.
+    events.yield(.disconnected(reason: nil))
+    await store.receive { if case .transport(.interfaceDisconnected) = $0 { return true }; return false }
+    // Drain the linkPlane fan-out so the state update is visible before we read rehomePermitted.
+    await store.receive { if case .linkPlane(.interfaceDisconnected) = $0 { return true }; return false }
+
+    // After disconnect: rehomePermitted must be true for the link on that interface.
+    // If the fan-out is missing, rehomePermitted stays false and this assertion fails.
+    #expect(store.state.linkPlane.links[id: elementID]?.rehomePermitted == true,
+            "TCP disconnected must fan-out interfaceDisconnected to LinkPlane so rehomePermitted is set")
+
+    await store.send(.disconnect)
+    await store.receive(\.interface.disconnect)
+}

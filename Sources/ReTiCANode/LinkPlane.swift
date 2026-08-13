@@ -66,6 +66,10 @@ public struct LinkPlane {
         /// Route an inbound link-addressed packet to the link that owns it.
         case routeLinkPacket(linkID: Data, arrivalInterface: InterfaceID, data: Data)
 
+        /// A local interface went away. Grants each link bound to it ONE unauthenticated re-home
+        /// so a reconnected peer is not stranded — see `LinkSession.State.rehomePermitted`.
+        case interfaceDisconnected(InterfaceID)
+
         case sendOverLink(linkID: Data, data: Data)
         case sendResourceOverLink(linkID: Data, data: Data)
         case identifyOverLink(linkID: Data, identity: Identity)
@@ -199,6 +203,12 @@ public struct LinkPlane {
                 // layer must not move the binding.
                 return .send(.link(.element(id: element.id,
                                             action: .received(data, arrivalInterface: arrivalInterface))))
+
+            case let .interfaceDisconnected(interfaceID):
+                for id in state.links.ids where state.links[id: id]?.interfaceID == interfaceID {
+                    state.links[id: id]?.rehomePermitted = true
+                }
+                return .none
 
             case let .sendOverLink(linkID, data):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }

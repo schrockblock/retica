@@ -118,6 +118,7 @@ public struct TCPEndpoint {
                               .send(.transport(.startMaintenance)))
             case .interface(.connectionEvent(.disconnected)):
                 return .merge(.send(.transport(.interfaceDisconnected(id))),
+                              .send(.linkPlane(.interfaceDisconnected(id))),
                               .send(.transport(.stopMaintenance)))
 
             case let .transport(.delegate(.transmit(txID, raw))):
@@ -274,7 +275,7 @@ extension TCPEndpoint.Action.AllCasePaths {
                     return .registerRequestHandler(path: path, policy: policy)
                 case let .deregisterRequestHandler(path):
                     return .deregisterRequestHandler(path: path)
-                case .openLink, .acceptLinkRequest, .routeLinkPacket, .delegate:
+                case .openLink, .acceptLinkRequest, .routeLinkPacket, .interfaceDisconnected, .delegate:
                     return .linkPlane(plane)
                 }
             },
