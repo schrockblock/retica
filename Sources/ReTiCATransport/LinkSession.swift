@@ -561,14 +561,33 @@ public struct LinkSession {
                     state.lastData = now
                     // RE-HOME, gated on authentication. A BLE peer that reconnects gets a new
                     // InterfaceID by construction, so the binding taken at creation goes stale and
-                    // outbound would fire at a dead interface. But re-homing on UNAUTHENTICATED
-                    // input is link theft: linkID is public and link packets bypass Transport's
-                    // dedup, so anyone could redirect a legitimate peer's traffic to themselves.
-                    // Only a packet that decrypted proves the sender holds the session key.
+                    // outbound would fire at a dead interface. Re-homing on UNAUTHENTICATED input
+                    // is link theft: `linkID` rides unencrypted in every link packet header, so
+                    // before this gate merely OBSERVING one packet was enough to redirect a
+                    // legitimate peer's traffic to yourself.
+                    //
+                    // What the gate actually establishes, stated precisely: this packet
+                    // ORIGINATED from a holder of the session key. It does NOT establish that the
+                    // party that just sent it holds that key. Nothing here dedupes inbound link
+                    // packets, so identical bytes decrypt identically however many times they
+                    // arrive, and from wherever.
+                    //
+                    // RESIDUAL, deliberately left open and recorded here because this is the only
+                    // site that reasons about it: an attacker who CAPTURES one authenticated data
+                    // packet can replay those exact bytes from its own interface and still re-home
+                    // the link. Link traffic reaches us ahead of Transport's replay dedup —
+                    // `Transport`'s `.received` returns `.delegate(.linkPacket(...))` for link
+                    // packets before it reaches the `seenPacketHashes.insert` guard, which sits
+                    // below that return — and `LinkSession` keeps no inbound packet-hash set of
+                    // its own (`pendingDataReceipts` is keyed by OUTBOUND packet hash, for proofs).
+                    // The vector is narrowed from "observe a linkID" to "capture a data packet",
+                    // not closed. Closing it needs per-packet replay rejection on the link, which
+                    // does not exist anywhere in the link path today.
                     //
                     // The idle-BLE-reconnect case, where the only inbound traffic is plaintext
-                    // keepalives, is covered by the one-shot permission a LOCAL interface
-                    // disconnect grants (see `rehomePermitted`).
+                    // keepalives, is not covered here at all: no keepalive ever sets
+                    // `sawAuthenticatedData`, so a link that goes idle across a reconnect cannot
+                    // re-home by this route.
                     if let arrival = arrivalInterface, arrival != state.interfaceID {
                         state.interfaceID = arrival
                         extra.append(.send(.delegate(.rehomed(arrival))))

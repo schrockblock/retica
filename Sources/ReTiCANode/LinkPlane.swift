@@ -329,6 +329,17 @@ public struct LinkPlane {
                 // transfer transmit uses that stored copy, so a transfer running when the peer
                 // reconnects would keep firing parts, hashmap updates, proofs and cancels at the
                 // dead interface.
+                //
+                // Note the limit on when that actually gets repaired today: `LinkSession` sets
+                // `sawAuthenticatedData` only inside its `authDecrypt` helper, and the resource
+                // SEGMENT branches (`.resource`, `.resourceRequest`, `.resourceHashmapUpdate`,
+                // `.resourceProof`, and the two cancels) forward raw bytes to `ResourceTransfer`
+                // children that decrypt internally — they never call it. Only
+                // `.resourceAdvertisement`, at transfer START, does. So an in-flight transfer's
+                // OWN inbound traffic cannot trigger the re-home this handler repairs; some other
+                // authenticated packet on the link has to arrive first. The scenario above is
+                // therefore motivation for keeping transfer bindings consistent WHEN a re-home
+                // happens, not a claim that a mid-transfer reconnect self-heals.
                 for tid in state.links[id: elementID]?.transfers.ids ?? [] {
                     state.links[id: elementID]?.transfers[id: tid]?.interfaceID = interfaceID
                 }

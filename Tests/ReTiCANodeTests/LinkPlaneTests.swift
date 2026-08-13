@@ -195,9 +195,20 @@ private func authenticatedPacket(linkID: Data, sessionKey: Data, body: Data) -> 
     #expect(store.state.links[id: session.id]?.interfaceID == ifNew)
 }
 
-/// An authenticated packet arriving on the SAME interface changes nothing — the common case
-/// must not churn state. This is also the TCP case: TCPEndpoint has one fixed InterfaceID, so
-/// the arrival always equals the stored value and no re-home fires.
+/// An authenticated packet arriving on the SAME interface must not re-home — the common case
+/// must not churn. This is also the TCP case: TCPEndpoint has one fixed InterfaceID, so the
+/// arrival always equals the stored value.
+///
+/// The load-bearing assertion is that NO `.rehomed` action is emitted, not merely that the
+/// binding ends up unchanged. Those differ: without the `arrival != state.interfaceID` guard
+/// the session would be reassigned to the value it already holds, so an end-state-only
+/// assertion passes either way and the test proves nothing. `.rehomed` is the observable that
+/// distinguishes them — which matters because a one-shot re-home permission consumed inside
+/// that same block would be spent by ordinary same-interface traffic.
+///
+/// Driven under `.on` exhaustivity so a spurious `.rehomed` cannot be silently skipped:
+/// under `.off`, `receive(predicate)` skips non-matching actions, which is exactly how this
+/// test failed to catch the missing guard before.
 @Test @MainActor func linkPacketFromTheSameInterfaceLeavesTheSessionUnchanged() async {
     let ifTCP = InterfaceID("tcp")
     let destHash = Data(repeating: 0x02, count: 16)
@@ -212,12 +223,22 @@ private func authenticatedPacket(linkID: Data, sessionKey: Data, body: Data) -> 
                                                destHash: destHash, interfaceID: ifTCP)
     #expect(store.state.links[id: session.id]?.interfaceID == ifTCP)
 
-    // Authenticated packet on the SAME interface: the binding must not move.
+    // Authenticated packet on the SAME interface: the binding must not move, and no re-home
+    // may be announced. Flip to exhaustive BEFORE the send so every resulting action must be
+    // accounted for by name.
+    store.exhaustivity = .on
     let raw = authenticatedPacket(linkID: session.linkID, sessionKey: session.sessionKey,
                                   body: Data([0x03, 0x04]))
     await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: ifTCP, data: raw))
+    await store.receive { if case .link(.element(_, .received)) = $0 { return true }; return false }
+    await store.receive { if case .link(.element(_, .delegate(.dataReceived))) = $0 { return true }; return false }
     await store.receive { if case .delegate(.linkDataReceived) = $0 { return true }; return false }
     #expect(store.state.links[id: session.id]?.interfaceID == ifTCP)
+
+    // Close so the inactivity timer the inbound packet re-armed is cancelled; an in-flight
+    // effect at teardown is reported as a failure under `.on`.
+    store.exhaustivity = .off
+    await store.send(.closeLink(linkID: session.linkID))
 }
 
 /// Re-homing is keyed to the addressed link only: an authenticated packet arriving on a new
@@ -281,10 +302,13 @@ private func authenticatedPacket(linkID: Data, sessionKey: Data, body: Data) -> 
     // Drain the advertisement that fires immediately from sendResource.
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
 
-    // Confirm a transfer is now in-flight on the old interface.
-    let xferID = store.state.links[id: session.id]?.transfers.ids.first
-    #expect(xferID != nil)
-    #expect(store.state.links[id: session.id]?.transfers[id: xferID!]?.interfaceID == ifOld)
+    // Confirm a transfer is now in-flight on the old interface. Bail rather than trap if the
+    // transfer never started: without one this test would silently assert nothing.
+    guard let xferID = store.state.links[id: session.id]?.transfers.ids.first else {
+        Issue.record("no in-flight transfer was created; the re-home assertions below would be vacuous")
+        return
+    }
+    #expect(store.state.links[id: session.id]?.transfers[id: xferID]?.interfaceID == ifOld)
 
     // Authenticated packet from the new interface: session AND transfer must re-home.
     let raw = authenticatedPacket(linkID: session.linkID, sessionKey: session.sessionKey,
@@ -295,7 +319,7 @@ private func authenticatedPacket(linkID: Data, sessionKey: Data, body: Data) -> 
     // Both session and transfer moved — this is the assertion that dies if the rehomed
     // handler body is deleted.
     #expect(store.state.links[id: session.id]?.interfaceID == ifNew)
-    #expect(store.state.links[id: session.id]?.transfers[id: xferID!]?.interfaceID == ifNew)
+    #expect(store.state.links[id: session.id]?.transfers[id: xferID]?.interfaceID == ifNew)
 }
 
 // MARK: - Duplicate inbound LINKREQUEST dedup tests
