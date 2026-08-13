@@ -353,10 +353,28 @@ private func authenticatedPacket(linkID: Data, sessionKey: Data, body: Data) -> 
     await store.receive { if case .link(.element(_, .acceptRequest)) = $0 { return true }; return false }
     #expect(store.state.links.count == 1)
 
-    // Byte-identical replay: no new element.
+    // Byte-identical replay: no new element, and — the half this test is named for — no new
+    // PROOF. The proof half is load-bearing on its own. A dedupe that recognised the duplicate
+    // but re-dispatched `.acceptRequest` to the existing element would keep `links.count` at 1
+    // while still paying the DH, HKDF, Ed25519 signature and fresh keypair generation the guard
+    // exists to avoid, and putting a second LRPROOF on the wire per replay. Element-count
+    // assertions alone cannot see that.
+    //
+    // The emission is invisible under `.off`: `TestStore.send` checks `receivedActions` before
+    // it clears them, but routes the complaint through `reportIssueHelper`, which reads
+    // exhaustivity at call time and drops the message entirely under
+    // `.off(showSkippedAssertions: false)` — then clears the queue, so nothing downstream can
+    // recover it. So the observation has to happen under `.on`.
     await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
                                         interfaceID: InterfaceID("i"), data: raw))
     #expect(store.state.links.count == 1)
+
+    // Proof probe: a no-op action (unknown linkID → `.none`, no state change) sent under `.on`,
+    // purely so its pre-send check runs against whatever the replay left queued. A re-dispatched
+    // `.acceptRequest` shows up here as an unhandled received action.
+    store.exhaustivity = .on
+    await store.send(.sendOverLink(linkID: Data(repeating: 0xEE, count: 16), data: Data()))
+    store.exhaustivity = .off
 
     // A genuinely NEW request (different ephemeral → different linkID) still works.
     let request2 = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,

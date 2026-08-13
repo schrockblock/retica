@@ -1029,44 +1029,59 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 /// links with real RNS peers — and would not bound anything anyway, since an attacker holds a
 /// valid session key and can send authenticated keepalives.
 ///
-/// Two-part structure:
-///   (1) The keepalive must refresh: advance to 90 % of stale, send the keepalive, then advance
-///       ANOTHER 90 % (total = 180 % of stale from establishment). Without the keepalive refresh
-///       the original timer (armed at t=0) would have fired already; with it, the freshly-armed
-///       timer does NOT fire until a full stale from the keepalive. Use `.on` exhaustivity at the
-///       `store.send` inside the second window so that a pending `.inactivityDeadline` is
-///       detected before it can be silently discarded — a send with `.on` fails if there are
-///       unhandled received actions in the queue.
-///   (2) The refreshed timer eventually fires: advance past the refreshed deadline and receive
-///       `.inactivityDeadline` explicitly, proving the timer was tracking from the keepalive.
+/// Two-part structure, because "the keepalive refreshed the clock" and "the clock is still armed
+/// afterwards" are different properties and a bug can break either one alone:
+///   (1) The keepalive must refresh. Each `almostStale` advance stops deliberately short of the
+///       deadline, so two of them back-to-back overshoot a timer that was NEVER re-armed while
+///       leaving a re-armed one comfortably alive. The observation runs under `.on`, because a
+///       fired-but-unhandled `.inactivityDeadline` is silent under `.off`.
+///   (2) The refreshed timer is still armed, not cancelled. A change that cancelled the
+///       inactivity timer on a keepalive without re-arming it would sail through (1) — no
+///       deadline is queued — while leaving the link immortal, which is the opposite failure.
+///       Advancing a full `stale` past the last keepalive must therefore still reap it.
 @Test @MainActor func plaintextKeepaliveStillRefreshesInactivity() async {
     let clock = testClock()
     let store = await activeResponderStore(clock: clock)
     let stale = store.state.staleTime
     let linkID = store.state.linkID
+    // Deliberately short of the deadline: one of these alone never reaps, two back-to-back reap
+    // an un-refreshed timer. Let the advances carry the arithmetic.
+    let almostStale = Duration.seconds(stale * 0.9)
+
+    func plaintextKeepalive() -> Data {
+        let ka = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                        destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                        destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+        return try! ka.packed()
+    }
 
     // Advance to just under the stale deadline, then ping with an UNAUTHENTICATED keepalive.
-    await clock.advance(by: .seconds(stale * 0.9))
-    let ka = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
-                    destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
-                    destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
-    await store.send(.received(try! ka.packed()))
+    await clock.advance(by: almostStale)
+    await store.send(.received(plaintextKeepalive()))
     _ = await captureTransmit(store)                       // 0xFE reply confirms keepalive processed
 
-    // Advance again by the same amount. Without the keepalive refresh, the original inactivity
-    // timer (armed at establishment) would have already expired at total = stale * 1.8 > stale.
-    // With the refresh, the freshly-armed timer does NOT fire until 90% more from NOW.
-    await clock.advance(by: .seconds(stale * 0.9))
+    // Advance again by the same amount. The timer armed at establishment is now overshot, so if
+    // the keepalive had not re-armed it the deadline would already have fired; the timer the
+    // keepalive armed still has time left on it.
+    await clock.advance(by: almostStale)
 
-    // Detection step: switch to .on and send a second keepalive. If a pending .inactivityDeadline
-    // is in the queue from the advance above, the .on-mode send fails at its pre-send check
-    // ("must handle received actions before sending"). Without mutation the queue is empty here.
-    let ka2 = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
-                     destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
-                     destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+    // (1) Detection step: send a second keepalive under `.on`. `TestStore.send` checks
+    // `receivedActions` before clearing them, but routes the complaint through
+    // `reportIssueHelper`, which reads exhaustivity at call time — under `.off` the message is
+    // dropped and the queue then cleared, so a fired `.inactivityDeadline` leaves no trace.
+    // Under `.on` it fails the test. Without a mutation the queue is empty here.
     store.exhaustivity = .on
-    await store.send(.received(try! ka2.packed()))
+    await store.send(.received(plaintextKeepalive()))
     store.exhaustivity = .off
     _ = await captureTransmit(store)                       // second 0xFE reply
     #expect(store.state.status == .active, "link must survive if keepalive reset the inactivity clock")
+
+    // (2) The timer that keepalive armed is real: a full stale of silence past it reaps the link.
+    store.exhaustivity = .on
+    await clock.advance(by: .seconds(stale))
+    await store.receive(.inactivityDeadline) { $0.status = .closed }
+    _ = await captureTransmit(store)                       // LINKCLOSE teardown
+    await store.receive(.delegate(.closed(.timedOut)))
+    store.exhaustivity = .off
+    #expect(store.state.status == .closed)
 }
