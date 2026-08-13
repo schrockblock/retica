@@ -33,7 +33,12 @@ for most rows below:
   cleartext, so observing one packet is enough to address a link.
 - `Transport.received` returns `.delegate(.linkPacket(...))` for `destinationType == .link` **above**
   the `seenPacketHashes.insert` guard, so replay on the link path is free. `LinkSession` adds no
-  dedup of its own — every `packetHash` use there is keyed by OUTBOUND hash, for proofs.
+  dedup of its own — it keeps no inbound packet-hash SET, so nothing there remembers that a packet
+  has been seen. (State that precisely. The tempting shorthand — "every `packetHash` use there is
+  outbound-keyed" — is FALSE: `(_, .active, .data, .none)` surfaces the INBOUND `packet.packetHash`
+  via `.dataReceived(data:packetHash:)`, and `.provePacket(packetHash:)` signs that inbound value.
+  Only `pendingDataReceipts` is outbound-keyed. Inbound hashes are computed and used; they are
+  never RETAINED for comparison, and retention is the property that matters.)
 
 ---
 
@@ -69,10 +74,11 @@ Verdicts: **safe** — unauthenticated input cannot reach the verb, or reaching 
 | `(.responder, .handshake, .data, .linkRequestRTT)` | yes | activate / no-op | **fixed** (F6, Task 1). Decrypt failure now returns `.none` and lets the establishment timer decide. |
 | `(_, .active, .data, .none)` | no | — | safe. `authDecrypt` gate; failure is ignored. Replayable (F9). |
 | `(_, .active, .data, .linkClose)` | no | DESTROY | safe. Requires decrypt AND `plain == linkID`. Replayable in principle (F9), but the ciphertext only exists once the link is already closing. |
-| `(.responder, .active, .data, .keepalive)` | **yes** | EXTEND + reflect | **deliberate.** RNS keepalives are unencrypted by explicit design, so gating this breaks interop, and it bounds nothing — an attacker holding a link holds a session key. Pinned by `plaintextKeepaliveStillRefreshesInactivity`. Reflection (`0xFF` in → `0xFE` out) is unauthenticated; note it is subsumed by F12's broader re-arm, so removing this branch would not change the extension property. |
+| `(.responder, .active, .data, .keepalive)` | **yes** | EXTEND + reflect | **deliberate.** RNS keepalives are unencrypted by explicit design, so gating this breaks interop, and it bounds nothing — an attacker holding a link holds a session key. Pinned by `plaintextKeepaliveStillRefreshesInactivity`. Reflection (`0xFF` in → `0xFE` out) is unauthenticated. The EXTENSION here is subsumed by F16's broader re-arm, so removing this branch would not change the extension property — but it would remove the `0xFE` liveness answer RNS expects, which is pinned by `responderRepliesToKeepaliveWith0xFE`. The branch is redundant for extension, not redundant overall. |
 | `(.initiator, .active, .data, .keepalive)` | **yes** | EXTEND | **deliberate**, same reasoning. |
 | `(_, .active, .data, .resourceAdvertisement)` | no (needs the key) | CREATE (transfer) | **OPEN — F11.** Decrypt + unpack + a SAME-hash dedup only; distinct hashes append without bound. Probe: 25 advertisements → 25 transfers. Combined with `LinkPlane`'s `transfers.isEmpty` eviction filter this pins the link and refuses everyone else in. |
-| `(_, .active, .data, .resource \| .resourceRequest \| .resourceHashmapUpdate \| .resourceInitiatorCancel \| .resourceReceiverCancel)` | yes (bytes reach the child) | — | safe. Every one of those `ResourceTransfer` branches gates on `Link.decrypt`. Bytes arrive; nothing acts on them. |
+| `(_, .active, .data, .resourceRequest \| .resourceHashmapUpdate \| .resourceInitiatorCancel \| .resourceReceiverCancel)` | yes (bytes reach the child) | — | safe. These four `ResourceTransfer` branches each open with `Link.decrypt`, so unauthenticated bytes arrive and nothing acts on them. |
+| `(_, .active, .data, .resource)` — the bulk SEGMENT branch | yes (bytes reach the child) | — | **safe, but NOT for the reason the other four are**, and an earlier draft of this row asserted the wrong mechanism for both. `ResourceTransfer.received`'s `(.receiver, .data, .resource)` branch calls **no `Link.decrypt` at all**, and on a match it DOES act: it writes `receivedParts[idx]`, does `outstanding.remove(idx)`, sets `status = .transferring`, sets `receivedFirstPart`/`partTimeoutFactor`, advances `consecutiveCompletedHeight`, and then either arms the receiver watchdog or calls `requestNextWindow`, which transmits. **The actual gate is `Resource.mapHash(chunk:randomHash:)`** — a 4-byte hash of the chunk under `state.randomHash` — looked up in `knownHashmap`, plus a `receivedParts[idx] == nil` per-index dedup. `randomHash` reaches the receiver only inside the advertisement, which IS decrypted, so it is a per-transfer secret an off-link attacker does not hold. Two further nets catch anything that slips through: `Resource.assemble` decrypts the joined stream under the session key, and `Resource.verify` checks `fullHash(data ‖ randomHash) == hash`. **Bounded residual, not promoted to an F-number:** the map hash is 4 bytes, so a blind chunk collides with one of the `N` hashmap entries with probability about `N / 2^32`. A collision poisons that part slot — the `receivedParts[idx] == nil` guard then REJECTS the legitimate part — and the transfer fails at `assemble`/`verify`. That is a transfer-scoped DoS costing on the order of `2^32 / N` packets, which is why it is recorded here rather than ranked. |
 | `(_, .active, .data, .resourceProof)` and `(_, .active, .proof, .resourceProof)` | **yes** | **DESTROY (transfer)** | **OPEN — F15.** Fanned out raw to EVERY element of `state.transfers`. `ResourceTransfer`'s `(.sender, .proof, .resourceProof)` branch calls `Resource.validateProof`, which is a plaintext 64-byte equality check on an UNENCRYPTED payload, with no status guard and no check that the proof names this transfer. A non-matching value takes the `else` and sets `.failed`. Probe-proven: one 64-byte junk packet at the cleartext `linkID` emitted `resourceFailed` and removed the transfer. |
 | `(_, .active, .data, .response)` | no | — | safe. Decrypt + `pendingRequests` membership. |
 | `(_, .active, .data, .linkIdentify)` | no | — | safe. Decrypt + Ed25519 over `linkID ‖ pub`. |
@@ -84,7 +90,7 @@ Verdicts: **safe** — unauthenticated input cannot reach the verb, or reaching 
 
 | Branch (symbol) | Unauth? | Verb | Verdict |
 |---|---|---|---|
-| `guard state.status == .active` → `lastInbound = now` → `inactivityTimer(state.staleTime)` | **yes** | **EXTEND** | **OPEN — F16.** Every `guard … else { return .none }` inside `dispatch` returns from `dispatch`, not from the reducer, so control always reaches the re-arm. **ANY** packet bearing the cleartext `linkID` extends an `.active` link — a failed decrypt, an unhandled context, an 8-byte junk payload. Probe: eight rounds of `0.9 × staleTime` fed only undecryptable `.cacheRequest` packets left the link `.active`; a full `staleTime` of silence closed it. The keepalive branches are not the extension mechanism; they are redundant with this. |
+| `guard state.status == .active` → `lastInbound = now` → `inactivityTimer(state.staleTime)` | **yes** | **EXTEND** | **OPEN — F16.** Every `guard … else { return .none }` inside `dispatch` returns from `dispatch`, not from the reducer, so control always reaches the re-arm. **ANY** packet bearing the cleartext `linkID` extends an `.active` link — a failed decrypt, an unhandled context, an 8-byte junk payload. Probe: eight rounds of `0.9 × staleTime` fed only undecryptable `.cacheRequest` packets left the link `.active`; a full `staleTime` of silence closed it. So the keepalive branches are not the extension mechanism — they are redundant with this **for extension only**, and remain load-bearing for the `0xFE` liveness reply. |
 | `if sawAuthenticatedData { state.lastData = now }` | no | — | **fixed** (Task 3). Only decrypted traffic advances the eviction clock. |
 | re-home block (`sawAuthenticatedData \|\| state.rehomePermitted`) | **yes**, two ways | **RE-HOME** | **fixed with two OPEN residuals — F9 and F10.** (a) `sawAuthenticatedData` proves the packet ORIGINATED from a key holder, not that the sender holds the key, and nothing dedupes inbound link packets — so replaying one captured ciphertext re-homes. (b) `rehomePermitted` is spendable by any interface. |
 
@@ -93,7 +99,7 @@ Verdicts: **safe** — unauthenticated input cannot reach the verb, or reaching 
 | Branch (symbol) | Unauth? | Verb | Verdict |
 |---|---|---|---|
 | `.establishmentDeadline` | no | DESTROY | safe. Clock-driven; nothing inbound re-arms it, so a `.pending`/`.handshake` element cannot be held past its deadline. |
-| `.inactivityDeadline` | no | DESTROY | safe in itself; its firing time is postponed indefinitely by unauthenticated input (F12). |
+| `.inactivityDeadline` | no | DESTROY | safe in itself; its firing time is postponed indefinitely by unauthenticated input (F16). |
 | `.keepaliveDeadline` | no | — | safe. |
 | `.transfer(.element(_, .delegate(.received \| .concluded \| .failed)))` | via F15 | DESTROY (transfer) | the removal is correct; what reaches it unauthenticated is F15. |
 
@@ -127,7 +133,7 @@ Verdicts: **safe** — unauthenticated input cannot reach the verb, or reaching 
 | `case .data:` relay / local delivery | no | — | safe. Local delivery requires `destination.decrypt`. |
 | `case .announce:` and the ingress-control machinery | yes | — | touches no link element. `learned` entries do gate F13's relay branch. |
 | `.maintenanceTick` → `linkTable` GC at `linkTableExpiry` | no | DESTROY | correct, and defeated by F13's refresh. |
-| `.stopRelaying` → `linkTable = [:]` | no | DESTROY | safe. |
+| `setTransportIdentity(nil)` — the `guard identity == nil else { return .none }` branch → `linkTable = [:]` | no | DESTROY | safe. (There is no `stopRelaying` symbol in this repo; an earlier draft of this row invented one, against this document's own cite-symbols convention.) |
 
 ---
 
@@ -207,5 +213,30 @@ exactly — every node correct, one arrow wrong — and it is the reason nothing
 recorded here without a probe or a repo-wide grep behind it.
 
 **Cite symbols, not line numbers, and do not encode derived arithmetic.** Both conventions held
-through this document; the two places that wanted a number (`staleTime`, `linkTableExpiry`) name
-the constant and point at a probe instead.
+through this document with one lapse, caught on review: an earlier draft cited a `.stopRelaying`
+action that does not exist in this repo. The real site is the `identity == nil` branch of
+`setTransportIdentity`. Inventing a plausible symbol name is a failure mode the convention was
+supposed to prevent, and it is harder to spot than a drifted line number because it reads right.
+
+**The false claims that survived to review were all in "safe" and "corrects X" positions.** Six
+accuracy defects were found after this document was first committed. Their distribution is the
+lesson, not their count:
+
+- Two were **inside entries whose job is to correct other claims** — the F16 entry, which exists to
+  correct F1, itself overstated the correction ("removing the keepalive branches would change
+  nothing" — false; they also emit the `0xFE` liveness reply, pinned by a test in the suite); and
+  F1's own CLOSED banner said the link-theft half was "closed" three paragraphs before pointing at
+  the two residuals that make it merely narrowed.
+- One was **the justification behind a `safe` verdict**: the resource-segment row claimed every
+  child branch gates on `Link.decrypt`. The bulk `(.receiver, .data, .resource)` branch calls no
+  `Link.decrypt` at all and DOES act on a match. The verdict survives, but on a completely
+  different mechanism (`Resource.mapHash` under the advertisement's secret `randomHash`).
+- Two were **stable-ID mis-citations** (F12 written where F16 was meant), which is the worst kind
+  of typo in a document whose IDs are its routing.
+- One was **a shorthand that overreached** ("every `packetHash` use is outbound-keyed").
+
+**A `safe` row and a "this corrects X" paragraph are the two places a wrong arrow does the most
+damage,** because both are exactly what a later reader will NOT re-derive — one because it is
+marked as nothing to worry about, the other because it is marked as the already-corrected version.
+Every such claim in this document has now been re-checked against the code. Apply that ordering to
+the next sweep: verify the reassuring sentences first.

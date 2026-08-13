@@ -188,9 +188,19 @@ populations. Do not plan them as one slice on the strength of the shared cause.
 **CLOSED by `4ef3a21..034a4c9`**, and read the qualification before trusting the
 word. What closed it is `LinkPlane.State.maxResponderLinks` (default 256) with
 eviction ordered by `lastData`, a clock only successfully-decrypted non-keepalive
-traffic advances (`7169c73`, `39d44bc`, `b384ed6`). The link-theft half was closed
-separately by moving the re-home decision into `LinkSession` behind an
-authentication gate (`5414b0b`).
+traffic advances (`7169c73`, `39d44bc`, `b384ed6`).
+
+**The link-theft half is NARROWED, not closed** — say it here rather than three
+paragraphs down, because "closed" is the word a skimmer takes away. The re-home
+decision moved into `LinkSession` behind an authentication gate (`5414b0b`,
+then `349a77b` pinning the same-interface guard), and `e3eb397` then deliberately
+WIDENED it again with the one-shot local-disconnect grant, so this is a
+three-commit story and not a single one. What remains: **F9** — the gate proves a
+packet originated from a key holder, not that its sender is one, and nothing
+dedupes inbound link packets, so one captured ciphertext still re-homes; and
+**F10** — the disconnect grant is spendable by any interface. The attacker's price
+went from "observe a cleartext linkID" to "capture one ciphertext", or to "be
+connected when a local interface drops". Real improvement; not closure.
 
 **This is a RESOURCE-POLICY bound, not an authentication one, and it cannot be
 anything else.** Opening a link is unauthenticated by protocol design: an
@@ -508,8 +518,16 @@ probe recorded in
 ### F9 — link traffic has no per-packet replay rejection, anywhere in the link path
 
 **Where:** `Transport.received` (the `destinationType == .link` return sits ABOVE
-`seenPacketHashes.insert`) and `LinkSession.received` (no inbound hash set at all
-— every `packetHash` use there is keyed by OUTBOUND hash, for proofs).
+`seenPacketHashes.insert`) and `LinkSession.received`, which keeps **no inbound
+packet-hash SET** — nothing there remembers that a packet has been seen.
+
+State that precisely, because the obvious shorthand ("every `packetHash` use
+there is outbound-keyed") is FALSE and was written that way in an earlier draft:
+`(_, .active, .data, .none)` surfaces the INBOUND `packet.packetHash` in
+`.dataReceived(data:packetHash:)`, and `.provePacket(packetHash:)` signs that
+inbound value. Only `pendingDataReceipts` is outbound-keyed. Inbound hashes are
+computed and used — they are just never RETAINED for comparison, which is the
+property that matters.
 
 The Transport half is deliberate and correct in isolation: byte-identical
 keepalives share a packet hash and must not be deduped, and a retried link
@@ -721,9 +739,19 @@ decrypt, an unhandled context, an 8-byte junk payload. Probe: eight rounds of
 link `.active`; a full `staleTime` of silence closed it.
 
 **This corrects F1 and F10.** F1 attributes life extension to "the keepalive
-branches"; those branches are redundant with this and removing them would change
-nothing. F10 was described as bounded by the watchdog; it is not, because the
-party spending the grant refreshes the watchdog itself.
+branches". Those branches are redundant with this re-arm **for the EXTENSION
+property only** — deleting them would not change how long an unauthenticated
+party can hold a link open, because the re-arm runs regardless. They are NOT
+otherwise redundant, and an earlier draft of this entry said "removing them would
+change nothing" without that scope, which is false:
+`(.responder, .active, .data, .keepalive)` also emits the `0xFE` reply via
+`linkPacket(state.linkID, .keepalive, …)` → `.delegate(.transmit)`, which is
+RNS's liveness answer and is pinned by `responderRepliesToKeepaliveWith0xFE`.
+Removing it breaks interop AND reddens the suite. The sweep's table row carried
+the scope; this entry dropped it.
+
+F10 was described as bounded by the watchdog; it is not, because the party
+spending the grant refreshes the watchdog itself.
 
 The hoisting is deliberate and was the fix for a real bug — per-branch re-arming
 is how a 60s mid-transfer teardown got in, and the comment above it says so. So
@@ -807,7 +835,10 @@ version to trust. Three facts, in the order they execute:
    drained" rule above, not a separate quirk.
 
 2. **`TestStore.send` checks `!self.reducer.receivedActions.isEmpty`
-   UNCONDITIONALLY, BEFORE the exhaustivity switch**, and routes the resulting
+   UNCONDITIONALLY, BEFORE the exhaustivity switch** — "unconditionally" meaning
+   for every exhaustivity setting, but only AFTER the `isDismissed` early return
+   above it, which reports "Can't send action to dismissed test store" and returns
+   without ever reaching the queue check. It routes the resulting
    "Must handle N received actions before sending an action" message through
    `reportIssueHelper` — which reads `self.exhaustivity` **at call time**:
    - `.on` → `reportIssue` → a real failure;
@@ -833,6 +864,17 @@ reports the discarded actions through the same `reportIssueHelper`. So every
 non-matching action ahead of the match is silently dropped under the default
 `.off`. `captureTransmit`-style helpers therefore consume the queue, and a test
 that relies on a later assertion "catching" an earlier stray will not.
+
+**The trap has a floor, and knowing where it is stops over-correction.**
+`receive`'s two "no matching action" guards — the empty-queue one and the
+`!contains(where: predicate)` one — and the async timeout path all call **raw
+`reportIssue`, not `reportIssueHelper`**, so they do not consult exhaustivity at
+all. A MISSING action therefore fails hard even under `.off`. Non-exhaustivity
+silences EXTRA actions; it never silences ABSENT ones. So a `receive` that
+returns without complaint really did see its action, at any setting — which is
+why the characterization tests in this repo can rely on `receive` under `.off`
+for positive assertions and only need `.on` for negative ones ("nothing else
+happened").
 
 **Fix pattern: keep `.on` ACROSS the boundary where silence must be proven** —
 flip before the send whose effects you are making a claim about, and flip back
