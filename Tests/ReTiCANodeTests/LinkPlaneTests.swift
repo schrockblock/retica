@@ -288,25 +288,72 @@ private let ifA = InterfaceID("iface-a")
     #expect(store.state.links[id: session.id]?.transfers[id: xferID]?.interfaceID == ifNew)
 }
 
+// MARK: - Duplicate inbound LINKREQUEST dedup tests
+
+/// F2: a replayed LINKREQUEST must not mint a second element. Duplicates share a linkID, and
+/// each one costs a DH, an HKDF, an Ed25519 signature with our long-term destination key, and a
+/// fresh keypair generation. A retry is never a duplicate — both we and RNS mint a fresh
+/// ephemeral per attempt, so an identical linkID is always a replay or a multipath copy.
+@Test @MainActor func replayedLinkRequestMintsExactlyOneElementAndOneProof() async {
+    let owner = Identity()
+    let initEph = Identity()
+    let destHash = Data(repeating: 0x21, count: 16)
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: destHash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    let raw = try! request.packed()
+
+    let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"), data: raw))
+    await store.receive { if case .link(.element(_, .acceptRequest)) = $0 { return true }; return false }
+    #expect(store.state.links.count == 1)
+
+    // Byte-identical replay: no new element.
+    await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"), data: raw))
+    #expect(store.state.links.count == 1)
+
+    // A genuinely NEW request (different ephemeral → different linkID) still works.
+    let request2 = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                          destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                          destinationHash: destHash, transportId: nil,
+                          payload: Identity().publicKey + Link.signallingBytes)
+    await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"), data: try! request2.packed()))
+    await store.receive { if case .link(.element(_, .acceptRequest)) = $0 { return true }; return false }
+    #expect(store.state.links.count == 2)
+}
+
 // MARK: - Malformed inbound LINKREQUEST element-reaping tests
 
-/// A malformed inbound LINKREQUEST must not leave a permanent element behind. `LinkPlane`
-/// appends the session BEFORE dispatching `.acceptRequest`, and removal happens only on a
-/// delegate — so a guard that bails to `.none` leaks the element forever. Remotely triggerable:
-/// any peer that has heard our announce can send wrong-sized payloads and grow `state.links`
-/// without bound, which `routeLinkPacket` then linear-scans on every inbound packet.
+/// A malformed inbound LINKREQUEST must not leave a permanent element behind. Remotely
+/// triggerable: any peer that has heard our announce can send wrong-sized payloads and grow
+/// `state.links` without bound, which `routeLinkPacket` then linear-scans on every inbound
+/// packet.
 ///
 /// Three malformed shapes are covered:
-///   1. Unparseable bytes (random garbage that is not a valid packet).
-///   2. A validly-packed packet whose `packetType` is not `.linkRequest`.
+///   1. Unparseable bytes (random garbage that `Packet(raw:)` cannot parse). With the dedup
+///      guard in `acceptLinkRequest`, `Packet(raw:)` fails before any element is minted — the
+///      "no leak" property holds by a STRONGER mechanism than before: zero element is created,
+///      not one-then-reaped.
+///   2. A validly-packed packet whose `packetType` is not `.linkRequest`. This parses
+///      successfully, so an element is minted and then reaped by `LinkSession.acceptRequest`'s
+///      malformed guard (unchanged behaviour).
 ///   3. A validly-packed `.linkRequest` with the wrong payload size (10 bytes, not 64/67).
+///      Same as shape 2: parses, element minted, reaped downstream.
 ///
-/// In all three cases the element must be reaped (links is empty after draining) and NO
-/// `.linkFailed` delegate must escape (a responder's `destinationHash` is the destination WE
-/// serve — reporting it as unreachable would misinform the delivery layer).
-///
-/// No `.linkFailed` escape is verified by teardown enforcement: `LinkPlane` gates `.linkFailed`
-/// on `session.role == .initiator`, and the spawned session is always `.responder` (set by
+/// For shapes 2 and 3: no `.linkFailed` delegate must escape (a responder's `destinationHash`
+/// is the destination WE serve — reporting it as unreachable would misinform the delivery
+/// layer). This is verified by teardown enforcement: `LinkPlane` gates `.linkFailed` on
+/// `session.role == .initiator`, and the spawned session is always `.responder` (set by
 /// `acceptLinkRequest`). The `store.exhaustivity = .on` at the end of each shape arms the TCA
 /// deinit check — deleting `LinkPlane`'s role gate causes the test to FAIL at teardown with an
 /// unhandled `.linkFailed` action. Those `.on` lines are not decoration; they are the only thing
@@ -316,6 +363,10 @@ private let ifA = InterfaceID("iface-a")
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: owner)!
 
     // Shape 1: unparseable bytes.
+    // `Packet(raw:)` returns nil for garbage, so the `acceptLinkRequest` dedup guard fires and
+    // returns `.none` BEFORE any element is minted. The "no leak" property holds by an even
+    // stronger mechanism: zero elements are ever created, so links is empty immediately after
+    // the send, with no action to drain.
     do {
         let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
             $0.uuid = .incrementing
@@ -326,13 +377,8 @@ private let ifA = InterfaceID("iface-a")
         let garbage = Data(repeating: 0xFF, count: 10)
         await store.send(.acceptLinkRequest(owner: owner, destinationHash: dest.hash,
                                             interfaceID: ifA, data: garbage))
-        // Drain: must see .establishmentFailed from the session — LinkPlane reaps the element and
-        // the role gate suppresses any .linkFailed delegate (verified by exhaustivity ON below).
-        await store.receive(
-            { if case .link(.element(_, .delegate(.establishmentFailed(.handshakeRejected)))) = $0 { return true }; return false }
-        )
-        #expect(store.state.links.isEmpty, "Shape 1 (unparseable): element must be reaped")
-        // Flip to exhaustive for teardown: any stray .delegate(.linkFailed) would surface here.
+        // No element was minted: links is immediately empty, no action to drain.
+        #expect(store.state.links.isEmpty, "Shape 1 (unparseable): no element must be minted")
         store.exhaustivity = .on
     }
 

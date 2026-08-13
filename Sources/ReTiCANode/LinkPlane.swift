@@ -108,6 +108,24 @@ public struct LinkPlane {
                 return .send(.link(.element(id: newID, action: .establish)))
 
             case let .acceptLinkRequest(owner, destinationHash, interfaceID, data):
+                // DEDUPE BEFORE CRYPTO. A duplicate LINKREQUEST costs a DH, an HKDF, an Ed25519
+                // signature with our long-term destination key, and — because we do not pass
+                // `ephemeral:` below — a fresh keypair generation from the defaulted
+                // `ephemeral: Identity = Identity()`. Transport hands LINKREQUESTs to us BEFORE
+                // its seenPacketHashes dedup, so byte-identical replays arrive freely.
+                //
+                // Dropping a duplicate is always correct: both we and RNS mint a fresh ephemeral
+                // per attempt (`Link.__init__` calls X25519PrivateKey.generate()) and neither
+                // retransmits a LINKREQUEST, so an identical linkID is a replay or a multipath
+                // copy — never a legitimate retry. Note HEADER_1 and relayed HEADER_2 copies of
+                // the same request share a linkID (`hashablePart` excludes hops/headerType/
+                // transportType/transportId), so this also collapses non-adversarial mesh
+                // duplicates.
+                //
+                // Same shape as the dedup-before-PoW guard in `PropagationStore.ingest`.
+                guard let requestPacket = Packet(raw: data) else { return .none }
+                let requestLinkID = Link.linkID(requestPacket: requestPacket)
+                guard !state.links.contains(where: { $0.linkID == requestLinkID }) else { return .none }
                 let newID = uuid()
                 state.links.append(LinkSession.State(id: newID, responderFor: owner,
                                                      destinationHash: destinationHash,
