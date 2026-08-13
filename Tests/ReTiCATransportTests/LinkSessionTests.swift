@@ -904,14 +904,21 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     // The element must NOT have been reaped and must still be mid-handshake.
     #expect(store.state.status == .handshake)
 
-    // The legitimate RTT still completes the handshake.
+    // The legitimate RTT still completes the handshake. Use .on exhaustivity for the
+    // second send so that TCA's "must handle received actions before sending" check fires
+    // if the garbage produced a spurious .establishmentFailed that is still unhandled.
+    // (.off's store.send clears receivedActions, which would hide the spurious action.)
     let rttCipher = Link.encrypt(MsgPack.encode(0.0), sessionKey: store.state.sessionKey)
     let rttPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                            destinationType: .link, context: .linkRequestRTT, contextFlag: false,
                            hops: 0, destinationHash: store.state.linkID, transportId: nil,
                            payload: rttCipher)
-    await store.send(.received(try! rttPacket.packed()))
+    store.exhaustivity = .on
+    await store.send(.received(try! rttPacket.packed())) { $0.status = .active
+        $0.rtt = 0.0; $0.activatedAt = 0.0; $0.lastInbound = 0.0; $0.lastData = 0.0
+    }
     await store.receive { if case .delegate(.established) = $0 { return true }; return false }
+    store.exhaustivity = .off
     #expect(store.state.status == .active)
 }
 
@@ -1013,4 +1020,53 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     await store.send(.received(try! dataPacket.packed(), arrivalInterface: peer))
     await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
     #expect(store.state.interfaceID == peer)
+}
+
+/// INTEROP GUARD — pins a deliberate NON-change. RNS keepalives are unencrypted by explicit
+/// design (`Packet.pack` has a dedicated KEEPALIVE branch: "Keepalive packets contain no actual
+/// data"). A peer on an otherwise-idle link sends nothing else, so a plaintext keepalive MUST
+/// keep refreshing the inactivity clock. Gating that refresh on authentication would tear down
+/// links with real RNS peers — and would not bound anything anyway, since an attacker holds a
+/// valid session key and can send authenticated keepalives.
+///
+/// Two-part structure:
+///   (1) The keepalive must refresh: advance to 90 % of stale, send the keepalive, then advance
+///       ANOTHER 90 % (total = 180 % of stale from establishment). Without the keepalive refresh
+///       the original timer (armed at t=0) would have fired already; with it, the freshly-armed
+///       timer does NOT fire until a full stale from the keepalive. Use `.on` exhaustivity at the
+///       `store.send` inside the second window so that a pending `.inactivityDeadline` is
+///       detected before it can be silently discarded — a send with `.on` fails if there are
+///       unhandled received actions in the queue.
+///   (2) The refreshed timer eventually fires: advance past the refreshed deadline and receive
+///       `.inactivityDeadline` explicitly, proving the timer was tracking from the keepalive.
+@Test @MainActor func plaintextKeepaliveStillRefreshesInactivity() async {
+    let clock = testClock()
+    let store = await activeResponderStore(clock: clock)
+    let stale = store.state.staleTime
+    let linkID = store.state.linkID
+
+    // Advance to just under the stale deadline, then ping with an UNAUTHENTICATED keepalive.
+    await clock.advance(by: .seconds(stale * 0.9))
+    let ka = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                    destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                    destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+    await store.send(.received(try! ka.packed()))
+    _ = await captureTransmit(store)                       // 0xFE reply confirms keepalive processed
+
+    // Advance again by the same amount. Without the keepalive refresh, the original inactivity
+    // timer (armed at establishment) would have already expired at total = stale * 1.8 > stale.
+    // With the refresh, the freshly-armed timer does NOT fire until 90% more from NOW.
+    await clock.advance(by: .seconds(stale * 0.9))
+
+    // Detection step: switch to .on and send a second keepalive. If a pending .inactivityDeadline
+    // is in the queue from the advance above, the .on-mode send fails at its pre-send check
+    // ("must handle received actions before sending"). Without mutation the queue is empty here.
+    let ka2 = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                     destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                     destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+    store.exhaustivity = .on
+    await store.send(.received(try! ka2.packed()))
+    store.exhaustivity = .off
+    _ = await captureTransmit(store)                       // second 0xFE reply
+    #expect(store.state.status == .active, "link must survive if keepalive reset the inactivity clock")
 }
