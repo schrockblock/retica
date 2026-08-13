@@ -24,7 +24,8 @@ Task 4 implemented §2.3's cap in `LinkPlane.acceptLinkRequest` and paid for it 
 evicting an `.active` responder link. That gave unauthenticated input a DESTROY
 verb it had never had before: pre-slice, a junk LINKREQUEST could only CREATE
 elements. Worse, a junk request is viable enough to reach `.handshake` — `Link.sessionKey`
-succeeds on a random 32-byte key; it is the all-zeros key that CryptoKit rejects —
+succeeds on a random 32-byte key (overwhelmingly likely to be accepted); several canonical
+low-order values including all-zeros ARE rejected by CryptoKit —
 and a `.handshake` element is not evictable,
 so each one killed an authenticated link and then held the slot it freed. Probed
 through production wiring at a cap of four: zero of four established links

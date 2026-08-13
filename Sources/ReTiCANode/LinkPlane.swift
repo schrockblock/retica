@@ -171,8 +171,9 @@ public struct LinkPlane {
                 // enforced HERE and paid for by evicting an `.active` responder. That was
                 // exploitable, not merely unfair: a LINKREQUEST whose 64-byte payload is random
                 // bytes is viable all the way to `.handshake`. `Link.sessionKey` succeeds on such a
-                // payload — the ALL-ZEROS key is the one that fails, because CryptoKit rejects that
-                // point, and choosing it is what made the original F14 probe look mild. A
+                // payload — several canonical low-order X25519 values (all-zeros among them) are
+                // rejected by CryptoKit, but a random 32-byte key is overwhelmingly likely to be
+                // accepted; it was choosing all-zeros that made the original F14 probe look mild. A
                 // `.handshake` element is not evictable, so each junk request evicted an
                 // authenticated link on
                 // its way in and then parked in the slot it had just freed. A burst the size of
