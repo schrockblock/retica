@@ -882,6 +882,54 @@ private func acceptAndActivateResponder(_ store: TestStore<LinkPlane.State, Link
     #expect(store.state.links[id: session.id]?.interfaceID == reconnected)
 }
 
+/// The grant must survive ordinary SAME-interface traffic. `arrival != state.interfaceID` guards
+/// the consumption as well as the re-home, so a keepalive arriving on the interface the link is
+/// already bound to must not burn the permission — otherwise the first packet after a disconnect
+/// would spend the grant and the reconnecting peer, arriving second, would still be stranded.
+/// Pinned directly (rather than via a spurious `.rehomed`) because that is the failure mode.
+@Test @MainActor func samePathTrafficDoesNotConsumeTheReHomePermission() async {
+    let dead = InterfaceID("dead")
+    let reconnected = InterfaceID("reconnected")
+    let linkID = Data(repeating: 0x52, count: 16)
+    var session = LinkSession.State(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000C2")!,
+                                    responderFor: Identity(),
+                                    destinationHash: Data(repeating: 0x06, count: 16),
+                                    interfaceID: dead)
+    session.linkID = linkID
+    session.status = .active
+
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [session])
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    let keepalive = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                           destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                           destinationHash: linkID, transportId: nil, payload: Data([0xFF]))
+    let kaRaw = try! keepalive.packed()
+
+    await store.send(.interfaceDisconnected(dead))
+    #expect(store.state.links[id: session.id]?.rehomePermitted == true)
+
+    // Ordinary traffic on the interface the link is ALREADY bound to. No re-home is possible here,
+    // so the grant must be left intact.
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: dead, data: kaRaw))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == dead)
+    #expect(store.state.links[id: session.id]?.rehomePermitted == true,
+            "same-interface traffic must not consume the one-shot re-home permission")
+
+    // The grant is still spendable: the reconnecting peer's unauthenticated keepalive re-homes.
+    await store.send(.routeLinkPacket(linkID: linkID, arrivalInterface: reconnected, data: kaRaw))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.interfaceID == reconnected)
+    #expect(store.state.links[id: session.id]?.rehomePermitted == false)
+}
+
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {
     let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
         $0.uuid = .incrementing

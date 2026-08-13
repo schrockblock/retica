@@ -596,11 +596,34 @@ public struct LinkSession {
                 // Local-disconnect permission (`rehomePermitted`): an idle link whose only
                 // inbound traffic is plaintext keepalives can never set `sawAuthenticatedData`,
                 // so a BLE peer that reconnects after an idle period would stay bound to the dead
-                // interface and every outbound would fail. A LOCAL interface disconnect is
-                // unforgeable by a remote attacker and always precedes a BLE reconnect, so it
-                // is a safe one-shot trigger. The permission is consumed on first use so that a
-                // disconnect does not permanently downgrade this element to unauthenticated
-                // re-homing.
+                // interface and every outbound would fail. A LOCAL interface disconnect cannot be
+                // forged by a remote attacker, so the TRIGGER is sound.
+                //
+                // The trigger being unforgeable does NOT make the CONSUMPTION authenticated, and
+                // nothing below constrains who spends the grant. Recorded here because this block
+                // is the only site that reasons about it: once `rehomePermitted` is set, the first
+                // link-addressed packet arriving on ANY interface other than the stored one
+                // re-homes the link with no authentication whatsoever. The reducer cannot tell the
+                // reconnecting peer from anyone else — it sees only `arrivalInterface`.
+                //
+                // That is reachable, not theoretical. `BLEEndpoint.State.peerInterfaces` is a
+                // multi-peer map (`[InterfaceID: Data]`), and BLEEndpoint's
+                // `.transport(.delegate(.linkPacket))` handler routes EVERY peer's link packets
+                // into `LinkPlane.routeLinkPacket` tagged with that peer's `InterfaceID`
+                // (`Transport` passes through the `interfaceID` given to `.received`). Since
+                // `linkID` rides in cleartext, a second connected BLE peer that has merely
+                // OBSERVED one link packet can claim the grant ahead of the returning peer. Note
+                // this residual has a WEAKER prerequisite than the replay residual above: that one
+                // needs a captured authenticated packet, this one needs only an observed `linkID`.
+                //
+                // It is bounded: at most ONE re-home per local disconnect (the permission is
+                // consumed on first use below, so a disconnect does not permanently downgrade this
+                // element to unauthenticated re-homing), and only while the element survives — the
+                // inactivity watchdog (`staleTime`) reaps an unrefreshed link into
+                // `.closed(.timedOut)`. Closing it properly needs the same thing the replay
+                // residual needs: authenticated proof of liveness on the link, which does not
+                // exist in the link path today. Accepted deliberately: without it a reconnected
+                // BLE peer is stranded on a dead interface with no recovery short of link timeout.
                 //
                 // The `arrival != state.interfaceID` guard is load-bearing in BOTH branches: an
                 // ordinary same-interface packet would otherwise burn the one-shot permission

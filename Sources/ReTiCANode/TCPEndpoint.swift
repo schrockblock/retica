@@ -117,6 +117,15 @@ public struct TCPEndpoint {
                 return .merge(.send(.transport(.interfaceConnected(id, state.profile))),
                               .send(.transport(.startMaintenance)))
             case .interface(.connectionEvent(.disconnected)):
+                // The `.linkPlane(.interfaceDisconnected)` fan-out is INERT here by construction,
+                // and is kept for symmetry with `BLEEndpoint` and for future multi-interface TCP
+                // endpoints — do not delete it as dead code. `TCPEndpoint` has a single fixed
+                // `state.interfaceID`: it is the only value ever handed to `.transport(.received)`,
+                // so every `arrivalInterface` on a routed link packet equals it, and it is the
+                // `interfaceID` every link here is created with. `LinkSession`'s re-home gate
+                // requires `arrival != state.interfaceID`, which therefore never holds, so the
+                // `rehomePermitted` flag this sets is never consumed. The flag matters on BLE,
+                // where each peer session has its own `InterfaceID`.
                 return .merge(.send(.transport(.interfaceDisconnected(id))),
                               .send(.linkPlane(.interfaceDisconnected(id))),
                               .send(.transport(.stopMaintenance)))
