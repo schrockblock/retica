@@ -16,6 +16,33 @@ The final clause is the correction that motivated this design. **Opening a link
 is unauthenticated by protocol design**, so authentication can never be the
 *bound* on link-element growth. It can only be a *gate on transitions*.
 
+**Correction, added 2026-08-13 after the slice shipped — the KILL half was
+FALSIFIED by this slice's own Task 4, and restored afterwards.** Recorded as a
+correction rather than a rewrite, because the sequence is the point.
+
+Task 4 implemented §2.3's cap in `LinkPlane.acceptLinkRequest` and paid for it by
+evicting an `.active` responder link. That gave unauthenticated input a DESTROY
+verb it had never had before: pre-slice, a junk LINKREQUEST could only CREATE
+elements. Worse, a junk request is viable enough to reach `.handshake` — `Link.sessionKey`
+succeeds on a random 32-byte key; it is the all-zeros key that CryptoKit rejects —
+and a `.handshake` element is not evictable,
+so each one killed an authenticated link and then held the slot it freed. Probed
+through production wiring at a cap of four: zero of four established links
+survived. The invariant above read as satisfied for the whole slice while the
+opposite was true, and neither Task 1's review (one packet cannot kill an
+element) nor Task 4's (growth is bounded) asked what happened to the links that
+died on the way to the bound.
+
+Fixed in `381d731` by splitting the budgets: unauthenticated input spends only
+`maxIncompleteResponderLinks` and evicts nothing, and the `maxResponderLinks`
+eviction moved to promotion, where the peer has demonstrably completed a
+handshake. The KILL half of the invariant holds again.
+
+The other two halves are weaker than this sentence claims and were already
+qualified during execution: STEAL is narrowed, not closed (F9, F10 in the
+handoff), and PIN is "refusable-into" rather than prevented (F11). Read the
+handoff's F-entries before relying on any of the three words.
+
 ### 1a. Two premises in the handoff were falsified before designing
 
 Both were verified against the reference tree, not reasoned about.
@@ -99,6 +126,15 @@ non-adversarially on any multipath mesh.**
 
 Two traps here. A naive cap hits both, and the second one silently inverts the
 policy.
+
+> **Trap 3, which this section MISSED and Task 4 walked into — see §1's
+> correction.** It says nothing about WHERE the cap is checked, and the obvious
+> place (`acceptLinkRequest`, at the moment the population grows) is the one place
+> the eviction is paid for by unauthenticated input. Both traps below are about
+> WHICH link is evicted; neither asks who gets to trigger an eviction. Since
+> `381d731` the answer is: the half-open population is bounded at the request, with
+> no eviction at all, and the `.active` cap is enforced at PROMOTION. Everything
+> below still describes the eviction POLICY correctly; only its site moved.
 
 **Trap 1 — cap responder links only.** A global cap with oldest-eviction lets an
 attacker flood us into evicting **our own outbound initiator links**. The cap
@@ -214,6 +250,9 @@ authenticated and the interface differs, rebind and emit `rehomed` →
 **Inbound LINKREQUEST.** Endpoint ownership/private-key guards →
 `LinkPlane.acceptLinkRequest` → compute `linkID`, drop if already present →
 responder-cap check, evict if full → append → dispatch `.acceptRequest`.
+*(Corrected in `381d731`: the step now reads "half-open-budget check, REFUSE if
+full", and the eviction happens on the `.delegate(.established)` promotion
+instead. See §1's correction — "evict if full" here is what Trap 3 was.)*
 
 **Local disconnect.** Endpoint peer/socket loss → existing
 `.transport(.interfaceDisconnected(id))` **plus** new
@@ -245,7 +284,10 @@ before teardown.
 2. **F2 dedupe** — the same LINKREQUEST twice yields exactly one element and
    exactly one LRPROOF.
 3. **Cap** — N+1 distinct requests leave the count bounded, and **an initiator
-   link is never the victim**.
+   link is never the victim**. *(Missing, and this is the gap Trap 3 fell
+   through: nothing here asks whether the ESTABLISHED links survive the flood.
+   `junkLinkRequestBurstDoesNotEvictASingleEstablishedLink` is that test, added
+   with the `381d731` fix.)*
 4. **Eviction policy — the load-bearing test.** Construct an attacker link kept
    fresh by keepalives alongside a quieter legitimate link whose `lastData` is
    newer but whose `lastInbound` is older. **This test must fail if eviction
@@ -298,7 +340,11 @@ slice:
 **The cap can evict a legitimate responder link under genuine load.** A
 propagation node serving many peers is the realistic case. Mitigated by choosing
 the default against PN expectations and by evicting on `lastData`, but not
-eliminated.
+eliminated. *(Since `381d731` there is a second such risk: a flood of half-open
+handshakes fills `maxIncompleteResponderLinks` and new inbound establishment is
+refused until those elements hit their establishment deadline. That window
+self-clears without the attacker's cooperation, which the eviction it replaced
+did not.)*
 
 **Auth-gated re-homing can still flap** for a genuinely multi-interface peer
 whose authenticated packets arrive over more than one interface. Strictly better

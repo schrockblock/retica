@@ -5,6 +5,15 @@
 **Suite:** 824 serially (`swift test --no-parallel`), 1 known issue
 (`holdArmsDeferredReleaseTimerNotImmediateFireDuringFlood`, pre-existing, `TransportTests`).
 
+> **CORRECTED 2026-08-13 by the final whole-branch review over `4ef3a21..86086b0`,
+> and by the fix it produced (`381d731`; suite now 826).** Two rows below said the
+> wrong thing about the same code, and F14 turned out to be a Critical REGRESSION
+> this slice introduced rather than a bounded pre-existing defect. **F14 is now
+> CLOSED**; the `.acceptLinkRequest` cap/eviction rows are rewritten; F10 gained a
+> half it did not have. Every correction is marked inline as a correction — the
+> original claims are left visible, because what they got wrong is the lesson §4 is
+> about.
+
 The slice that precedes this document fixed **one instance of each of four verbs**: an element
 that died on unauthenticated input (F6), elements that were created in duplicate (F2), elements
 that could not be bounded (F1), and a binding that moved on unauthenticated input (F1's link-theft
@@ -54,9 +63,9 @@ Verdicts: **safe** — unauthenticated input cannot reach the verb, or reaching 
 |---|---|---|---|
 | role/status/`owningIdentity` guard → `.none` | no | — | safe. Internal invariant; role and status are locally set. It is the only reap-less exit in the file (every sibling was converted to `.establishmentFailed`), but the element it strands has an empty `linkID` and is therefore unaddressable — see §2. |
 | `Packet(raw:)` / `packetType` / payload-size guard → `.establishmentFailed` | yes | DESTROY (self) | safe. Destroys only the element just minted for this request. |
-| empty-session-key guard → `.establishmentFailed` | **yes** | DESTROY (self) | safe. Probe-proven remotely reachable: an all-zeros 32-byte X25519 key is a valid 64-byte payload, CryptoKit's `sharedSecretFromKeyAgreement` rejects the point, and `Link.sessionKey` returns `Data()`. Probe confirmed the element IS reaped (`links` → 0) and that `LinkPlane`'s role gate suppresses `linkFailed`. The brief listed this as untested behaviour; it is correct behaviour. **But see F14** — the eviction it triggers upstream is not. |
+| empty-session-key guard → `.establishmentFailed` | **yes** | DESTROY (self) | safe. Probe-proven remotely reachable: an all-zeros 32-byte X25519 key is a valid 64-byte payload, CryptoKit's `sharedSecretFromKeyAgreement` rejects the point, and `Link.sessionKey` returns `Data()`. Probe confirmed the element IS reaped (`links` → 0) and that `LinkPlane`'s role gate suppresses `linkFailed`. The brief listed this as untested behaviour; it is correct behaviour. **But see F14** — the eviction it triggered upstream was not. Note this guard is also what made F14 look milder than it was: a payload that dies HERE frees its slot again, and F14's probe used one. A payload that does not die here holds the slot instead, which is the difference between "one link per refill" and a flush. |
 | `packed()` guard → `.establishmentFailed` | no | DESTROY (self) | safe/defensive. `linkID` is always a 16-byte `truncatedHash` and `buildProof` always returns 99 bytes. |
-| success → `.handshake` + establishment timer | yes | CREATE | bounded by `LinkPlane`'s cap. |
+| success → `.handshake` + establishment timer | yes | CREATE | bounded by `LinkPlane`'s half-open bound (`maxIncompleteResponderLinks`) since `381d731`; by `maxResponderLinks` before that. |
 
 ### `LinkSession.received` — pre-dispatch
 
@@ -110,11 +119,12 @@ Verdicts: **safe** — unauthenticated input cannot reach the verb, or reaching 
 | `.openLink` | no | CREATE | safe. Local. |
 | `.acceptLinkRequest` — `Packet(raw:)` guard | yes | — | safe, and stronger than before: unparseable bytes now mint no element at all. |
 | `.acceptLinkRequest` — linkID dedupe | yes | prevents duplicate CREATE | **fixed** (F2). Probed against the ordering concern that the guard reads a `linkID` written only by the deferred child action: two identical requests driven back-to-back through a real `Store` with no awaiting produced ONE element. TCA drains the child before the second action is reduced. |
-| `.acceptLinkRequest` — cap / eviction | **yes** | **DESTROY** | **deliberate** (F1). Opening a link is unauthenticated by protocol design, so only resource policy can bound it. Probed for batch overshoot: three requests driven with no draining at a cap of two left the responder count at two. |
-| `.acceptLinkRequest` — eviction is emitted BEFORE the request is validated | **yes** | **DESTROY** | **OPEN — F14.** Probe: at the cap, a LINKREQUEST with an all-zeros X25519 key evicted a legitimate `.active` responder link and then self-destructed on the empty-session-key guard, leaving the freed slot unused. The victim dies for a request that was never viable. |
-| `.acceptLinkRequest` — `guard !evictable.isEmpty else { return .none }` | yes | refuses | safe as a bound on `links`; its availability cost is F11's payload. |
+| `.acceptLinkRequest` — half-open bound (`maxIncompleteResponderLinks`) | **yes** | refuses only | **fixed** (F14, `381d731`). This row previously read "cap / eviction … **deliberate** (F1)", on the reasoning that opening a link is unauthenticated by protocol design so only resource policy can bound it. That reasoning is still true, but the verdict was WRONG: what was deliberate was the BOUND, not the eviction that paid for it, and the two were in the same branch. Unauthenticated input now spends only this budget and evicts nothing; when it is full the request is refused. (The batch-overshoot probe that supported the old row still holds: three requests driven with no draining at a bound of two leave the count at two.) |
+| `.acceptLinkRequest` — eviction is emitted BEFORE the request is validated | **yes** | **DESTROY** | **CLOSED (`381d731`) — was F14, and was UNDERSTATED here.** The probe behind this row used an ALL-ZEROS X25519 key, which self-destructs at the empty-session-key guard and frees its slot again, so the harm looked like one link per refill. A payload of RANDOM bytes does not self-destruct: `Link.sessionKey` succeeds on it, so the element reaches `.handshake`, which is not evictable and holds the freed slot for a full establishment timeout. Probed through production wiring at a cap of four: **zero of four** established links survived four junk requests, and everything behind them was refused. Fixed by moving the eviction to promotion; see F14 in the handoff. |
+| `.acceptLinkRequest` — refusal when the half-open budget is full | yes | refuses | safe as a bound on `links`. Availability cost: new inbound establishment is denied for the length of an establishment timeout. **Correction:** the earlier version of this row attributed the cost to "F11's payload", which is incomplete — the identical refusal-DoS needs no session key and no transfer at all. Anyone who can put well-formed LINKREQUESTs on the wire can hold the budget full, and F11 is only the variant that does it with links that never self-clear. |
+| `.link(… .delegate(.established))` — active-responder cap / eviction | no | **DESTROY** | **deliberate** (F1), and this is where the eviction lives since `381d731`. Reached only after a peer decrypted the LRRTT under the session key, so the party that costs an incumbent its slot has demonstrably completed a handshake. Same policy as before (responder-only, `lastData` LRU, skip in-flight transfers, close via `.close`), plus: the promoted element is excluded by id, and when nothing is evictable the promotion itself is refused rather than the population growing. |
 | `.routeLinkPacket` | yes | — | safe. Addressing only; the re-home decision moved into `LinkSession` in Task 5. |
-| `.interfaceDisconnected` | trigger no, consumption **yes** | RE-HOME | **OPEN — F10.** |
+| `.interfaceDisconnected` | trigger no, consumption **yes** | RE-HOME | **OPEN — F10.** It issues the grant to INITIATOR links as well as responder ones, so after any local disconnect one unauthenticated packet from a foreign interface re-homes a link WE opened. Left as-is deliberately: our outbound links go stale on the same event, their peer never initiates a keepalive, and a peer mid-transfer to us sends only segments, which never set `sawAuthenticatedData` — so restricting the grant to responders would strand them until timeout. Reasoning recorded at the branch; pinned by the initiator phase of `theReHomeGrantIsSpentByWhicheverInterfaceSpeaksFirst`. |
 | `.link(… .delegate(.closed))` → `links.remove` | via cap only | DESTROY | safe. Reached from authenticated LINKCLOSE, local close, eviction, or a timer. |
 | `.link(… .delegate(.establishmentFailed))` → `links.remove` | **yes**, via F12 | DESTROY | the removal is correct; what reaches it unauthenticated is F12. |
 | `.link(… .delegate(.rehomed))` → rebind transfers | **yes**, via F9/F10 | RE-HOME | downstream of the re-home block. |
@@ -128,7 +138,7 @@ Verdicts: **safe** — unauthenticated input cannot reach the verb, or reaching 
 | IFAC unmask / plain-interface flag guard | yes | — | safe. |
 | `destinationType == .link` + `linkTable` hit → forward, `refreshedAt = date.now` | **yes** | **EXTEND** + **shadow** | **OPEN — F13.** |
 | `destinationType == .link`, no `linkTable` hit → `.delegate(.linkPacket)` | **yes** | gateway | **deliberate**, and the mechanism behind F9. Sits above `seenPacketHashes` on purpose: byte-identical keepalives share a packet hash and must not be deduped. Pinned by `identicalLinkPacketsBypassDedup`. |
-| `packetType == .linkRequest` + local destination → `.delegate(.linkRequest)` | **yes** | CREATE (at the plane) | bounded by the plane's cap. Also above `seenPacketHashes`, which is why the plane's own dedupe had to exist. |
+| `packetType == .linkRequest` + local destination → `.delegate(.linkRequest)` | **yes** | CREATE (at the plane) | bounded by the plane's half-open bound. Also above `seenPacketHashes`, which is why the plane's own dedupe had to exist. |
 | `case .linkRequest:` relay branch → `linkTable[linkID] = …` | **yes** | **CREATE** | **OPEN — F13.** |
 | `case .data:` relay / local delivery | no | — | safe. Local delivery requires `destination.decrypt`. |
 | `case .announce:` and the ingress-control machinery | yes | — | touches no link element. `learned` entries do gate F13's relay branch. |
@@ -143,14 +153,17 @@ Verdicts: **safe** — unauthenticated input cannot reach the verb, or reaching 
 an all-zeros 32-byte X25519 public key is a well-formed 64-byte payload that passes the size guard,
 and `Link.sessionKey` returns `Data()` because CryptoKit rejects the point. The element-reaping
 behaviour, which the brief flagged as untested, is **correct**: the element is removed and no
-`linkFailed` escapes. What is NOT correct is what happens one layer up when this fires at the cap —
-that is F14, and it was invisible until the two were probed together.
+`linkFailed` escapes. What was NOT correct is what happened one layer up when this fired at the cap —
+that was F14, and it was invisible until the two were probed together. **Correction:** choosing this
+key for the probe is also what made F14 look bounded. It is the one junk payload that frees its own
+slot; a random one does not, and the real harm was a flush. See F14 in the handoff.
 
 **`LinkSession.close` on a non-`.active` element.** Confirmed a silent no-op (`guard state.status ==
 .active else { return .none }`); a `.pending`/`.handshake` element leaves only at its establishment
-deadline. This is already accounted for: `LinkPlane`'s `evictable` filter requires `status ==
-.active` and REFUSES when nothing is evictable, so `links` cannot grow past the cap. The cost is an
-availability window of one establishment timeout, which self-clears — unlike F11, which does not.
+deadline. This is what forces `acceptLinkRequest` to REFUSE rather than try to make room: there is
+nothing there to close. Since `381d731` the half-open population is bounded by
+`maxIncompleteResponderLinks` on exactly that reasoning. The cost is an availability window of one
+establishment timeout, which self-clears — unlike F11, which does not.
 
 **Can an element with an empty `linkID` be addressed?** No. `Packet.init?(raw:)` always yields a
 16-byte `destinationHash`, `Transport` passes that same value as `.linkPacket(linkID:)`,
@@ -166,13 +179,17 @@ Numbered continuing from the handoff. Full write-ups live there; this is the swe
 
 - **F9** — no per-packet replay rejection anywhere on the link path. Narrows Task 5's re-home gate
   from "closed" to "costs one captured ciphertext".
-- **F10** — the local-disconnect re-home grant is spent by whichever interface speaks first.
-- **F11** — advertise-and-stall pins a link against eviction and refuses everyone else in.
+- **F10** — the local-disconnect re-home grant is spent by whichever interface speaks first, on
+  INITIATOR links as well as responder ones.
+- **F11** — advertise-and-stall pins a link against eviction and locks everyone else out.
 - **F12** — one injected packet kills a legitimate OUTBOUND establishment
   (`(.initiator, .pending, .proof, .linkRequestProof)`). The initiator-side mirror of F6.
 - **F13** — a reflected LINKREQUEST creates a relay `linkTable` entry that SHADOWS one of our own
   links, and unauthenticated traffic refreshes `linkTable` entries forever.
-- **F14** — the responder cap evicts before it validates.
+- **F14** — the responder cap evicts before it validates. **CLOSED in `381d731`**, after the final
+  whole-branch review showed this entry had both understated it (the harm is a flush, not one link
+  per refill) and prescribed a fix that would not have worked (a random payload passes every
+  validation `acceptRequest` performs).
 - **F15** — an unauthenticated RESOURCE_PRF destroys every sender transfer on a link.
 - **F16** — the hoisted inactivity re-arm fires for ANY link-addressed packet, so extension is not
   a keepalive property and F10's exposure is not bounded by the watchdog.
@@ -181,7 +198,8 @@ Numbered continuing from the handoff. Full write-ups live there; this is the swe
 attacker rather than merely denying service, and it is one packet. Then F12 (one packet, kills an
 outbound link, mislabels the failure as PEER-shaped so the delivery layer burns its whole budget
 retrying the same path). Then F15 (one packet, aborts transfers; and it fires between two of our own
-concurrent transfers with no attacker present). Then F11, F14, F16, F9, F10.
+concurrent transfers with no attacker present). Then F11, F16, F9, F10. (F14 was ranked here and is
+now closed.)
 
 **F13 is gated on relay mode.** It requires `transportIdentity != nil`, set only via
 `TCPEndpoint.enableRelay` / `BLEEndpoint.enableRelay`. Neither has an in-repo caller, so this is a
@@ -240,3 +258,19 @@ damage,** because both are exactly what a later reader will NOT re-derive — on
 marked as nothing to worry about, the other because it is marked as the already-corrected version.
 Every such claim in this document has now been re-checked against the code. Apply that ordering to
 the next sweep: verify the reassuring sentences first.
+
+**The final whole-branch review then produced the lesson AGAIN, one level up.** Six of its findings
+were false claims, and five sat in reassuring or "this-corrects-X" positions — including inside this
+very section's corrections. The two that mattered were both attached to F14: its severity sentence
+("one legitimate link per refill rather than a flush") and its prescribed fix ("validate enough of
+the request to know it can become an element"). Both read as the calm, already-handled part of an
+entry whose alarming half was correct, and both were wrong, and the second would have persuaded an
+implementer that they had fixed something they had not.
+
+**The mechanism behind both is worth naming, because it is not carelessness.** Each was a
+generalisation from ONE probe input. The F14 probe used an all-zeros X25519 key; that key is
+unrepresentative in the exact dimension the severity claim turned on, because it self-destructs at
+the empty-session-key guard and frees the slot again. A random key does not, and the harm is a
+flush. **When a probe's result becomes a severity claim, ask what about that specific INPUT the
+claim depends on** — and probe a second input chosen to differ in that dimension. That is cheaper
+than the review round it saves.

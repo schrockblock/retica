@@ -14,6 +14,14 @@ Re-confirmed on the revision pass below — count and known issue both still exa
 > mechanism behind its own rules, and §6 gained the defect shape that produced two
 > of that slice's three worst holes. The branch-by-branch table those came out of
 > is `docs/superpowers/2026-08-13-unauthenticated-link-element-sweep.md`.
+>
+> **Updated again 2026-08-13** by the final whole-branch review over
+> `4ef3a21..86086b0` and its single fix wave (`381d731`). Suite is now 826.
+> **F14 is CLOSED**, having first been escalated to Critical: it was a REGRESSION
+> the slice introduced, and both its severity sentence and its prescribed fix were
+> false — read its entry, which now records both corrections. **F10 gained a
+> second half** (the grant reaches initiator links too). Nothing else changed
+> status.
 
 **Revised 2026-08-10, after an independent verification pass** that re-derived
 every claim below from the code rather than from this document. Most held. What
@@ -170,15 +178,16 @@ Current priority:
 3. **F15** — one injected packet aborts every sender transfer on a link, and the
    same branch makes two of our own concurrent transfers destroy each other with
    no attacker present.
-4. **F11** — advertise-and-stall pins a link against eviction and then refuses
-   every inbound LINKREQUEST. Does not self-clear.
+4. **F11** — advertise-and-stall pins a link against eviction and then locks out
+   every other peer. Does not self-clear.
 5. **F7** — a real unbounded leak, in the router rather than the link plane.
-6. **F14**, then **F16**, then **F9**/**F10** (the two accepted residuals of the
-   re-home fix — deliberate, pinned by tests, listed so a future fix confronts
-   them rather than deleting them).
+6. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
+   deliberate, pinned by tests, listed so a future fix confronts them rather than
+   deleting them). **F14 was here and is now CLOSED (`381d731`).**
 7. **F8**, then F3/F4/F5.
 
-F12, F13, F14, F15 and F16 share the root cause F1/F2/F6 shared —
+F12, F13, F15 and F16 (and F14, while it was open) share the root cause
+F1/F2/F6 shared —
 **unauthenticated input drives link-element lifecycle** — but NOT one fix
 surface: they are in four different files and three different element
 populations. Do not plan them as one slice on the strength of the shared cause.
@@ -210,9 +219,17 @@ perfectly AUTHENTICATED keepalives forever. No gate bounds that. The element
 count is bounded; the identity of who holds the elements is not.
 
 **And the cap is refusable-into.** F11 shows a peer can make its own link
-eviction-immune and, at the cap, cause every inbound LINKREQUEST from anyone to
-be refused. F14 shows the cap evicts before it validates. The bound holds on
+eviction-immune and, at the cap, lock every other peer out. The bound holds on
 `links.count`; the availability guarantee does not.
+
+**The cap also, briefly, let unauthenticated input DESTROY established links —
+that was F14, and it is CLOSED in `381d731`.** It is worth stating in this entry
+rather than only in F14's, because F1's closure is the reason the cap exists: as
+first written, the cap was enforced in `acceptLinkRequest` and paid for by
+evicting an `.active` responder, so a junk LINKREQUEST burst flushed the whole
+responder population. The cap is now two budgets — a half-open one that inbound
+requests spend and that evicts nothing, and the `maxResponderLinks` one enforced
+at promotion, where the peer has demonstrably completed a handshake.
 
 The original text follows, because its mechanism description is still accurate
 and F9/F10/F16 are corrections to it rather than replacements.
@@ -515,6 +532,14 @@ defects the sweep found.** All eight are pinned by something executable or by a
 probe recorded in
 `docs/superpowers/2026-08-13-unauthenticated-link-element-sweep.md`.
 
+**Status as of `381d731`: F14 is CLOSED.** The final whole-branch review escalated
+it to Critical — its severity sentence and its prescribed fix were both wrong, and
+the defect was a REGRESSION this slice introduced rather than a pre-existing one —
+and it was fixed in the same pass. F10 gained a second half (initiator links) in
+the same review; the behaviour was left as it stands, with the reasoning recorded
+both here and at `LinkPlane.interfaceDisconnected`. F9, F11, F12, F13, F15 and F16
+remain OPEN.
+
 ### F9 — link traffic has no per-packet replay rejection, anywhere in the link path
 
 **Where:** `Transport.received` (the `destinationType == .link` return sits ABOVE
@@ -580,6 +605,29 @@ needs only an observed `linkID`. Pinned by
 grant), which was chosen over closing every link on a local disconnect — that
 alternative aborts in-flight transfers on every reconnect and is worse.
 
+**Extension, added 2026-08-13 by the final whole-branch review: this is not
+confined to inbound links.** `LinkPlane.interfaceDisconnected` does not filter on
+role, so the grant is issued to INITIATOR links too — links WE opened. After any
+local disconnect, one unauthenticated packet from a foreign interface re-homes
+one of our own outbound links, which sits awkwardly beside `maxResponderLinks`'s
+own comment ("Initiator links are ours"). On an initiator link the relevant
+plaintext is `0xFE`, the responder's keepalive reply — `0xFF` is dropped as our
+own loopback at the top of `LinkSession.received` before the re-home block — but
+per F16 any link-addressed packet at all will do. The original write-up and its
+characterization test described only the responder/BLE-peer case.
+
+**Left as-is deliberately, and here is why.** Restricting the grant to responders
+would not remove the exposure, it would trade it for a worse failure. Our
+initiator links go stale on exactly the same event — a BLE peer reconnects under
+a new token, so the `InterfaceID` bound at creation is dead — and an initiator
+link's peer is the RESPONDER, which never initiates keepalives; it only replies
+to ours, which would be going to the dead interface. If that peer is mid-transfer
+to us, the segments it sends never set `sawAuthenticatedData` (see F9's mechanism
+and `LinkPlane`'s `.rehomed` comment). Without the grant those links recover only
+by timing out, aborting the transfer with them. The reasoning is recorded at
+`LinkPlane.interfaceDisconnected`; the behaviour is pinned by the initiator phase
+of `theReHomeGrantIsSpentByWhicheverInterfaceSpeaksFirst`.
+
 **Correction to how this was first written, including in the production comment:**
 it was described as bounded "to the window before the inactivity watchdog reaps
 the element." That bound does not hold against an attacker — see F16, the same
@@ -590,7 +638,8 @@ spends it, so the grant does not expire either.
 ### F11 — advertise-and-stall pins a link against eviction
 
 **Where:** `LinkSession.received`'s `(_, .active, .data, .resourceAdvertisement)`
-branch, and `LinkPlane.acceptLinkRequest`'s `evictable` filter.
+branch, and `LinkPlane`'s `evictable` filter — which since F14's fix lives in the
+`.link(… .delegate(.established))` handler, not in `acceptLinkRequest`.
 
 The branch appends to `state.transfers` after decrypt, unpack and a SAME-hash
 dedup only, so DISTINCT-hash advertisements append without bound (probe: 25
@@ -602,11 +651,16 @@ maximally idle exactly when evicting it is most wasteful.
 
 Composed: a peer holding an active link advertises, never sends a segment, and
 becomes eviction-immune; re-advertising outruns `ResourceTransfer`'s receiver
-watchdog. Holding the cap that way makes every inbound LINKREQUEST from anyone be
-refused. This is the same class of unauthenticated-input resource exhaustion the
-slice exists to close, and unlike the `.handshake` variant — where elements leave
-on their own establishment deadline — it does NOT self-clear without the
-advertiser's cooperation. Pinned by
+watchdog. Holding the cap that way locks everyone else out. **Since F14's fix the
+shape of that lockout changed** — the newcomer is no longer refused at the
+request, because `acceptLinkRequest` no longer consults the active cap. It is now
+admitted, completes a whole handshake, and is then the element CLOSED on
+promotion, because the advertiser is not an eviction candidate and the newcomer
+is the only one left to refuse. The denial is the same; it costs the newcomer a
+handshake first. This is the same class of unauthenticated-input resource
+exhaustion the slice exists to close, and unlike the half-open variant — where
+elements leave on their own establishment deadline — it does NOT self-clear
+without the advertiser's cooperation. Pinned by
 `distinctAdvertisementsGrowTransfersAndPinTheLinkAgainstEviction`.
 
 The durable fix is a per-link bound on `transfers`. That is its own slice: it has
@@ -681,25 +735,66 @@ via `TCPEndpoint.enableRelay` / `BLEEndpoint.enableRelay`, neither of which has 
 in-repo caller. Latent for relay deployments rather than live in anything that
 ships today — but enabling relay is a one-line integrator decision.
 
-### F14 — the responder cap evicts before it validates
+### F14 — the responder cap evicts before it validates — **CLOSED in `381d731`**
 
-**Where:** `LinkPlane.acceptLinkRequest`.
+**Where it was:** `LinkPlane.acceptLinkRequest`.
 
-The eviction effects are appended before the new element is minted, and the
-request itself is never checked for viability first. Probe: at the cap, a
+The eviction effects were appended before the new element was minted, and the
+request itself was never checked for viability first. Probe: at the cap, a
 LINKREQUEST carrying an all-zeros X25519 key (a well-formed 64-byte payload that
 passes the size guard and dies at `LinkSession.acceptRequest`'s empty-session-key
 guard) evicted a legitimate `.active` responder link and then self-destructed,
 leaving the freed slot unused.
 
 The cheapest unviable request is even simpler — a wrong-size payload, caught by
-the `64 || 67` guard. Either way a legitimate link dies for a request that was
+the `64 || 67` guard. Either way a legitimate link died for a request that was
 never going to become one.
 
-Not a leak and not unbounded: the count settles back below the cap, so the
-availability harm is one legitimate link per refill rather than a flush. Fix by
-validating enough of the request to know it can become an element before
-committing an eviction.
+**Two corrections to how this was first written, both found by the final
+whole-branch review and both worse than the original entry.**
+
+*The severity sentence was FALSE.* It read: "Not a leak and not unbounded: the
+count settles back below the cap, so the availability harm is one legitimate
+link per refill rather than a flush." A probe through production wiring at a cap
+of four showed **zero of four** established links surviving four junk requests.
+
+The whole difference is the probe's choice of key. The original used an
+ALL-ZEROS one, which CryptoKit rejects at `sharedSecretFromKeyAgreement`, so the
+element self-destructs at `acceptRequest`'s empty-session-key guard and frees its
+slot again — and that is what made the harm look self-limiting. `Link.sessionKey`
+succeeds on a RANDOM 32-byte key, so that element does not self-destruct: it
+reaches `.handshake`, `evictable` requires `.active`, and it therefore holds the
+slot it just freed for a full establishment timeout. Each junk request killed one
+authenticated link and took its place.
+
+*The prescribed fix was INSUFFICIENT.* It read: "Fix by validating enough of the
+request to know it can become an element before committing an eviction." A
+random 64-byte payload passes every validation `LinkSession.acceptRequest`
+performs, so anyone implementing that sentence as written would have believed
+they had closed this and would have changed nothing about the flush.
+
+**What was actually implemented (`381d731`).** Split the budgets, so that
+unauthenticated input can only ever spend an unauthenticated one:
+
+- `LinkPlane.State.maxIncompleteResponderLinks` bounds the responder population
+  that has not reached `.active`. `acceptLinkRequest` checks it and REFUSES when
+  it is full. It evicts nothing, ever.
+- The `maxResponderLinks` eviction moved to PROMOTION — `LinkPlane`'s
+  `.link(.element(_, .delegate(.established)))` handler, reachable only by a peer
+  that decrypted the LRRTT and therefore holds the session key. It keeps every
+  property the old eviction had (responder-only, `lastData` not `lastInbound`,
+  skip in-flight transfers, close via `.close` so the element leaves through
+  `.delegate(.closed)`, refuse when nothing is evictable), and additionally
+  excludes the element being promoted by id.
+
+Pinned by `junkLinkRequestBurstDoesNotEvictASingleEstablishedLink` (restoring the
+pre-fix shape in `acceptLinkRequest` leaves zero of four survivors and reddens it)
+and `promotingOneOfOurOwnLinksIsNeverRefusedByTheResponderCap`.
+
+**Residual, accepted:** a flood still fills the half-open budget, so new inbound
+establishment is refused for as long as those elements take to hit their
+establishment deadline. Links that are already up are untouched — that is the
+property the old shape did not have.
 
 ### F15 — an unauthenticated RESOURCE_PRF destroys every sender transfer on a link ⚠️
 
