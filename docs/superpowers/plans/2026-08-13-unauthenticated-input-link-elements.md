@@ -541,10 +541,18 @@ Expected: FAIL to compile — `maxResponderLinks` does not exist.
                 if let cap = state.maxResponderLinks {
                     let responders = state.links.filter { $0.role == .responder }
                     if responders.count >= cap {
-                        let victims = responders
+                        // Only an .active element is evictable: `LinkSession.close` guards on
+                        // `status == .active`, so `.close` to a .pending/.handshake element is a
+                        // silent no-op. If we appended anyway, a flood of INCOMPLETE handshakes
+                        // would grow `links` without bound — precisely the attack this cap exists
+                        // to stop. So when nothing is evictable, REFUSE the new request. Incomplete
+                        // elements are not stranded: each leaves on its own establishment deadline.
+                        let evictable = responders
+                            .filter { $0.status == .active }
                             .sorted { ($0.lastData ?? $0.activatedAt ?? 0) < ($1.lastData ?? $1.activatedAt ?? 0) }
                             .prefix(responders.count - cap + 1)
-                        for victim in victims {
+                        guard !evictable.isEmpty else { return .none }
+                        for victim in evictable {
                             evictions.append(.send(.link(.element(id: victim.id, action: .close))))
                         }
                     }
@@ -556,7 +564,42 @@ Expected: FAIL to compile — `maxResponderLinks` does not exist.
                 return .merge(evictions + [.send(.link(.element(id: newID, action: .acceptRequest(data))))])
 ```
 
-**Note for the implementer:** `LinkSession.close` guards on `status == .active`, so a victim still in `.pending`/`.handshake` will not close on this action — it will still be reaped by its own establishment deadline, but it will not free a slot immediately. That is acceptable (the cap is a bound, not a hard real-time guarantee) and it is *recorded as a known limitation in Task 8's sweep artifact*. Do not "fix" it here by removing the element directly; that reintroduces the stranding bug.
+**Note for the implementer:** the `guard !evictable.isEmpty else { return .none }` is load-bearing, not defensive. `LinkSession.close` guards on `status == .active`, so a `.pending`/`.handshake` victim ignores `.close`. Without the guard, a flood of LINKREQUESTs that never complete their handshake would fill the cap with unevictable elements and then keep appending — the cap would bound nothing in the one scenario it exists for. Refusing the request is the correct response: incomplete elements still leave on their own establishment deadline, so the refusal is temporary.
+
+Do **not** "fix" this by removing the element directly with `state.links.remove` — that bypasses the `.closed` delegate and strands `LXMFRouter.linkResourceInFlight` (handoff item F7).
+
+- [ ] **Step 3b: Add the flood-of-incomplete-handshakes test**
+
+This is the test that proves the cap bounds the actual attack, not just the polite case.
+
+```swift
+/// The cap must bound the ATTACK, not just orderly usage. An attacker floods LINKREQUESTs and
+/// never completes a handshake, so every element sits in .handshake — where `LinkSession.close`
+/// is a no-op. If the plane appended regardless, `links` would grow without bound in exactly the
+/// case the cap exists to stop.
+@Test @MainActor func floodOfIncompleteHandshakesCannotGrowLinksWithoutBound() async {
+    let owner = Identity()
+    let destHash = Data(repeating: 0x32, count: 16)
+    let cap = 4
+    let store = TestStore(
+        initialState: LinkPlane.State(maxResponderLinks: cap)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    // Every request is well-formed and distinct, but none is ever completed with an RTT,
+    // so every element stays in .handshake and none is evictable.
+    for _ in 0 ..< (cap * 10) {
+        await store.send(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                            interfaceID: InterfaceID("i"),
+                                            data: freshLinkRequest(destHash: destHash)))
+    }
+    #expect(store.state.links.count <= cap)
+}
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1072,6 +1115,7 @@ Apply ALL of these at once, then run the suite ONCE:
 6. `LinkSession` re-home condition: change `sawAuthenticatedData || state.rehomePermitted` to `true`
 7. `LinkSession` re-home: delete `state.rehomePermitted = false`
 8. `LinkPlane`: delete the body of the `.delegate(.rehomed)` handler, leaving `return .none`
+9. `LinkPlane.acceptLinkRequest`: delete the `guard !evictable.isEmpty else { return .none }` line
 
 - [ ] **Step 5: Run the suite and verify EVERY targeted test fails**
 
@@ -1086,6 +1130,7 @@ Expected failures, one per mutation:
 6. `onlyAuthenticatedTrafficReHomesTheSession`
 7. `localDisconnectGrantsExactlyOneUnauthenticatedReHome`
 8. `linkPacketFromANewInterfaceReHomesSessionAndItsTransfers`
+9. `floodOfIncompleteHandshakesCannotGrowLinksWithoutBound`
 
 **If any of these still passes, that test is not testing what it claims.** Fix the test, revert the mutations, and restart from Step 3. Do not proceed.
 
