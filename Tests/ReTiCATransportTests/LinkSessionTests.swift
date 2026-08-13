@@ -74,6 +74,41 @@ private func activeResponderStore(clock: TestClock<Duration>)
     return store
 }
 
+// As `activeResponderStore`, but the `date` dependency reads a mutable `seconds` box so a test can
+// make distinct events land at distinct timestamps. `activeResponderStore` pins `.constant(epoch)`,
+// under which every stamp is 0 — that cannot distinguish "stamped again with the same value" from
+// "not stamped at all", so a clock-valued assertion built on it is blind in both directions.
+@MainActor
+private func advancingResponderStore(clock: TestClock<Duration>, seconds: LockIsolated<Double>)
+    async -> TestStore<LinkSession.State, LinkSession.Action>
+{
+    let owner = Identity()
+    let initEph = Identity()
+    let destHash = Data(repeating: 0x66, count: 16)
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: destHash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    let store = TestStore(
+        initialState: LinkSession.State(responderFor: owner, destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"))
+    ) { LinkSession() } withDependencies: {
+        $0.date = .init { Date(timeIntervalSince1970: seconds.value) }
+        $0.continuousClock = clock
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.acceptRequest(try! request.packed()))
+    _ = await captureTransmit(store)                                   // LRPROOF
+    let rttCipher = Link.encrypt(MsgPack.encode(0.0), sessionKey: store.state.sessionKey)
+    let rttPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                           destinationType: .link, context: .linkRequestRTT, contextFlag: false, hops: 0,
+                           destinationHash: store.state.linkID, transportId: nil, payload: rttCipher)
+    await store.send(.received(try! rttPacket.packed()))
+    await store.receive { if case .delegate(.established) = $0 { return true }; return false }
+    return store
+}
+
 @Test @MainActor func initiatorEstablishEmitsLinkRequestAndGoesPending() async {
     let clock = testClock()
     let dest = Identity()
@@ -906,34 +941,48 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 /// `lastData` must advance ONLY on successfully-decrypted non-keepalive traffic. Task 4 evicts
 /// on it, so if a keepalive or an undecryptable packet advanced it, an attacker could hold its
 /// link at the head of the eviction order with garbage and the cap would evict legitimate links
-/// instead. RNS stamps last_data BEFORE decrypting; we deliberately do not.
+/// instead. RNS stamps last_data BEFORE decrypting (RNS/Link.py:936, 1.4.1); we deliberately add
+/// the decryption requirement RNS lacks, while keeping RNS's keepalive-vs-data distinction intact.
+///
+/// Every event below lands at a DISTINCT timestamp. Under a constant clock these assertions would
+/// be vacuous: "stamped again with the same value" and "not stamped at all" are indistinguishable.
 @Test @MainActor func lastDataAdvancesOnlyOnDecryptedNonKeepaliveTraffic() async {
     let clock = testClock()
-    let store = await activeResponderStore(clock: clock)
-    let established = store.state.lastData
+    let seconds = LockIsolated(100.0)                                   // t0 — establishment
+    let store = await advancingResponderStore(clock: clock, seconds: seconds)
+
+    // LRRTT is a non-keepalive that decrypts, so it DOES stamp lastData. That matches the
+    // reference: RNS stamps last_data for every non-KEEPALIVE context (Link.py:936) and handles
+    // LRRTT later in the same receive path (Link.py:1015). We narrow RNS on decryption, not on
+    // which contexts count.
+    #expect(store.state.lastData == 100.0)
 
     // 1. A plaintext keepalive must NOT advance lastData.
+    seconds.setValue(200.0)                                             // t1
     let ka = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                     destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
                     destinationHash: store.state.linkID, transportId: nil,
                     payload: Data([0xFF]))
     await store.send(.received(try! ka.packed()))
-    #expect(store.state.lastData == established)
+    #expect(store.state.lastData == 100.0)                              // still t0, not t1
 
-    // 2. An UNDECRYPTABLE non-keepalive packet must NOT advance lastData either.
+    // 2. An UNDECRYPTABLE non-keepalive packet must NOT advance lastData either. This is the
+    //    case RNS would stamp and we deliberately do not.
+    seconds.setValue(300.0)                                             // t2
     let garbage = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                          destinationType: .link, context: .none, contextFlag: false, hops: 0,
                          destinationHash: store.state.linkID, transportId: nil,
                          payload: Data(repeating: 0x00, count: 48))
     await store.send(.received(try! garbage.packed()))
-    #expect(store.state.lastData == established)
+    #expect(store.state.lastData == 100.0)                              // still t0, not t2
 
     // 3. Real decrypted application data DOES advance it.
+    seconds.setValue(400.0)                                             // t3
     let cipher = Link.encrypt(Data([0x01, 0x02, 0x03]), sessionKey: store.state.sessionKey)
     let dataPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                             destinationType: .link, context: .none, contextFlag: false, hops: 0,
                             destinationHash: store.state.linkID, transportId: nil, payload: cipher)
     await store.send(.received(try! dataPacket.packed()))
     await store.receive { if case .delegate(.dataReceived) = $0 { return true }; return false }
-    #expect(store.state.lastData != established)
+    #expect(store.state.lastData == 400.0)                              // advanced to t3
 }

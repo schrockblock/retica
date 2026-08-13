@@ -426,7 +426,7 @@ public struct LinkSession {
                     // (_, .active, .data, .none) branch below: corrupt/foreign data is ignored and
                     // the element stays alive. The establishment timer is already armed, so the
                     // element is still reapable — the §1b invariant holds.
-                    guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
+                    guard let plain = authDecrypt(packet.payload, state.sessionKey),
                           let rtt = MsgPack.decodeDouble(plain)
                     else { return .none }
                     state.rtt = rtt
