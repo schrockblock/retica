@@ -79,7 +79,14 @@ Report which, with the evidence. This single question determines whether Task 1 
 
 - negative fixint (`0xE0-0xFF`)
 - `int8` / `int16` / `int32` / `int64` (`0xD0-0xD3`)
-- `float32` (`0xCA`)
+- `float32` (`0xCA`) — **correction, 2026-08-14:** this plan implied reference *emits* float32. It
+  does not. `umsgpack._pack_float` reads the module global `_float_precision`, which is `"double"`
+  on every mainstream CPython, so reference always emits `0xCB`. Supporting `0xCA` is **defensive
+  interop** (another implementation may emit it), not parity — correct and cheap, but its stated
+  justification here was wrong. Note the implementation consequence went the other way from the
+  integers: because `_pack_float` reads a *global* rather than the value, a decoded `0xCA` folded
+  into `.double` would re-encode as 9 bytes instead of 5 and break the signature — so `float32`
+  genuinely needs its own case, where the integers genuinely do not.
 - `map32` (`0xDF`)
 - all `ext` / `fixext`
 

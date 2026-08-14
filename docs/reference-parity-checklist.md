@@ -92,6 +92,23 @@ cannot see**. That is what tier 1 is about.
       `ResourceTransfer.swift:408`: 41 bytes can drive a 64 MiB allocation. Not reference parity —
       `Resource.py:691` uses an incremental `BZ2Decompressor(max_length=)`.
 
+## Tier 2b — the amplifier
+
+*Not a defect on its own. It is what turns decode bugs into remote aborts, and it is why Tier 1's
+MsgPack work was hard.*
+
+- [ ] **`LXMessage.validateSignature` re-encodes unconditionally.** Reference validates against the
+      **received bytes** when there is no stamp; we always re-pack the decoded fields and validate
+      against our own output. Consequences: (a) every inbound rich message traverses the
+      decode→re-encode path, so any encode-side trap becomes **wire-reachable** — this is exactly
+      how a recorded *host-only* `UInt16(n)` in the map encoders was one commit away from becoming
+      a remote abort; (b) round-trip must be **byte-identical** or valid messages fail validation,
+      which is a far stricter constraint on the codec than reference labours under.
+      Validating against received bytes would demote "decode support requires byte-exact encode
+      support" from a **correctness** constraint to a tidiness one, and shrink the blast radius of
+      every future codec change. *Found 2026-08-14 while landing the decoder widening; pre-existing
+      and untouched.* **Worth its own task.**
+
 ## Tier 3 — identity and anti-spam interop
 
 - [ ] **No delivery-announce app data** — `LXMFNode.swift:92` announces `appData: nil`.
