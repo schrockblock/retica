@@ -448,6 +448,13 @@ public struct ResourceTransfer {
                           items.count == 2,
                           case let .uint(chunkIndex) = items[0],
                           case let .bin(chunkBytes) = items[1] else { return .none }
+                    // Guard the product before the conversion: Int(chunkIndex) traps above Int.max,
+                    // and Int(chunkIndex) * hashmapMaxLen * mapHashLength traps for any chunkIndex
+                    // above roughly Int.max / 296 — the multiply evaluates BEFORE the contiguity
+                    // check on the next line, so the contiguity check offers no protection here.
+                    // (Recorded as the origin of plan Rule 2; see docs/wire-narrowing-inventory.md.)
+                    let hmProduct = UInt64(Resource.hashmapMaxLen) * UInt64(Resource.mapHashLength)
+                    guard chunkIndex <= UInt64(Int.max) / hmProduct else { return .none }
                     let offset = Int(chunkIndex) * Resource.hashmapMaxLen * Resource.mapHashLength
                     guard offset == state.knownHashmap.count else { return .none }   // must extend contiguously
                     state.knownHashmap.append(chunkBytes)

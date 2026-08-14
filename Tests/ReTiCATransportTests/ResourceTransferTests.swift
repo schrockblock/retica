@@ -687,6 +687,71 @@ private func hmuPacket(_ hash: Data, chunk: Int, hashes: Data) -> Data {
     await store.send(.cancel); _ = await captureTransmits(store, count: 1)
 }
 
+// Build a RESOURCE_HMU packet for chunk `idx` using a raw UInt64 (for hostile-input tests).
+private func hmuPacketRaw(_ hash: Data, chunkU64: UInt64, hashes: Data) -> Data {
+    let payload = hash + MsgPack.encode(.array([.uint(chunkU64), .bin(hashes)]))
+    let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                   destinationType: .link, context: .resourceHashmapUpdate, contextFlag: false, hops: 0,
+                   destinationHash: linkID, transportId: nil, payload: Link.encrypt(payload, sessionKey: key))
+    return try! p.packed()
+}
+
+// MARK: — Task 8: HMU hostile-chunkIndex rejection (wire-input-trap-sweep)
+
+/// A RESOURCE_HMU with chunkIndex = UInt64.max would trap at Int(chunkIndex) because
+/// UInt64.max > Int.max. With the fix in place, the receiver must return .none (reject)
+/// without crashing. The enclosing function under test is ResourceTransfer.reduce (the
+/// .receiver/.data/.resourceHashmapUpdate case).
+///
+/// RED evidence (before fix): the test process crashes with a Swift runtime trap —
+/// `EXC_BAD_INSTRUCTION` / `SIGILL` — because `Int(UInt64.max)` is an uncatchable trap.
+@Test @MainActor func receiverRejectsHmuChunkIndexAboveIntMax() async {
+    // A minimal multi-part resource: 100 bytes of incompressible data at sdu=8 → 13 parts.
+    let data = incompressibleData(count: 100)
+    let sender = senderState(data, sdu: 8)
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+    await store.send(.accept(advertisementPacket(sender)))
+    _ = await captureTransmits(store, count: 1)    // drain initial REQ
+    let stateBefore = store.state
+
+    // Wire chunkIndex = UInt64.max. With no fix this traps at Int(UInt64.max).
+    let hostile = hmuPacketRaw(sender.resourceHash, chunkU64: UInt64.max, hashes: Data(repeating: 0, count: 4))
+    await store.send(.received(hostile))
+
+    // State must be unchanged: the packet was rejected without a crash.
+    #expect(store.state.hashmapHeight == stateBefore.hashmapHeight)
+    #expect(store.state.knownHashmap == stateBefore.knownHashmap)
+    // cleanup
+    await store.send(.cancel); _ = await captureTransmits(store, count: 1)
+}
+
+/// A RESOURCE_HMU with chunkIndex = UInt64(Int.max / 296 + 1) converts fine to Int (it is
+/// <= Int.max) but the subsequent multiply by Resource.hashmapMaxLen * Resource.mapHashLength
+/// (= 74 * 4 = 296) overflows. With the fix in place, the receiver must return .none.
+///
+/// RED evidence (before fix): the test process crashes with a Swift arithmetic overflow trap —
+/// `EXC_BAD_INSTRUCTION` / `SIGILL` — because Swift's `*` traps on overflow.
+@Test @MainActor func receiverRejectsHmuChunkIndexOverflowOnMultiply() async {
+    let data = incompressibleData(count: 100)
+    let sender = senderState(data, sdu: 8)
+    let clock = TestClock<Duration>()
+    let store = receiverStore(clock)
+    await store.send(.accept(advertisementPacket(sender)))
+    _ = await captureTransmits(store, count: 1)    // drain initial REQ
+    let stateBefore = store.state
+
+    // This value converts fine to Int (it is < Int.max) but chunkIndex * 74 * 4 overflows.
+    let overflowChunk = UInt64(Int.max / 296 + 1)
+    let hostile = hmuPacketRaw(sender.resourceHash, chunkU64: overflowChunk, hashes: Data(repeating: 0, count: 4))
+    await store.send(.received(hostile))
+
+    #expect(store.state.hashmapHeight == stateBefore.hashmapHeight)
+    #expect(store.state.knownHashmap == stateBefore.knownHashmap)
+    // cleanup
+    await store.send(.cancel); _ = await captureTransmits(store, count: 1)
+}
+
 // How many transmits the sender will emit in response to `reqFrame`:
 // one RESOURCE part per requested map-hash, plus one RESOURCE_HMU if the request was exhausted (0xFF).
 private func expectedSenderTransmits(_ reqFrame: Data) -> Int {

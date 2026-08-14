@@ -26,7 +26,7 @@ Reticulum/LXMF, ordered by *what a real peer notices*. Tick items as they land.
 |---|---|
 | **Wire format** | Essentially complete, byte-verified against genuine reference output. No algorithmic gap in the crypto primitives. |
 | **Protocol mechanics** | Good for the paths ReTiCA uses — links, resources, requests, announces, path requests, relaying, LXMF opportunistic/direct/propagated. |
-| **Adversarial robustness** | ~17 remotely-reachable aborts closed plus two fail-opens; **3 remain** (Tier 2, Tasks 8-10 — and only one of those, Task 8, is a narrowing conversion the gate can see). |
+| **Adversarial robustness** | ~18 remotely-reachable aborts closed plus two fail-opens; **2 remain** (Tier 2, Tasks 9-10 — neither is a narrowing conversion the gate can see). |
 | **Durability** | Absent. Nothing in the transport core persists. |
 | **Breadth** | 2 of 15 interfaces; no `Channel`/`Buffer`, tickets, tunnels, or non-link proofs. |
 
@@ -77,9 +77,9 @@ cannot see**. That is what tier 1 is about.
 
 ## Tier 2 — remotely reachable crashes still open
 
-*Planned and gated; mostly execution. Plan: `2026-08-12-wire-input-trap-sweep.md` (7/10 done).*
-*Gate status: **1 known-open conversion left** (Task 8). Tasks 9 and 10 are not narrowing
-conversions, so the gate cannot see them — their tests are the only regression guard.*
+*Planned and gated; mostly execution. Plan: `2026-08-12-wire-input-trap-sweep.md` (8/10 done).*
+*Gate status: **zero known-open conversions** — `--fail-on-open` now exits 0. Tasks 9 and 10
+are not narrowing conversions, so the gate cannot see them — their tests are the only regression guard.*
 
 - [x] **Task 6 — `LXMFServiceNode.swift` `Int(raw)` (in `requestReceived`)** — `[[], [], float64(NaN)]` on a `/get`
       aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client.
@@ -91,8 +91,10 @@ conversions, so the gate cannot see them — their tests are the only regression
       `nil`; any single bad field fails the whole predicate, matching reference's per-field
       `try/except` shape in `pn_announce_data_is_valid` (LXMF.py:224-250). Reject, not truncate.
       Commit: see Task 7 report.
-- [ ] **Task 8 — `ResourceTransfer.swift:451` `Int(chunkIndex) * 74 * 4`** — traps twice, at the
-      conversion *and* the multiply. Bound the **product**, not just the conversion.
+- [x] **Task 8 — `ResourceTransfer.swift` `Int(chunkIndex)` (in `ResourceTransfer.reduce`, `.resourceHashmapUpdate` case)** — traps twice, at the
+      conversion *and* the multiply. **Fixed** — `guard chunkIndex <= UInt64(Int.max) / hmProduct`
+      added before the conversion, bounding the product. Reject semantics: a large chunkIndex
+      violates the contiguity invariant. Commit: see Task 8 report.
 - [ ] **Task 9 — unkillable stamp generation** — `LXMFNode.swift:340` → `LXStamper.swift:73-79`: a
       wire `targetStampCost` reaches a bare `while true` in a `.run` effect with **no cancellation
       ID**. Clamp the cost *and* give the effect an ID.
@@ -221,5 +223,5 @@ exactly the class Tier 1 just closed.*
 | Slice | Covers | Plan | Status |
 |---|---|---|---|
 | Interop & crashes | Tier 1 | `2026-08-14-lxmf-interop-data-loss.md` | **in progress** |
-| Wire-input trap sweep | Tier 2 | `2026-08-12-wire-input-trap-sweep.md` | 5/10 |
+| Wire-input trap sweep | Tier 2 | `2026-08-12-wire-input-trap-sweep.md` | 8/10 |
 | Link liveness remainder | — | `2026-08-11-link-liveness-remainder.md` | ⚠️ do-not-execute; needs rework |

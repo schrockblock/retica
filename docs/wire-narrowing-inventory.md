@@ -62,9 +62,9 @@ The durable key is *file + expression text*, which is what the allowlist matches
 
 | | |
 |---|---|
-| Conversions found in `Sources/` | **115** across **76** distinct file+expression groups, in 56 files |
-| Reviewed safe | 114 findings / 75 groups |
-| **Known-open (confirmed traps)** | **1 finding / 1 group** — Task 8 |
+| Conversions found in `Sources/` | **118** across **79** distinct file+expression groups, in 56 files |
+| Reviewed safe | 118 findings / 79 groups |
+| **Known-open (confirmed traps)** | **0** — Task 8 FIXED |
 | Defects in this plan that are *not* conversions | 3 — Tasks 3, 4, 5 (see [Not detectable by this check](#not-detectable-by-this-check)) |
 
 Run the gate:
@@ -75,7 +75,7 @@ swift Scripts/check-wire-narrowing.swift --report     # every finding, allowlist
 swift Scripts/check-wire-narrowing.swift --fail-on-open   # also fails on known-open sites
 ```
 
-`--fail-on-open` is the completion gate: when it exits 0, every site in this plan is closed.
+`--fail-on-open` is the narrowing-conversion completion gate: when it exits 0, every narrowing-conversion site in this plan is closed. **It now exits 0.** Tasks 9 and 10 remain but are not narrowing conversions — the gate is structurally blind to both.
 
 ---
 
@@ -146,12 +146,17 @@ forget one; `--fail-on-open` will tell you if any remain.
   correctly throughout; this bullet is the only thing that needed hand-editing, which is why the
   header now names `requestReceived` as well.
 
-- [ ] **`Sources/ReTiCATransport/ResourceTransfer.swift:451`** — `Int(chunkIndex)` — **Task 8** *(was `:442`; drifted 2026-08-14 when the destructive-transition slice touched this file. The allowlist keys on expression text, not line number, so the gate stayed correct throughout — this line number is documentation only.)*
+- [x] **`Sources/ReTiCATransport/ResourceTransfer.swift`** — `Int(chunkIndex)` — **Task 8 FIXED** (enclosing function: `ResourceTransfer.reduce`, `.receiver/.data/.resourceHashmapUpdate` case) *(line was `:442`, drifted to `:451` — allowlist keys on expression text, gate tracked it correctly throughout)*
   Source: `chunkIndex` is a raw wire `UInt64` from a RESOURCE_HMU msgpack array.
-  Guarded: **no.** The predecessor's ledger recorded this as guarded by the contiguity check
-  `offset == state.knownHashmap.count` — that check is on `:443` and evaluates *after*. Traps
-  twice: at the conversion, and again at `* Resource.hashmapMaxLen * Resource.mapHashLength`.
-  **Bound the product, not just the conversion.**
+  Traps twice: (1) `Int(chunkIndex)` for `chunkIndex > Int.max`; (2) the subsequent multiply
+  `Int(chunkIndex) * hashmapMaxLen * mapHashLength` overflows for `chunkIndex > Int.max / 296`.
+  The contiguity guard `offset == state.knownHashmap.count` on the *next* line offers no
+  protection — the trapping expression evaluates first.
+  **Fix:** guard `chunkIndex <= UInt64(Int.max) / hmProduct` before the conversion, where
+  `hmProduct = UInt64(hashmapMaxLen) * UInt64(mapHashLength) = 296`. Reject, not clamp: a
+  large chunkIndex violates the contiguity invariant and must fail.
+  Wire compatibility: no emitted bytes changed — this path is receive-only.
+  Commit: see Task 8 report.
 
 ---
 

@@ -21,11 +21,6 @@
 # 64-bit. "Int is 64-bit" is therefore load-bearing in several reasons below.
 
 # ---------------------------------------------------------------------------
-# OPEN — confirmed traps, owned by the wire-input-trap-sweep plan. Do not bless.
-# ---------------------------------------------------------------------------
-Sources/ReTiCATransport/ResourceTransfer.swift | 1 | OPEN Task 8 — wire UInt64 narrowed, then multiplied by hashmapMaxLen*mapHashLength. Traps twice. The contiguity check recorded as its guard is on the NEXT line and evaluates after. | Int(chunkIndex)
-
-# ---------------------------------------------------------------------------
 # Reviewed safe — widening conversions the lexical check cannot distinguish
 # ---------------------------------------------------------------------------
 Sources/ReTiCA/Crypto/PKCS7.swift | 2 | Widening: `n` is the UInt8 from `data.last`, so 0...255. Always fits Int. | Int(n)
@@ -73,7 +68,9 @@ Sources/ReTiCAInterfaces/BLEInterface.swift | 1 | BLEHello.length is the constan
 Sources/ReTiCANode/LXMFServiceNode.swift | 1 | Positive compile-time constant. | Int64(Int.max / 1000)
 Sources/ReTiCANode/LXMFServiceNode.swift | 1 | Positive compile-time constant. | UInt64(Int.max / 1000)
 Sources/ReTiCA/Resource/ResourceAdvertisement.swift | 1 | Positive compile-time constant. | UInt64(Resource.maxAdvertisedTransferSize)
-Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant. | UInt64(Int.max)
+Sources/ReTiCATransport/ResourceTransfer.swift | 2 | Positive compile-time constant. Second site is the Task 8 fix (resourceHashmapUpdate): `chunkIndex <= UInt64(Int.max) / hmProduct` bounds the product before any conversion. | UInt64(Int.max)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant (Resource.hashmapMaxLen = 74). Used in Task 8 fix to compute hmProduct in UInt64 before the chunkIndex bound check. | UInt64(Resource.hashmapMaxLen)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant (Resource.mapHashLength = 4). Used in Task 8 fix to compute hmProduct in UInt64 before the chunkIndex bound check. | UInt64(Resource.mapHashLength)
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant. | UInt64(LinkSession.maxEfficientSize)
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant. | UInt64(Resource.autoCompressMaxSize)
 
@@ -105,6 +102,7 @@ Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :397 — guarded by `adv.da
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :389 — the clamp is inside the argument, so it cannot be bypassed. Predecessor fix 4b4526d, split branch. | Int(min(adv.dataSize, UInt64(LinkSession.maxEfficientSize)))
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :220 — type invariant, not a local guard. State.expectedParts is assigned at exactly three sites: :75 UInt64(chunks.count), :115 literal 0, :263 min(adv.numberOfParts, UInt64(Int.max)). All three are <= Int.max. Predecessor fix 4b4526d. NOTE: the field is `public var`, so a host could break the invariant; it holds against wire input. | Int(s.expectedParts)
 Sources/ReTiCATransport/ResourceTransfer.swift | 3 | :365/:371/:372 — same three-assignment-site invariant as Int(s.expectedParts). | Int(state.expectedParts)
+Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Task 8 FIXED (enclosing function ResourceTransfer.reduce, .receiver/.data/.resourceHashmapUpdate case) — guarded on the PRIOR LINE by `chunkIndex <= UInt64(Int.max) / hmProduct` where hmProduct = UInt64(hashmapMaxLen)*UInt64(mapHashLength) = 296. That bound ensures Int(chunkIndex) cannot trap (chunkIndex <= Int.max) AND the subsequent multiply cannot overflow (chunkIndex*296 <= Int.max). | Int(chunkIndex)
 Sources/ReTiCANode/LXMFServiceNode.swift | 1 | Task 6 FIXED — `requestReceived` handler, `.double` branch. Two guards evaluate first on earlier lines: `raw.isNaN` and `raw < 0` both map to 0 (done, else skipped); `raw >= Double(Int.max)` maps to Int.max (done, else skipped). The else branch executes only when raw is a finite non-negative value less than Double(Int.max), which fits Int. | Int(raw)
 
 # ---------------------------------------------------------------------------
