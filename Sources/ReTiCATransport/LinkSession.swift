@@ -401,15 +401,29 @@ public struct LinkSession {
                 func dispatch(_ state: inout State) -> Effect<Action> {
                 switch (state.role, state.status, packet.packetType, packet.context) {
                 case (.initiator, .pending, .proof, .linkRequestProof):
+                    // UNAUTHENTICATED INPUT — the initiator-side mirror of the responder RTT
+                    // branch below. `linkID` rides unencrypted in every link packet header and
+                    // `Transport` routes link-addressed packets ahead of `seenPacketHashes`, so
+                    // any observer can inject a packet that lands here.
+                    //
+                    // Reaping on a bad proof cost us twice: `LinkPlane` removed our own outbound
+                    // element, AND `.handshakeRejected` is the one PEER-shaped `LinkFailure`, so
+                    // `LXMFNode` answered by retrying the link instead of requesting a path —
+                    // spending the whole establishment budget against a route that works.
+                    //
+                    // Ignore it and let `establishmentDeadline` decide. The establishment timer is
+                    // already armed, so the element stays reapable; and the failure then arrives
+                    // as `.timedOut` → `.establishmentTimedOut`, which is PATH-shaped and triggers
+                    // a path request.
                     guard let destID = state.destinationIdentity,
                           let peerPub = Link.validateProof(proofData: packet.payload,
                                                            linkID: state.linkID,
                                                            destinationIdentity: destID)
-                    else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
+                    else { return .none }
                     let ourPriv = Data((state.ephemeral.privateKey ?? Data()).prefix(32))
                     let key = Link.sessionKey(ephemeralPrivateX25519: ourPriv,
                                               peerPublicX25519: peerPub, linkID: state.linkID)
-                    guard !key.isEmpty else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
+                    guard !key.isEmpty else { return .none }
                     state.peerX25519Pub = peerPub
                     state.sessionKey = key
                     state.status = .active

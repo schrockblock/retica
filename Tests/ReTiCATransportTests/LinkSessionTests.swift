@@ -172,7 +172,20 @@ private func advancingResponderStore(clock: TestClock<Duration>, seconds: LockIs
     await store.receive(.delegate(.closed(.timedOut))) { $0.status = .closed }
 }
 
-@Test @MainActor func initiatorRejectsTamperedProof() async {
+/// F12: an invalid LRPROOF is UNAUTHENTICATED input — linkID is cleartext and link packets
+/// bypass Transport's dedup, so anyone can inject one. The element must survive when a
+/// wrongly-signed proof arrives (old contract: it was reaped and the establishment ended).
+///
+/// Renamed from `initiatorRejectsTamperedProof`. That name encoded the old behaviour: the branch
+/// REJECTED the proof by emitting `.establishmentFailed(.handshakeRejected)` and reaping the
+/// element. The new contract is IGNORE — the branch returns `.none` and the element stays alive
+/// so the real proof can still establish the link.
+///
+/// Mutation-catching: after the tampered proof, exhaustivity is flipped to `.on`. With the old
+/// code, `.handshakeRejected` queues as a received action; `store.receive(.establishmentDeadline)`
+/// then finds `.handshakeRejected` as the first action and fails. Under the correct (`.none`)
+/// implementation, no action is queued and the deadline is the first action received.
+@Test @MainActor func initiatorIgnoresTamperedProofElementSurvives() async {
     let clock = testClock()
     let dest = Identity()
     let store = TestStore(
@@ -192,40 +205,36 @@ private func advancingResponderStore(clock: TestClock<Duration>, seconds: LockIs
                              destinationType: .link, context: .linkRequestProof, contextFlag: false,
                              hops: 0, destinationHash: linkID, transportId: nil, payload: proof)
     await store.send(.received(try! proofPacket.packed()))
-    // The peer ANSWERED with a proof that failed to validate — peer-shaped, not path-shaped.
-    await store.receive(.delegate(.establishmentFailed(.handshakeRejected)))
-    #expect(store.state.status == .pending)                      // no transition on failure
-    // The establishment timer is still running. With exhaustivity=.off, TCA silently ignores
-    // the in-flight timer effect at teardown (it's cancelled when the store is deallocated).
-    // We advance the clock to fire it cleanly rather than leaving it dangling.
+    // No delegate action — the element is not reaped, still pending.
+    #expect(store.state.status == .pending)
+    // Flip to .on so that if a stray .handshakeRejected was queued, receive(.establishmentDeadline)
+    // finds it as the first action and fails the test (mutation catcher).
+    store.exhaustivity = .on
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
-    // If clock.advance woke the timer, the deadline + establishmentFailed actions (this is an
-    // INITIATOR, so the deadline emits .establishmentFailed, not .closed) are silently consumed by
-    // exhaustivity=.off. If it did not (TCA 1.26 timing), the in-flight effect is silently
-    // cancelled at store dealloc. Either way the test passes with .off exhaustivity.
-    #expect(store.state.status == .pending || store.state.status == .closed)
+    // .establishmentDeadline sets status=.closed and emits .establishmentFailed(.timedOut).
+    await store.receive(.establishmentDeadline) { $0.status = .closed }
+    await store.receive(.delegate(.establishmentFailed(.timedOut)))
 }
 
-/// An initiator whose proof VALIDATES but whose session-key derivation fails must still report
-/// `.handshakeRejected`, not `.timedOut`.
+/// F12, second half — the MISLABEL. After an injected proof (degenerate session-key variant),
+/// the element must fail as PATH-shaped (.timedOut → .establishmentTimedOut), not PEER-shaped
+/// (.handshakeRejected → link-retry).
 ///
-/// This pins a genuinely live label that the tampered-proof test does not reach. That test fails
-/// at `validateProof`; this one gets past it and fails one step later, at the empty-session-key
-/// guard. Both are inside `case (.initiator, .pending, .proof, .linkRequestProof)`, so neither is
-/// covered by the responder role gate — the claim that the remaining unpinned labels are all
-/// "dead via the role gate" was false for this one, and mutating it to `.timedOut` left the whole
-/// suite green.
+/// Renamed from `initiatorEmptySessionKeyReportsHandshakeRejectedNotTimeout`. The old name
+/// asserted `.handshakeRejected`; the new contract is the opposite: this guard now returns `.none`
+/// and failure only arrives via `establishmentDeadline` as `.timedOut`. The name was exactly
+/// backwards. The session-key guard is the second failure point inside the same branch
+/// (`validateProof` is the first); both now return `.none`.
 ///
-/// Why the label matters beyond bookkeeping: `LinkPlane` maps it to `LinkFailure.handshakeRejected`,
-/// which is the ONE reason `LXMFNode` answers by retrying the LINK rather than requesting a path
-/// (see `handshakeRejectedLinkFailureStillRetriesTheLinkNotAPath`). Mislabelled `.timedOut` it
-/// would be treated as path-shaped and would throw away a route that demonstrably works — the peer
-/// answered, which is exactly what reaching this code proves.
+/// The drive: a degenerate-X25519 proof, correctly signed so `validateProof` succeeds, but whose
+/// key causes `Link.sessionKey` to return empty. Preconditions verify both properties hold.
 ///
-/// The drive: a proof carrying an all-zeros X25519 key, correctly signed. `validateProof` checks
-/// the signature and returns the key WITHOUT checking it is a usable curve point, so it succeeds;
-/// the subsequent ECDH then rejects the low-order point and `Link.sessionKey` returns empty.
-@Test @MainActor func initiatorEmptySessionKeyReportsHandshakeRejectedNotTimeout() async {
+/// Mutation-catching: exhaustivity is flipped to `.on` after the degenerate proof is sent.
+/// With the old (mutation-b) code, `.handshakeRejected` queues as a received action before the
+/// clock advance; `store.receive(.establishmentDeadline)` finds `.handshakeRejected` first
+/// and fails. Under the correct implementation, no action queues and the test receives
+/// `.establishmentDeadline` → `.timedOut`.
+@Test @MainActor func initiatorEmptySessionKeyFailsAsTimedOutNotHandshakeRejected() async {
     let clock = testClock()
     let dest = Identity()
     let store = TestStore(
@@ -247,7 +256,7 @@ private func advancingResponderStore(clock: TestClock<Duration>, seconds: LockIs
     let proof = dest.sign(signedData) + degeneratePub + Link.signallingBytes
 
     // Precondition: the proof really does validate. If this ever returns nil the test would be
-    // re-testing the tampered-proof path (:271) instead of the empty-key path (:275).
+    // re-testing the tampered-proof path instead of the empty-key path.
     #expect(Link.validateProof(proofData: proof, linkID: linkID, destinationIdentity: dest) != nil,
             "proof must validate — otherwise this test no longer reaches the session-key guard")
     // Precondition: derivation really does fail, which is what makes the guard fire.
@@ -259,13 +268,105 @@ private func advancingResponderStore(clock: TestClock<Duration>, seconds: LockIs
                              destinationType: .link, context: .linkRequestProof, contextFlag: false,
                              hops: 0, destinationHash: linkID, transportId: nil, payload: proof)
     await store.send(.received(try! proofPacket.packed()))
-    await store.receive(.delegate(.establishmentFailed(.handshakeRejected)))
-    #expect(store.state.status == .pending)                      // no transition on failure
-    #expect(store.state.sessionKey.isEmpty)                      // and no key was adopted
+    // The branch returns .none — no delegate action, no transition.
+    #expect(store.state.status == .pending)
+    #expect(store.state.sessionKey.isEmpty)                      // no key was adopted
 
-    // Drain the still-running establishment timer, as initiatorRejectsTamperedProof does.
+    // Flip to .on: if the old code queued .handshakeRejected, receive(.establishmentDeadline)
+    // finds it first and fails (mutation-b catcher).
+    store.exhaustivity = .on
+    // Failure arrives PATH-shaped via the establishment deadline, not PEER-shaped immediately.
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
-    #expect(store.state.status == .pending || store.state.status == .closed)
+    // .establishmentDeadline sets status=.closed and emits .establishmentFailed(.timedOut).
+    await store.receive(.establishmentDeadline) { $0.status = .closed }
+    await store.receive(.delegate(.establishmentFailed(.timedOut)))
+}
+
+/// F12: an invalid LRPROOF is UNAUTHENTICATED input — linkID is cleartext and link packets
+/// bypass Transport's dedup, so anyone can inject one. Reaping here let a single packet kill
+/// our own outbound establishment. The element must survive and still establish when the real
+/// proof arrives.
+///
+/// Mutation coverage is provided by `initiatorIgnoresTamperedProofElementSurvives` (mutation-a)
+/// and `initiatorEmptySessionKeyFailsAsTimedOutNotHandshakeRejected` (mutation-b), both of which
+/// flip exhaustivity to `.on` at the critical point. This test focuses on the survival-then-
+/// establish flow end-to-end.
+@Test @MainActor func garbageLinkProofDoesNotReapTheInitiatorElement() async {
+    let clock = testClock()
+    let dest = Identity()
+    let destHash = Data(repeating: 0x91, count: 16)
+    let store = TestStore(
+        initialState: LinkSession.State(initiatorTo: Identity(publicKey: dest.publicKey)!,
+                                        destinationHash: destHash, interfaceID: InterfaceID("i"))
+    ) { LinkSession() } withDependencies: {
+        $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    await store.send(.establish)
+    _ = await captureTransmit(store)                                   // LINKREQUEST
+    #expect(store.state.status == .pending)
+
+    // Inject a bogus proof at the (publicly derivable) linkID.
+    let garbage = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                         destinationType: .link, context: .linkRequestProof, contextFlag: false,
+                         hops: 0, destinationHash: store.state.linkID, transportId: nil,
+                         payload: Data(repeating: 0x00, count: 99))
+    await store.send(.received(try! garbage.packed()))
+
+    // Not reaped, still pending.
+    #expect(store.state.status == .pending)
+
+    // The genuine proof still establishes the link.
+    let proof = Link.buildProof(linkID: store.state.linkID,
+                                responderEphemeral: Identity(),
+                                destinationIdentity: dest)
+    let proofPacket = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                             destinationType: .link, context: .linkRequestProof, contextFlag: false,
+                             hops: 0, destinationHash: store.state.linkID, transportId: nil,
+                             payload: proof)
+    await store.send(.received(try! proofPacket.packed()))
+    _ = await captureTransmit(store)                                   // LRRTT
+    await store.receive { if case .delegate(.established) = $0 { return true }; return false }
+    #expect(store.state.status == .active)
+}
+
+/// F12, second half — the MISLABEL. After an injected proof, the establishment must fail as
+/// PATH-shaped (.timedOut → .establishmentTimedOut), not PEER-shaped (.handshakeRejected).
+/// LXMFNode answers .handshakeRejected by retrying the link instead of requesting a path, so a
+/// mislabel here burns the whole delivery budget against a route that works. This is the
+/// expensive half of F12 and needs its own test — a survival assertion would not catch it.
+///
+/// Mutation-catching: exhaustivity is flipped to `.on` after the garbage proof is sent.
+/// With the old code, `.handshakeRejected` queues as a received action before the clock advance;
+/// `store.receive(.establishmentDeadline)` finds `.handshakeRejected` as the first action and fails.
+@Test @MainActor func garbageLinkProofFailsAsPathShapedNotPeerShaped() async {
+    let clock = testClock()
+    let dest = Identity()
+    let destHash = Data(repeating: 0x92, count: 16)
+    let store = TestStore(
+        initialState: LinkSession.State(initiatorTo: Identity(publicKey: dest.publicKey)!,
+                                        destinationHash: destHash, interfaceID: InterfaceID("i"))
+    ) { LinkSession() } withDependencies: {
+        $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    await store.send(.establish)
+    _ = await captureTransmit(store)
+    let garbage = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                         destinationType: .link, context: .linkRequestProof, contextFlag: false,
+                         hops: 0, destinationHash: store.state.linkID, transportId: nil,
+                         payload: Data(repeating: 0x00, count: 99))
+    await store.send(.received(try! garbage.packed()))
+
+    // Flip to .on: if the old code queued .handshakeRejected, receive(.establishmentDeadline)
+    // finds it first and fails (mutation catcher for the path-shape / peer-shape distinction).
+    store.exhaustivity = .on
+    await clock.advance(by: .seconds(store.state.establishmentTimeout))
+    // .establishmentDeadline sets status=.closed and emits .establishmentFailed(.timedOut).
+    await store.receive(.establishmentDeadline) { $0.status = .closed }
+    await store.receive(.delegate(.establishmentFailed(.timedOut)))
 }
 
 @Test @MainActor func initiatorAndResponderReachActiveWithEqualSessionKey() async {
