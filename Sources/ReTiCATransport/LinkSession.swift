@@ -516,13 +516,31 @@ public struct LinkSession {
                 case (_, .active, .data, .resource),
                      (_, .active, .data, .resourceRequest),
                      (_, .active, .data, .resourceHashmapUpdate),
-                     (_, .active, .data, .resourceProof),
                      (_, .active, .data, .resourceInitiatorCancel),
-                     (_, .active, .data, .resourceReceiverCancel),
-                     (_, .active, .proof, .resourceProof):
+                     (_, .active, .data, .resourceReceiverCancel):
                     return .merge(state.transfers.ids.map {
                         .send(.transfer(.element(id: $0, action: .received(data))))
                     })
+
+                case (_, .active, .data, .resourceProof),
+                     (_, .active, .proof, .resourceProof):
+                    // OWNERSHIP ROUTING. `Resource.proofData` is `hash ‖ fullHash(data ‖ hash)`,
+                    // so the leading 32 bytes ARE the resource hash. Fanning a proof out to every
+                    // transfer meant one packet reached transfers that did not own it — and two of
+                    // our OWN concurrent sends destroyed each other, with no attacker involved.
+                    //
+                    // Reference routes the same way in `Link.receive`, and scopes to
+                    // `outgoing_resources` — sender-role only. Note a proof CANNOT be
+                    // authenticated: `Packet.pack` has a branch dedicated to `RESOURCE_PRF`
+                    // leaving resource proofs unencrypted, so ownership is the only discriminator
+                    // available. That is why `ResourceTransfer` must also never destroy itself on
+                    // a proof that fails to validate.
+                    guard packet.payload.count >= 32 else { return .none }
+                    let owner = Data(packet.payload.prefix(32))
+                    guard let target = state.transfers.first(where: {
+                        $0.role == .sender && $0.resourceHash == owner
+                    }) else { return .none }
+                    return .send(.transfer(.element(id: target.id, action: .received(data))))
 
                 case (_, .active, .data, .response):
                     guard let plain = authDecrypt(packet.payload, state.sessionKey),

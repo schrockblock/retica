@@ -364,6 +364,136 @@ private func activeLinkHostingPlainReceiver(
     #expect(store.state.transfers[id: tid] == nil)             // GC'd
 }
 
+// MARK: - Proof routing
+
+/// F15: two concurrent SENDER transfers on one link. A's valid proof must reach A ONLY.
+/// Before this fix the proof was fanned out to every transfer and each one failed itself on a
+/// mismatch, so two of our OWN transfers destroyed each other with no attacker present.
+///
+/// This asserts ROUTING, not just outcome: the `.on` window makes a delivery to B an
+/// unexpected action. An outcome-only assertion would stop discriminating once a mis-delivered
+/// proof became harmless.
+@Test @MainActor func aResourceProofReachesOnlyTheTransferThatOwnsIt() async {
+    // Set up two SENDER transfers injected directly into state so no ResourceTransfer effects are
+    // in flight. This is necessary for the `.on`-mode window: live `.sendResource` effects
+    // (advertise/transmit/watchdog timers) accumulate in receivedActions and cannot cleanly be
+    // synchronised with the routing window. Injecting state (as the GC tests do) gives a clean
+    // queue.
+    let clock = TestClock<Duration>()
+    let tA = senderFor(Data(repeating: 0x01, count: 64))
+    let tB = senderFor(Data(repeating: 0x02, count: 64))
+    #expect(tA.resourceHash != tB.resourceHash)
+
+    var s = LinkSession.State(responderFor: Identity(),
+                              destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .active
+    s.sessionKey = resKey
+    s.linkID = resLinkID
+    s.rtt = 1.0
+    s.lastInbound = 0.0     // pre-seeded so the `.on`-window sends produce no nil→0 change
+    s.transfers.append(tA)
+    s.transfers.append(tB)
+
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = clock
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    let proof = Resource.proofData(data: Data(repeating: 0x01, count: 64), hash: tA.resourceHash)
+    let packet = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                        destinationType: .link, context: .resourceProof, contextFlag: false,
+                        hops: 0, destinationHash: resLinkID, transportId: nil,
+                        payload: proof)
+
+    store.exhaustivity = .on
+    // The routing effect (.send(.transfer(tA.id, .received(data)))) is async — A's status
+    // change happens when ResourceTransfer processes the child action, not during this send.
+    await store.send(.received(try! packet.packed()))
+    await store.receive { action in
+        if case let .transfer(.element(id, .received)) = action { return id == tA.id }
+        return false
+    } assert: { state in
+        // A's ResourceTransfer validates the proof → status .complete. B is untouched.
+        state.transfers[id: tA.id]?.status = .complete
+    }
+    // A's ResourceTransfer validates the proof → .complete → emits .delegate(.concluded).
+    // The parent then handles .concluded → removes A and emits .delegate(.resourceConcluded).
+    // Drain these cascading actions before the inert send; they are A's own expected effects
+    // and are not evidence of a stray B-delivery.
+    await store.receive { action in
+        if case let .transfer(.element(id, .delegate(.concluded))) = action { return id == tA.id }
+        return false
+    } assert: { state in
+        state.transfers.remove(id: tA.id)
+    }
+    await store.receive { action in
+        if case .delegate(.resourceConcluded) = action { return true }
+        return false
+    }
+    // FLIP-THEN-SEND, and it is load-bearing. `send`'s "must handle N received actions" check
+    // fires on actions queued by a PREVIOUS send, so a stray delivery to B is only observable
+    // on the NEXT send while still `.on`. Asserting here and flipping to `.off` would let B's
+    // action be silently discarded — and flipping back before teardown also disables the
+    // teardown check. This second send is what makes the routing claim real.
+    let inert = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                       destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                       destinationHash: resLinkID, transportId: nil,
+                       payload: Data(repeating: 0x00, count: 8))
+    await store.send(.received(try! inert.packed()))
+
+    store.exhaustivity = .off
+    #expect(store.state.transfers[id: tB.id]?.status != .failed)
+    await store.send(.close)
+}
+
+/// Reference scopes proof routing to `outgoing_resources` — sender-role only. A RECEIVER-role
+/// transfer must not consume a proof even when its resourceHash matches.
+///
+/// This test uses the existing `activeLinkHostingPlainReceiver` helper in this file, which
+/// stands up a link whose only transfer is receiver-role. Read that helper for its exact
+/// signature and for the receiver's `resourceHash`; the assertions below are the point.
+@Test @MainActor func aResourceProofIsNotDeliveredToAReceiverRoleTransfer() async {
+    let clock = TestClock<Duration>()
+    // activeLinkHostingPlainReceiver returns (store, transferID: UUID), not (store, hash).
+    // Take the resourceHash directly from state; the helper sets it to Data(repeating: 0xAA, count: 32).
+    let (store, _) = activeLinkHostingPlainReceiver(clock)
+    let receiverHash = store.state.transfers.first!.resourceHash
+
+    // Warm up lastInbound to 0.0 while still `.off` so the `.on`-window sends don't see nil→0.
+    // An unencrypted .none packet fails authDecrypt → dispatch returns .none; no queued actions.
+    let warmupPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                              destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                              destinationHash: store.state.linkID, transportId: nil,
+                              payload: Data(repeating: 0x00, count: 8))
+    await store.send(.received(try! warmupPacket.packed()))
+
+    // A proof addressed to the receiver's own resource hash. Sender-role scoping means it must
+    // not be delivered at all — under `.on`, any `.transfer(.element(...))` is unhandled.
+    let proof = Resource.proofData(data: Data(repeating: 0x04, count: 64), hash: receiverHash)
+    let packet = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                        destinationType: .link, context: .resourceProof, contextFlag: false,
+                        hops: 0, destinationHash: store.state.linkID, transportId: nil,
+                        payload: proof)
+
+    store.exhaustivity = .on
+    await store.send(.received(try! packet.packed()))
+    // FLIP-THEN-SEND — see the note in the previous test. Without this second `.on` send, a
+    // delivery to the receiver-role transfer is queued, never inspected, and then discarded when
+    // exhaustivity drops. The test would assert nothing at all.
+    let inert = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                       destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                       destinationHash: store.state.linkID, transportId: nil,
+                       payload: Data(repeating: 0x00, count: 8))
+    await store.send(.received(try! inert.packed()))
+
+    store.exhaustivity = .off
+    #expect(store.state.transfers.first?.status != .failed)
+    await store.send(.close)
+}
+
 @Test @MainActor func completedSplitSegmentReceiversAreRemovedAsTheyArrive() async {
     let clock = TestClock<Duration>()
     let oh = Data(repeating: 0x11, count: 32)
