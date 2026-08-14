@@ -24,7 +24,7 @@ Re-confirmed on the revision pass below — count and known issue both still exa
 > status.
 >
 > **Updated a third time 2026-08-13** by the "a destructive transition requires
-> authenticated, owned input" slice (`892652a..a4b5e21`). Suite is now 834, same
+> authenticated, owned input" slice (`892652a..a4b5e21`). Suite is now 835, same
 > one known issue. **F12 and F15 are CLOSED** — but read F15's entry before
 > reading "closed" as "authenticated": a resource proof CANNOT be authenticated at
 > all, so what closed it is ownership routing plus non-destructiveness. **F17 and
@@ -195,12 +195,23 @@ Current priority:
    deliberate, pinned by tests, listed so a future fix confronts them rather than
    deleting them).
 5. **F8**, then F3/F4/F5.
-6. **F17**, then **F18** — both low, both from the destructive-transition sweep.
-   F17 has no reference-aligned fix (RNS routes resource segments the same way),
-   so taking it means choosing a deliberate divergence; F18 is a one-line length
-   check whose value is removing a class rather than closing a live hole.
-   Deliberately ranked below F3/F4/F5: those are cheaper and F17's price to an
-   attacker is set by `Resource.mapHashLength`.
+6. **F18**, then **F17** — both low, both from the destructive-transition sweep.
+   **F18 comes first because it CAUSES part of F17**: F17's route 3 is free only
+   because `m` is unvalidated, and F18 is also the real weakness behind the
+   `.transfer(… .delegate(.failed))` request-cancellation path. An item that
+   causes others should not sit below the leaf it causes. F18 is one length check
+   at `unpack`, and the widening from one consumer to four (`h`, `o`, `m`, `q`)
+   argues FOR doing it, not against — the cost is unchanged while the payoff
+   quadrupled. F17 then has no reference-aligned fix at all (RNS routes resource
+   segments the same way, with a standing TODO), so taking it means choosing a
+   deliberate divergence.
+
+   Both stay below F3/F4/F5 because the widening does NOT widen the trust
+   boundary: all four F18 consumers require the session key and are bounded to
+   that peer's own link. **Do not restate the old rationale that stood here —
+   "F17's price to an attacker is set by `Resource.mapHashLength`" — which
+   `8aa02ee` falsified.** That price applies to the accidental and sprayed
+   routes; for a session-key-holding peer, route 3 is free.
 
 **F12, F14 and F15 were ranked here and are now CLOSED** (`bd5dd7f`, `381d731`,
 `d0570ef` + `0101a74`).
@@ -1061,13 +1072,18 @@ versions: `diff` between the local 1.4.1-fork `Link.py` and the stock 1.4.2 one 
 the conda `rns` env is EMPTY. The claims above are stock behaviour, not fork
 behaviour.
 
-### F18 — `ResourceAdvertisement.unpack` validates the length of none of `h`, `r`, `o`, `m`
+### F18 — `ResourceAdvertisement.unpack` validates the length of none of `h`, `r`, `o`, `m`, `q`
 
-**Where:** `ResourceAdvertisement.unpack`. All four are read through the same
-`bin(_:)` helper, which checks only that the MsgPack value is a `.bin`. Only `t`
-has any gate (a magnitude gate against `Resource.maxAdvertisedTransferSize`).
-Probed: an advertisement with all four fields EMPTY round-trips intact, and so
+**Where:** `ResourceAdvertisement.unpack`. `h`, `r`, `o` and `m` are read through
+the same `bin(_:)` helper, which checks only that the MsgPack value is a `.bin`;
+`q` goes through its own `switch`, which likewise accepts any `.bin`. Only `t` has
+any gate (a magnitude gate against `Resource.maxAdvertisedTransferSize`). Probed:
+an advertisement with all four `bin(_:)` fields EMPTY round-trips intact, and so
 does one with over-long `h` / `r` / `o`.
+
+**Ranked ABOVE F17** (see §3), because it is the upstream cause of F17's route 3
+and of the `q` weakness below. The fix is one length check; the widening from one
+consumer to four argues for doing it.
 
 **Impact today is nil, and the framing matters more than the finding.** An empty
 `h` becomes a receiver transfer's `resourceHash`, and an empty `owner` prefix
@@ -1111,7 +1127,17 @@ worth naming, because "unvalidated advertisement field" is the shared cause and
   adv.isResponse`, so an advertisement with NEITHER flag can carry a live
   requestID past it. Probed. What actually holds is the `.failed` handler's own
   `state.pendingRequests.contains(rid)` plus `pendingRequests` being
-  per-`LinkSession` — so a peer can cancel only requests we sent to THAT peer.
+  per-`LinkSession` — whose only INSERT sites are `.sendRequest`'s two branches
+  (say "inserted", not "written": the file has six other write sites, all
+  removals) — so a peer can cancel only requests we sent to THAT peer.
+
+  Reference nests this identically and still lacks the defect, which locates ours
+  exactly: RNS's `RESOURCE_ADV` matches `read_request_id` against
+  `pending_requests` inside `elif is_response(packet)`, but its
+  non-request/non-response paths call `RNS.Resource.accept(packet, callback)`
+  WITHOUT `request_id=`, so a borrowed id is never bound to a plain resource. Our
+  divergence is not the nesting — it is storing `q` regardless of flags and
+  reading it back unconditionally.
 
 ---
 

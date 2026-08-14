@@ -2200,6 +2200,99 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     await store.send(.stopMaintenance)
 }
 
+/// CHARACTERIZATION TEST for a behaviour RULED INTENDED by the 2026-08-13 destructive-transition
+/// sweep (see `docs/superpowers/2026-08-13-destructive-transition-sweep.md`, the ruling under §4's
+/// row 34). It is here because the ruling has no F-number, and an intended behaviour with no test
+/// is indistinguishable from an unnoticed one.
+///
+/// THE BEHAVIOUR: a genuine newer announce arriving on a `.roaming` interface re-homes a path
+/// previously learned on a `.full` one — `Transport.shouldReplace` compares only `announceEmitted`
+/// and `hops`, so it is MODE-BLIND — and the maintenance sweep reads
+/// `pathExpiry(forMode: interfaces[entry.interfaceID]?.mode)` at GC time. Net effect: the path's
+/// lifetime drops from the 7-day default to the 6-hour roaming window. Inbound data has moved a GC
+/// earlier, which is why the sweep had to retract a universal that said it could not.
+///
+/// WHY IT IS INTENDED, so that a future edit confronts the reasoning rather than the symptom: after
+/// the replacement the entry genuinely IS a roaming path. `Transport.send` transmits on
+/// `entry.interfaceID`, which now names the roaming interface, so the route really does run over it,
+/// and classifying it by the mode it actually rides is the entire purpose of `pathExpiry(forMode:)`.
+/// Nothing is truncated mid-life either: the replacement also resets `learnedAt`, so the entry gets
+/// a FULL roaming lifetime measured from the moment it became a roaming path.
+///
+/// WHAT THIS PINS THAT THE NEIGHBOURING TESTS DO NOT. `roamingPathExpiresAfterSixHours` and
+/// `fullModePathSurvivesShortWindows` each connect ONE interface and never re-class anything, so
+/// adding a mode comparison to `shouldReplace` breaks neither. It breaks the first assertion here.
+/// The control half — the same newer announce arriving on the FULL interface — is what keeps the
+/// re-class load-bearing rather than passing under a blanket "everything expires at 6h".
+@Test @MainActor func newerAnnounceOnRoamingInterfaceReClassesAFullLearnedPathToTheRoamingLifetime() async {
+    // One identity, so both announces name the SAME destination. The convenience overload mints a
+    // fresh Identity per call and would give two different destinations.
+    let peer = Identity()
+    let (first, destHash) = makeAnnouncePacket(identity: peer, appName: "app", aspects: ["svc"],
+                                               hops: 2, emitted: 1000)
+    // Strictly newer `emitted` → wins `shouldReplace`, and also yields a different announce blob,
+    // so it is not dropped as a replay.
+    let (newer, newerDest) = makeAnnouncePacket(identity: peer, appName: "app", aspects: ["svc"],
+                                                hops: 2, emitted: 2000)
+    #expect(newerDest == destHash)
+
+    let fullIf = InterfaceID("i-full"), roamIf = InterfaceID("i-roam")
+    let roaming = InterfaceProfile(name: "cell", bitrate: 80_000, mode: .roaming)
+
+    // --- the re-class: newer announce arrives on the ROAMING interface ---
+    let clock = TestClock()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock
+        $0.transportDate = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(fullIf, .default))          // mode .full
+    await store.send(.interfaceConnected(roamIf, roaming))
+    await store.send(.received(fullIf, first))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.learned[destHash]?.interfaceID == fullIf)
+
+    await store.send(.received(roamIf, newer))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.learned[destHash]?.interfaceID == roamIf)    // mode-blind replacement
+
+    await store.send(.startMaintenance)
+    now.setValue(Date(timeIntervalSince1970: Transport.roamingPathExpiry - 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    #expect(store.state.learned[destHash] != nil)                    // full roaming lifetime, not truncated
+    now.setValue(Date(timeIntervalSince1970: Transport.roamingPathExpiry + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.receive(.maintenanceTick)
+    // Under the ORIGINAL full binding this entry had ~7 days left.
+    #expect(store.state.learned[destHash] == nil)
+    await store.send(.stopMaintenance)
+
+    // --- control: the same newer announce on the FULL interface does NOT shorten anything ---
+    let clock2 = TestClock()
+    let now2 = LockIsolated(Date(timeIntervalSince1970: 0))
+    let control = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.continuousClock = clock2
+        $0.transportDate = DateGenerator { now2.value }
+    }
+    control.exhaustivity = .off
+    await control.send(.interfaceConnected(fullIf, .default))
+    await control.send(.interfaceConnected(roamIf, roaming))
+    await control.send(.received(fullIf, first))
+    await control.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await control.send(.received(fullIf, newer))
+    await control.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(control.state.learned[destHash]?.interfaceID == fullIf)
+
+    await control.send(.startMaintenance)
+    now2.setValue(Date(timeIntervalSince1970: Transport.roamingPathExpiry + 1))
+    await clock2.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await control.receive(.maintenanceTick)
+    #expect(control.state.learned[destHash] != nil)                  // still on the 7-day window
+    await control.send(.stopMaintenance)
+}
+
 /// A stale relay linkTable entry is swept; an entry refreshed by a link-packet forward survives.
 @Test @MainActor func staleLinkEntrySweptButRefreshedSurvives() async {
     let clock = TestClock()

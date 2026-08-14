@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-13
 **Slice:** `892652a..a4b5e21` (+ this commit)
-**Suite:** 834 serially (`swift test --no-parallel`), 1 known issue
+**Suite:** 835 serially (`swift test --no-parallel`), 1 known issue — 834 at the slice's last code
+commit, plus the one characterization test this document's row-34 ruling required (see §4).
 (`holdArmsDeferredReleaseTimerNotImmediateFireDuringFlood`, pre-existing, `TransportTests`).
 
 ## Why this is not the previous sweep again
@@ -130,12 +131,31 @@ response-Resource whose `q` is already in `pendingRequests`."* **That gate is re
 
 The verdict survives, on a different mechanism. **The actual gate is this handler's own
 `state.pendingRequests.contains(rid)`**, and the actual bound is that `pendingRequests` is
-per-`LinkSession` state, written only by `.sendRequest` on that session — so a peer holding the
-session key can cancel only requests WE SENT TO THAT PEER, which it could equally well just refuse to
-answer. Control probe: with the id absent from `pendingRequests`, the same sequence emits nothing.
+per-`LinkSession` state whose only INSERT sites are `.sendRequest`'s two branches — so a peer holding
+the session key can cancel only requests WE SENT TO THAT PEER, which it could equally well just
+refuse to answer. (Say "inserted", not "written": `pendingRequests` has six other write sites in the
+file — `cancelPending`'s `removeAll`, the `.response` branch, `.requestDeadline`,
+`.transfer(… .delegate(.received))`'s response branch, and this handler — all of them REMOVALS. Only
+the two inserts decide what can ever be cancelled.)
+
+Control: with the id absent from `pendingRequests`, no request is cancelled and no `requestFailed`
+is emitted. **Not "nothing is emitted" — an earlier version of this paragraph said that and it is
+false.** Execution falls past the membership branch, past the `isRequest`/`isResponse` early return
+(neither flag is set, so it does not fire), past the `segmentedSend` and `isSplit` branches, and
+reaches `return .send(.delegate(.resourceFailed(hash)))`. The transfer still reports its own failure;
+what the membership test gates is specifically the request cancellation.
 
 Stating it the old way was worse than saying nothing: it pointed a future reader at a gate that does
 not cover the case, and would have survived deleting the one that does.
+
+**Reference nests this the same way — and still does not have our defect, which locates it
+precisely.** RNS's `RESOURCE_ADV` branch reads `read_request_id` and matches it against
+`pending_requests` inside `elif RNS.ResourceAdvertisement.is_response(packet)`, exactly the nesting
+that lets a neither-flag advertisement past. But on its non-request/non-response paths reference
+calls `RNS.Resource.accept(packet, callback)` **without** `request_id=`, so a borrowed id is never
+bound to a plain resource in the first place. Our divergence is not the nesting: it is that
+`.resourceAdvertisement` stores `q` on the transfer regardless of flags and
+`.transfer(… .delegate(.failed))` reads it back unconditionally.
 
 ## 3. `LinkPlane` — the only place a link element is removed
 
@@ -158,8 +178,25 @@ not have to re-derive that:
 | 35 | `case .announce:` replay-suppression branch → `announceTable[dest] = nil` + `.cancel(announceRetransmit)` | **partial** — `Announce.parse` validates the destination's Ed25519 signature and re-derives `destinationHash` from `nameHash ‖ identity.hash`, but REPLAYING a genuine announce needs no key | **yes** — keyed by `destinationHash`, and additionally requires `transportId != nil` and a `rebroadcastHops` match | **deliberate.** This is RNS's collaborative suppression (Transport.py:1774-1791) and what it destroys is our own pending re-broadcast, not anyone else's state. Bounded: the cancelling paths both require `entry.rebroadcasts >= 1`, so nothing can be suppressed before the retransmit timer has fired at least once. (Precisely that, NOT "before we have broadcast at least once" — `entry.rebroadcasts += 1` sits outside the `eligible` loop in `.announceRetransmitDue` and increments even when no interface was eligible and nothing was sent.) |
 | 36 | `case .announce:` ingress hold → `held[destinationHash] = …` replaces an existing held announce | same as 35 | keyed by `destinationHash` | **safe.** Reference `hold_announce` (Interface.py:223-229); bounded by `maxHeldAnnounces`. |
 | 37 | `.interfaceDisconnected`, `.announceQueueDrainDue` interface-vanished branch, `.announceRetransmitDue` lifecycle-complete branch | local / clock | keyed | **safe.** |
-| 37b | `setTransportIdentity(nil)` → `announceTable = [:]`, `linkTable = [:]`, `discoveryPathRequests = [:]` | local | **none — three WHOLESALE wipes**, including every transited link's routing state | **safe, and the verdict rests entirely on the TRIGGER being local.** Split out of row 37 because calling it "keyed" was wrong: it is the single least discriminating destructive action in the file. Nothing inbound reaches it — the only emitters repo-wide are `TCPEndpoint.enableRelay` and `BLEEndpoint.enableRelay`, both host commands — and dropping relay state on leaving relay mode is the point. But if that trigger ever became reachable from the network, this branch has no second line of defence. |
+| 37b | `setTransportIdentity(nil)` → `announceTable = [:]`, `linkTable = [:]`, `discoveryPathRequests = [:]` | n/a | **none — three WHOLESALE wipes**, including every transited link's routing state | **safe because it is UNREACHABLE from production, which is stronger than "the trigger is local" and also a latent trap.** See the note below the table. |
 | 38 | `seenPacketHashes` ring eviction under load | no | n/a | **outside the verb set, recorded anyway.** An unauthenticated flood evicts dedup memory, which re-enables replay of an evicted packet. Pinned by `seenPacketRingEvictsOldestAndReDeliversIt`; the ring is deliberately sized for this (`seenPacketRingSize`). Not a destructive transition, but it is the one place in `Transport` where unauthenticated volume erases state that a security property rests on. |
+
+**Note on row 37b, where two successive drafts both understated the verdict.** The first called the
+three wipes "keyed", which they are not — they are the least discriminating destructive action in the
+file. The second said the `safe` verdict "rests entirely on the TRIGGER being local", and added that
+"dropping relay state on leaving relay mode is the point". Also wrong, and in the more interesting
+direction: **leaving relay mode is a transition no production code can perform.**
+`Transport.Action.setTransportIdentity` takes an `Identity?`, but every emitter reaches it through an
+`enableRelay(Identity)` case — `TCPEndpoint`, `BLEEndpoint` and `TransportEndpoint` all declare the
+payload NON-optional — so those sends can only ever produce `.some`. There is no `disableRelay`
+action and no literal `setTransportIdentity(nil)` anywhere in `Sources`.
+
+So the accurate verdict is: **the `nil` branch has no production emitter at all.** It is reachable
+only from a test or a future caller. That is safer than "local trigger" today and worse tomorrow —
+whoever adds the `disableRelay` this API obviously implies will silently enable three unguarded
+wholesale wipes, including every transited link's routing state, and nothing in the suite is watching
+that seam. Recorded here rather than numbered because an unreachable branch performs none of the five
+verbs; it belongs with whoever implements relay teardown.
 
 **Ruling on row 34: the mode re-class is INTENDED, and the universal an earlier draft carried
 ("nothing inbound makes any of them fire early") is FALSE.** Both halves matter, so both are stated.
@@ -181,7 +218,20 @@ route really does run over it. Classifying it by the mode it actually rides is t
 shows the lookup-at-GC-time behaviour was chosen deliberately: it reasons explicitly about the `nil`
 case and elects to fall back to the 7-day default "rather than expiring early". Nothing is truncated
 mid-life either — the replacement resets `learnedAt`, so the entry gets a FULL roaming lifetime from
-the moment it became a roaming path. Pinned by `roamingPathExpiresAfterSixHours`. **No F-number.**
+the moment it became a roaming path. **No F-number.**
+
+*And it is now pinned, which it was not when this ruling was first written.* An earlier draft cited
+`roamingPathExpiresAfterSixHours`; that test connects a single `.roaming` interface and never
+re-classes anything, so it does not cover this at all — adding a mode comparison to `shouldReplace`
+broke neither it nor `fullModePathSurvivesShortWindows`. For a behaviour ruled intended and given no
+F-number, a characterization test is worth more than a sentence, so one was written:
+**`newerAnnounceOnRoamingInterfaceReClassesAFullLearnedPathToTheRoamingLifetime`**, which learns a
+path on a `.full` interface, delivers a genuine newer announce for the same destination on a
+`.roaming` one, and asserts the entry survives to just under the roaming window and is GC'd just
+past it — with a control half where the newer announce arrives on the FULL interface and the entry
+stays on the 7-day window. Mutation-verified: adding `if candidate.interfaceID != existing.interfaceID
+{ return false }` to `shouldReplace` reddens the new test with three issues and leaves both
+neighbours green. The doc comment names this ruling, so a future edit has to confront it.
 
 *The rider, considered and deliberately not numbered.* The GC nils `announceBlobs[dest]` alongside
 `learned[dest]`, so after expiry an old captured announce for that destination is adoptable again
@@ -279,10 +329,13 @@ no hash filter at all — and it is preceded by a standing upstream TODO:
 `RESOURCE_REQ`, `RESOURCE_HMU`, `RESOURCE_ICL` and `RESOURCE_RCL` each decrypt and then match
 `resource.hash` against the appropriate list, and `RESOURCE_PRF` matches
 `packet.data[0:HASHLENGTH//8]` against `outgoing_resources` — which is exactly what `d0570ef`
-implemented. The sixth, `RESOURCE_ADV`, does not filter because it has nothing to filter against: it
-CREATES the resource. (An earlier draft said "the other five all filter", which is a universal over
-an enumerated set that is off by one — the same sentence class as the drafting error disclosed in §6.
-Substantively harmless, listed because the class is the point.)
+implemented. The sixth, `RESOURCE_ADV`, is the one that CREATES rather than routes, so it has no
+existing resource to select. (Two drafting errors here, both listed because the class is the point.
+The first said "the other five all filter" — a universal over an enumerated set, off by one. The
+second said `RESOURCE_ADV` "has nothing to filter against", which is wrong about reference:
+`RESOURCE_ADV` DOES filter, matching `read_request_id` against `pending_requests` on its
+`is_response` branch. What is true is only the second clause — there is no existing resource to route
+to. That same `is_response` nesting is what row 29's correction turns on.)
 
 **So `.resource` is the one context that routes to an existing resource and has no discriminator to
 copy.** A fix is therefore a deliberate divergence and needs choosing, not just porting: scope a
@@ -304,14 +357,15 @@ acts on the first. Two sender transfers cannot collide on a full-length hash in 
 shapes agree. It matters only when a SHORT hash can enter the candidate set, which is exactly
 F18: there, a matched decoy would SHADOW the real recipient rather than merely accompany it.
 
-### F18 — `ResourceAdvertisement.unpack` validates the length of none of `h`, `r`, `o`, `m`
+### F18 — `ResourceAdvertisement.unpack` validates the length of none of `h`, `r`, `o`, `m`, `q`
 
-**Where:** `ResourceAdvertisement.unpack`. Each of `h`, `r`, `o`, `m` is read through the same
-`bin(_:)` helper, which checks only that the MsgPack value is a `.bin`. Only `t` has any gate at
-all (a magnitude gate against `Resource.maxAdvertisedTransferSize`).
+**Where:** `ResourceAdvertisement.unpack`. `h`, `r`, `o` and `m` are read through the same `bin(_:)`
+helper, which checks only that the MsgPack value is a `.bin`; `q` goes through its own `switch` that
+likewise accepts any `.bin` (or `.null`). Only `t` has any gate at all (a magnitude gate against
+`Resource.maxAdvertisedTransferSize`).
 
-Probe P7: an advertisement with all four fields EMPTY round-trips through `unpack` intact, and so
-does one with over-long `h` / `r` / `o`.
+Probe P7: an advertisement with all four `bin(_:)` fields EMPTY round-trips through `unpack` intact,
+and so does one with over-long `h` / `r` / `o`.
 
 **Impact today is nil, and the accurate framing matters more than the finding.** An empty `h`
 becomes a receiver-role transfer's `resourceHash` (probe P2), and an empty `owner` prefix compares
@@ -336,9 +390,22 @@ precisely, because the Task 2 report said them loosely:
    mutated predicates literally over a decoy-first array: the (b) predicate selects the receiver
    decoy; the (c) predicate selects the sender and cannot select a receiver at all.
 
-A length check on `h` at unpack time would remove the class outright. This belongs to whoever owns
-advertisement validation, not to the proof-routing code — and the same unvalidated-field class has a
-second consumer already, `o`, which keys `incomingSegments` (row 29).
+A length check at unpack time would remove the class outright, and **this belongs to whoever owns
+advertisement validation, not to the proof-routing code.** The `h` story above is only the most
+visible instance: FOUR consumers already depend on a downstream check instead, and each one of them
+was found by following a different thread in this slice rather than by looking at `unpack`.
+
+| field | consumer | what holds today instead |
+|---|---|---|
+| `h` | a receiver's `resourceHash` | the `payload.count >= 32` guard plus the `role == .sender` gate (§5 above) |
+| `o` | keys `incomingSegments` | nothing — two advertisements from one peer can share an accumulator (row 29) |
+| `m` | copied verbatim into `knownHashmap` | nothing — this is what makes F17's route 3 free rather than found |
+| `q` | copied onto the transfer, read by `.transfer(… .delegate(.failed))` | that handler's own `pendingRequests.contains(rid)`, NOT the flag gate (row 29's correction) |
+
+All four require the session key and are bounded to that peer's own link, so the trust boundary is
+unchanged by the widening — which is why F18 stays below F3/F4/F5. What the widening DOES change is
+the cost/benefit: the fix is the same one length check it always was, and it now closes four
+consumers rather than one.
 
 ---
 
@@ -382,6 +449,26 @@ rule.** The review also reported that a "merely buggy peer that reuses `r`" gets
 free. Probing it first showed that is FALSE — map hashes are over freshly-IV'd ciphertext, so
 repetition of `r` yields nothing — while confirming the underlying point that the collision IS free
 via peer control of `m`. Fixing as reported would have replaced one wrong price with another.
+(Independently re-run afterwards at 1000 trials per variant: zero colliding map hashes in all three.)
+
+**The CORRECTIONS then introduced two more defects of the same class, which is the honest headline
+of this document's method section.** Round two found them:
+
+- The row-29 correction paragraph ended with a false absolute — "the same sequence emits nothing" —
+  where the truth is that no *request cancellation* happens but the transfer still emits
+  `.resourceFailed`. I had probed the narrow claim (`pendingRequests` unchanged) and then written a
+  broader one than the probe supported. **A probe licenses exactly the proposition it observed**;
+  mine printed one field and the sentence spoke about all effects.
+- The row-37b rewrite said the `safe` verdict "rests on the trigger being local" and that "dropping
+  relay state on leaving relay mode is the point". Both understate it: `enableRelay` carries a
+  NON-optional `Identity` in all three endpoints, so the `nil` branch has no production emitter at
+  all and "leaving relay mode" is not a transition this codebase can perform.
+
+Three rounds, and every round's defects were in the same two positions — a `safe` row's reason, or a
+paragraph whose job was correcting an earlier claim. **The lesson is not "check harder", it is that
+correcting text is itself high-risk text and should be re-verified as if it were new.** The rule
+that would have caught both: *state the narrowest claim your evidence supports, then check whether
+the sentence you actually wrote is wider than that.*
 
 **Probes over reasoning, again.** P5 is the whole of F17 and reasoning did not produce it —
 "`.resource` is gated by a map hash" reads like a gate until you watch a chunk from one transfer
