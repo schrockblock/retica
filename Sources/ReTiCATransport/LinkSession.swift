@@ -533,8 +533,22 @@ public struct LinkSession {
                     // `outgoing_resources` — sender-role only. Note a proof CANNOT be
                     // authenticated: `Packet.pack` has a branch dedicated to `RESOURCE_PRF`
                     // leaving resource proofs unencrypted, so ownership is the only discriminator
-                    // available. That is why `ResourceTransfer` must also never destroy itself on
-                    // a proof that fails to validate.
+                    // available. `ResourceTransfer` therefore also does not destroy itself on a
+                    // proof that fails to validate — that half landed in `0101a74`, and the two
+                    // together are what make an unownable, unauthenticatable packet harmless.
+                    //
+                    // Only `.resourceProof` left the fan-out group. The FIVE contexts in the case
+                    // directly above still fan out to every transfer. Four of them are safe to
+                    // fan out because their `ResourceTransfer` branch decrypts and THEN compares
+                    // against `state.resourceHash`, so a non-owner returns `.none`:
+                    // `.resourceRequest`, `.resourceHashmapUpdate`, `.resourceInitiatorCancel`,
+                    // `.resourceReceiverCancel`. The fifth, `.resource`, carries no resource hash
+                    // at all — its only discriminator is `Resource.mapHash` under the per-transfer
+                    // `randomHash`, which is narrower than the other four. See
+                    // `docs/superpowers/2026-08-13-destructive-transition-sweep.md`.
+                    // (`d0570ef`'s commit message says "the other six resource contexts"; it is
+                    // five. The code was right, the message was not, and a pushed message cannot
+                    // be corrected in place.)
                     // The length check is load-bearing, not a formality: `prefix(32)` yields a
                     // SHORT `Data` rather than trapping, so without it a truncated payload would
                     // reach the comparison below. `role == .sender` independently saves us today

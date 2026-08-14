@@ -449,11 +449,21 @@ private func activeLinkHostingPlainReceiver(
         if case .delegate(.resourceConcluded) = action { return true }
         return false
     }
-    // FLIP-THEN-SEND, and it is load-bearing. `send`'s "must handle N received actions" check
-    // fires on actions queued by a PREVIOUS send, so a stray delivery to A is only observable
-    // on the NEXT send while still `.on`. Asserting here and flipping to `.off` would let A's
-    // action be silently discarded — and flipping back before teardown also disables the
-    // teardown check. This second send is what makes the routing claim real.
+    // FLIP-THEN-SEND. `send`'s "must handle N received actions" check fires on actions queued by
+    // a PREVIOUS send, so an unasserted action is only observable on the NEXT send while still
+    // `.on`. Asserting here and flipping to `.off` would let it be silently discarded — and
+    // flipping back before teardown also disables the teardown check.
+    //
+    // In THIS test the inert send is belt-and-braces, not the catcher. Under `.on`, `receive`
+    // does not skip: `TestStore.receiveAction(matching:)` gates its skip-and-report block on
+    // `exhaustivity != .on` and otherwise asserts the predicate against the HEAD of the queue.
+    // So the three `receive` steps above already fail on a stray delivery to A queued ahead of
+    // B's — which is where the fan-out and the drop-the-hash-check mutations both put it. The
+    // inert send additionally catches one queued AFTER the last asserted receive.
+    //
+    // The inert send IS the sole catcher in the other three proof tests in this file, which
+    // assert no `receive` steps at all — there, without it, a delivery is queued, never
+    // inspected, and then discarded when exhaustivity drops.
     let inert = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                        destinationType: .link, context: .none, contextFlag: false, hops: 0,
                        destinationHash: resLinkID, transportId: nil,
@@ -542,7 +552,7 @@ private func activeLinkHostingPlainReceiver(
     }
     store.exhaustivity = .off
 
-    // 8 bytes — a quarter of a resource hash. Deliberately a PREFIX of B's real hash, so a
+    // A payload shorter than a resource hash, and deliberately a PREFIX of B's real hash, so a
     // router that compared only the bytes it received (rather than requiring a full hash) would
     // still be tempted to match it.
     let shortPayload = Data(tB.resourceHash.prefix(8))
