@@ -1064,8 +1064,14 @@ to allow multiple transfers at the same time, sending resource hash on each pack
 is a huge overhead."* `RNS.Packet` defines seven resource contexts; of the six
 others, five filter (`RESOURCE_REQ`, `RESOURCE_HMU`, `RESOURCE_ICL`,
 `RESOURCE_RCL` decrypt and match `resource.hash`; `RESOURCE_PRF` matches against
-`outgoing_resources`) and the sixth, `RESOURCE_ADV`, has nothing to filter against
-because it CREATES the resource. So `.resource` is the one context that routes to
+`outgoing_resources`) and the sixth, `RESOURCE_ADV`, has no existing resource to
+route to because it CREATES the resource. (An earlier draft said it "has nothing
+to filter against". That is wrong about reference and is contradicted by this
+document's own F18 `q` bullet: `RESOURCE_ADV` DOES filter, matching
+`read_request_id` against `pending_requests` on its `is_response` branch. Only the
+no-existing-resource clause is true. The sweep named this a drafting error in
+round 2 and the fix landed there and not here — see §6's twin rule.)
+So `.resource` is the one context that routes to
 an existing resource with no reference discriminator to copy, and a fix has to be
 CHOSEN rather than ported: scope a segment to the transfer whose `outstanding`
 contains its index, or carry the resource hash on segments — which is the overhead
@@ -1307,6 +1313,20 @@ committed and reported green.
 **Contradictory memories can coexist.** My memory index already recorded the
 CORRECT `.on` rule in one file while I wrote the opposite into another and
 propagated that one. Nothing forces two entries to be read side by side.
+
+**A claim that lives in BOTH this document and its sweep must be fixed in both,
+or in neither — added 2026-08-14, and it is the most transferable thing the
+destructive-transition slice produced.** The sweeps and this handoff deliberately
+restate each other, and **two of the four minors that slice deferred were
+one-sided fixes**: round 3 narrowed "would remove the `h` class" here and left
+"would remove the class outright" standing in the sweep, and round 2's
+`RESOURCE_ADV` correction landed in the sweep and not here. A one-sided
+correction is **strictly worse than leaving both wrong**: the wider statement
+survives in the document that is not open at the time, and the disagreement
+between the twins is invisible from either one — which is the entry directly
+above, one document over. The check is one grep of the twin for the claim before
+committing the fix. Where a finding is big enough that duplicating it is itself a
+hazard, state it ONCE and point at it from the other — F19 is written that way.
 
 **A test whose NAME claims two properties while its assertions cover only one —
 added 2026-08-13.** This shape produced two of the three worst holes in the

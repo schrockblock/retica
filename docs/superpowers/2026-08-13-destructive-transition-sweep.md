@@ -201,9 +201,16 @@ action in the file. That correction stands.
   produce `.some`. There is no `disableRelay` and no literal `setTransportIdentity(nil)` anywhere in
   `Sources`. Narrowest supportable statement: **no emitter inside this package's `Sources`.** NOT
   "unreachable from production" — `Transport.Action` and the case are both `public`, so a package
-  consumer can emit `nil` directly. The one in-tree consumer, `ReTiCaMsgr`, does not (grepped). Same
-  caveat this document already applies to `destinationIdentity`, and an earlier draft of this note
-  failed to apply it here.
+  consumer can emit `nil` directly. There are **TWO** local path-dependency consumers, not one —
+  `apps/ReTiCaMsgr/ReTiCaMsgrCore/Package.swift` and `apps/Nbhd/Packages/NbhdKernel/Package.swift` —
+  and NEITHER names `setTransportIdentity` or `enableRelay` (grepped across both trees), so the
+  verdict survives on a wider consumer set than the sentence originally claimed. (The second is easy
+  to miss: `NbhdKernel` declares its path as `../../../../pods/ReTiCa`, lower-case `a`, which a
+  case-sensitive search for the directory name does not match — a case-insensitive grep over
+  `Package.swift` finds both.) Commit `7125076`'s message carries the earlier "the one in-tree
+  consumer" wording and a pushed message cannot be corrected, so it is corrected here. Same caveat
+  this document already applies to `destinationIdentity`, and an earlier draft of this note failed
+  to apply it here.
 - **Rationale — draft 2 was wrong to call this wrong.** "Dropping relay state on leaving relay mode
   is the point" is not a reachability claim; it is the repo's own recorded intent, and
   `relayStopClearsLinkTable`'s doc comment states it almost verbatim ("relay reverse-routing is
@@ -409,10 +416,16 @@ precisely, because the Task 2 report said them loosely:
    mutated predicates literally over a decoy-first array: the (b) predicate selects the receiver
    decoy; the (c) predicate selects the sender and cannot select a receiver at all.
 
-A length check at unpack time would remove the class outright, and **this belongs to whoever owns
-advertisement validation, not to the proof-routing code.** The `h` story above is only the most
-visible instance: FOUR consumers already depend on a downstream check instead, and each one of them
-was found by following a different thread in this slice rather than by looking at `unpack`.
+A length check on `h` at unpack time would remove **the `h` class** outright, and **this belongs to
+whoever owns advertisement validation, not to the proof-routing code.** The `h` story above is only
+the most visible instance: FOUR consumers already depend on a downstream check instead — but **do
+not read them as things the length check closes; it closes `h` and nothing else**, which is what the
+table below and §7 exist to establish. Each of the four was found by following a different thread in
+this slice rather than by looking at `unpack`.
+
+(This sentence was narrowed in the handoff in round 3 and left wide HERE until the final review —
+which is the one-sided-fix hazard §6 now carries a rule about. Until then, the widest surviving
+statement of the claim §7 exists to retract sat directly above the table that refutes it.)
 
 | field | consumer | what holds today instead | would a LENGTH check at `unpack` close it? |
 |---|---|---|---|
@@ -527,6 +540,29 @@ rewrite was so focused on the reachability error that it swept up a rationale th
 test-coverage claim that was checkable in one grep. When a draft is wrong, the fix is to narrow the
 wrong clause, not to invert the whole paragraph.
 
+**A claim that lives in BOTH documents must be fixed in both, or in neither.** This document and
+`docs/superpowers/2026-08-10-handoff-link-lifecycle-and-delivery-termination.md` deliberately
+restate each other, and **two of the four minors this slice deferred were one-sided fixes**: round 3
+narrowed the handoff's "would remove the `h` class" and left this document's "would remove the class
+outright" standing, and round 2's `RESOURCE_ADV` correction landed here and not in the handoff. A
+one-sided correction is **strictly worse than leaving both wrong**, because the wider statement
+survives in the document that is not open at the time, and the disagreement between the twins is
+invisible from either one — nothing forces them to be read side by side. (That is the same shape as
+the contradictory-memory failure §6 of the handoff records.) The check is one grep of the other file
+for the claim, before committing the fix. Where a finding is large enough that duplicating it is
+itself a hazard, state it ONCE and point — which is what F19 below does.
+
+**Every probe in this document is REDUCER-level, and the endpoint boundary has a trap that makes
+such probes silently vacuous.** The final whole-branch review re-ran the equivalents through the
+full composition and every claim here held — but its first run injected UNFRAMED packets into
+`TCPEvent.data`, and `TCPClientInterface` deframes with HDLC: `HDLCDeframer.ingest` finds no
+`HDLC.flag`, clears its buffer and emits nothing, so **an unframed packet is silently swallowed and
+never reaches `Transport.received`.** Every injection was a no-op while the probe printed
+reassuring state, which would have made every "the attacker cannot hurt us" assertion vacuous — in
+exactly the reassuring position this section's other entries occupy. The guard is a POSITIVE
+CONTROL: inject N frames (`HDLC.frame`), assert N `Transport.received`s, and only then assert
+anything about what the injection failed to do.
+
 **One prose defect from this slice could not be fixed in place.** Commit `d0570ef`'s message says
 "The other six resource contexts keep fanning out." It is five. The code was always right; only the
 message is wrong, and a pushed commit message cannot be corrected. The count is now stated
@@ -570,5 +606,7 @@ restored.**
 **The reviewer who requested the flip also supplied the finding that retracted it, and explicitly
 invited that outcome.** The process point worth keeping: a review instruction is evidence about where
 to look, not a verdict to implement. Two of three rounds contained a relayed claim that did not
-survive checking — `r`-reuse in round 1, this flip in round 3 — and in both cases implementing as
-instructed would have replaced one false claim with another.
+survive checking — `r`-reuse in round 1, this flip in round 2 — and in both cases implementing as
+instructed would have replaced one false claim with another. (Both are labelled by the round the
+claim ARRIVED in, which is what §5, §6 and this section's opening already do: the flip was MADE in
+round 2, on `234805c`, and RETRACTED in round 3.)
