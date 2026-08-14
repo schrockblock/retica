@@ -62,9 +62,9 @@ The durable key is *file + expression text*, which is what the allowlist matches
 
 | | |
 |---|---|
-| Conversions found in `Sources/` | **119** across **80** distinct file+expression groups, in 56 files |
-| Reviewed safe | 111 findings / 72 groups |
-| **Known-open (confirmed traps)** | **8 findings / 8 groups** — Tasks 6, 7, 8 |
+| Conversions found in `Sources/` | **121** across **82** distinct file+expression groups, in 56 files |
+| Reviewed safe | 114 findings / 75 groups |
+| **Known-open (confirmed traps)** | **7 findings / 7 groups** — Tasks 7, 8 |
 | Defects in this plan that are *not* conversions | 3 — Tasks 3, 4, 5 (see [Not detectable by this check](#not-detectable-by-this-check)) |
 
 Run the gate:
@@ -108,13 +108,18 @@ forget one; `--fail-on-open` will tell you if any remain.
   (`:30`, `:32`, `:33`, `:34` ×3), which traps on a negative. Same constraint as Task 2 —
   reject or clamp, do not truncate.
 
-- [ ] **`Sources/ReTiCANode/LXMFServiceNode.swift:219`** — `Int(raw)` — **Task 6**
+- [x] **`Sources/ReTiCANode/LXMFServiceNode.swift:239`** — `Int(raw)` — **Task 6 FIXED**
   Source: `raw = kb * 1000` where `kb` is a wire `float64` from a `/get` request.
-  Guarded: **partially, and the partial guard is the problem.** The ternary
-  `raw >= Double(Int.max) ? Int.max : Int(raw)` evaluates before the conversion (correct order)
-  but covers only `+inf` and the large-positive range. `NaN >= x` is `false`, so `NaN` falls
-  through to `Int(NaN)` and traps; so does any sufficiently large negative. `[[], [], float64(NaN)]`
-  on a `/get` aborts. No `/get` handler is registered, so no `RequestPolicy` gate applies.
+  Guarded: **partially, and the partial guard was the problem.** The ternary
+  `raw >= Double(Int.max) ? Int.max : Int(raw)` evaluated before the conversion (correct order)
+  but covered only `+inf` and the large-positive range. `NaN >= x` is `false`, so `NaN` fell
+  through to `Int(NaN)` and trapped; so did any sufficiently large negative. `[[], [], float64(NaN)]`
+  on a `/get` aborted. No `/get` handler is registered, so no `RequestPolicy` gate applies.
+  Fixed by checking `raw.isNaN` and `raw < 0` (→ 0) before the existing `raw >= Double(Int.max)`
+  guard, then converting only when raw is finite and non-negative and less than `Double(Int.max)`.
+  The `.int` divergence (negative int → nil → unlimited) is also fixed in the same switch.
+  Line number drifted from `:219` (inventory) to `:239` (Task 6 fix commit) — the expression text
+  key in the allowlist tracked it correctly throughout.
 
 - [ ] **`Sources/ReTiCATransport/ResourceTransfer.swift:451`** — `Int(chunkIndex)` — **Task 8** *(was `:442`; drifted 2026-08-14 when the destructive-transition slice touched this file. The allowlist keys on expression text, not line number, so the gate stayed correct throughout — this line number is documentation only.)*
   Source: `chunkIndex` is a raw wire `UInt64` from a RESOURCE_HMU msgpack array.

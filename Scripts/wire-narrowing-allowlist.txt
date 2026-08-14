@@ -29,7 +29,6 @@ Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | I
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(cost)
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(flex)
 Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(peer)
-Sources/ReTiCANode/LXMFServiceNode.swift | 1 | OPEN Task 6 — Double -> Int. The `raw >= Double(Int.max)` ternary on the same line covers +inf and the large-positive range but NOT NaN (NaN >= x is false) and NOT the large-negative range. A float64 NaN on a /get aborts. | Int(raw)
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | OPEN Task 8 — wire UInt64 narrowed, then multiplied by hashmapMaxLen*mapHashLength. Traps twice. The contiguity check recorded as its guard is on the NEXT line and evaluates after. | Int(chunkIndex)
 
 # ---------------------------------------------------------------------------
@@ -77,6 +76,7 @@ Sources/ReTiCAInterfaces/FCBDriverAdapter.swift | 1 | `psm` is UInt16, so `psm >
 # Reviewed safe — compile-time constants
 # ---------------------------------------------------------------------------
 Sources/ReTiCAInterfaces/BLEInterface.swift | 1 | BLEHello.length is the constant 20 (BLESupport.swift:59). | UInt8(BLEHello.length)
+Sources/ReTiCANode/LXMFServiceNode.swift | 1 | Positive compile-time constant. | Int64(Int.max / 1000)
 Sources/ReTiCANode/LXMFServiceNode.swift | 1 | Positive compile-time constant. | UInt64(Int.max / 1000)
 Sources/ReTiCA/Resource/ResourceAdvertisement.swift | 1 | Positive compile-time constant. | UInt64(Resource.maxAdvertisedTransferSize)
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | Positive compile-time constant. | UInt64(Int.max)
@@ -105,12 +105,13 @@ Sources/ReTiCA/Support/MsgPack.swift | 1 | encodeUInt :41 — consequent of `if 
 Sources/ReTiCA/Support/MsgPack.swift | 1 | encodeUInt :42 — consequent of `if u <= 0xFFFF_FFFF` on the same line. | UInt32(u)
 Sources/ReTiCAInterfaces/BLESupport.swift | 1 | BLEFraming.frame :19 — guarded by `packet.count <= maxFrameLength` (1196) at :16, three lines EARLIER, which throws. 1196 >> 8 == 4. | UInt8(packet.count >> 8)
 Sources/ReTiCAInterfaces/BLESupport.swift | 1 | BLEFraming.frame :19 — same :16 guard, and `& 0xFF` bounds it independently. | UInt8(packet.count & 0xFF)
-Sources/ReTiCANode/LXMFServiceNode.swift | 1 | :216 — ternary condition `kb > UInt64(Int.max / 1000)` evaluates before the else-branch. The following `* 1000` also cannot overflow, since (Int.max / 1000) * 1000 <= Int.max. | Int(kb)
+Sources/ReTiCANode/LXMFServiceNode.swift | 2 | Two sites in `requestReceived`, both in the transfer-limit switch. First (`.uint` branch, `requestReceived`): ternary condition `kb > UInt64(Int.max / 1000)` evaluates before the else-branch. Second (`.int` branch, Task 6 FIXED): guarded by `kb < 0` (→ 0) then `kb > Int64(Int.max / 1000)` (→ Int.max) on earlier lines; the else executes only when `0 <= kb <= Int.max / 1000`. On this platform Int == Int64, so Int(kb) is an identity conversion. The `* 1000` also cannot overflow at either site because kb <= Int.max / 1000. | Int(kb)
 Sources/ReTiCATransport/Bzip2.swift | 1 | :37 — guarded by `expectedSize <= Resource.autoCompressMaxSize` (64 MiB) at :34, THREE LINES EARLIER, which returns nil. `bufSize = max(expectedSize, 1)` then lies in 1...64 MiB. Predecessor fix 95e8739/4b4526d; evaluation order re-verified. | UInt32(bufSize)
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :397 — guarded by `adv.dataSize <= UInt64(Resource.autoCompressMaxSize)` at :393, which fails the transfer. Predecessor fix 4b4526d, non-split branch; order re-verified. | Int(adv.dataSize)
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :389 — the clamp is inside the argument, so it cannot be bypassed. Predecessor fix 4b4526d, split branch. | Int(min(adv.dataSize, UInt64(LinkSession.maxEfficientSize)))
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | :220 — type invariant, not a local guard. State.expectedParts is assigned at exactly three sites: :75 UInt64(chunks.count), :115 literal 0, :263 min(adv.numberOfParts, UInt64(Int.max)). All three are <= Int.max. Predecessor fix 4b4526d. NOTE: the field is `public var`, so a host could break the invariant; it holds against wire input. | Int(s.expectedParts)
 Sources/ReTiCATransport/ResourceTransfer.swift | 3 | :365/:371/:372 — same three-assignment-site invariant as Int(s.expectedParts). | Int(state.expectedParts)
+Sources/ReTiCANode/LXMFServiceNode.swift | 1 | Task 6 FIXED — `requestReceived` handler, `.double` branch. Two guards evaluate first on earlier lines: `raw.isNaN` and `raw < 0` both map to 0 (done, else skipped); `raw >= Double(Int.max)` maps to Int.max (done, else skipped). The else branch executes only when raw is a finite non-negative value less than Double(Int.max), which fits Int. | Int(raw)
 
 # ---------------------------------------------------------------------------
 # Reviewed — cannot trap on wire input, but CAN trap on a hostile host/dependency.

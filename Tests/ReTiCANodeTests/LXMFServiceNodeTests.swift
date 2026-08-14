@@ -1026,6 +1026,103 @@ import ComposableArchitecture
     }
 }
 
+// MARK: - FIX 6: Task 6 — float64 NaN / negative / infinite transfer limit must not abort
+
+/// Helper: sends a /get phase-2 request with the given data[2] value and returns the transferLimitBytes
+/// the reducer forwards to PropagationNode. Used by all Task-6 trap tests to avoid boilerplate.
+@MainActor private func getTransferLimit(
+    limitElement: MsgPackValue,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async -> Int?? {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: true)
+    let client = Identity()
+    let clientHash = LXMessage.deliveryHash(identityHash: client.hash)
+    let e = clientHash + Data("limit-test".utf8)
+    let tid = LXMFPropagation.transientId(lxmfData: e)
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    let getPath = Crypto.truncatedHash(Data("/get".utf8))
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
+    await store.send(.client(.endpoint(.delegate(.resourceReceived(linkID: linkID, data: container)))))
+    await store.receive { if case .delegate(.messagesStored) = $0 { return true }; return false }
+    await store.send(.client(.endpoint(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: client)))))
+
+    await store.send(.client(.endpoint(.delegate(.requestReceived(
+        linkID: linkID, requestID: Data([42]), pathHash: getPath,
+        data: MsgPack.encode(.array([.array([.bin(tid)]), .array([]), limitElement])))))))
+
+    let captured = LockIsolated<Int??>(nil)
+    await store.receive { action in
+        if case let .pn(.messagesRequested(_, _, _, limit)) = action {
+            captured.setValue(limit)
+            return true
+        }
+        return false
+    }
+    return captured.value
+}
+
+/// `float64(NaN)` in data[2] must not trap. Reference raises a catchable ValueError from
+/// `int(float('nan'))` — it never reaches the code that uses the cap and therefore serves nothing.
+/// We match that effective behaviour: NaN → 0 (serve nothing). The previous partial guard
+/// (`raw >= Double(Int.max)`) evaluated to false for NaN, falling straight through to `Int(NaN)`.
+@MainActor @Test func serviceNodeParsesNaNTransferLimitAsZero() async {
+    let result = await getTransferLimit(limitElement: .double(Double.nan))
+    // result is Int?? — outer optional means "the action fired at all"; inner is the parsed limit.
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == 0, "float64(NaN) limit must parse as 0 (serve nothing), not nil or trap")
+    }
+}
+
+/// `float64(-inf)` in data[2] must not trap. Reference would compute `float('-inf')*1000 = -inf` and
+/// then `int(-inf)` raises `OverflowError` — same branch as NaN, never serves. We treat it as 0.
+@MainActor @Test func serviceNodeParsesNegInfTransferLimitAsZero() async {
+    let result = await getTransferLimit(limitElement: .double(-Double.infinity))
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == 0, "float64(-inf) limit must parse as 0 (serve nothing), not nil or trap")
+    }
+}
+
+/// A large negative float64 in data[2] must not trap or silently become nil.
+/// Reference: `float(-1e18)*1000 = -1e21` → `int(-1e21)` raises `OverflowError`. We treat it as 0.
+@MainActor @Test func serviceNodeParsesLargeNegativeFloatTransferLimitAsZero() async {
+    let result = await getTransferLimit(limitElement: .double(-1e18))
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == 0, "large-negative float limit must parse as 0 (serve nothing), not nil or trap")
+    }
+}
+
+/// A wire-decoded negative int64 in data[2] (e.g. `int8(-1)` = 0xFF) must not fall through to nil.
+/// Before the decoder widening (`177da8c`) this failed the msgpack parse entirely; now it decodes as
+/// `.int`. Reference: `float(-1)*1000 = -1000` — less than any message size → serves nothing.
+/// We treat it as 0 (serve nothing) rather than nil (unlimited).
+@MainActor @Test func serviceNodeParsesNegativeIntTransferLimitAsZero() async {
+    let result = await getTransferLimit(limitElement: .int(-1))
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == 0, "int64(-1) limit must parse as 0 (serve nothing), not nil (unlimited)")
+    }
+}
+
+/// A wire-decoded positive int64 in data[2] (e.g. `int8(256)`) must parse to the correct byte count.
+/// This confirms the `.int` case is not a dead stub but actually works.
+@MainActor @Test func serviceNodeParsesPositiveIntTransferLimit() async {
+    let result = await getTransferLimit(limitElement: .int(200))
+    #expect(result != nil, "messagesRequested must fire")
+    if let outerResult = result {
+        #expect(outerResult == 200_000, "int64(200) limit must parse to 200000 bytes")
+    }
+}
+
 // MARK: - FIX 2: stamp rejection — ERROR_INVALID_STAMP on under-cost packet offer
 
 /// A PACKET-framed offer whose stamp fails validation (absent or below minStampCost) must NOT be

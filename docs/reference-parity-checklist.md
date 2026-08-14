@@ -79,8 +79,10 @@ cannot see**. That is what tier 1 is about.
 
 *Planned and gated; mostly execution. Plan: `2026-08-12-wire-input-trap-sweep.md` (5/10 done).*
 
-- [ ] **Task 6 — `LXMFServiceNode.swift:219` `Int(raw)`** — `[[], [], float64(NaN)]` on a `/get`
+- [x] **Task 6 — `LXMFServiceNode.swift` `Int(raw)` (in `requestReceived`)** — `[[], [], float64(NaN)]` on a `/get`
       aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client.
+      **Fixed** — `[SHA pending]`: NaN/negative/infinite float → 0 (serve nothing); negative int → 0
+      (not nil/unlimited). Also closes the `.int` fall-through divergence opened by `177da8c`.
 - [ ] **Task 7 — `PNAnnounce.swift:56-59`, six `Int(UInt64)`** — a 21-byte app-data blob aborts.
       `PNAnnounce.isValid`, the *validity predicate*, crashes on the input it exists to reject.
 - [ ] **Task 8 — `ResourceTransfer.swift:451` `Int(chunkIndex) * 74 * 4`** — traps twice, at the

@@ -223,8 +223,37 @@ public struct LXMFServiceNode {
                     case let .uint(kb):
                         transferLimitBytes = kb > UInt64(Int.max / 1000) ? Int.max : Int(kb) * 1000
                     case let .double(kb):
+                        // Guard ALL non-finite and negative values before converting.
+                        // Reference computes `float(data[2])*1000` and then `int(...)`, which raises
+                        // ValueError (NaN) or OverflowError (±inf, large-negative) — catchable
+                        // exceptions that leave client_transfer_limit unset and serve nothing.
+                        // We replicate that effective behaviour: NaN/negative/−inf → 0 (serve nothing).
+                        // +inf and large-positive clamp to Int.max (effectively unlimited — matching
+                        // reference's `float(large)*1000` saturating to a huge positive).
                         let raw = kb * 1000
-                        transferLimitBytes = raw >= Double(Int.max) ? Int.max : Int(raw)
+                        if raw.isNaN || raw < 0 {
+                            transferLimitBytes = 0
+                        } else if raw >= Double(Int.max) {
+                            transferLimitBytes = Int.max
+                        } else {
+                            transferLimitBytes = Int(raw)
+                        }
+                    case let .int(kb):
+                        // A wire-decoded signed integer (e.g. int8(-1) = 0xFF). Before the decoder
+                        // widening (177da8c) this type failed the msgpack parse and the whole request
+                        // was rejected. Now it decodes as .int and fell to default: break → nil →
+                        // unlimited — strictly more permissive than reference. Reference: `float(kb)*1000`
+                        // on a negative kb produces a negative float, which is less than every message
+                        // size, so nothing is served. We match that: negative → 0 (serve nothing).
+                        // For non-negative: Int(kb) is an identity conversion (both are 64-bit Int/Int64),
+                        // safe as long as kb <= Int.max / 1000. On this platform Int.max == Int64.max.
+                        if kb < 0 {
+                            transferLimitBytes = 0
+                        } else if kb > Int64(Int.max / 1000) {
+                            transferLimitBytes = Int.max
+                        } else {
+                            transferLimitBytes = Int(kb) * 1000
+                        }
                     default: break
                     }
                 }
