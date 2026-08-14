@@ -39,11 +39,20 @@ cannot see**. That is what tier 1 is about.
 
 *Fix first. Both sides believe the exchange succeeded.*
 
-- [ ] **`perTransferLimit` / `perSyncLimit` advertised as `0`** — `LXMFServiceNode.swift:120`, `PNNode.swift:85`
+- [x] **`perTransferLimit` / `perSyncLimit` advertised as `0`** — `LXMFServiceNode.swift:120`, `PNNode.swift:85`
       Reference reads 0, drops **every** message, and calls `add_handled_message` so it is never
       retried (`LXMPeer.py:370-373`). Reference→ReTiCA mesh sync silently delivers nothing, forever.
       Default-reachable via `AUTOPEER` / `AUTOPEER_MAXDEPTH = 4`. Reference defaults are 256 / 10240
       (`LXMRouter.py:55, 59`). *Verified `46e838e`.* → **slice 1**
+      **Fixed `f2eb255`** — both nodes advertise `LXMFPropagation.defaultPropagationTransferLimitKB`
+      (256) / `defaultPropagationSyncLimitKB` (`256*40`), from one shared constant. Established that
+      these fields are a *request the SENDER honours*, never receiver-enforced: `Handlers.py:61` →
+      `LXMRouter.py:2025/2041` stores them on the peer's `LXMPeer` record for **us**, and that same
+      object filters its own outbound offer at `LXMPeer.py:370`. No inbound cap is needed — a
+      package-wide grep finds no inbound enforcement of `propagation_transfer_limit` in reference at
+      all, and under-enforcing is the safe direction (we accept more than we asked for). Note we
+      still do **not** enforce a sync-size cap on inbound resources, which reference does do
+      (`LXMRouter.py:2220-2224`); deliberately out of scope.
 - [ ] **MsgPack decoder rejects types reference emits** — `MsgPack.swift:121-148`
       Missing negative fixint (`0xE0-0xFF`), `int8/16/32/64` (`0xD0-0xD3`), `float32` (`0xCA`),
       `map32` (`0xDF`), all ext. `LXMessage.unpack` decodes in one shot and `LXMFRouter.received`
