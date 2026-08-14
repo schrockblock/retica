@@ -377,6 +377,13 @@ the duplication does not happen.
 SENDER transfers it creates on our side are exactly the two-concurrent-senders shape whose proof
 fan-out was F15 — see F15 in the handoff.
 
+**And it has a second consequence that is not a collision at all, recorded as a LEAD.** Those same
+two `sendResource` calls also CLOBBER `LinkSession.State.segmentedSend` — a single optional keyed on
+one `currentTransferID`, assigned unconditionally by every call above
+`LinkSession.maxEfficientSize` — stranding the first chain's segments 2…N. Stated ONCE, in the
+handoff's F17 (§6's twin rule: where duplicating an item is itself the hazard, state it once and
+point). Read it there before acting on it; F17's own candidate fixes do not close it.
+
 **Route 3 does not raise the severity, and the reason is worth stating rather than assuming.** The
 peer that constructs it is the peer that advertised BOTH transfers, so what it destroys is a delivery
 it controls anyway — it could simply not send the data. It cannot reach another peer's transfers:
@@ -644,9 +651,27 @@ the contradictory-memory failure §6 of the handoff records.) The check is one g
 for the claim, before committing the fix. Where a finding is large enough that duplicating it is
 itself a hazard, state it ONCE and point — which is what F19 below does.
 
-**Every probe in this document is REDUCER-level, and the endpoint boundary has a trap that makes
-such probes silently vacuous.** The final whole-branch review re-ran the equivalents through the
-full composition and every claim here held — but its first run injected UNFRAMED packets into
+**The rule was then broken again, by a commit on this very branch, and that is the third instance.**
+`c702ddf` narrowed F19's permanence claim HERE — to "for as long as the pin holds" — and left the
+handoff's absolutes standing: six occurrences across four paragraphs (§3's priority bullet, F9's
+third-order consequence, F15's cross-reference, and §3c's "what it costs us"). The same claim had
+also gone out in a commit SUBJECT line, where it cannot be corrected at all. Fixed in the handoff on
+2026-08-14.
+
+Two things this instance taught that the paragraph above did not. **What made it survive:** the
+narrowing commit's own diff looked complete, because the wider twin was in the file the diff did not
+touch. Nothing about reviewing a correction shows you the sentence it was supposed to be paired
+with — only the grep does. **And the grep has to be re-run, not inherited:** the follow-up note that
+scheduled this fix carried a table of the sites to correct, listed five, and missed F9's — a
+one-line `git grep -e` over the pair found the sixth. A prior author's list of occurrences is a lead,
+with the same status as any other relayed finding in this document.
+
+**The probes in this document are REDUCER-level except where the paragraph carrying one says
+otherwise — F17's reachability correction and F19's outline both cite probes run through production
+wiring — and the endpoint boundary has a trap that makes reducer-level probes silently vacuous.**
+The final whole-branch review re-ran composition equivalents of several of them, and the claims
+those cover held; that is not a statement about every probe here, and it is deliberately written
+without a count because the count was never recorded. Its first run injected UNFRAMED packets into
 `TCPEvent.data`, and `TCPClientInterface` deframes with HDLC: `HDLCDeframer.ingest` finds no
 `HDLC.flag`, clears its buffer and emits nothing, so **an unframed packet is silently swallowed and
 never reaches `Transport.received`.** Every injection was a no-op while the probe printed
@@ -655,7 +680,12 @@ exactly the reassuring position this section's other entries occupy. The guard i
 CONTROL: inject N frames (`HDLC.frame`), assert N `Transport.received`s, and only then assert
 anything about what the injection failed to do.
 
-**One prose defect from this slice could not be fixed in place.** Commit `d0570ef`'s message says
+**Two prose defects from this slice could not be fixed in place, both in pushed commit messages.**
+The second is `c47443b`'s subject, *"docs: F19 — a replayed RESOURCE_REQ postpones the sender
+watchdog for ever"* — the permanence overstatement the twin-rule note above describes; the pin lasts
+as long as the replays do, and stopping them lets the watchdog spend `Const.proofRetries` and fail
+the transfer. The correction lives where a reader arrives, in the handoff's F19 entry. The first:
+commit `d0570ef`'s message says
 "The other six resource contexts keep fanning out." It is five. The code was always right; only the
 message is wrong, and a pushed commit message cannot be corrected. The count is now stated
 explicitly in the routing comment in `LinkSession`, together with a note that the message is wrong,

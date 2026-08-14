@@ -193,13 +193,13 @@ Current priority:
    peer's traffic rather than merely denying service. Gated on relay mode.
 2. **F11** — advertise-and-stall pins a link against eviction and then locks out
    every other peer. Does not self-clear.
-3. **F19** — a replayed `RESOURCE_REQ` postpones the sender watchdog for ever, so
-   the transfer never ends and its responder link is never evictable: F11's
-   lockout without the session key. Below F11 because the attacker cannot create
-   the transfer — we must already be serving a resource to that peer — and above
-   F7 because it denies service to every other peer rather than leaking a map
-   entry, and its cheapest fix (F9's `req_hashlist`) is already specified. Full
-   entry and the rest of the ranking argument in §3c.
+3. **F19** — a replayed `RESOURCE_REQ` re-arms the sender watchdog, so for as long
+   as the replays keep arriving the transfer does not self-terminate and its
+   responder link is not evictable: F11's lockout without the session key. Below
+   F11 because the attacker cannot create the transfer — we must already be
+   serving a resource to that peer — and above F7 because it denies service to
+   every other peer rather than leaking a map entry. Full entry, what bounds the
+   pin, and the rest of the ranking argument in §3c.
 4. **F7** — a real unbounded leak, in the router rather than the link plane.
 5. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
    deliberate, pinned by tests, listed so a future fix confronts them rather than
@@ -644,8 +644,11 @@ is equally exposed.
 — that is F19, added 2026-08-14.** "Re-arm the sender watchdog" understates it:
 the re-arm uses `cancelInFlight: true`, so it RESTARTS the window, and
 `proofRetriesLeft` is decremented only when the deadline actually fires. Replays
-faster than the window therefore mean the transfer never terminates at all, which
-pins its link against eviction. See §3c for the composition and the ranking.
+faster than the window therefore mean the transfer never SELF-terminates for as
+long as they keep arriving, which pins its link against eviction for that whole
+time. It is unbounded while replayed, not unconditionally permanent — the peer's
+proof or `RESOURCE_RCL`, the host's `.cancel`, and simply stopping the replays each
+still end it. See §3c for the composition, the bound and the ranking.
 
 Closing F9 needs per-packet replay rejection on the link, which does not exist
 anywhere in the link path today, and which has to be designed around the
@@ -930,11 +933,11 @@ next reader is not surprised by F19.** The old destructive branch was also the
 only un-keyed way to clear a stuck sender transfer: one junk `RESOURCE_PRF` from
 any off-path party failed EVERY sender-role transfer on the link, so a transfer
 whose peer had gone silent could be swept away by a passer-by. F19 — a replayed
-`RESOURCE_REQ` postponing the sender watchdog for ever, which pins the transfer
-and with it the link — is PRE-EXISTING and unchanged by this slice, but it no
-longer has that accidental teardown. Removing it was still right: the teardown was
-itself the kill primitive this entry is about, and restoring it to close F19 would
-reopen F15. See §3c.
+`RESOURCE_REQ` postponing the sender watchdog for as long as the replays continue,
+which pins the transfer and with it the link — is PRE-EXISTING and unchanged by
+this slice, but it no longer has that accidental teardown. Removing it was still
+right: the teardown was itself the kill primitive this entry is about, and
+restoring it to close F19 would reopen F15. See §3c.
 
 **Do not summarise this as "proofs are now authenticated."** The honest statement
 is that the branch no longer destroys anything, and that when it does act it acts
@@ -1133,6 +1136,27 @@ drops the duplicate delivery. The harmful shape — two receivers carrying DIFFE
 resources — still needs two genuinely concurrent sends. (c) Nothing crosses a
 trust boundary: `transfers` is per-`LinkSession` and both transfers are ours.
 
+**A SECOND consequence of the same duplication chain, recorded 2026-08-14 as a LEAD
+for whoever takes F17 — not a finding of its own, and not a collision.**
+`LinkSession.State.segmentedSend` is a SINGLE optional keyed on one
+`currentTransferID`, and `.sendResource` assigns it unconditionally on every call
+whose `data.count` exceeds `LinkSession.maxEfficientSize`. So the second of the two
+`sendResource` calls the retry chain produces OVERWRITES the first chain's
+continuation state. Both handlers that act on it —
+`.transfer(… .delegate(.concluded))` and `.transfer(… .delegate(.failed))` — are
+gated on `send.currentTransferID == elementID`, so when the first chain's segment 1
+concludes it no longer matches, falls through to the ordinary non-segmented exit,
+and **its segments 2…N are never advertised** — that branch is their only emitter,
+and the `remaining` array holding them was overwritten. Narrower than the collision
+routes: it needs a payload above `maxEfficientSize`, where a collision needs none.
+**Note that F17's own candidate fixes do NOT close it** — scoping a segment to the
+transfer whose `outstanding` holds its index, or carrying the resource hash on
+segments, both act on the RECEIVE side, and this clobber happens on the SEND side
+before any segment goes out. Closing it means either scoping duplicate sends (the
+`LXMFRouter.retryDue` half of the chain) or giving `segmentedSend` one entry per
+chain instead of one per link; neither is on F17's list. Verify all of it before
+acting.
+
 **Test-visibility trap, which is why no in-repo test can currently observe this.**
 `RandomBytesGenerator.testValue` is a deterministic ramp, so in-tree tests get the
 same `randomHash` — and therefore the same `resourceHash` — for the same payload,
@@ -1303,21 +1327,42 @@ not say** — F9 records the re-transmission and the re-arm as amplification and
 life extension; it does not say the retry counter never advances.
 
 **What it costs us, composed from two facts this repo records separately and never
-put together.** The sender watchdog is the transfer's only SELF-terminator (the
-others are the peer's `RESOURCE_RCL` and the host's `.cancel`), so disabling it
-means a sender transfer whose peer has gone silent — the exact case the watchdog
-exists for — never ends. `LinkSession` removes a transfer only on a child
-`.delegate(.received/.concluded/.failed)`, so `transfers` stays non-empty; and
-`LinkPlane`'s eviction filter is
+put together.** The sender watchdog is the transfer's only SELF-terminator — every
+other exit needs someone to act, and all three were read out of
+`ResourceTransfer`: a proof that satisfies `Resource.validateProof`
+(`received`'s `(.sender, .proof, .resourceProof)` → `.complete` →
+`.delegate(.concluded)`), the peer's `RESOURCE_RCL` (`received`'s
+`(.sender, .data, .resourceReceiverCancel)`, gated on `Link.decrypt`, so it needs
+the session key), and the host's `.cancel` — which is a reducer ACTION, not a
+`received` branch. Postponing the watchdog therefore means a sender transfer whose
+peer has gone silent — the exact case the watchdog exists for — does not end **on
+its own** for as long as the replays keep arriving. `LinkSession` removes a transfer only on a child
+`.delegate(.received/.concluded/.failed)`, so `transfers` stays non-empty for that
+whole time; and `LinkPlane`'s eviction filter is
 `active.filter { $0.id != elementID && $0.transfers.isEmpty }`, so that RESPONDER
-link becomes permanently un-evictable, and once nothing is evictable the plane
-REFUSES the newcomer at the cap. **That is F11's lockout, reached without the
-session key.** The comment above that filter prices the RECEIVER-side version —
+link is un-evictable for as long as the pin holds, and while nothing is evictable
+the plane REFUSES the newcomer at the cap. **That is F11's lockout, reached without
+the session key.** The comment above that filter prices the RECEIVER-side version —
 "a peer holding an active link … can advertise a resource, never send a segment,
 and become eviction-immune" — and scopes it to a peer holding the session key. The
 sender-side version needs one captured frame.
 
-Two riders that keep the pin from being cleared by anything else, both verified in
+**What bounds the pin, stated because an earlier draft of this entry — and the
+subject line of the commit that added it — said "for ever", which is wider than the
+evidence.** The pin lasts exactly as long as the replays do. Stop them and the next
+`.awaitingProof` deadline is no longer postponed: `.senderDeadline` decrements
+`proofRetriesLeft` from `Const.proofRetries`, and on the deadline that finds it at
+zero the branch sets `.failed` and emits `.delegate(.failed)` — at which point
+`LinkSession` removes the transfer, and once that empties `transfers` the link is
+evictable again. The correct claim is **unbounded while replayed**, which is what
+the probe observed; "never ends" unconditionally is not, and neither is
+"permanently un-evictable". **Note for anyone arriving by git blame:** commit
+`c47443b`'s subject line is *"docs: F19 — a replayed `RESOURCE_REQ` postpones the
+sender watchdog for ever"*. That overstates it in the same way, and a pushed commit
+message cannot be corrected — this paragraph is the correction.
+
+Two riders that keep the pin from being cleared by the link's own inactivity timer
+or by the LRU that picks eviction candidates, both verified in
 `LinkSession.received`: the replay is a link-addressed packet, so the hoisted
 re-arm below `dispatch` refreshes `inactivityTimer(state.staleTime)` on every
 round (F16) and the link element does not time out either; and the fan-out
@@ -1364,12 +1409,27 @@ it:
   the attacker sends. F11 already accepts the KEYED version of this exact immunity
   as a priced trade — F19 is the same immunity at a lower price with a narrower
   trigger.
-- **Above F7**, because the consequences are not comparable in kind: F7 leaks a map
-  entry, while F19 denies service to every other peer once the responder
-  population is at the cap, and it does so to an off-path party holding no key.
-  And F19 has a cheap, reference-blessed partial already specified — F9's
-  `req_hashlist` — where F11's real fix (a per-link bound on `transfers`) is its
-  own slice that has to decide what it displaces.
+- **Above F7**, because the consequences are not comparable in kind: per instance
+  F19 pins a whole `ResourceTransfer.State` plus the `LinkSession` element and
+  denies service to every new responder peer once the responder population is at
+  the cap, where F7 leaks one map entry — and F19 does it for an off-path party
+  holding no key.
+  **The opposing consideration, stated because a rank argument that omits it is the
+  same over-wide shape as everything else this slice had to correct:** F7 needs no
+  attacker at all — our own idle timer produces it, and the only clearer on that
+  path, `closed()`'s `if case let .active(linkID)`, cannot match because
+  `.idleDeadline` nil'd `directLinks[dest]` first — where F19's pin clears once the
+  replays stop (see "what bounds the pin" above). Do not read the rank as "F19 is
+  worse in every dimension"; it is worse in blast radius per instance, which is what
+  this bullet ranks on.
+  **Cost of fix is deliberately NOT part of this argument, and a clause arguing
+  from it was removed here on 2026-08-14.** It said F19 has a cheap
+  reference-blessed partial already specified (F9's `req_hashlist`) — true, but it
+  argues F19 over **F11**, whose fix is its own slice, not over F7, whose fix is
+  cheaper still: bind `linkID` in `LXMFRouter.idleDeadline`'s existing `.active`
+  guard and clear `linkResourceInFlight[linkID]` before nil'ing `directLinks[dest]`.
+  As a reason to outrank F7 it was backwards. Fix costs for F19 are listed at the
+  end of this entry, where they inform the fix rather than the rank.
 - **What would move it DOWN:** if a deployment never serves resources on responder
   links, the precondition never arises and F19 collapses into F9's group. It is
   ranked for the propagation-node case, which this library supports and which
