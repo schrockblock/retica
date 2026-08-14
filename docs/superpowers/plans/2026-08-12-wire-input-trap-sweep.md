@@ -64,7 +64,7 @@ Each was reproduced as a real abort or measured DoS. Ordered by reach. Each task
 
 - [ ] **Task 6 — `LXMFServiceNode.swift:219` `Int(Double)`.** `[[], [], float64(NaN)]` on a `/get` aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client, any PN with node mode on. Fix the conversion *and* note whether the missing policy gate is a separate defect worth its own task.
 
-- [ ] **Task 7 — `PNAnnounce.swift:56-59`, six `Int(UInt64)`.** A 21-byte app-data blob aborts. `PNAnnounce.isValid` — the *validity predicate* — crashes on the input it exists to reject, which is the sharpest illustration of the class in the codebase.
+- [x] **Task 7 — `PNAnnounce.swift:56-59`, six `Int(UInt64)`.** A 21-byte app-data blob aborts. `PNAnnounce.isValid` — the *validity predicate* — crashes on the input it exists to reject, which is the sharpest illustration of the class in the codebase. **FIXED** — see Task 7 report.
 
 - [ ] **Task 8 — `ResourceTransfer.swift:451` `Int(chunkIndex) * 74 * 4`.** Signal 5 **twice** — the conversion and the multiply. The predecessor's ledger wrongly recorded this as guarded by the contiguity check on the following line; the conversion evaluates first. **Bound the product.** *(Re-verified 2026-08-14: was `:442`, drifted to `:451` when the destructive-transition slice touched this file. The surrounding logic is unchanged — the `guard offset == state.knownHashmap.count` contiguity check is still on the line **after** the conversion, so it still does not protect it.)*
 

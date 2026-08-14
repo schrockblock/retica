@@ -83,8 +83,12 @@ cannot see**. That is what tier 1 is about.
       aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client.
       **Fixed** — `59f900e`: NaN/negative/infinite float → 0 (serve nothing); negative int → 0
       (not nil/unlimited). Also closes the `.int` fall-through divergence opened by `177da8c`.
-- [ ] **Task 7 — `PNAnnounce.swift:56-59`, six `Int(UInt64)`** — a 21-byte app-data blob aborts.
-      `PNAnnounce.isValid`, the *validity predicate*, crashes on the input it exists to reject.
+- [x] **Task 7 — `PNAnnounce.swift:56-59`, six `Int(UInt64)` (in `PNAnnounce.parse`)** — a 21-byte
+      app-data blob aborts. `PNAnnounce.isValid`, the *validity predicate*, crashed on the input it
+      exists to reject. **Fixed** — all six `Int(x)` replaced with `Int(exactly:)` guard-returning
+      `nil`; any single bad field fails the whole predicate, matching reference's per-field
+      `try/except` shape in `pn_announce_data_is_valid` (LXMF.py:224-250). Reject, not truncate.
+      Commit: see Task 7 report.
 - [ ] **Task 8 — `ResourceTransfer.swift:451` `Int(chunkIndex) * 74 * 4`** — traps twice, at the
       conversion *and* the multiply. Bound the **product**, not just the conversion.
 - [ ] **Task 9 — unkillable stamp generation** — `LXMFNode.swift:340` → `LXStamper.swift:73-79`: a

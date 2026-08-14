@@ -53,10 +53,22 @@ public struct PNAnnounce: Equatable {
         case .map, .intMap: break
         default: return nil
         }
-        return PNAnnounce(timebase: Int(timebase), nodeState: nodeState,
-                          perTransferLimit: Int(transfer), perSyncLimit: Int(sync),
-                          targetStampCost: Int(cost), stampCostFlexibility: Int(flex),
-                          peeringCost: Int(peer), metadata: metadata)
+        // Each field is a wire UInt64. Int(UInt64) traps on values > Int.max — identical to
+        // Python pn_announce_data_is_valid (LXMF.py:230-243) wrapping each int() in its own
+        // try/except so any bad field fails the whole predicate. We reject rather than truncate:
+        // truncating produces a negative Int that would later trap in PNAnnounce.packed
+        // (UInt64(Int) traps on a negative). Task 7 fix; Task 7 brief §constraint.
+        guard let tbInt  = Int(exactly: timebase),
+              let trInt  = Int(exactly: transfer),
+              let syInt  = Int(exactly: sync),
+              let coInt  = Int(exactly: cost),
+              let flInt  = Int(exactly: flex),
+              let peInt  = Int(exactly: peer)
+        else { return nil }
+        return PNAnnounce(timebase: tbInt, nodeState: nodeState,
+                          perTransferLimit: trInt, perSyncLimit: syInt,
+                          targetStampCost: coInt, stampCostFlexibility: flInt,
+                          peeringCost: peInt, metadata: metadata)
     }
 
     /// True iff `data` is well-formed announce app-data (mirrors pn_announce_data_is_valid).

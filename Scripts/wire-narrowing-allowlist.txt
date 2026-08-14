@@ -23,12 +23,6 @@
 # ---------------------------------------------------------------------------
 # OPEN — confirmed traps, owned by the wire-input-trap-sweep plan. Do not bless.
 # ---------------------------------------------------------------------------
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — wire UInt64 narrowed inside the validity predicate itself. A 21-byte app-data blob aborts. | Int(timebase)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(transfer)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(sync)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(cost)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(flex)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | OPEN Task 7 — as Int(timebase). | Int(peer)
 Sources/ReTiCATransport/ResourceTransfer.swift | 1 | OPEN Task 8 — wire UInt64 narrowed, then multiplied by hashmapMaxLen*mapHashLength. Traps twice. The contiguity check recorded as its guard is on the NEXT line and evaluates after. | Int(chunkIndex)
 
 # ---------------------------------------------------------------------------
@@ -118,12 +112,12 @@ Sources/ReTiCANode/LXMFServiceNode.swift | 1 | Task 6 FIXED — `requestReceived
 # Recorded rather than fixed: none is remotely triggerable, so none belongs to this
 # plan. See docs/wire-narrowing-inventory.md for the escalation conditions.
 # ---------------------------------------------------------------------------
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :30 — Int -> UInt64 traps if the field is negative. Producers are PNNode.swift:84 and LXMFServiceNode.swift:119, both Int(date.now.timeIntervalSince1970); negative only if the `date` dependency is set before 1970. Not attacker-controlled. Task 7 must not fix parse by truncating, or a wire value could reach here negative. | UInt64(timebase)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :32 — as UInt64(timebase); host-set field. | UInt64(perTransferLimit)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :33 — as UInt64(timebase); host-set field. | UInt64(perSyncLimit)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); sourced from PropagationStore.minStampCost. | UInt64(targetStampCost)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); host-set field. | UInt64(stampCostFlexibility)
-Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); host-set field. | UInt64(peeringCost)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :30 — Int -> UInt64 traps if the field is negative. Producers are PNNode.swift:84 and LXMFServiceNode.swift:119, both Int(date.now.timeIntervalSince1970); negative only if the `date` dependency is set before 1970. Not attacker-controlled. Task 7 CLOSED: parse now uses Int(exactly:) and returns nil for out-of-range values (never truncates), so no wire-derived value can reach packed as a negative Int. | UInt64(timebase)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :32 — as UInt64(timebase); host-set field. Task 7 CLOSED: wire-parse uses Int(exactly:) so no wire-derived negative can reach here. | UInt64(perTransferLimit)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :33 — as UInt64(timebase); host-set field. Task 7 CLOSED: as UInt64(perTransferLimit). | UInt64(perSyncLimit)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); sourced from PropagationStore.minStampCost. Task 7 CLOSED: as UInt64(perTransferLimit). | UInt64(targetStampCost)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); host-set field. Task 7 CLOSED: as UInt64(perTransferLimit). | UInt64(stampCostFlexibility)
+Sources/ReTiCA/LXMF/PNAnnounce.swift | 1 | PNAnnounce.packed :34 — as UInt64(timebase); host-set field. Task 7 CLOSED: as UInt64(perTransferLimit). | UInt64(peeringCost)
 Sources/ReTiCANode/LXMFServiceNode.swift | 1 | :119 — Double -> Int on the TCA `date` dependency. Traps for NaN or a date outside roughly +/- 2.9e11 years. Clock, not wire. | Int(date.now.timeIntervalSince1970)
 Sources/ReTiCANode/PNNode.swift | 1 | :84 — as LXMFServiceNode:119. | Int(date.now.timeIntervalSince1970)
 Sources/ReTiCATransport/Transport.swift | 2 | :542 and :878 — Double -> UInt64 on the `date` dependency. Traps for NaN, and additionally for ANY pre-1970 date because the destination is unsigned. Clock, not wire. | UInt64(date.now.timeIntervalSince1970)

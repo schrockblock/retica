@@ -62,9 +62,9 @@ The durable key is *file + expression text*, which is what the allowlist matches
 
 | | |
 |---|---|
-| Conversions found in `Sources/` | **121** across **82** distinct file+expression groups, in 56 files |
+| Conversions found in `Sources/` | **115** across **76** distinct file+expression groups, in 56 files |
 | Reviewed safe | 114 findings / 75 groups |
-| **Known-open (confirmed traps)** | **7 findings / 7 groups** — Tasks 7, 8 |
+| **Known-open (confirmed traps)** | **1 finding / 1 group** — Task 8 |
 | Defects in this plan that are *not* conversions | 3 — Tasks 3, 4, 5 (see [Not detectable by this check](#not-detectable-by-this-check)) |
 
 Run the gate:
@@ -95,18 +95,22 @@ forget one; `--fail-on-open` will tell you if any remain.
   directly, but that is not wire-reachable — same category as `PNAnnounce.packed`. Allowlist
   entry updated from OPEN to reviewed-safe.
 
-- [ ] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:56`** — `Int(timebase)` — **Task 7**
-- [ ] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:57`** — `Int(transfer)` — **Task 7**
-- [ ] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:57`** — `Int(sync)` — **Task 7**
-- [ ] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:58`** — `Int(cost)` — **Task 7**
-- [ ] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:58`** — `Int(flex)` — **Task 7**
-- [ ] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:59`** — `Int(peer)` — **Task 7**
-  Source: all six are `UInt64`s destructured from wire announce app-data in `PNAnnounce.parse`.
-  Guarded: **no.** A 21-byte app-data blob aborts. `PNAnnounce.isValid` — the validity predicate
-  itself — crashes on the input it exists to reject.
-  Note for the fix: `PNAnnounce.packed` converts these fields straight back with `UInt64(...)`
-  (`:30`, `:32`, `:33`, `:34` ×3), which traps on a negative. Same constraint as Task 2 —
-  reject or clamp, do not truncate.
+- [x] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:56`** — `Int(timebase)` — **Task 7 FIXED**
+- [x] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:57`** — `Int(transfer)` — **Task 7 FIXED**
+- [x] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:57`** — `Int(sync)` — **Task 7 FIXED**
+- [x] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:58`** — `Int(cost)` — **Task 7 FIXED**
+- [x] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:58`** — `Int(flex)` — **Task 7 FIXED**
+- [x] **`Sources/ReTiCA/LXMF/PNAnnounce.swift:59`** — `Int(peer)` — **Task 7 FIXED**
+  Source: all six are `UInt64`s destructured from wire announce app-data in `PNAnnounce.parse`
+  (enclosing function). A 21-byte app-data blob with any field > `Int.max` aborts.
+  `PNAnnounce.isValid` — the validity predicate itself — crashed on the input it exists to reject.
+  Fixed by replacing all six `Int(x)` calls with `guard let x = Int(exactly: x) else { return nil }`
+  in `PNAnnounce.parse`. Any single bad field returns `nil`, failing the whole predicate — matching
+  reference `pn_announce_data_is_valid` (LXMF.py:224-250) which wraps each `int()` in its own
+  `try/except`. Reject, not truncate: truncating produces a negative `Int` that would later trap in
+  `PNAnnounce.packed` (`UInt64(Int)` on a negative). The packed-side `UInt64(...)` entries in the
+  allowlist now carry updated reasoning confirming the coupling is resolved.
+  Commit: see Task 7 report.
 
 - [x] **`Sources/ReTiCANode/LXMFServiceNode.swift:261` (in `requestReceived`, `.double` branch)** — `Int(raw)` — **Task 6 FIXED**
   Source: `raw = kb * 1000` where `kb` is a wire `float64` from a `/get` request.
@@ -245,9 +249,12 @@ sites named above, re-verify by hand.
 
 Recorded, not fixed: none is remotely triggerable, so none belongs to this plan.
 
-- **`PNAnnounce.swift:30,32,33,34`(×3)** — `UInt64(Int)` in `packed`; traps on a negative field.
-  Only producers are `PNNode.swift:84` / `LXMFServiceNode.swift:119`, which take
-  `Int(date.now.timeIntervalSince1970)`; negative only if the `date` dependency is set pre-1970.
+- **`PNAnnounce.swift:30,32,33,34`(×3)** — `UInt64(Int)` in `packed` (`PNAnnounce.packed`); traps
+  on a negative field. Only producers are `PNNode.swift:84` / `LXMFServiceNode.swift:119`, which
+  take `Int(date.now.timeIntervalSince1970)`; negative only if the `date` dependency is set pre-1970.
+  **Task 7 NOTE:** The previous forward warning ("Task 7 must not fix parse by truncating") is now
+  resolved. `PNAnnounce.parse` uses `Int(exactly:)` and returns `nil` for out-of-range values, so
+  no wire-derived value can arrive at `packed` as a negative `Int`.
 - **`LXMFServiceNode.swift:119`, `PNNode.swift:84`** — `Int(Double)` on the TCA `date` dependency;
   traps on NaN.
 - **`Transport.swift:542,878`** — `UInt64(Double)` on `date`; traps on NaN *and* on any pre-1970
