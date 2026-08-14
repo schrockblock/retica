@@ -81,8 +81,15 @@ public struct PNNode {
                 // advertising 0 while the store enforces 16 breaks every reference client, and any
                 // unstamped entry that did arrive would be silently skipped with no error returned.
                 // Read from the store rather than a mirrored copy: one source of truth, no drift.
+                // The propagation limits are a REQUEST our peers honour, not a promise we keep: a peer
+                // stores them on its LXMPeer record for US (Handlers.py:61 → LXMRouter.py:2025) and
+                // filters its own outbound offer against them (LXMPeer.py:370). Advertising 0 said "no
+                // message may ever be sent to me", and reference marks each oversized message handled,
+                // so mesh sync into this node dropped everything, permanently and silently.
+                // Shared constants rather than literals, for the reason the stamp-cost fix exists.
                 let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: true,
-                                         perTransferLimit: 0, perSyncLimit: 0,
+                                         perTransferLimit: LXMFPropagation.defaultPropagationTransferLimitKB,
+                                         perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
                                          targetStampCost: state.node.store.minStampCost,
                                          stampCostFlexibility: 0, peeringCost: state.peeringCost).packed
                 return .merge(.send(.endpoint(.registerLocalDestination(d))),

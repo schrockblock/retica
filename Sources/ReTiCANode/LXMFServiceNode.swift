@@ -117,7 +117,15 @@ public struct LXMFServiceNode {
                 else { return .none }
                 state.client.propagationDestinationHash = d.hash
                 let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: true,
-                                         perTransferLimit: 0, perSyncLimit: 0,
+                                         // These are a REQUEST our peers honour, not a promise we keep:
+                                         // a peer stores them on its LXMPeer record for US and filters
+                                         // its own outbound offer (LXMPeer.py:370). 0 meant "no message
+                                         // may ever be sent to me" — and reference marks each oversized
+                                         // message handled, so it dropped everything, permanently.
+                                         // Shared constants, not literals: the mirrored-copy drift that
+                                         // produced the stamp-cost bug applies equally here.
+                                         perTransferLimit: LXMFPropagation.defaultPropagationTransferLimitKB,
+                                         perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
                                          // Single source of truth: the value PropagationStore.ingest
                                          // actually enforces. A mirrored copy is what let PNNode
                                          // advertise 0 while enforcing 16.

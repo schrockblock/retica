@@ -32,6 +32,36 @@ public enum LXMFPropagation {
     /// Default propagation stamp cost for client→PN offers (RNS PROPAGATION_COST = 16).
     public static let defaultPropagationStampCost = 16
 
+    /// Per-MESSAGE propagation transfer limit in KILOBYTES, announced as PN app-data field [3]
+    /// (`LXMRouter.PROPAGATION_LIMIT = 256`, LXMRouter.py:55).
+    ///
+    /// This field is a REQUEST the announcing node makes of its peers, and the SENDER honours it —
+    /// it is never enforced by the receiver. A peer that reads our announce stores this value on the
+    /// `LXMPeer` object representing *us* (Handlers.py:61 → LXMRouter.py:2025/2041), then filters its
+    /// own outbound offer against it in `LXMPeer.sync` (LXMPeer.py:370), where `self` is that peer
+    /// record for us. So the honest value is "the largest single message we are willing to receive",
+    /// and under-enforcing it costs a peer nothing — we simply accept more than we asked for.
+    ///
+    /// It must NOT be lowered below reference's 256 without cause: a message larger than this is
+    /// `remove_unhandled_message` + `add_handled_message`'d (LXMPeer.py:371-372), i.e. dropped
+    /// PERMANENTLY and never retried. Advertising 0 made that condition unconditional. 256 KB is a
+    /// single Resource segment for us (`LinkSession.maxEfficientSize` = 1_048_575), so it lands on the
+    /// already-proven single-segment receive path.
+    public static let defaultPropagationTransferLimitKB = 256
+
+    /// Aggregate per-SYNC limit in KILOBYTES, announced as PN app-data field [4]
+    /// (`LXMRouter.SYNC_LIMIT = PROPAGATION_LIMIT*40` = 10240, LXMRouter.py:59). Derived from the
+    /// per-transfer limit rather than restated, mirroring reference — and reference additionally
+    /// clamps sync >= transfer (LXMRouter.py:156-157), an invariant this expression cannot violate.
+    ///
+    /// Exceeding this is less severe than exceeding the transfer limit: the sender merely skips the
+    /// message for THIS sync (LXMPeer.py:375-376 `continue` without marking it handled), so it is
+    /// retried later. Advertising 0 therefore stalled syncs rather than losing messages outright.
+    /// 10240 KB spans ~10 Resource segments inbound, which `ResourceTransfer` handles, and stays
+    /// under `LXMFServiceNode.State.defaultStorageLimitBytes` (32 MiB) so one maximal sync cannot by
+    /// itself evict the backlog.
+    public static let defaultPropagationSyncLimitKB = defaultPropagationTransferLimitKB * 40
+
     /// `LXMPeer.ERROR_NO_IDENTITY` (lxmf 1.1.0 LXMPeer.py:24) — the response BODY a propagation node
     /// returns for a request on a link that never IDENTIFY'd (LXMRouter.py:1483). Reference clients
     /// compare the decoded response against this integer (LXMRouter.py:1563 / :1608) to tear the link

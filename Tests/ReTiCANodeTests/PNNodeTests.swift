@@ -48,6 +48,48 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     #expect(announced?.targetStampCost == enforced)
 }
 
+/// A propagation node MUST advertise propagation limits a peer can actually act on. These fields are
+/// a REQUEST the SENDER honours (Handlers.py:61 → LXMRouter.py:2025 → LXMPeer.py:370, where `self` is
+/// the peer record for US): a reference node reads field [3], and for any message bigger than it calls
+/// `remove_unhandled_message` + `add_handled_message` — dropped permanently, never retried. Advertising
+/// 0 made `lxm_transfer_size > 0` unconditionally true, so reference→ReTiCA mesh sync silently
+/// delivered NOTHING, forever. Field [4] = 0 likewise stalled every sync (LXMPeer.py:375).
+///
+/// Asserted on bytes parsed back out of the emitted announce, not read off state: a serialisation
+/// mistake in these fields is exactly what reaches the peer.
+@Test @MainActor func pnNodeAdvertisesActionablePropagationLimits() async {
+    let store = makeStore(Identity())
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.registerPropagation)
+    await store.receive { action in
+        if case let .endpoint(.announce(_, appData)) = action { captured.setValue(appData); return true }
+        return false
+    }
+
+    #expect(captured.value != nil)
+    if let appData = captured.value {
+        #expect(PNAnnounce.isValid(appData))
+        let announced = PNAnnounce.parse(appData)
+        #expect(announced != nil)
+        if let announced {
+            #expect(announced.perTransferLimit != 0)
+            #expect(announced.perSyncLimit != 0)
+            #expect(announced.perTransferLimit == LXMFPropagation.defaultPropagationTransferLimitKB)
+            #expect(announced.perSyncLimit == LXMFPropagation.defaultPropagationSyncLimitKB)
+            // Reference clamps sync >= transfer (LXMRouter.py:156-157); never advertise the inverse.
+            #expect(announced.perSyncLimit >= announced.perTransferLimit)
+            // No OTHER announce field may change as a side effect of this fix.
+            #expect(announced.timebase == 1700000000)
+            #expect(announced.nodeState == true)
+            #expect(announced.targetStampCost == store.state.node.store.minStampCost)
+            #expect(announced.stampCostFlexibility == 0)
+            #expect(announced.peeringCost == store.state.peeringCost)
+            #expect(announced.metadata == .map([]))
+        }
+    }
+}
+
 /// registerPropagation registers the lxmf.propagation destination and announces valid PNAnnounce app-data.
 @Test @MainActor func pnNodeRegistersAndAnnounces() async {
     let store = makeStore(Identity())

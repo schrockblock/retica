@@ -80,6 +80,56 @@ import ComposableArchitecture
     return makeServiceNodeStore(initial)
 }
 
+/// The service node's announce must carry propagation limits a peer can act on, for the same reason
+/// PNNode's must: reference stores field [3] on the `LXMPeer` record for US (Handlers.py:61 →
+/// LXMRouter.py:2025) and the SENDER filters its outbound offer against it (LXMPeer.py:370). With 0,
+/// `lxm_transfer_size > 0` always holds, so every message is removed AND marked handled — permanent,
+/// unretried, silent loss. Parsed back out of the emitted wire bytes, not read off state.
+@MainActor @Test func serviceNodeAdvertisesActionablePropagationLimits() async {
+    let identity = Identity()
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 12)
+    initial.nodeModeEnabled = true
+    let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.registerPropagation)
+    await store.receive { action in
+        if case let .client(.endpoint(.announce(_, appData))) = action { captured.setValue(appData); return true }
+        return false
+    }
+
+    #expect(captured.value != nil)
+    if let appData = captured.value {
+        #expect(PNAnnounce.isValid(appData))
+        let announced = PNAnnounce.parse(appData)
+        #expect(announced != nil)
+        if let announced {
+            #expect(announced.perTransferLimit != 0)
+            #expect(announced.perSyncLimit != 0)
+            #expect(announced.perTransferLimit == LXMFPropagation.defaultPropagationTransferLimitKB)
+            #expect(announced.perSyncLimit == LXMFPropagation.defaultPropagationSyncLimitKB)
+            // Reference clamps sync >= transfer (LXMRouter.py:156-157); never advertise the inverse.
+            #expect(announced.perSyncLimit >= announced.perTransferLimit)
+            // No OTHER announce field may change as a side effect of this fix.
+            #expect(announced.timebase == 1700000000)
+            #expect(announced.nodeState == true)
+            #expect(announced.targetStampCost == 12)
+            #expect(announced.stampCostFlexibility == 0)
+            #expect(announced.peeringCost == 0)
+            #expect(announced.metadata == .map([]))
+        }
+    }
+}
+
 /// registerPropagation registers lxmf.propagation, announces it, and the announce advertises exactly
 /// the stamp cost the store enforces (advertised == enforced).
 @MainActor @Test func serviceNodeRegistersPropagationAndAdvertisesEnforcedCost() async {
