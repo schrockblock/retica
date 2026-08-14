@@ -118,7 +118,24 @@ scratch SwiftPM package outside the repo (`/tmp/ReTiCA/probe5`) and are deleted;
 |---|---|---|---|---|
 | 27 | `.transfer(… .delegate(.received))` → `transfers.remove(id:)` | n/a | **yes** — `elementID` | **safe.** Reached only after the child completed `Resource.assemble` under the session key AND `Resource.verify`. |
 | 28 | `.transfer(… .delegate(.concluded))` → `transfers.remove(id:)`, and `segmentedSend = nil` on the last segment | n/a | **yes** — `elementID`, plus `send.currentTransferID == elementID` for the segmented half | **safe.** |
-| 29 | `.transfer(… .delegate(.failed))` → `transfers.remove(id:)`, `pendingRequests.remove(rid)`, `segmentedSend = nil`, `incomingSegments[a.originalHash] = nil` | n/a | **mixed** — `elementID` and `currentTransferID` are sound; `advertisement.requestID` and `advertisement.originalHash` are WIRE-DERIVED for a receiver-role transfer and length-unvalidated | **safe today, with a recorded weakness.** `requestID` is safe because the `.resourceAdvertisement` branch only accepts a response-Resource whose `q` is already in `pendingRequests`. `originalHash` (`o`) is not checked against anything, so two advertisements from the same peer may share one accumulator — but reaching that needs the session key, so a peer can only disrupt its own delivery. Folded into **F18**. This handler is also the amplifier for F17: a poisoned RESPONSE receiver fails here and takes a legitimate `requestFailed` out with it. |
+| 29 | `.transfer(… .delegate(.failed))` → `transfers.remove(id:)`, `pendingRequests.remove(rid)`, `segmentedSend = nil`, `incomingSegments[a.originalHash] = nil` | n/a | **mixed** — `elementID` and `currentTransferID` are sound; `advertisement.requestID` and `advertisement.originalHash` are WIRE-DERIVED for a receiver-role transfer and length-unvalidated | **safe, but NOT for the reason an earlier draft gave** — read the correction below the table before trusting this row. The gate is `state.pendingRequests.contains(rid)` in THIS handler; the bound is that `pendingRequests` is per-`LinkSession`. `originalHash` (`o`) is checked against nothing, so two advertisements from one peer may share an accumulator — that needs the session key, so a peer can only disrupt its own delivery. Folded into **F18**. This handler is also the amplifier for F17: a poisoned RESPONSE receiver fails here and takes a legitimate `requestFailed` with it. |
+
+**Correction to row 29 — the kind this document exists to catch.** An earlier draft justified the
+`safe` verdict with: *"`requestID` is safe because the `.resourceAdvertisement` branch only accepts a
+response-Resource whose `q` is already in `pendingRequests`."* **That gate is real but it sits INSIDE
+`if adv.isResponse`.** An advertisement with NEITHER the request nor the response flag set, carrying
+`q` = a live pending requestID, sails straight past it. Probed end to end: the transfer is created,
+`.accept` populates `advertisement.requestID` with the borrowed id, and the transfer's
+`.delegate(.failed)` then removes that id from `pendingRequests` and emits `requestFailed`.
+
+The verdict survives, on a different mechanism. **The actual gate is this handler's own
+`state.pendingRequests.contains(rid)`**, and the actual bound is that `pendingRequests` is
+per-`LinkSession` state, written only by `.sendRequest` on that session — so a peer holding the
+session key can cancel only requests WE SENT TO THAT PEER, which it could equally well just refuse to
+answer. Control probe: with the id absent from `pendingRequests`, the same sequence emits nothing.
+
+Stating it the old way was worse than saying nothing: it pointed a future reader at a gate that does
+not cover the case, and would have survived deleting the one that does.
 
 ## 3. `LinkPlane` — the only place a link element is removed
 
@@ -137,11 +154,43 @@ not have to re-derive that:
 
 | # | Branch (symbol) | AUTH | OWN | Verdict |
 |---|---|---|---|---|
-| 34 | `.maintenanceTick` — GC of `learned`, `announceBlobs`, `announceCache`, `linkTable`, `discoveryPathRequests`, `pathRequests`, `announceQueues` | clock | keyed | **safe.** Inbound data only POSTPONES these (that is F13's `refreshedAt` half); nothing inbound makes any of them fire early. |
-| 35 | `case .announce:` replay-suppression branch → `announceTable[dest] = nil` + `.cancel(announceRetransmit)` | **partial** — `Announce.parse` validates the destination's Ed25519 signature and re-derives `destinationHash` from `nameHash ‖ identity.hash`, but REPLAYING a genuine announce needs no key | **yes** — keyed by `destinationHash`, and additionally requires `transportId != nil` and a `rebroadcastHops` match | **deliberate.** This is RNS's collaborative suppression (Transport.py:1774-1791) and what it destroys is our own pending re-broadcast, not anyone else's state. Bounded: the cancelling paths both require `entry.rebroadcasts >= 1`, so nothing can be suppressed before we have broadcast at least once. |
+| 34 | `.maintenanceTick` — GC of `learned`, `announceBlobs`, `announceCache`, `linkTable`, `discoveryPathRequests`, `pathRequests`, `announceQueues` | clock | keyed | **safe, and INTENDED — but the obvious universal is false.** Inbound data CAN shorten the time to a `learned` GC; see the ruling below the table. |
+| 35 | `case .announce:` replay-suppression branch → `announceTable[dest] = nil` + `.cancel(announceRetransmit)` | **partial** — `Announce.parse` validates the destination's Ed25519 signature and re-derives `destinationHash` from `nameHash ‖ identity.hash`, but REPLAYING a genuine announce needs no key | **yes** — keyed by `destinationHash`, and additionally requires `transportId != nil` and a `rebroadcastHops` match | **deliberate.** This is RNS's collaborative suppression (Transport.py:1774-1791) and what it destroys is our own pending re-broadcast, not anyone else's state. Bounded: the cancelling paths both require `entry.rebroadcasts >= 1`, so nothing can be suppressed before the retransmit timer has fired at least once. (Precisely that, NOT "before we have broadcast at least once" — `entry.rebroadcasts += 1` sits outside the `eligible` loop in `.announceRetransmitDue` and increments even when no interface was eligible and nothing was sent.) |
 | 36 | `case .announce:` ingress hold → `held[destinationHash] = …` replaces an existing held announce | same as 35 | keyed by `destinationHash` | **safe.** Reference `hold_announce` (Interface.py:223-229); bounded by `maxHeldAnnounces`. |
-| 37 | `.interfaceDisconnected`, `setTransportIdentity(nil)`, `.announceQueueDrainDue` interface-vanished branch, `.announceRetransmitDue` lifecycle-complete branch | local / clock | keyed | **safe.** |
+| 37 | `.interfaceDisconnected`, `.announceQueueDrainDue` interface-vanished branch, `.announceRetransmitDue` lifecycle-complete branch | local / clock | keyed | **safe.** |
+| 37b | `setTransportIdentity(nil)` → `announceTable = [:]`, `linkTable = [:]`, `discoveryPathRequests = [:]` | local | **none — three WHOLESALE wipes**, including every transited link's routing state | **safe, and the verdict rests entirely on the TRIGGER being local.** Split out of row 37 because calling it "keyed" was wrong: it is the single least discriminating destructive action in the file. Nothing inbound reaches it — the only emitters repo-wide are `TCPEndpoint.enableRelay` and `BLEEndpoint.enableRelay`, both host commands — and dropping relay state on leaving relay mode is the point. But if that trigger ever became reachable from the network, this branch has no second line of defence. |
 | 38 | `seenPacketHashes` ring eviction under load | no | n/a | **outside the verb set, recorded anyway.** An unauthenticated flood evicts dedup memory, which re-enables replay of an evicted packet. Pinned by `seenPacketRingEvictsOldestAndReDeliversIt`; the ring is deliberately sized for this (`seenPacketRingSize`). Not a destructive transition, but it is the one place in `Transport` where unauthenticated volume erases state that a security property rests on. |
+
+**Ruling on row 34: the mode re-class is INTENDED, and the universal an earlier draft carried
+("nothing inbound makes any of them fire early") is FALSE.** Both halves matter, so both are stated.
+
+*The mechanism, probe-confirmed in two halves.* The `learned` sweep predicate is
+`pathExpiry(forMode: state.interfaces[entry.interfaceID]?.mode)` — it looks the mode up at GC time
+rather than storing it. And `case .announce:` replaces the WHOLE `LearnedDestination`, `interfaceID`
+included, whenever `Transport.shouldReplace` says so — and `shouldReplace` compares only
+`announceEmitted` and `hops`, so it is mode-blind. Probe (a): with the entry seeded, a `.full`
+binding survives a tick at an age a `.roaming` binding does not. Probe (b): a genuine newer announce
+arriving on a roaming interface moves a full-learned entry's `interfaceID` to the roaming one, resets
+`learnedAt`, and the entry is then GC'd at the roaming lifetime. The same loop also nils
+`announceBlobs[dest]`, the per-destination announce anti-replay ring.
+
+*Why INTENDED rather than a finding.* The entry after the replacement genuinely IS a roaming path —
+`Transport.send` transmits on `entry.interfaceID`, which now names the roaming interface, so the
+route really does run over it. Classifying it by the mode it actually rides is the whole purpose of
+`pathExpiry(forMode:)` (RNS `ROAMING_PATH_TIME` / `AP_PATH_TIME`), and the function's own doc comment
+shows the lookup-at-GC-time behaviour was chosen deliberately: it reasons explicitly about the `nil`
+case and elects to fall back to the 7-day default "rather than expiring early". Nothing is truncated
+mid-life either — the replacement resets `learnedAt`, so the entry gets a FULL roaming lifetime from
+the moment it became a roaming path. Pinned by `roamingPathExpiresAfterSixHours`. **No F-number.**
+
+*The rider, considered and deliberately not numbered.* The GC nils `announceBlobs[dest]` alongside
+`learned[dest]`, so after expiry an old captured announce for that destination is adoptable again
+(`shouldReplace(nil, _)` is unconditionally true), and an adopting candidate takes its `interfaceID`
+and `nextHop` from the arriving packet. Real, but: it is a property of path expiry in GENERAL, not of
+the mode mechanism — the identical reset happens at the ordinary 7-day expiry — it is pre-existing
+and untouched by this slice, and it performs none of this sweep's five verbs. It belongs with F13's
+family (relay/path redirection) if anyone picks that up, and is recorded here rather than numbered
+so that the ranking of this document's OPEN items stays honest.
 
 **Also cross-referenced, not re-litigated:** the `destinationType == .link` + `linkTable`-hit branch
 (F13) is not itself destructive, but it causes a destructive transition downstream — it shadows
@@ -187,12 +236,36 @@ The adversarial half was already priced by the previous sweep, which chose to re
 F-number; the self-collision case is what it did not see, and it is the same shape as F15's
 non-adversarial half one context over. That is why it gets a number now.
 
-**Rank it low and read the price honestly.** The collision probability per fanned part is set by
-`Resource.mapHashLength` against the other transfer's hashmap height, so both the accidental and
-the sprayed variants are expensive. Two smaller blast-radius facts belong with it: a collision also
-drops `partTimeoutFactor` to `Const.partTimeoutFactorAfterRTT` for the rest of that transfer's
-life, and if the poisoned transfer is a response-Resource, its failure reaches
-`.transfer(… .delegate(.failed))` and cancels a legitimate request (row 29).
+**Rank it low, but price all THREE routes — an earlier draft priced only two and would have led a
+reader to "this needs a rare event", which is false.**
+
+1. *Accidental*, between two of our own concurrent receivers: probability per fanned part is set by
+   `Resource.mapHashLength` against the other transfer's hashmap height. Expensive.
+2. *Sprayed*, by an off-link party with no key: same probability, and it must spray. Expensive.
+3. *Constructed, by a peer holding the session key: FREE and deterministic.* `.accept` copies
+   `adv.randomHash` into `state.randomHash` and `adv.hashmap` into `state.knownHashmap` **verbatim**,
+   with no validation (that is F18's field set). A peer therefore does not have to FIND a collision —
+   it DECLARES one: it advertises transfer B with a hashmap whose entries are the map hashes of the
+   chunks it is about to send for transfer A. Probed: a peer-chosen `m` survives `unpack` byte-for-byte.
+
+**Route 3 does not raise the severity, and the reason is worth stating rather than assuming.** The
+peer that constructs it is the peer that advertised BOTH transfers, so what it destroys is a delivery
+it controls anyway — it could simply not send the data. It cannot reach another peer's transfers:
+`transfers` is per-`LinkSession`. LOW stands.
+
+**A framing to avoid, because it is the intuitive one and it is wrong.** "A merely buggy peer that
+reuses `r` gets this for free" is FALSE, and reusing `r` alone never produces a collision. Map hashes
+are taken over CIPHERTEXT chunks, and `Resource.buildStream` → `Token.encrypt` draws a fresh random
+IV per call (`SecureRandom.bytes(16)`), so two sends of byte-identical data under the same
+`randomHash` and the same prefix still yield completely different chunks and completely different map
+hashes. Probed all three ways: same `r` + different data → zero collisions; same `r` + same data +
+same prefix → maps still differ; same `r` + same data + different prefix → maps still differ. The
+deterministic route is control of `m`, not repetition of `r`.
+
+Two smaller blast-radius facts belong with it: a collision also drops `partTimeoutFactor` to
+`Const.partTimeoutFactorAfterRTT` for the rest of that transfer's life, and if the poisoned transfer
+is a response-Resource, its failure reaches `.transfer(… .delegate(.failed))` and cancels a
+legitimate request (row 29).
 
 **Reference has the same defect and knows it**, which is the strongest single fact about this item
 and was read out of `RNS/Link.py` rather than assumed. Its `RESOURCE` branch is
@@ -202,19 +275,27 @@ no hash filter at all — and it is preceded by a standing upstream TODO:
 > `# TODO: find the most efficient way to allow multiple transfers at the same time, sending`
 > `# resource hash on each packet is a huge overhead. Probably some kind of hash -> sequence map`
 
-The same file's other five resource contexts all filter. `RESOURCE_REQ`, `RESOURCE_HMU`,
-`RESOURCE_ICL`, `RESOURCE_RCL` each decrypt and then match `resource.hash` against the appropriate
-list, and `RESOURCE_PRF` matches `packet.data[0:HASHLENGTH//8]` against `outgoing_resources` —
-which is exactly what `d0570ef` implemented. **So `.resource` is the one context where reference
-itself has no discriminator to copy.** A fix is therefore a deliberate divergence and needs
-choosing, not just porting: scope a segment to the transfer whose `outstanding` contains its index,
-or carry the resource hash on segments (which is the overhead the upstream TODO is about).
+`RNS.Packet` defines SEVEN resource contexts, so there are six others, and five of them filter:
+`RESOURCE_REQ`, `RESOURCE_HMU`, `RESOURCE_ICL` and `RESOURCE_RCL` each decrypt and then match
+`resource.hash` against the appropriate list, and `RESOURCE_PRF` matches
+`packet.data[0:HASHLENGTH//8]` against `outgoing_resources` — which is exactly what `d0570ef`
+implemented. The sixth, `RESOURCE_ADV`, does not filter because it has nothing to filter against: it
+CREATES the resource. (An earlier draft said "the other five all filter", which is a universal over
+an enumerated set that is off by one — the same sentence class as the drafting error disclosed in §6.
+Substantively harmless, listed because the class is the point.)
 
-Checked in BOTH RNS checkouts, deliberately, because this repo has two and they are not the same
-version: the local `Reticulum` tree is a 1.4.1 BLE fork, and the conda `rns` env is stock 1.4.2.
-The unfiltered `incoming_resources` loop and the TODO above it are present, identical, in both. No
-line numbers are cited here for exactly that reason — the fork's extra import shifts every later
-line, so a line cite would have had to name a version to mean anything.
+**So `.resource` is the one context that routes to an existing resource and has no discriminator to
+copy.** A fix is therefore a deliberate divergence and needs choosing, not just porting: scope a
+segment to the transfer whose `outstanding` contains its index, or carry the resource hash on
+segments (which is the overhead the upstream TODO is about).
+
+Checked in BOTH RNS checkouts, because this repo has two and they are not the same version: the
+local `Reticulum` tree is a 1.4.1 BLE fork, the conda `rns` env is stock 1.4.2. **`diff` between the
+two `Link.py` files is EMPTY** — they are byte-identical, so every claim above holds for stock RNS
+and not merely for the fork. Symbols rather than line numbers are cited here by this repo's standing
+convention. (An earlier draft justified that with "the fork's extra import shifts every later line",
+which is false for THIS file — the empty diff is the proof — and the shift it was remembering is in
+`Reticulum.py`. The convention is right; that reason was not.)
 
 **One general divergence, recorded here because this is where the reference comparison lives:**
 reference iterates and acts on EVERY hash match; ReTiCA's proof routing uses `first(where:)` and
@@ -275,6 +356,32 @@ sweep's post-mortem instructed. Two needed more than the evidence they arrived w
   fan-out contexts "re-check `state.resourceHash` after decrypting". That is false for `.resource`,
   which is F17. It was caught before commit, and it is a clean instance of the shape §6 of the
   handoff names: a reassuring generalisation over a set, wrong on one member.
+
+**And the first committed draft of this document still shipped two more of exactly that shape,
+found on review.** Both are `safe` rows whose VERDICT survives but whose stated REASON was wrong —
+which is the precise failure the "verify the reassuring sentences first" rule exists to prevent,
+because a `safe` row is what nobody re-derives. They are corrected in place above, and both are
+worth reading as a pair:
+
+- **Row 29** named a gate (`.resourceAdvertisement`'s `pendingRequests` check) that sits inside
+  `if adv.isResponse` and therefore does not cover the case, instead of the gate that actually holds
+  (the `.failed` handler's own membership test). *Reading the guard is not enough — read what
+  BRANCH the guard is nested in.* That single nesting level is the whole defect.
+- **Row 34** carried a universal ("nothing inbound makes any of them fire early") that is falsified
+  by a two-step chain, neither step of which is surprising alone: the GC predicate looks the
+  interface mode up at GC time, and a mode-blind `shouldReplace` can move an entry's `interfaceID`.
+  *A universal over a GC is a claim about every write to every field it reads*, and this one reads a
+  field owned by a different branch in a different file section.
+
+The two share a shape with the six defects the previous sweep's post-mortem catalogued: **every node
+in the chain was individually true, and the error was in an arrow** — nesting in one case, a
+cross-branch write in the other. Verifying "does this guard exist?" catches neither.
+
+**One correction that came back the other way, and it is the reason for the verify-before-fixing
+rule.** The review also reported that a "merely buggy peer that reuses `r`" gets F17's collision for
+free. Probing it first showed that is FALSE — map hashes are over freshly-IV'd ciphertext, so
+repetition of `r` yields nothing — while confirming the underlying point that the collision IS free
+via peer control of `m`. Fixing as reported would have replaced one wrong price with another.
 
 **Probes over reasoning, again.** P5 is the whole of F17 and reasoning did not produce it —
 "`.resource` is gated by a map hash" reads like a gate until you watch a chunk from one transfer

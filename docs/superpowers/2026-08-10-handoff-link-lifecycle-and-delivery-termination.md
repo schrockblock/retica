@@ -1008,12 +1008,36 @@ The ADVERSARIAL version of this was already priced by the previous sweep, which
 deliberately recorded it without an F-number. The self-collision case is the half
 it did not see, and it is F15's non-adversarial half one context over.
 
-**Price it honestly before ranking it.** Collision probability per fanned part is
-set by `Resource.mapHashLength` against the other transfer's hashmap height, so
-both the accidental and the sprayed variants are expensive. Two blast-radius facts
-belong with it: a collision also drops `partTimeoutFactor` to
-`Const.partTimeoutFactorAfterRTT` for the rest of that transfer's life, and if the
-poisoned transfer is a response-Resource its failure reaches
+**Price it honestly before ranking it — there are THREE routes, not two.**
+
+1. *Accidental*, between two of our own concurrent receivers: probability per
+   fanned part is set by `Resource.mapHashLength` against the other transfer's
+   hashmap height. Expensive.
+2. *Sprayed*, by an off-link party holding no key: same probability. Expensive.
+3. *Constructed by a peer holding the session key: FREE and deterministic.*
+   `.accept` copies `adv.randomHash` and `adv.hashmap` into `state.randomHash` and
+   `state.knownHashmap` VERBATIM, with no validation (F18's field set). The peer
+   does not have to FIND a collision — it DECLARES one, advertising transfer B
+   with a hashmap containing the map hashes of the chunks it is about to send for
+   transfer A.
+
+Route 3 does not raise the severity, and the reason is worth stating rather than
+assuming: the peer that constructs it advertised BOTH transfers, so it destroys a
+delivery it controls anyway and could equally well just not send, and `transfers`
+is per-`LinkSession` so it cannot reach another peer's. LOW stands.
+
+**Do not restate this as "a buggy peer that reuses `r` gets it for free" — that is
+FALSE, and it is the intuitive summary.** Map hashes are taken over CIPHERTEXT
+chunks, and `Resource.buildStream` → `Token.encrypt` draws a fresh random IV per
+call, so two sends of byte-identical data under the same `randomHash` and the same
+prefix still yield entirely different chunks and entirely different map hashes.
+Probed three ways (same `r` + different data; same `r` + same data + same prefix;
+same `r` + same data + different prefix) — zero collisions in all three. The
+deterministic route is control of `m`, not repetition of `r`.
+
+Two blast-radius facts belong with it: a collision also drops `partTimeoutFactor`
+to `Const.partTimeoutFactorAfterRTT` for the rest of that transfer's life, and if
+the poisoned transfer is a response-Resource its failure reaches
 `.transfer(… .delegate(.failed))` and cancels a legitimate request with it.
 
 **Reference has the same defect and knows it.** Read out of `RNS/Link.py`, not
@@ -1021,14 +1045,21 @@ assumed: its `RESOURCE` branch is
 `for resource in self.incoming_resources: resource.receive_part(packet)` — no hash
 filter at all — carrying a standing upstream TODO, *"find the most efficient way
 to allow multiple transfers at the same time, sending resource hash on each packet
-is a huge overhead."* Every OTHER resource context in that same file filters:
-`RESOURCE_REQ`, `RESOURCE_HMU`, `RESOURCE_ICL` and `RESOURCE_RCL` decrypt and then
-match `resource.hash`, and `RESOURCE_PRF` matches against `outgoing_resources`.
-So `.resource` is the one context with no reference discriminator to copy, and a
-fix has to be CHOSEN rather than ported: scope a segment to the transfer whose
-`outstanding` contains its index, or carry the resource hash on segments — which
-is the overhead the upstream TODO is about. That is why this is ranked below
-F3/F4/F5 despite being a real correctness defect.
+is a huge overhead."* `RNS.Packet` defines seven resource contexts; of the six
+others, five filter (`RESOURCE_REQ`, `RESOURCE_HMU`, `RESOURCE_ICL`,
+`RESOURCE_RCL` decrypt and match `resource.hash`; `RESOURCE_PRF` matches against
+`outgoing_resources`) and the sixth, `RESOURCE_ADV`, has nothing to filter against
+because it CREATES the resource. So `.resource` is the one context that routes to
+an existing resource with no reference discriminator to copy, and a fix has to be
+CHOSEN rather than ported: scope a segment to the transfer whose `outstanding`
+contains its index, or carry the resource hash on segments — which is the overhead
+the upstream TODO is about. That is why this is ranked below F3/F4/F5 despite
+being a real correctness defect.
+
+**Verified against BOTH RNS checkouts**, since this repo has two at different
+versions: `diff` between the local 1.4.1-fork `Link.py` and the stock 1.4.2 one in
+the conda `rns` env is EMPTY. The claims above are stock behaviour, not fork
+behaviour.
 
 ### F18 — `ResourceAdvertisement.unpack` validates the length of none of `h`, `r`, `o`, `m`
 
@@ -1063,11 +1094,24 @@ probe before being recorded here:
    literally over a decoy-first array.
 
 A length check on `h` at unpack time would remove the class outright. **This
-belongs to whoever owns advertisement validation**, not to the proof-routing code
-— and the same unvalidated-field class already has a second consumer: `o`
-(`originalHash`) keys `incomingSegments`, so two advertisements can share one
-accumulator. That one needs the session key too, so a peer can only disrupt its
-own delivery.
+belongs to whoever owns advertisement validation**, not to the proof-routing code.
+
+**Three more consumers of the same unvalidated-field class**, all needing the
+session key and so all bounded to what that peer could refuse to do anyway — but
+worth naming, because "unvalidated advertisement field" is the shared cause and
+`h` is only its most visible instance:
+
+- `o` (`originalHash`) keys `incomingSegments`, so two advertisements from one
+  peer can share an accumulator.
+- `m` (`hashmap`) is copied verbatim into `state.knownHashmap`, which is what makes
+  F17's collision constructible for free rather than found — see F17, route 3.
+- `q` (`requestID`) is copied into the transfer's advertisement and later read by
+  `.transfer(… .delegate(.failed))`. **The flag gate does not cover it:** the
+  `pendingRequests` check in `.resourceAdvertisement` sits inside `if
+  adv.isResponse`, so an advertisement with NEITHER flag can carry a live
+  requestID past it. Probed. What actually holds is the `.failed` handler's own
+  `state.pendingRequests.contains(rid)` plus `pendingRequests` being
+  per-`LinkSession` — so a peer can cancel only requests we sent to THAT peer.
 
 ---
 
