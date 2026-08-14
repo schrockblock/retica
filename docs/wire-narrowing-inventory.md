@@ -24,14 +24,30 @@ The durable key is *file + expression text*, which is what the allowlist matches
 > track of it — which is the design working as intended. The surrounding logic is unchanged: the
 > contiguity check still evaluates *after* the conversion, so it still does not protect it.
 
+> **Updated 2026-08-14 by the LXMF-interop-data-loss slice (MsgPack signed/float32/map32 decode).**
+> 117 → **119** conversions; no new groups, six count changes, and one recorded reason falsified.
+>
+> The falsified one is the interesting one. `UInt16(n)` in the map encoders was blessed as
+> host-only on the grounds that *"the DECODER has no map32 (`0xDF`) branch either, so a decoded
+> map is capped at 65535 pairs."* That reason was load-bearing on a fact in a **different
+> function**, and the slice's job was to add exactly that decode branch. Adding it alone would
+> have converted a recorded host-only trap into a remote abort, reachable because
+> `LXMessage.validateSignature` re-encodes every inbound message's fields. The encode branch
+> landed in the same commit; `encodeMap`/`encodeIntMap` now share one `mapHeader` so the two
+> cannot diverge again.
+>
+> **The generalisable lesson:** an allowlist reason that cites the *absence* of a capability
+> elsewhere is a reason with an expiry date. Grep the allowlist for the function you are about to
+> add a capability to, not just the lines you are about to edit.
+
 ---
 
 ## Status
 
 | | |
 |---|---|
-| Conversions found in `Sources/` | **117** across **80** distinct file+expression groups, in 56 files |
-| Reviewed safe | 109 findings / 72 groups |
+| Conversions found in `Sources/` | **119** across **80** distinct file+expression groups, in 56 files |
+| Reviewed safe | 111 findings / 72 groups |
 | **Known-open (confirmed traps)** | **8 findings / 8 groups** — Tasks 6, 7, 8 |
 | Defects in this plan that are *not* conversions | 3 — Tasks 3, 4, 5 (see [Not detectable by this check](#not-detectable-by-this-check)) |
 
@@ -129,7 +145,7 @@ depth-limit change was scanned and adds none.
 Grouped by *why* they cannot trap. Full reasons live in
 `Scripts/wire-narrowing-allowlist.txt`, one line per group.
 
-### Widening (destination is wider than the source type) — 32 findings
+### Widening (destination is wider than the source type) — 34 findings
 `PKCS7.swift:17,20`; `MsgPack.swift:105,109,20,162,100,101,96`;
 `ResourceAdvertisement.swift:39`; `BLESupport.swift:40,41`; `FCBDriverAdapter.swift:245,246`;
 `Bzip2.swift:11,24,50`; `RingSet.swift:77,78`; `Transport.swift:347,416,499,567,612,629,981,1093`.
@@ -138,7 +154,7 @@ Grouped by *why* they cannot trap. Full reasons live in
 identity/widening **because `Int` is 64-bit**, which the iOS 17 / macOS 13 / macCatalyst 17
 floor guarantees.
 
-### Masked or range-bounded inside the argument — 20 findings
+### Masked or range-bounded inside the argument — 21 findings
 `HKDF.swift:22`; `PKCS7.swift:13`; `Announce.swift:88` (both); `LXStamper.swift:16`;
 `Data+Hex.swift:14`; `MsgPack.swift:108,112,114` and `:106,110,113,115` and `:107,111,116`;
 `BLEDriver.swift:126`; `RandomBytesDependency.swift:21`; `FCBDriverAdapter.swift:19` (both).
@@ -183,7 +199,7 @@ of the conversion's own expression. The gate keys on expression text, so **delet
 guard does not change the expression and will not be flagged.** If you edit any of the guard
 sites named above, re-verify by hand.
 
-### Cannot trap on wire input, but can on a hostile host or dependency — 27 findings
+### Cannot trap on wire input, but can on a hostile host or dependency — 26 findings
 
 Recorded, not fixed: none is remotely triggerable, so none belongs to this plan.
 
@@ -194,12 +210,13 @@ Recorded, not fixed: none is remotely triggerable, so none belongs to this plan.
   traps on NaN.
 - **`Transport.swift:542,878`** — `UInt64(Double)` on `date`; traps on NaN *and* on any pre-1970
   date, because the destination is unsigned.
-- **`MsgPack.swift:64,70`** — the encoder **map32 gap** the plan lists as out of scope: the
-  `n <= 15 ? … : UInt16(n)` ternary has no upper bound, so a host-built map with >65535 pairs
-  traps. Not wire-reachable — the decoder has no map32 (`0xDF`) branch either, so a decoded map
-  is capped at 65535 pairs.
-- **`MsgPack.swift:50,59,79`** — `UInt32(n)` in the final `else` of the bin/str/array encoders,
-  unbounded above. Host-side; needs a >4 GiB in-memory value.
+- ~~**`MsgPack.swift:64,70`** — the encoder **map32 gap**~~ **CLOSED.** `encodeMap` and
+  `encodeIntMap` now share `mapHeader`, which has a `0xDF` branch, so `UInt16(n)` is bounded by
+  `n <= 0xFFFF` on every path. Closed together with the map32 *decode* branch, because the old
+  reason ("not wire-reachable — the decoder has no map32 branch either") would have stopped being
+  true the moment the decoder gained one.
+- **`MsgPack.swift`** — `UInt32(n)` in the final `else` of the bin/str/array encoders **and** in
+  `mapHeader`'s map32 branch, unbounded above. Host-side; needs a >4 GiB in-memory value.
 - **`Bzip2.swift:10,20`** — egress; our own outbound payload.
 - **`Bzip2.swift:46`** — `UInt32(data.count)` on the *received* compressed payload, so genuinely
   wire-derived, but reaching `UInt32.max` means an attacker actually transferred 4 GiB, which
