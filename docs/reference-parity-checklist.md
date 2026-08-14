@@ -81,7 +81,7 @@ cannot see**. That is what tier 1 is about.
 
 - [x] **Task 6 — `LXMFServiceNode.swift` `Int(raw)` (in `requestReceived`)** — `[[], [], float64(NaN)]` on a `/get`
       aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client.
-      **Fixed** — `[SHA pending]`: NaN/negative/infinite float → 0 (serve nothing); negative int → 0
+      **Fixed** — `59f900e`: NaN/negative/infinite float → 0 (serve nothing); negative int → 0
       (not nil/unlimited). Also closes the `.int` fall-through divergence opened by `177da8c`.
 - [ ] **Task 7 — `PNAnnounce.swift:56-59`, six `Int(UInt64)`** — a 21-byte app-data blob aborts.
       `PNAnnounce.isValid`, the *validity predicate*, crashes on the input it exists to reject.
