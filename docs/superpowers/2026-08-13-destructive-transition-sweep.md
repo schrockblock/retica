@@ -133,10 +133,13 @@ The verdict survives, on a different mechanism. **The actual gate is this handle
 `state.pendingRequests.contains(rid)`**, and the actual bound is that `pendingRequests` is
 per-`LinkSession` state whose only INSERT sites are `.sendRequest`'s two branches — so a peer holding
 the session key can cancel only requests WE SENT TO THAT PEER, which it could equally well just
-refuse to answer. (Say "inserted", not "written": `pendingRequests` has six other write sites in the
-file — `cancelPending`'s `removeAll`, the `.response` branch, `.requestDeadline`,
-`.transfer(… .delegate(.received))`'s response branch, and this handler — all of them REMOVALS. Only
-the two inserts decide what can ever be cancelled.)
+refuse to answer. (Say "inserted", not "written". `pendingRequests` has NINE write sites in the file:
+the two `.sendRequest` inserts; five removals — `cancelPending`'s `removeAll`, the `.response`
+branch, `.requestDeadline`, `.transfer(… .delegate(.received))`'s response branch, and this handler;
+and two initialiser assignments, which are writes but not removals. Only the two inserts decide what
+can ever be cancelled. An earlier draft said "six other write sites, all removals" and then listed
+five — off by one against its own enumeration AND mischaracterising the initialisers, which is the
+same class this document flags twice elsewhere.)
 
 Control: with the id absent from `pendingRequests`, no request is cancelled and no `requestFailed`
 is emitted. **Not "nothing is emitted" — an earlier version of this paragraph said that and it is
@@ -178,25 +181,41 @@ not have to re-derive that:
 | 35 | `case .announce:` replay-suppression branch → `announceTable[dest] = nil` + `.cancel(announceRetransmit)` | **partial** — `Announce.parse` validates the destination's Ed25519 signature and re-derives `destinationHash` from `nameHash ‖ identity.hash`, but REPLAYING a genuine announce needs no key | **yes** — keyed by `destinationHash`, and additionally requires `transportId != nil` and a `rebroadcastHops` match | **deliberate.** This is RNS's collaborative suppression (Transport.py:1774-1791) and what it destroys is our own pending re-broadcast, not anyone else's state. Bounded: the cancelling paths both require `entry.rebroadcasts >= 1`, so nothing can be suppressed before the retransmit timer has fired at least once. (Precisely that, NOT "before we have broadcast at least once" — `entry.rebroadcasts += 1` sits outside the `eligible` loop in `.announceRetransmitDue` and increments even when no interface was eligible and nothing was sent.) |
 | 36 | `case .announce:` ingress hold → `held[destinationHash] = …` replaces an existing held announce | same as 35 | keyed by `destinationHash` | **safe.** Reference `hold_announce` (Interface.py:223-229); bounded by `maxHeldAnnounces`. |
 | 37 | `.interfaceDisconnected`, `.announceQueueDrainDue` interface-vanished branch, `.announceRetransmitDue` lifecycle-complete branch | local / clock | keyed | **safe.** |
-| 37b | `setTransportIdentity(nil)` → `announceTable = [:]`, `linkTable = [:]`, `discoveryPathRequests = [:]` | n/a | **none — three WHOLESALE wipes**, including every transited link's routing state | **safe because it is UNREACHABLE from production, which is stronger than "the trigger is local" and also a latent trap.** See the note below the table. |
+| 37b | `setTransportIdentity(nil)` → `announceTable = [:]`, `linkTable = [:]`, `discoveryPathRequests = [:]` | n/a | **none — three WHOLESALE wipes**, including every transited link's routing state | **safe: no emitter inside this package's `Sources`, the behaviour is deliberate, and three tests pin it.** Took three drafts to state — see the note below the table, which separates the reachability claim from the rationale claim. |
 | 38 | `seenPacketHashes` ring eviction under load | no | n/a | **outside the verb set, recorded anyway.** An unauthenticated flood evicts dedup memory, which re-enables replay of an evicted packet. Pinned by `seenPacketRingEvictsOldestAndReDeliversIt`; the ring is deliberately sized for this (`seenPacketRingSize`). Not a destructive transition, but it is the one place in `Transport` where unauthenticated volume erases state that a security property rests on. |
 
-**Note on row 37b, where two successive drafts both understated the verdict.** The first called the
-three wipes "keyed", which they are not — they are the least discriminating destructive action in the
-file. The second said the `safe` verdict "rests entirely on the TRIGGER being local", and added that
-"dropping relay state on leaving relay mode is the point". Also wrong, and in the more interesting
-direction: **leaving relay mode is a transition no production code can perform.**
-`Transport.Action.setTransportIdentity` takes an `Identity?`, but every emitter reaches it through an
-`enableRelay(Identity)` case — `TCPEndpoint`, `BLEEndpoint` and `TransportEndpoint` all declare the
-payload NON-optional — so those sends can only ever produce `.some`. There is no `disableRelay`
-action and no literal `setTransportIdentity(nil)` anywhere in `Sources`.
+**Note on row 37b, which took THREE drafts to state correctly. Two claims are in play and the first
+two drafts kept conflating them — reachability and rationale.**
 
-So the accurate verdict is: **the `nil` branch has no production emitter at all.** It is reachable
-only from a test or a future caller. That is safer than "local trigger" today and worse tomorrow —
-whoever adds the `disableRelay` this API obviously implies will silently enable three unguarded
-wholesale wipes, including every transited link's routing state, and nothing in the suite is watching
-that seam. Recorded here rather than numbered because an unreachable branch performs none of the five
-verbs; it belongs with whoever implements relay teardown.
+*Draft 1* called the three wipes "keyed". They are not; they are the least discriminating destructive
+action in the file. That correction stands.
+
+*Draft 2* said the `safe` verdict "rests entirely on the TRIGGER being local", and added that
+"dropping relay state on leaving relay mode is the point".
+
+*Draft 3 (this one) corrects the reachability half and RESTORES the rationale half.*
+
+- **Reachability — draft 2 was wrong.** `Transport.Action.setTransportIdentity` takes an `Identity?`,
+  but every in-package emitter reaches it through an `enableRelay(Identity)` case (`TCPEndpoint`,
+  `BLEEndpoint` and `TransportEndpoint` all declare the payload NON-optional), so those sends can only
+  produce `.some`. There is no `disableRelay` and no literal `setTransportIdentity(nil)` anywhere in
+  `Sources`. Narrowest supportable statement: **no emitter inside this package's `Sources`.** NOT
+  "unreachable from production" — `Transport.Action` and the case are both `public`, so a package
+  consumer can emit `nil` directly. The one in-tree consumer, `ReTiCaMsgr`, does not (grepped). Same
+  caveat this document already applies to `destinationIdentity`, and an earlier draft of this note
+  failed to apply it here.
+- **Rationale — draft 2 was wrong to call this wrong.** "Dropping relay state on leaving relay mode
+  is the point" is not a reachability claim; it is the repo's own recorded intent, and
+  `relayStopClearsLinkTable`'s doc comment states it almost verbatim ("relay reverse-routing is
+  meaningless without relay mode"). It stands.
+- **And the seam is NOT unwatched, which draft 2 also got wrong.** Three tests drive
+  `.setTransportIdentity(nil)` and assert each wipe by name:
+  `relayStopCancelsPendingRebroadcastAndClearsAnnounceTable` (`announceTable.isEmpty`),
+  `relayStopClearsLinkTable` (`linkTable.isEmpty`) and `deRelayingClearsInFlightRecursiveSearches`
+  (`discoveryPathRequests.isEmpty`). The wipes are pinned as INTENDED behaviour, not left unguarded.
+
+Net verdict: **safe.** No in-package emitter, the behaviour is deliberate, and it is covered by three
+tests. Not numbered, because it performs none of the five verbs against anything an attacker reaches.
 
 **Ruling on row 34: the mode re-class is INTENDED, and the universal an earlier draft carried
 ("nothing inbound makes any of them fire early") is FALSE.** Both halves matter, so both are stated.
@@ -395,17 +414,20 @@ advertisement validation, not to the proof-routing code.** The `h` story above i
 visible instance: FOUR consumers already depend on a downstream check instead, and each one of them
 was found by following a different thread in this slice rather than by looking at `unpack`.
 
-| field | consumer | what holds today instead |
-|---|---|---|
-| `h` | a receiver's `resourceHash` | the `payload.count >= 32` guard plus the `role == .sender` gate (§5 above) |
-| `o` | keys `incomingSegments` | nothing — two advertisements from one peer can share an accumulator (row 29) |
-| `m` | copied verbatim into `knownHashmap` | nothing — this is what makes F17's route 3 free rather than found |
-| `q` | copied onto the transfer, read by `.transfer(… .delegate(.failed))` | that handler's own `pendingRequests.contains(rid)`, NOT the flag gate (row 29's correction) |
+| field | consumer | what holds today instead | would a LENGTH check at `unpack` close it? |
+|---|---|---|---|
+| `h` | a receiver's `resourceHash` | the `payload.count >= 32` guard plus the `role == .sender` gate (§5 above) | **YES** — `h.count == 32` kills the empty-hash decoy outright |
+| `o` | keys `incomingSegments` | nothing — two advertisements from one peer can share an accumulator (row 29) | **no** — the weakness is two advertisements declaring the SAME valid `o`. Needs a consumer-side uniqueness check, not a length gate, and `unpack` sees one advertisement at a time |
+| `m` | copied verbatim into `knownHashmap` | nothing at `unpack`; F17's routing is the only thing between it and another transfer | **no, and NO validation of any kind would** — `m` IS the peer's own resource's map hashes by protocol design, so a hostile hashmap is indistinguishable from a legitimate one. This is F17's to fix, not F18's |
+| `q` | copied onto the transfer, read by `.transfer(… .delegate(.failed))` | that handler's own `pendingRequests.contains(rid)`, NOT the flag gate (row 29's correction) | **no** — a borrowed id is a legitimate full-length `truncatedHash`. The gap is PROVENANCE (`q` honoured with neither flag set), fixable by a cross-field rule at `unpack` or a flag check in `LinkSession` |
 
-All four require the session key and are bounded to that peer's own link, so the trust boundary is
-unchanged by the widening — which is why F18 stays below F3/F4/F5. What the widening DOES change is
-the cost/benefit: the fix is the same one length check it always was, and it now closes four
-consumers rather than one.
+**The narrowest supportable statement, and it is narrower than two earlier drafts claimed:** four
+consumers rely on a downstream check instead of validation at `unpack`; **one length check closes
+exactly ONE of them (`h`), and the other three need value, uniqueness or provenance checks — not
+length.** All four require the session key and are bounded to that peer's own link, so the widening
+does not move the trust boundary.
+
+**This retracts the round-2 ranking flip. See §7.**
 
 ---
 
@@ -497,6 +519,14 @@ correctly-encrypted-wrong-value payload, so "both gates are load-bearing" rests 
 than on one plus an inference. P3 does it too, running both `.proof` and `.data` packet types
 against the receiver so "there is no receiver-side handler" is not a claim about one case label.
 
+**Round 3's defects were, again, sentences wider than their evidence — and one of them was a RANKING
+rationale.** NEW-A found "one length check now closes four consumers", which closes one; NEW-B found
+an over-correction that called a pinned, intended behaviour "unwatched" and "unguarded". The second
+is the sharper lesson: **over-correction is a failure mode in its own right.** Round 2's row-37b
+rewrite was so focused on the reachability error that it swept up a rationale that was correct and a
+test-coverage claim that was checkable in one grep. When a draft is wrong, the fix is to narrow the
+wrong clause, not to invert the whole paragraph.
+
 **One prose defect from this slice could not be fixed in place.** Commit `d0570ef`'s message says
 "The other six resource contexts keep fanning out." It is five. The code was always right; only the
 message is wrong, and a pushed commit message cannot be corrected. The count is now stated
@@ -504,3 +534,41 @@ explicitly in the routing comment in `LinkSession`, together with a note that th
 because that comment is where a reader arrives. Note that the corresponding claim in
 `docs/superpowers/plans/2026-08-13-destructive-transitions-need-authentication.md` also says six —
 plans are left as written per the handoff's §6 convention.
+
+---
+
+## 7. A ranking change that was made, then retracted
+
+**F17 is ranked above F18. A round-2 review instruction flipped that order; round 3 showed the flip
+rested on two false premises, and it is retracted. Recorded rather than silently reverted, because
+the false premises are more instructive than the ordering.**
+
+The flip was justified by: *"F18 is the upstream cause of F17's route 3 (free only because `m` is
+unvalidated) and of row 29's real weakness."* Both halves fail.
+
+- **F18 does not cause F17's route 3.** `m` carries the peer's own resource's map hashes — that is
+  what a resource advertisement is FOR, and the receiver has no independent source for them. A
+  hostile hashmap is therefore indistinguishable from a legitimate one, so **no validation at
+  `unpack` — of length, range, shape or anything else — can close route 3.** The fix is F17's own
+  routing. `m` is not really an F18 consumer at all; listing it as one was the mis-attribution that
+  made the causal claim look sound.
+- **F18 does not cause row 29's weakness either.** The `q` gap is PROVENANCE — a live requestID
+  honoured on an advertisement with neither flag set. A length check is irrelevant to it (a borrowed
+  id is a legitimate full-length `truncatedHash`), and row 29's verdict is `safe` regardless, because
+  the `.failed` handler's own membership test bounds it to requests we sent that same peer.
+
+The sentence that carried the flip into both documents — *"one length check now closes four
+consumers"* — is simply false: **it closes one.** Third consecutive round in which the failure was a
+sentence wider than its evidence, this time inside a ranking rationale rather than a `safe` row.
+
+**Ruling.** F18 stays what its title says: a length item. Its fix closes `h`. The other three fields
+flow into consumers needing uniqueness (`o`), routing (`m`) or provenance (`q`) checks that are not
+F18's, and mostly not `unpack`'s at all. F17 — an actual behaviour defect, where two transfers
+destroy each other — outranks a defence-in-depth item whose current impact is nil. **Original order
+restored.**
+
+**The reviewer who requested the flip also supplied the finding that retracted it, and explicitly
+invited that outcome.** The process point worth keeping: a review instruction is evidence about where
+to look, not a verdict to implement. Two of three rounds contained a relayed claim that did not
+survive checking — `r`-reuse in round 1, this flip in round 3 — and in both cases implementing as
+instructed would have replaced one false claim with another.

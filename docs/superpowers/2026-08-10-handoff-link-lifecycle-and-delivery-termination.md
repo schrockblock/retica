@@ -195,23 +195,28 @@ Current priority:
    deliberate, pinned by tests, listed so a future fix confronts them rather than
    deleting them).
 5. **F8**, then F3/F4/F5.
-6. **F18**, then **F17** — both low, both from the destructive-transition sweep.
-   **F18 comes first because it CAUSES part of F17**: F17's route 3 is free only
-   because `m` is unvalidated, and F18 is also the real weakness behind the
-   `.transfer(… .delegate(.failed))` request-cancellation path. An item that
-   causes others should not sit below the leaf it causes. F18 is one length check
-   at `unpack`, and the widening from one consumer to four (`h`, `o`, `m`, `q`)
-   argues FOR doing it, not against — the cost is unchanged while the payoff
-   quadrupled. F17 then has no reference-aligned fix at all (RNS routes resource
-   segments the same way, with a standing TODO), so taking it means choosing a
-   deliberate divergence.
+6. **F17**, then **F18** — both low, both from the destructive-transition sweep.
+   F17 is an actual behaviour defect (two of our own transfers destroy each
+   other) with no reference-aligned fix — RNS routes resource segments the same
+   way, carrying a standing TODO — so taking it means choosing a deliberate
+   divergence. F18 is defence-in-depth whose impact today is nil.
 
-   Both stay below F3/F4/F5 because the widening does NOT widen the trust
-   boundary: all four F18 consumers require the session key and are bounded to
-   that peer's own link. **Do not restate the old rationale that stood here —
-   "F17's price to an attacker is set by `Resource.mapHashLength`" — which
-   `8aa02ee` falsified.** That price applies to the accidental and sprayed
-   routes; for a session-key-holding peer, route 3 is free.
+   **Two rationales that stood here are RETRACTED. Do not restore either.**
+   (a) *"F17's price to an attacker is set by `Resource.mapHashLength`"* — false
+   since `8aa02ee`: that price covers the accidental and sprayed routes, but for
+   a session-key-holding peer route 3 is free.
+   (b) *"F18 causes F17's route 3 and row 29's weakness, so rank it first"* — a
+   flip made on a review instruction and then retracted, because **no validation
+   at `unpack` can close route 3 at all** (`m` IS the peer's own resource's map
+   hashes by protocol design, so a hostile hashmap is indistinguishable from a
+   legitimate one) and row 29's `q` gap is PROVENANCE, not length. The
+   load-bearing sentence — "one length check now closes four consumers" — closes
+   exactly ONE (`h`). Full reasoning in §7 of
+   `docs/superpowers/2026-08-13-destructive-transition-sweep.md`.
+
+   Both stay below F3/F4/F5: all four F18 consumers require the session key and
+   are bounded to that peer's own link, so widening from one consumer to four
+   does not move the trust boundary.
 
 **F12, F14 and F15 were ranked here and are now CLOSED** (`bd5dd7f`, `381d731`,
 `d0570ef` + `0101a74`).
@@ -1081,9 +1086,13 @@ any gate (a magnitude gate against `Resource.maxAdvertisedTransferSize`). Probed
 an advertisement with all four `bin(_:)` fields EMPTY round-trips intact, and so
 does one with over-long `h` / `r` / `o`.
 
-**Ranked ABOVE F17** (see §3), because it is the upstream cause of F17's route 3
-and of the `q` weakness below. The fix is one length check; the widening from one
-consumer to four argues for doing it.
+**Ranked BELOW F17** (see §3). A round-2 review flipped that and round 3 retracted
+the flip: F18 is NOT the upstream cause of F17's route 3, because no `unpack`
+validation of any kind can close it — `m` carries the peer's own resource's map
+hashes by protocol design, so a hostile hashmap is indistinguishable from a
+legitimate one. **A length check closes exactly ONE of the four consumers below
+(`h`);** the others need uniqueness (`o`), routing (`m`, which is F17's fix) or
+provenance (`q`) checks. §7 of the sweep has the full retraction.
 
 **Impact today is nil, and the framing matters more than the finding.** An empty
 `h` becomes a receiver transfer's `resourceHash`, and an empty `owner` prefix
@@ -1109,27 +1118,36 @@ probe before being recorded here:
    mechanism is irrelevant to it. Probed by running both mutated predicates
    literally over a decoy-first array.
 
-A length check on `h` at unpack time would remove the class outright. **This
-belongs to whoever owns advertisement validation**, not to the proof-routing code.
+A length check on `h` at unpack time would remove **the `h` class** outright, and
+**that belongs to whoever owns advertisement validation**, not to the
+proof-routing code.
 
-**Three more consumers of the same unvalidated-field class**, all needing the
-session key and so all bounded to what that peer could refuse to do anyway — but
-worth naming, because "unvalidated advertisement field" is the shared cause and
-`h` is only its most visible instance:
+**Three more consumers of unvalidated advertisement fields**, all needing the
+session key and so all bounded to what that peer could refuse to do anyway. Name
+them here because they share a SITE (`unpack` validates nothing), but **do not
+read them as things the length check closes — it closes none of them.** That
+mis-reading is what produced the retracted ranking flip in §3:
 
 - `o` (`originalHash`) keys `incomingSegments`, so two advertisements from one
-  peer can share an accumulator.
+  peer can share an accumulator. **Needs a uniqueness check at the consumer**, not
+  a length gate — the weakness is two advertisements declaring the SAME valid `o`,
+  and `unpack` only ever sees one advertisement at a time.
 - `m` (`hashmap`) is copied verbatim into `state.knownHashmap`, which is what makes
   F17's collision constructible for free rather than found — see F17, route 3.
+  **No `unpack` validation of any kind closes this**: `m` IS the peer's own
+  resource's map hashes by protocol design, so a hostile hashmap is
+  indistinguishable from a legitimate one. This one is F17's to fix, not F18's.
 - `q` (`requestID`) is copied into the transfer's advertisement and later read by
   `.transfer(… .delegate(.failed))`. **The flag gate does not cover it:** the
   `pendingRequests` check in `.resourceAdvertisement` sits inside `if
   adv.isResponse`, so an advertisement with NEITHER flag can carry a live
-  requestID past it. Probed. What actually holds is the `.failed` handler's own
-  `state.pendingRequests.contains(rid)` plus `pendingRequests` being
-  per-`LinkSession` — whose only INSERT sites are `.sendRequest`'s two branches
-  (say "inserted", not "written": the file has six other write sites, all
-  removals) — so a peer can cancel only requests we sent to THAT peer.
+  requestID past it. Probed. **Length is irrelevant here** — a borrowed id is a
+  legitimate full-length `truncatedHash`; the gap is PROVENANCE. What actually
+  holds is the `.failed` handler's own `state.pendingRequests.contains(rid)` plus
+  `pendingRequests` being per-`LinkSession` — whose only INSERT sites are
+  `.sendRequest`'s two branches (say "inserted", not "written": the file has NINE
+  write sites — two inserts, five removals, and two initialiser assignments) — so
+  a peer can cancel only requests we sent to THAT peer.
 
   Reference nests this identically and still lacks the defect, which locates ours
   exactly: RNS's `RESOURCE_ADV` matches `read_request_id` against
