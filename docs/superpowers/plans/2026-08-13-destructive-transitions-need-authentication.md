@@ -261,9 +261,20 @@ Note it scopes to `outgoing_resources` — **sender-role only**. That is part of
         if case let .transfer(.element(id, .received)) = action { return id == a.id }
         return false
     }
-    // Under `.on`, a delivery to B would surface here as an unhandled action.
+    // FLIP-THEN-SEND, and it is load-bearing. `send`'s "must handle N received actions" check
+    // fires on actions queued by a PREVIOUS send, so a stray delivery to B is only observable
+    // on the NEXT send while still `.on`. Asserting here and flipping to `.off` would let B's
+    // action be silently discarded — and flipping back before teardown also disables the
+    // teardown check. This second send is what makes the routing claim real.
+    let inert = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                       destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                       destinationHash: store.state.linkID, transportId: nil,
+                       payload: Data(repeating: 0x00, count: 8))
+    await store.send(.received(try! inert.packed()))
+
     store.exhaustivity = .off
     #expect(store.state.transfers[id: b.id]?.status != .failed)
+    await store.send(.close)
 }
 
 /// Reference scopes proof routing to `outgoing_resources` — sender-role only. A RECEIVER-role
@@ -286,8 +297,18 @@ Note it scopes to `outgoing_resources` — **sender-role only**. That is part of
 
     store.exhaustivity = .on
     await store.send(.received(try! packet.packed()))
+    // FLIP-THEN-SEND — see the note in the previous test. Without this second `.on` send, a
+    // delivery to the receiver-role transfer is queued, never inspected, and then discarded when
+    // exhaustivity drops. The test would assert nothing at all.
+    let inert = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                       destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                       destinationHash: store.state.linkID, transportId: nil,
+                       payload: Data(repeating: 0x00, count: 8))
+    await store.send(.received(try! inert.packed()))
+
     store.exhaustivity = .off
     #expect(store.state.transfers.first?.status != .failed)
+    await store.send(.close)
 }
 ```
 
