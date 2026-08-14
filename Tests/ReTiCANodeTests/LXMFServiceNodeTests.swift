@@ -1068,10 +1068,16 @@ import ComposableArchitecture
     return captured.value
 }
 
-/// `float64(NaN)` in data[2] must not trap. Reference raises a catchable ValueError from
-/// `int(float('nan'))` — it never reaches the code that uses the cap and therefore serves nothing.
-/// We match that effective behaviour: NaN → 0 (serve nothing). The previous partial guard
-/// (`raw >= Double(Int.max)`) evaluated to false for NaN, falling straight through to `Int(NaN)`.
+/// `float64(NaN)` in data[2] must not trap. The previous partial guard (`raw >= Double(Int.max)`)
+/// evaluated to false for NaN, falling straight through to `Int(NaN)` and aborting the process.
+///
+/// The value we choose is a DELIBERATE DIVERGENCE from reference, and the only one in this switch.
+/// Reference keeps the cap as a float (`LXMRouter.py:1528`) and skips a message only when
+/// `next_size > client_transfer_limit`; against NaN that comparison is FALSE, so reference serves
+/// EVERYTHING — a NaN cap silently disables the cap the client just asked for. We serve NOTHING (0).
+/// Rationale: the permissive reading lets any client opt out of its own limit, and no legitimate
+/// client sends NaN, so the restrictive direction costs no interop. Verified by modelling
+/// `LXMRouter.py:1525-1547`; do not "restore parity" here without re-reading that reasoning.
 @MainActor @Test func serviceNodeParsesNaNTransferLimitAsZero() async {
     let result = await getTransferLimit(limitElement: .double(Double.nan))
     // result is Int?? — outer optional means "the action fired at all"; inner is the parsed limit.
@@ -1081,8 +1087,9 @@ import ComposableArchitecture
     }
 }
 
-/// `float64(-inf)` in data[2] must not trap. Reference would compute `float('-inf')*1000 = -inf` and
-/// then `int(-inf)` raises `OverflowError` — same branch as NaN, never serves. We treat it as 0.
+/// `float64(-inf)` in data[2] must not trap. Reference computes `float('-inf')*1000 = -inf` and keeps
+/// it as a float; `next_size > -inf` is true, so it skips every message and serves nothing
+/// (`LXMRouter.py:1547`). We treat it as 0 (serve nothing) — genuine parity.
 @MainActor @Test func serviceNodeParsesNegInfTransferLimitAsZero() async {
     let result = await getTransferLimit(limitElement: .double(-Double.infinity))
     #expect(result != nil, "messagesRequested must fire (process must not crash)")
@@ -1092,7 +1099,8 @@ import ComposableArchitecture
 }
 
 /// A large negative float64 in data[2] must not trap or silently become nil.
-/// Reference: `float(-1e18)*1000 = -1e21` → `int(-1e21)` raises `OverflowError`. We treat it as 0.
+/// Reference: `float(-1e18)*1000 = -1e21`, kept as a float; `next_size > -1e21` is true, so every
+/// message is skipped and nothing is served. We treat it as 0 (serve nothing) — genuine parity.
 @MainActor @Test func serviceNodeParsesLargeNegativeFloatTransferLimitAsZero() async {
     let result = await getTransferLimit(limitElement: .double(-1e18))
     #expect(result != nil, "messagesRequested must fire (process must not crash)")
@@ -1110,6 +1118,36 @@ import ComposableArchitecture
     #expect(result != nil, "messagesRequested must fire (process must not crash)")
     if let outerResult = result {
         #expect(outerResult == 0, "int64(-1) limit must parse as 0 (serve nothing), not nil (unlimited)")
+    }
+}
+
+/// `float64(+inf)` in data[2] clamps to `Int.max` (effectively unlimited) and must not trap.
+///
+/// This is genuine PARITY, reached by a different route. Reference never converts the cap to an int
+/// (`LXMRouter.py:1528` keeps it a float); it tests `next_size > client_transfer_limit`, and
+/// `next_size > inf` is false, so reference takes the else branch and serves everything. We saturate
+/// the cap to `Int.max` and also serve everything. Verified by modelling `LXMRouter.py:1525-1547`
+/// against the installed LXMF 1.1.0 source — an earlier draft of this test asserted the opposite on
+/// the assumption that reference called `int(float('inf'))` and raised `OverflowError`. It does not.
+@MainActor @Test func serviceNodeParsesPosInfTransferLimitAsUnlimited() async {
+    let result = await getTransferLimit(limitElement: .double(Double.infinity))
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == Int.max,
+                "float64(+inf) must clamp to Int.max — a known divergence from reference, which errors")
+    }
+}
+
+/// `float64(-0.0)` must parse as a 0-byte cap, NOT be swept into the negative arm and NOT become nil.
+///
+/// It reaches the right answer by a route worth pinning: `-0.0 * 1000 == -0.0`, and IEEE 754 defines
+/// `-0.0 == 0.0`, so `-0.0 < 0` is FALSE — the value falls past the negative guard to `Int(-0.0) == 0`.
+/// Reference's `int(-0.0)` is likewise `0`, so unlike the `+inf` case this one is genuine parity.
+@MainActor @Test func serviceNodeParsesNegativeZeroTransferLimitAsZero() async {
+    let result = await getTransferLimit(limitElement: .double(-0.0))
+    #expect(result != nil, "messagesRequested must fire")
+    if let outerResult = result {
+        #expect(outerResult == 0, "float64(-0.0) must parse as a 0-byte cap, not nil (unlimited)")
     }
 }
 

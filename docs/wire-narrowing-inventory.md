@@ -108,7 +108,7 @@ forget one; `--fail-on-open` will tell you if any remain.
   (`:30`, `:32`, `:33`, `:34` ×3), which traps on a negative. Same constraint as Task 2 —
   reject or clamp, do not truncate.
 
-- [x] **`Sources/ReTiCANode/LXMFServiceNode.swift:239`** — `Int(raw)` — **Task 6 FIXED**
+- [x] **`Sources/ReTiCANode/LXMFServiceNode.swift:261` (in `requestReceived`, `.double` branch)** — `Int(raw)` — **Task 6 FIXED**
   Source: `raw = kb * 1000` where `kb` is a wire `float64` from a `/get` request.
   Guarded: **partially, and the partial guard was the problem.** The ternary
   `raw >= Double(Int.max) ? Int.max : Int(raw)` evaluated before the conversion (correct order)
@@ -118,8 +118,29 @@ forget one; `--fail-on-open` will tell you if any remain.
   Fixed by checking `raw.isNaN` and `raw < 0` (→ 0) before the existing `raw >= Double(Int.max)`
   guard, then converting only when raw is finite and non-negative and less than `Double(Int.max)`.
   The `.int` divergence (negative int → nil → unlimited) is also fixed in the same switch.
-  Line number drifted from `:219` (inventory) to `:239` (Task 6 fix commit) — the expression text
-  key in the allowlist tracked it correctly throughout.
+  **Parity note, and a correction worth keeping.** The task brief, this inventory's predecessor and a
+  reviewer all stated that reference calls `int(float(data[2])*1000)` and is therefore protected by a
+  catchable `ValueError`/`OverflowError`. **It does not call `int()` at all.** `LXMRouter.py:1528`
+  keeps the cap as a float inside a bare `try/except: pass`, and `:1547` only ever compares
+  `next_size > client_transfer_limit`. Nothing raises. Re-derived by reading the installed LXMF 1.1.0
+  source and modelling `:1525-1547`. Consequences, all verified rather than assumed:
+  - `+inf` (and any `kb` whose `*1000` overflows to `+inf`) is **parity, not divergence**:
+    `next_size > inf` is false, so reference serves everything, and so does our `Int.max` clamp.
+  - `-inf`, large-finite-negative, `-0.0` and `0` are **parity**: the comparison is true, so reference
+    skips every message; our `0` cap does the same.
+  - **`NaN` is the one real divergence, and it runs opposite to the direction everyone assumed.**
+    Every comparison against NaN is false, so reference takes the else branch and **serves
+    everything** — a NaN cap silently disables the cap. We serve nothing. Deliberate: the permissive
+    reading lets a client opt out of the limit it just requested. Pinned by
+    `serviceNodeParsesNaNTransferLimitAsZero`, with the reasoning in-code.
+  Lesson for this file's own conventions: the false claim survived a brief, an inventory and a review
+  because each verified the *node* (`int(nan)` really does raise) and none verified the *arrow*
+  (that reference calls `int`). Cite the reference line you actually read.
+  Line number drifted `:219` (inventory) → `:227` (dispatch) → `:239` (fix) → `:261` (fix-round
+  comment rewrite) — **four times, twice within this task alone, and the last two were caused by
+  editing the comment directly above the conversion.** The allowlist's expression-text key tracked it
+  correctly throughout; this bullet is the only thing that needed hand-editing, which is why the
+  header now names `requestReceived` as well.
 
 - [ ] **`Sources/ReTiCATransport/ResourceTransfer.swift:451`** — `Int(chunkIndex)` — **Task 8** *(was `:442`; drifted 2026-08-14 when the destructive-transition slice touched this file. The allowlist keys on expression text, not line number, so the gate stayed correct throughout — this line number is documentation only.)*
   Source: `chunkIndex` is a raw wire `UInt64` from a RESOURCE_HMU msgpack array.
