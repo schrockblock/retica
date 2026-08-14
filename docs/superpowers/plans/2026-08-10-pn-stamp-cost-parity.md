@@ -245,4 +245,6 @@ git commit -m "refactor: read the PN stamp cost from the store, not a mirrored c
 
   Effect: reference→ReTiCA **mesh sync** silently delivers nothing, forever, and is default-reachable (`AUTOPEER = True`, `AUTOPEER_MAXDEPTH = 4`, `LXMRouter.py:44-45`). Client `/get` downloads are unaffected — the client sends its own limit in the request body, which `LXMFServiceNode.swift:204-226` honours.
 
-  Note the fix is *not* simply "advertise 256": that is the same lie in the opposite direction until inbound transfer caps exist. Either advertise a large-but-real cap, or land the cap first. Tracked in the gap analysis as a follow-up alongside the `nodeState` divergence.
+  ~~Note the fix is *not* simply "advertise 256": that is the same lie in the opposite direction until inbound transfer caps exist. Either advertise a large-but-real cap, or land the cap first.~~
+
+  **CORRECTED 2026-08-14 — the struck sentence is wrong; fixed in `f2eb255`.** Advertising a real number *is* the complete fix. These fields are a request the **sender** honours, not something the receiver enforces: the peer stores our advertised value on its `LXMPeer` record for us (`Handlers.py:61` → `LXMRouter.py:2025/2041`) and filters its *own outbound offer* against it (`LXMPeer.py:370`, where `self` is the node being synced *to*). Reference advertises 256 and enforces nothing on receive. I recorded the opposite here without tracing the arrow, and it would have kept blocking the fix — the plan that closed it explicitly asked its implementer to falsify me.

@@ -458,6 +458,26 @@ oversized packet then dies silently at `Packet.packed()`'s guard (`Packet.swift:
   `AUTOPEER = True` / `AUTOPEER_MAXDEPTH = 4` (`LXMRouter.py:44-45`). Client `/get` downloads are
   unaffected (the client sends its own limit, honoured at `LXMFServiceNode.swift:204-226`). The fix
   is not "advertise 256" — that is the same misstatement inverted until real inbound caps exist.
+>
+> **CORRECTED 2026-08-14 — the sentence immediately above is WRONG, and this whole item is FIXED
+> (`f2eb255`).** These fields are a *request the SENDER honours*, never receiver-enforced, so
+> advertising a real number is a complete fix requiring no inbound cap. The arrow, traced end to
+> end and re-verified by an independent reviewer: we emit field `[3]` → the peer reads
+> `int(data[3])` (`Handlers.py:61`) → stores it against **our** destination hash
+> (`LXMRouter.py:2025/2041`) → and *that same object* filters the peer's **own outbound offer** at
+> `LXMPeer.py:370`, where `self` is the record for the node being synced *to* (shown by
+> `self.link = RNS.Link(self.destination, …)` ~50 lines earlier). A package-wide grep finds no
+> inbound enforcement of `propagation_transfer_limit` anywhere in reference — **reference itself
+> advertises 256 and enforces nothing on receive.**
+>
+> Note also that a *conservative* value would have been the same defect in miniature: anything
+> above `perTransferLimit` is dropped permanently, so advertising 64 would silently destroy every
+> 64–256 KB message. Two refinements to the description above: the blast radius is **PN↔PN only**
+> (`Handlers.py:56` gates on `propagation_node`, so plain clients never read these fields), and
+> the two fields fail differently — `[3]`=0 is permanent loss, `[4]`=0 is a stall (bare `continue`,
+> not marked handled). What we still do *not* do is enforce a sync-size cap on inbound resources,
+> which reference does (`LXMRouter.py:2220-2224`) — deliberately out of scope, tracked in the
+> parity checklist.
 - **`nodeState` never re-announced when node mode is turned off.** `.setNodeMode(false)`
   (`LXMFServiceNode.swift:101-111`) clears bookkeeping and returns `.none`, so the last announce on
   the network still carries `nodeState: true` (`:119`). Reference `disable_propagation()`
