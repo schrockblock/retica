@@ -76,8 +76,8 @@ scratch SwiftPM package outside the repo (`/tmp/ReTiCA/probe5`) and are deleted;
 | 5 | `(.sender, .proof, .resourceProof)` | **impossible** — unencrypted by reference design | **yes, enforced upstream** — `LinkSession` routes on `prefix(32) == resourceHash` and `role == .sender` | **fixed in this slice.** Routing `d0570ef`, non-destructiveness `0101a74`. P6: a junk 64-byte proof at the cleartext `linkID` leaves both seeded senders present and `.idle`; B's genuine proof handed directly to A leaves A byte-identical. |
 | 6 | `.receiverDeadline` — `retriesLeft == 0` → `.failed` + receiver-cancel | clock | n/a | **safe**, with one qualification worth stating rather than eliding: an inbound part is not inert to the timer. The first accepted part sets `receivedFirstPart` and drops `partTimeoutFactor` to `Const.partTimeoutFactorAfterRTT`, shortening every subsequent watchdog. That ACCELERATES the deadline; it does not reach the failure exit, which needs `retriesLeft` to reach zero. Note what does and does not reset that counter, because the tempting shorthand is wrong: `retriesLeft = Const.maxRetries` is written by `.accept` and by the COMPLETED-ROUND branch (`outstanding.isEmpty` with parts still outstanding overall), NOT by every accepted part. A part that completes no round leaves the counter where it was. |
 | 7 | `.senderDeadline` `.advertised` — advert retries exhausted, or `linkPacket` returns nil → `.failed` | clock | n/a | **safe.** |
-| 8 | `.senderDeadline` `.transferring` → `.failed` | clock | n/a | **safe.** Entering `.transferring` requires row 1's two gates, so the window length is not settable by an unauthenticated party. |
-| 9 | `.senderDeadline` `.awaitingProof` — proof retries exhausted → `.failed` | clock | n/a | **safe, and load-bearing after this slice.** Since `0101a74` this is the only SELF-terminator for a sender whose proof never validates, which is deliberate: reference `Resource.validate_proof` has no else branch and lets the sender watchdog decide. It is not the only terminator — the peer can still cancel explicitly via row 4, and a host can via row 10. |
+| 8 | `.senderDeadline` `.transferring` → `.failed` | clock | n/a | **safe as a TRANSITION — it destroys only the transfer whose own clock fired — but the justification an earlier draft gave is FALSE, and what replaces it is F19.** The old reason was: *"entering `.transferring` requires row 1's two gates, so the window length is not settable by an unauthenticated party."* Row 1's gates are `Link.decrypt` plus the `resourceHash` match, and a **REPLAYED** `RESOURCE_REQ` satisfies both — it is a genuine packet, and F9 says nothing on the link path rejects replays; the slice's own F9 addition says exactly that. Two true nodes, false arrow: passing those gates does not imply an authenticated party. And what the replay does is not *set* the window's length: every accepted request calls `armSenderWatchdog` with `cancelInFlight: true`, which RESTARTS it — so ONE captured frame, replayed on any cycle shorter than the window, postpones this deadline without bound. Postponement is life extension rather than destruction, so it is outside this sweep's verb set — but it disables the transfer's only self-terminator, which is what **F19** numbers. |
+| 9 | `.senderDeadline` `.awaitingProof` — proof retries exhausted → `.failed` | clock | n/a | **safe, and load-bearing after this slice.** Since `0101a74` this is the only SELF-terminator for a sender whose proof never validates, which is deliberate: reference `Resource.validate_proof` has no else branch and lets the sender watchdog decide. It is not the only terminator — the peer can still cancel explicitly via row 4, and a host can via row 10. **But it is POSTPONABLE by the replay row 8 names:** the `.awaitingProof` window restarts on every accepted `RESOURCE_REQ`, and `proofRetriesLeft` is decremented in exactly one place — this branch — so a deadline that never fires never spends a retry. That is **F19**, and it is what makes "load-bearing" the right word rather than a reassuring one. |
 | 10 | `.cancel` → `.failed` | local action | n/a | **safe.** No emitter in `Sources` — it is a host-facing command, exercised only by tests today. |
 
 ## 2. `LinkSession`
@@ -494,6 +494,43 @@ length.** All four require the session key and are bounded to that peer's own li
 does not move the trust boundary.
 
 **This retracts the round-2 ranking flip. See §7.**
+
+### F19 — a replayed `RESOURCE_REQ` postpones the sender watchdog without bound
+
+**Added by the final whole-branch review.** Stated in OUTLINE here, because rows 8 and 9 are where
+it surfaces; the full entry, the preconditions and the RANKING live in
+`docs/superpowers/2026-08-10-handoff-link-lifecycle-and-delivery-termination.md` §3c. Written that
+way on purpose — duplicating a whole item is what produced two of this slice's four deferred minors
+(see §6's twin rule).
+
+**Where:** `ResourceTransfer.received`'s `(.sender, .data, .resourceRequest)` branch and
+`armSenderWatchdog`; `LinkPlane`'s `evictable` filter in the `.link(… .delegate(.established))`
+handler.
+
+The branch's gates (row 1) are `Link.decrypt` plus the `resourceHash` match. A captured genuine
+`RESOURCE_REQ` replayed by a third party satisfies both with no key — F9's `req_hashlist` instance,
+already recorded there — and the branch then re-arms `armSenderWatchdog(state)`, which is
+`.cancellable(id: CancelID.watchdog, cancelInFlight: true)`. `proofRetriesLeft` is decremented in
+exactly one place, `.senderDeadline`'s `.awaitingProof` branch, so a deadline that never fires never
+spends a retry. Probe, through production wiring: ONE captured frame replayed on a cycle shorter
+than the `.awaitingProof` window (`rtt × Const.proofTimeoutFactor + Const.senderGrace`) left the
+transfer `.awaitingProof` at t ≈ 600 s with `proofRetriesLeft` **pinned at its initial
+`Const.proofRetries`, never decremented**; the control run, junk proofs instead of replays,
+terminated at t ≈ 40 s.
+
+The consequence this document records in two places and never composed: `LinkSession` removes a
+transfer only on a child `.delegate(.received/.concluded/.failed)`, and `LinkPlane`'s eviction
+filter is `active.filter { $0.id != elementID && $0.transfers.isEmpty }` (row 32) — so a pinned
+transfer makes a RESPONDER link permanently un-evictable, and once nothing is evictable the plane
+refuses the newcomer. That is F11's lockout reached without the session key. The comment above that
+filter prices the RECEIVER-side version and scopes it to a peer holding the session key; the
+sender-side version needs one captured frame.
+
+**What this slice changed is only the teardown, not the pin.** Before `d0570ef` + `0101a74`, one
+junk `RESOURCE_PRF` from any off-path party fanned out to every transfer and failed every
+SENDER-role one — that was F15 — so the pin had an accidental, un-keyed teardown. Task 3 removed it,
+correctly: that teardown was itself the kill primitive F15 names. The attack is pre-existing; what
+is gone is the accident that used to clear it.
 
 ---
 
