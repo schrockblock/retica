@@ -316,13 +316,66 @@ non-adversarial half one context over. That is why it gets a number now.
 reader to "this needs a rare event", which is false.**
 
 1. *Accidental*, between two of our own concurrent receivers: probability per fanned part is set by
-   `Resource.mapHashLength` against the other transfer's hashmap height. Expensive.
+   `Resource.mapHashLength` against the other transfer's hashmap height. Expensive **per part — but
+   the two-concurrent-receivers PRECONDITION is not the rare part, and an earlier draft left the
+   reader assuming it was. See the reachability correction below.**
 2. *Sprayed*, by an off-link party with no key: same probability, and it must spray. Expensive.
 3. *Constructed, by a peer holding the session key: FREE and deterministic.* `.accept` copies
    `adv.randomHash` into `state.randomHash` and `adv.hashmap` into `state.knownHashmap` **verbatim**,
    with no validation (that is F18's field set). A peer therefore does not have to FIND a collision —
    it DECLARES one: it advertises transfer B with a hashmap whose entries are the map hashes of the
    chunks it is about to send for transfer A. Probed: a peer-chosen `m` survives `unpack` byte-for-byte.
+
+**Reachability correction to route 1, from the final whole-branch review: two concurrent receivers
+on one link is the ORDINARY case for a slow resource, because OUR OWN retry timer manufactures it.**
+Every arrow verified against the code:
+
+- `LXMFRouter`'s `.retryDue` `.direct` branch, on a destination whose `directLinks` entry is
+  `.active`, emits `.sendDirect(linkID:data:asResource:)` **unconditionally** and re-arms
+  `retryTimer(hash, LXMFDelivery.retryWaitSeconds)`. It never asks whether the previous send is
+  still in flight.
+- `LXMFNode` maps `.sendDirect(_, _, asResource: true)` to `.endpoint(.sendResourceOverLink)`, and
+  `LinkPlane` maps that to `LinkSession.sendResource`.
+- `LinkSession.sendResource` draws `randomBytes(8)` for a FRESH `randomHash` every call, and
+  `Resource.resourceHash` is `fullHash(data ‖ randomHash)` — so the identical payload gets a
+  **different `resourceHash`** on the retry.
+- The receiver's only dedup is `state.transfers.contains(where: { $0.resourceHash == adv.hash })` in
+  `(_, .active, .data, .resourceAdvertisement)`. Different hash, so it does not fire, and a second
+  receiver-role transfer is created.
+- The retry timer's only cancel is `.delivered`. For a resource-framed direct send the only route to
+  it is `.resourceDeliveredOnLink` ← `LinkSession`'s `.resourceConcluded` — i.e. only once the
+  resource PROOF has returned.
+
+So any resource-framed LXMF message whose transfer has not concluded within `retryWaitSeconds`
+duplicates itself, bounded by `maxAttempts` — and on the RF/mesh links this library targets, a
+transfer running longer than `retryWaitSeconds` is the ordinary case, not the exception. Probe (the
+final review's, through production wiring): two `sendResourceOverLink` calls of the IDENTICAL
+payload on one link produced two sender transfers with distinct hashes and **two concurrent receiver
+transfers, both `.requesting`.** The factors are positively correlated, too: the transfers most
+likely to duplicate are the large slow ones, which are exactly the ones with the tallest
+`knownHashmap`, and the number of collision opportunities is one transfer's part count against the
+other's hashmap height.
+
+**LOW survives, and the reason is that the correction is to the PRECONDITION's price, not to the
+collision's.** Three things hold it down. (a) The per-part probability against
+`Resource.mapHashLength` is unchanged — duplication multiplies OPPORTUNITIES, not the chance per
+opportunity. (b) Duplicates produced this way carry the SAME message, and a collision poisons only
+the transfer whose `knownHashmap` contained the colliding entry: the segment is fanned out to both,
+so the other twin absorbs its own part normally and still completes, after which
+`LXMFRouter.received`'s `state.seen.insert(message.hash)` drops the duplicate delivery. The harmful
+shape — two receivers carrying DIFFERENT resources — still needs two genuinely concurrent sends.
+(c) Nothing crosses a trust boundary: `transfers` is per-`LinkSession` and both transfers are ours.
+
+**The test-visibility trap, which is why no in-repo test can currently observe this shape.**
+`RandomBytesGenerator.testValue` is a deterministic ramp, so in-tree tests get the same
+`randomHash` — and therefore the same `resourceHash` — for the same payload, and the receiver's
+advertisement dedup swallows the duplicate. Nothing in `Tests/` can show the duplication without
+overriding `\.randomBytes`, and a test written without that override will look like evidence that
+the duplication does not happen.
+
+**The same chain is also why F15's fix is load-bearing rather than theoretical.** The duplicate
+SENDER transfers it creates on our side are exactly the two-concurrent-senders shape whose proof
+fan-out was F15 — see F15 in the handoff.
 
 **Route 3 does not raise the severity, and the reason is worth stating rather than assuming.** The
 peer that constructs it is the peer that advertised BOTH transfers, so what it destroys is a delivery

@@ -105,6 +105,22 @@ resource keeps its status and the sender watchdog terminates it.
 **Accepted cost:** a genuinely failed transfer now waits for the watchdog rather
 than concluding immediately. This is reference behaviour.
 
+**And say what that costs in COMPOSITION, because it is not confined to this
+reducer: the sender watchdog can outlast `LXMFRouter`'s whole delivery saga.**
+The `.awaitingProof` window is `rtt × Const.proofTimeoutFactor + Const.senderGrace`
+and it re-arms `Const.proofRetries` times before failing, so its total **scales
+with `rtt`**; the router's saga is bounded by `LXMFDelivery.retryWaitSeconds` and
+`LXMFDelivery.maxAttempts`, which do **not**. At `rtt` 0 the router's saga is the
+longer of the two; on a slow link the ordering reverses, and the sender transfer
+is still alive — holding a slot in `LinkSession.transfers`, which is what makes
+the link un-evictable; see F19 — after the router has already reported
+`deliveryFailed`. The wall-clock totals are deliberately NOT multiplied out here:
+that arithmetic is exactly what `LXMFRouter`'s own budget comment says it has had
+to correct three times, and the executable figures live in the tests it names.
+
+That ordering was ALREADY the case for a silent peer, whose proof simply never
+arrives. §3.2 puts the bad-proof case in the same bucket rather than creating it.
+
 ### 3.3 Why both, and why this is one omission rather than a design gap
 
 Either change alone closes the non-adversarial bug. Both together are reference
