@@ -1516,6 +1516,14 @@ the adversarial sequence — not "review this diff." Give it licence to write
 throwaway probes; the decisive findings in the last four slices all came from
 probes rather than reasoning. Budget for a fix wave after it.
 
+**And when a probe crosses the endpoint boundary, guard it with a positive
+control.** `TCPClientInterface` deframes with HDLC, so an unframed packet handed
+to `TCPEvent.data` is silently swallowed and never reaches `Transport.received` —
+a composition probe that injects raw packets will report reassuring state while
+every injection is a no-op. Inject N framed packets, assert N arrivals, and only
+then assert anything about what the injection failed to do. Full write-up in §6 of
+`docs/superpowers/2026-08-13-destructive-transition-sweep.md`.
+
 **Verify PROPERTY claims with a repo-wide grep.** Ten claims of mine were wrong
 this session. Citations became reliable once I started opening files; claims
 *about* behaviour did not. The failing shape is "only X does Y", "nothing
