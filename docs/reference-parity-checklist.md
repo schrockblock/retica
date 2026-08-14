@@ -53,12 +53,27 @@ cannot see**. That is what tier 1 is about.
       all, and under-enforcing is the safe direction (we accept more than we asked for). Note we
       still do **not** enforce a sync-size cap on inbound resources, which reference does do
       (`LXMRouter.py:2220-2224`); deliberately out of scope.
-- [ ] **MsgPack decoder rejects types reference emits** — `MsgPack.swift:121-148`
+- [x] **MsgPack decoder rejects types reference emits** — `MsgPack.swift:121-148`
       Missing negative fixint (`0xE0-0xFF`), `int8/16/32/64` (`0xD0-0xD3`), `float32` (`0xCA`),
       `map32` (`0xDF`), all ext. `LXMessage.unpack` decodes in one shot and `LXMFRouter.received`
       drops on failure with no diagnostic — so a message whose `fields` carry a **negative integer**
       (routine for telemetry/coordinates) is discarded whole, content and all, no error to the
       sender. *Verified `46e838e`.* → **slice 1**
+      **Fixed `177da8c`** — all of the above decode *and* encode. Decode alone would have been
+      wrong twice over: `LXMessage.validateSignature` re-packs the payload from the decoded fields
+      on every inbound message, so a readable-but-unwritable type just moves the failure to the
+      signature check; and `mapHeader`'s `UInt16(n)` was allowlisted as host-only *because the
+      decoder had no `0xDF` branch*, so map32 decode by itself would have made a >65535-pair map a
+      remote abort. Reference `_pack_integer` picks the width from the value alone
+      (`umsgpack.py:288-314`), so integers round-trip byte-identically with no wire-width memory;
+      `_pack_float` (`:325-333`) reads a module global instead, so float32 needs its own
+      `MsgPackValue.float` case or a re-encode would widen 5 bytes to 9. **ext/fixext is rejected
+      on purpose**, not still missing: umsgpack writes it only for a `datetime.datetime` or an
+      `umsgpack.Ext` (`:517-520`), and neither appears in an RNS or LXMF msgpack payload. Negative
+      `intMap` **keys** also remain rejected, per `eb244c3`'s reject-don't-truncate ruling — LXMF's
+      field keys are the non-negative `FIELD_*` constants (`LXMF.py:8-51`). No emitted byte
+      changed; the 167 cross-validation vectors that byte-compare against genuine Python output
+      all still pass.
 
 ## Tier 2 — remotely reachable crashes still open
 
