@@ -521,10 +521,12 @@ terminated at t ≈ 40 s.
 The consequence this document records in two places and never composed: `LinkSession` removes a
 transfer only on a child `.delegate(.received/.concluded/.failed)`, and `LinkPlane`'s eviction
 filter is `active.filter { $0.id != elementID && $0.transfers.isEmpty }` (row 32) — so a pinned
-transfer makes a RESPONDER link permanently un-evictable, and once nothing is evictable the plane
-refuses the newcomer. That is F11's lockout reached without the session key. The comment above that
-filter prices the RECEIVER-side version and scopes it to a peer holding the session key; the
-sender-side version needs one captured frame.
+transfer makes a RESPONDER link un-evictable for as long as the pin holds, and once nothing is
+evictable the plane refuses the newcomer. That is F11's lockout reached without the session key —
+though NOT the first un-keyed route to it, and the handoff entry says why F9's second-order
+consequence got there first and what F19 adds. The comment above that filter prices the
+RECEIVER-side version and scopes it to a peer holding the session key; the sender-side version needs
+one captured frame.
 
 **What this slice changed is only the teardown, not the pin.** Before `d0570ef` + `0101a74`, one
 junk `RESOURCE_PRF` from any off-path party fanned out to every transfer and failed every
