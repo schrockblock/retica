@@ -366,19 +366,32 @@ private func activeLinkHostingPlainReceiver(
 
 // MARK: - Proof routing
 
-/// F15: two concurrent SENDER transfers on one link. A's valid proof must reach A ONLY.
-/// Before this fix the proof was fanned out to every transfer and each one failed itself on a
-/// mismatch, so two of our OWN transfers destroyed each other with no attacker present.
+/// F15: two concurrent SENDER transfers on one link. A proof must reach ONLY the transfer whose
+/// `resourceHash` it names. Before this fix the proof was fanned out to every transfer and each
+/// one failed itself on a mismatch, so two of our OWN transfers destroyed each other with no
+/// attacker present.
 ///
-/// This asserts ROUTING, not just outcome: the `.on` window makes a delivery to B an
-/// unexpected action. An outcome-only assertion would stop discriminating once a mis-delivered
-/// proof became harmless.
+/// The proof is deliberately addressed to the SECOND sender (B), not the first. That choice is
+/// what makes the ownership check observable: a predicate that drops `resourceHash == owner` and
+/// keeps only `role == .sender` selects `first(where:)` — i.e. A — so routing-to-B versus
+/// routing-to-first-sender give DIFFERENT answers. Addressing the proof to A would make the two
+/// indistinguishable and the hash check unpinned.
+///
+/// This asserts ROUTING, not just outcome: the `.on` window makes a delivery to A an unexpected
+/// action. An outcome-only assertion would stop discriminating once a mis-delivered proof became
+/// harmless.
+///
+/// SEEDED STATE, deliberately. The property under test is WHICH TRANSFER RECEIVES the routed
+/// action — not whether transfers can be created, and not any part of the send pipeline. Driving
+/// this through `.sendResource` would spawn live `ResourceTransfer` effects (advertise, transmit
+/// delegate, advertise-retry watchdog) whose actions accumulate in `receivedActions` and cannot
+/// be synchronised with the `.on` window that carries the whole assertion; the routing signal
+/// would be buried under setup traffic it has nothing to do with. Seeding the two senders
+/// directly (as `activeLinkHostingPlainTransfer` and `resourceStoreHostingSplitReceivers` in this
+/// same file already do) gives a clean queue and leaves the reachability question to the tests
+/// that own it. The two seeded senders ARE the non-adversarial scenario this fix exists for:
+/// two of our own concurrent outbound transfers on one link, no attacker involved.
 @Test @MainActor func aResourceProofReachesOnlyTheTransferThatOwnsIt() async {
-    // Set up two SENDER transfers injected directly into state so no ResourceTransfer effects are
-    // in flight. This is necessary for the `.on`-mode window: live `.sendResource` effects
-    // (advertise/transmit/watchdog timers) accumulate in receivedActions and cannot cleanly be
-    // synchronised with the routing window. Injecting state (as the GC tests do) gives a clean
-    // queue.
     let clock = TestClock<Duration>()
     let tA = senderFor(Data(repeating: 0x01, count: 64))
     let tB = senderFor(Data(repeating: 0x02, count: 64))
@@ -394,6 +407,7 @@ private func activeLinkHostingPlainReceiver(
     s.lastInbound = 0.0     // pre-seeded so the `.on`-window sends produce no nil→0 change
     s.transfers.append(tA)
     s.transfers.append(tB)
+    #expect(s.transfers.first?.id == tA.id)   // A really is first — the (c) mutation's target
 
     let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 0))
@@ -402,40 +416,42 @@ private func activeLinkHostingPlainReceiver(
     }
     store.exhaustivity = .off
 
-    let proof = Resource.proofData(data: Data(repeating: 0x01, count: 64), hash: tA.resourceHash)
+    // Proof for B's resource, naming B's hash in its leading 32 bytes.
+    let proof = Resource.proofData(data: Data(repeating: 0x02, count: 64), hash: tB.resourceHash)
+    #expect(Data(proof.prefix(32)) == tB.resourceHash)
     let packet = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
                         destinationType: .link, context: .resourceProof, contextFlag: false,
                         hops: 0, destinationHash: resLinkID, transportId: nil,
                         payload: proof)
 
     store.exhaustivity = .on
-    // The routing effect (.send(.transfer(tA.id, .received(data)))) is async — A's status
+    // The routing effect (.send(.transfer(tB.id, .received(data)))) is async — B's status
     // change happens when ResourceTransfer processes the child action, not during this send.
     await store.send(.received(try! packet.packed()))
     await store.receive { action in
-        if case let .transfer(.element(id, .received)) = action { return id == tA.id }
+        if case let .transfer(.element(id, .received)) = action { return id == tB.id }
         return false
     } assert: { state in
-        // A's ResourceTransfer validates the proof → status .complete. B is untouched.
-        state.transfers[id: tA.id]?.status = .complete
+        // B's ResourceTransfer validates the proof → status .complete. A is untouched.
+        state.transfers[id: tB.id]?.status = .complete
     }
-    // A's ResourceTransfer validates the proof → .complete → emits .delegate(.concluded).
-    // The parent then handles .concluded → removes A and emits .delegate(.resourceConcluded).
-    // Drain these cascading actions before the inert send; they are A's own expected effects
-    // and are not evidence of a stray B-delivery.
+    // B's ResourceTransfer validates the proof → .complete → emits .delegate(.concluded).
+    // The parent then handles .concluded → removes B and emits .delegate(.resourceConcluded).
+    // Drain these cascading actions before the inert send; they are B's own expected effects
+    // and are not evidence of a stray A-delivery.
     await store.receive { action in
-        if case let .transfer(.element(id, .delegate(.concluded))) = action { return id == tA.id }
+        if case let .transfer(.element(id, .delegate(.concluded))) = action { return id == tB.id }
         return false
     } assert: { state in
-        state.transfers.remove(id: tA.id)
+        state.transfers.remove(id: tB.id)
     }
     await store.receive { action in
         if case .delegate(.resourceConcluded) = action { return true }
         return false
     }
     // FLIP-THEN-SEND, and it is load-bearing. `send`'s "must handle N received actions" check
-    // fires on actions queued by a PREVIOUS send, so a stray delivery to B is only observable
-    // on the NEXT send while still `.on`. Asserting here and flipping to `.off` would let B's
+    // fires on actions queued by a PREVIOUS send, so a stray delivery to A is only observable
+    // on the NEXT send while still `.on`. Asserting here and flipping to `.off` would let A's
     // action be silently discarded — and flipping back before teardown also disables the
     // teardown check. This second send is what makes the routing claim real.
     let inert = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
@@ -445,7 +461,10 @@ private func activeLinkHostingPlainReceiver(
     await store.send(.received(try! inert.packed()))
 
     store.exhaustivity = .off
-    #expect(store.state.transfers[id: tB.id]?.status != .failed)
+    // A never saw the proof, so it is neither failed nor concluded — it is still sitting there
+    // untouched. Under the pre-fix fan-out A would have failed itself on the hash mismatch.
+    #expect(store.state.transfers[id: tA.id]?.status != .failed)
+    #expect(store.state.transfers[id: tA.id] != nil)
     await store.send(.close)
 }
 
@@ -491,6 +510,130 @@ private func activeLinkHostingPlainReceiver(
 
     store.exhaustivity = .off
     #expect(store.state.transfers.first?.status != .failed)
+    await store.send(.close)
+}
+
+/// A proof payload SHORTER than the 32-byte resource hash it is supposed to lead with. The
+/// routing code slices `payload.prefix(32)` to recover the owner hash, so a truncated payload
+/// must neither trap nor be delivered to anything.
+///
+/// Same seeding rationale as `aResourceProofReachesOnlyTheTransferThatOwnsIt` above: the
+/// property is what the ROUTER does with a malformed payload, so the transfers are seeded.
+@Test @MainActor func aShortResourceProofPayloadIsDroppedWithoutDelivery() async {
+    let clock = TestClock<Duration>()
+    let tA = senderFor(Data(repeating: 0x01, count: 64))
+    let tB = senderFor(Data(repeating: 0x02, count: 64))
+
+    var s = LinkSession.State(responderFor: Identity(),
+                              destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .active
+    s.sessionKey = resKey
+    s.linkID = resLinkID
+    s.rtt = 1.0
+    s.lastInbound = 0.0
+    s.transfers.append(tA)
+    s.transfers.append(tB)
+
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = clock
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    // 8 bytes — a quarter of a resource hash. Deliberately a PREFIX of B's real hash, so a
+    // router that compared only the bytes it received (rather than requiring a full hash) would
+    // still be tempted to match it.
+    let shortPayload = Data(tB.resourceHash.prefix(8))
+    #expect(shortPayload.count == 8)
+    let packet = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                        destinationType: .link, context: .resourceProof, contextFlag: false,
+                        hops: 0, destinationHash: resLinkID, transportId: nil,
+                        payload: shortPayload)
+
+    store.exhaustivity = .on
+    // No crash, and under `.on` any `.transfer(.element(...))` queued here is an unhandled
+    // action that the inert send below reports.
+    await store.send(.received(try! packet.packed()))
+    // FLIP-THEN-SEND — see the note in the first proof-routing test. This is what observes a
+    // delivery that would otherwise be queued, never inspected, then silently discarded.
+    let inert = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                       destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                       destinationHash: resLinkID, transportId: nil,
+                       payload: Data(repeating: 0x00, count: 8))
+    await store.send(.received(try! inert.packed()))
+
+    store.exhaustivity = .off
+    // Both transfers untouched: no delivery means no status transition either way.
+    #expect(store.state.transfers[id: tA.id]?.status == tA.status)
+    #expect(store.state.transfers[id: tB.id]?.status == tB.status)
+    await store.send(.close)
+}
+
+/// Pins the `payload.count >= 32` length guard specifically.
+///
+/// READ THIS BEFORE JUDGING THE SEEDING: this test seeds a SENDER whose `resourceHash` is
+/// shorter than 32 bytes, which production cannot currently produce. A sender's `resourceHash`
+/// has exactly one write site — `ResourceTransfer.State.init(sending:...)`, which assigns
+/// `Resource.resourceHash(...)` = `Crypto.fullHash` = a 32-byte SHA-256 — so every real sender
+/// carries a full-length hash. The seeding is therefore NOT a reachability claim, and this test
+/// must not be read as one. It pins the guard's CONTRACT: a truncated payload must not be
+/// matched against anything, independent of who the candidates happen to be.
+///
+/// Why the guard is nonetheless worth pinning rather than deleting as dead code. The
+/// discriminator `Data(payload.prefix(32))` silently yields a SHORT `Data` for a short payload
+/// instead of trapping, so the length check is the only thing standing between a truncated
+/// packet and a prefix comparison. Today the `role == .sender` gate independently saves us,
+/// because sender hashes are always 32 bytes and a short `owner` can never equal one. But a
+/// RECEIVER's `resourceHash` is wire-controlled — `ResourceAdvertisement.unpack` reads `h` as
+/// an unvalidated `.bin` and does not check its length — so a peer can advertise an EMPTY hash,
+/// and an empty proof payload yields an empty `owner` that compares EQUAL to it (verified by
+/// probe). That combination is live the moment the role gate is weakened. This guard is the
+/// second lock on that door; it is defence-in-depth, not redundancy.
+@Test @MainActor func aTruncatedProofIsRejectedBeforeThePrefixComparison() async {
+    let clock = TestClock<Duration>()
+    var tShort = senderFor(Data(repeating: 0x01, count: 64))
+    tShort.resourceHash = Data(repeating: 0x07, count: 8)   // SEEDED: see note above
+    #expect(tShort.role == .sender)
+    #expect(tShort.resourceHash.count == 8)
+
+    var s = LinkSession.State(responderFor: Identity(),
+                              destinationHash: Data(repeating: 0x02, count: 16),
+                              interfaceID: InterfaceID("i"))
+    s.status = .active
+    s.sessionKey = resKey
+    s.linkID = resLinkID
+    s.rtt = 1.0
+    s.lastInbound = 0.0
+    s.transfers.append(tShort)
+
+    let store = TestStore(initialState: s) { LinkSession() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.continuousClock = clock
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+
+    // A payload that is EXACTLY the seeded short hash. Without the length guard,
+    // `Data(payload.prefix(32))` is those same 8 bytes and compares EQUAL to `resourceHash`,
+    // so the proof routes. With the guard, it is rejected before the comparison happens.
+    let packet = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                        destinationType: .link, context: .resourceProof, contextFlag: false,
+                        hops: 0, destinationHash: resLinkID, transportId: nil,
+                        payload: tShort.resourceHash)
+
+    store.exhaustivity = .on
+    await store.send(.received(try! packet.packed()))
+    // FLIP-THEN-SEND — see the note in the first proof-routing test.
+    let inert = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                       destinationType: .link, context: .none, contextFlag: false, hops: 0,
+                       destinationHash: resLinkID, transportId: nil,
+                       payload: Data(repeating: 0x00, count: 8))
+    await store.send(.received(try! inert.packed()))
+
+    store.exhaustivity = .off
+    #expect(store.state.transfers[id: tShort.id]?.status == tShort.status)   // never delivered
     await store.send(.close)
 }
 

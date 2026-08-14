@@ -535,6 +535,13 @@ public struct LinkSession {
                     // leaving resource proofs unencrypted, so ownership is the only discriminator
                     // available. That is why `ResourceTransfer` must also never destroy itself on
                     // a proof that fails to validate.
+                    // The length check is load-bearing, not a formality: `prefix(32)` yields a
+                    // SHORT `Data` rather than trapping, so without it a truncated payload would
+                    // reach the comparison below. `role == .sender` independently saves us today
+                    // (sender hashes are always 32-byte SHA-256), but a RECEIVER's `resourceHash`
+                    // is wire-controlled — `ResourceAdvertisement.unpack` does not validate `h`'s
+                    // length — so an empty advertised hash plus an empty payload would compare
+                    // EQUAL the moment the role gate is weakened. Two locks, deliberately.
                     guard packet.payload.count >= 32 else { return .none }
                     let owner = Data(packet.payload.prefix(32))
                     guard let target = state.transfers.first(where: {
