@@ -39,6 +39,22 @@ The durable key is *file + expression text*, which is what the allowlist matches
 > **The generalisable lesson:** an allowlist reason that cites the *absence* of a capability
 > elsewhere is a reason with an expiry date. Grep the allowlist for the function you are about to
 > add a capability to, not just the lines you are about to edit.
+>
+> **Two entries of that shape are still live.** Named here so nobody has to rediscover them:
+> - `wire-narrowing-allowlist.txt:102` — `UInt64(p.key)` in `encodeIntMap`, safe only because
+>   `parseMap` dispatches to the intMap branch on a `.uint` first key and rejects everything else.
+>   Re-verified by this slice; the expiry trigger is documented in code at `MsgPack.swift:257-263`.
+>   **Widening `parseMap`'s accepted key types re-opens it.**
+> - `wire-narrowing-allowlist.txt:120` — `UInt64(timebase)` in `PNAnnounce.packed`, safe only
+>   because no producer supplies a negative. It already carries a predecessor's forward warning:
+>   **Task 7 must not fix `PNAnnounce.parse` by truncating**, or a wire value reaches it negative.
+>
+> Line numbers in reasons rot silently — this slice first shipped nine that were uniformly `+6`
+> off, because a doc comment was added to the top of `MsgPack.swift` *after* the reasons were
+> written. The gate cannot catch that: it keys on expression text, so it stayed green while a
+> reader following "the map32 decode branch at `:184`" landed on `case 0xA0...0xBF` (fixstr).
+> When you edit a reason, re-derive its line numbers from the file as committed, and name the
+> enclosing function too — the function name survives what the line number does not.
 
 ---
 

@@ -243,7 +243,7 @@ public enum MsgPack {
             for _ in 0..<count {
                 // Reject any map key that exceeds Int.max. A bare Int(key) traps on
                 // such values (UInt64 > Int.max), and truncating to a negative Int
-                // would relocate the trap to encodeIntMap's UInt64(p.key) at :71,
+                // would relocate the trap to encodeIntMap's UInt64(p.key) at :140,
                 // reached via LXMessage.unpack's re-encode path (LXMessage.swift:108).
                 // Rejection is the correct semantic: a key outside the representable
                 // range is malformed input. This sets the precedent for Task 7
