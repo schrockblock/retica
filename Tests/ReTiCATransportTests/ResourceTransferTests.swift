@@ -138,7 +138,11 @@ private func senderStore(_ data: Data, _ clock: TestClock<Duration>) -> TestStor
     #expect(Packet(raw: icl)!.context == .resourceInitiatorCancel)
 }
 
-@Test @MainActor func senderRejectsInvalidProof() async {
+/// A proof with a wrong trailing 32 bytes (wrong proof body, correct length) must NOT fail the
+/// transfer. Reference `Resource.validate_proof` has no else branch; the sender watchdog is the
+/// terminator. Ownership routing is a secret, not an authenticator, so this is what keeps a
+/// leaked resource hash from being a kill primitive.
+@Test @MainActor func senderIgnoresProofThatDoesNotValidate() async {
     let data = Data("bad proof path".utf8)
     let clock = TestClock<Duration>()
     let store = senderStore(data, clock)
@@ -146,12 +150,69 @@ private func senderStore(_ data: Data, _ clock: TestClock<Duration>) -> TestStor
     _ = await captureTransmits(store, count: 1)
     await store.send(.received(resourceRequestPacket(store.state)))
     _ = await captureTransmits(store, count: store.state.parts.count)
+    #expect(store.state.status == .awaitingProof)
     let bad = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
                      destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
                      destinationHash: linkID, transportId: nil, payload: Data(repeating: 0x00, count: 64))
     await store.send(.received(try! bad.packed()))
-    await store.receive(.delegate(.failed))
+    #expect(store.state.status == .awaitingProof)
+    // Cleanup: exhaust proof retries via the watchdog to reach terminal state.
+    for _ in 0...ResourceTransfer.Const.proofRetries { await store.send(.senderDeadline) }
     #expect(store.state.status == .failed)
+}
+
+/// A proof correctly addressed to this transfer but whose trailing 32 bytes do not match must
+/// NOT fail the transfer. Reference `Resource.validate_proof` has no else branch; the sender
+/// watchdog is the terminator. Ownership routing is a secret, not an authenticator, so this is
+/// what keeps a leaked hash from being a kill primitive.
+@Test @MainActor func aProofThatDoesNotValidateLeavesTheTransferAlive() async {
+    let data = Data("a bad proof must not destroy the transfer".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)
+    let s = store.state
+    await store.send(.received(resourceRequestPacket(s)))            // requests all parts
+    _ = await captureTransmits(store, count: s.parts.count)
+    #expect(store.state.status == .awaitingProof)
+
+    // Correct owner prefix, wrong proof body.
+    let bad = Data(s.resourceHash) + Data(repeating: 0xAA, count: 32)
+    let pkt = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                     destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
+                     destinationHash: s.linkID, transportId: nil, payload: bad)
+    await store.send(.received(try! pkt.packed()))
+
+    #expect(store.state.status == .awaitingProof)
+}
+
+/// A 32–63 byte packet (resourceHash ‖ garbage, too short to be a valid 64-byte proof) that
+/// routes to the owning sender — because Task 2 routes on the resourceHash prefix — must NOT
+/// fail the transfer. `Resource.validateProof` requires exactly 64 bytes, so the 32-byte guard
+/// fails and the packet is ignored. This is the specific attack shape enabled by unencrypted
+/// proofs: an observer learns a live resourceHash from any legitimate proof on the link, so the
+/// attacker need not guess it.
+@Test @MainActor func a48ByteResourceHashPlusGarbageIsIgnored() async {
+    let data = Data("half-prefix attack must not abort the transfer".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)
+    let s = store.state
+    await store.send(.received(resourceRequestPacket(s)))            // requests all parts
+    _ = await captureTransmits(store, count: s.parts.count)
+    #expect(store.state.status == .awaitingProof)
+
+    // 48 bytes: resourceHash (32) ‖ 16 bytes of garbage — routes to the sender (≥32 bytes with
+    // the right prefix) but fails validateProof's 64-byte length check.
+    let attack = Data(s.resourceHash) + Data(repeating: 0xBB, count: 16)
+    #expect(attack.count == 48)
+    let pkt = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                     destinationType: .link, context: .resourceProof, contextFlag: false, hops: 0,
+                     destinationHash: s.linkID, transportId: nil, payload: attack)
+    await store.send(.received(try! pkt.packed()))
+
+    #expect(store.state.status == .awaitingProof)
 }
 
 private func receiverState() -> ResourceTransfer.State {

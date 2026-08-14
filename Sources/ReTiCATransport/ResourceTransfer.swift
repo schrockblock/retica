@@ -329,12 +329,21 @@ public struct ResourceTransfer {
                     return .merge(effects)
 
                 case (.sender, .proof, .resourceProof):
-                    if Resource.validateProof(proofData: packet.payload, expectedProof: state.expectedProof) {
-                        state.status = .complete
-                        return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.concluded)))
-                    }
-                    state.status = .failed
-                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                    // A proof that does not validate is IGNORED, never destructive. Resource
+                    // proofs are unencrypted by reference design (`Packet.pack` has a branch
+                    // dedicated to `RESOURCE_PRF`), so nothing here is authenticated — the
+                    // ownership routing in `LinkSession` keys on the resource hash, which is a
+                    // SECRET carried in an encrypted advertisement, not an authenticator.
+                    // Failing on a mismatch therefore made a leaked hash into a kill primitive,
+                    // and it is how one junk packet aborted a transfer.
+                    //
+                    // Reference `Resource.validate_proof` has no else branch: the resource keeps
+                    // its status and the sender watchdog terminates it.
+                    guard Resource.validateProof(proofData: packet.payload,
+                                                 expectedProof: state.expectedProof)
+                    else { return .none }
+                    state.status = .complete
+                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.concluded)))
 
                 case (.receiver, .data, .resource):
                     guard state.status == .requesting || state.status == .transferring,
