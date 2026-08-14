@@ -5,6 +5,19 @@
 **Suite:** 824 serially (`swift test --no-parallel`), 1 known issue
 (`holdArmsDeferredReleaseTimerNotImmediateFireDuringFlood`, pre-existing, `TransportTests`).
 
+> **STATUS UPDATE 2026-08-13 (`892652a..a4b5e21`).** Two rows below are now stale:
+> **F12 is CLOSED** (`bd5dd7f`) and **F15 is CLOSED** (`d0570ef` + `0101a74`).
+> Their table rows are left as written, because they record what the sweep saw.
+> The successor sweep —
+> `docs/superpowers/2026-08-13-destructive-transition-sweep.md` — asks a DIFFERENT
+> question (does a branch destroy something without checking that the input owns
+> it?) and found the half of F15 that this document's CREATE/EXTEND/RE-HOME/DESTROY
+> framing structurally could not see: two of our own concurrent transfers
+> destroying each other, no attacker involved. It also promoted this document's
+> `(_, .active, .data, .resource)` row — recorded here as a bounded residual and
+> deliberately not ranked — to **F17**, on the strength of the same
+> non-adversarial argument.
+>
 > **CORRECTED 2026-08-13 by the final whole-branch review over `4ef3a21..86086b0`,
 > and by the fix it produced (`381d731`; suite now 826).** Two rows below said the
 > wrong thing about the same code, and F14 turned out to be a Critical REGRESSION

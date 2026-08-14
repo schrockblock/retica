@@ -22,6 +22,17 @@ Re-confirmed on the revision pass below — count and known issue both still exa
 > false — read its entry, which now records both corrections. **F10 gained a
 > second half** (the grant reaches initiator links too). Nothing else changed
 > status.
+>
+> **Updated a third time 2026-08-13** by the "a destructive transition requires
+> authenticated, owned input" slice (`892652a..a4b5e21`). Suite is now 834, same
+> one known issue. **F12 and F15 are CLOSED** — but read F15's entry before
+> reading "closed" as "authenticated": a resource proof CANNOT be authenticated at
+> all, so what closed it is ownership routing plus non-destructiveness. **F17 and
+> F18 are new**, from the sweep in
+> `docs/superpowers/2026-08-13-destructive-transition-sweep.md`, which asked a
+> different question from the previous one ("does this destroy something without
+> checking that the input owns it?" rather than "can an attacker reach this?") and
+> found the half of F15 the first framing could not see.
 
 **Revised 2026-08-10, after an independent verification pass** that re-derived
 every claim below from the code rather than from this document. Most held. What
@@ -163,34 +174,43 @@ original IDs because plans and working notes reference them. F6–F8 were added 
 the revision pass. **F9–F16 were added on 2026-08-13** by the
 unauthenticated-input slice and the sweep that closed it — see
 `docs/superpowers/2026-08-13-unauthenticated-link-element-sweep.md` for the full
-branch-by-branch table those came out of.
+branch-by-branch table those came out of. **F17 and F18 were added later the same
+day** by the destructive-transition slice and its sweep,
+`docs/superpowers/2026-08-13-destructive-transition-sweep.md`.
 
-**F1, F2 and F6 are CLOSED** by `4ef3a21..034a4c9`. See their entries.
+**F1, F2 and F6 are CLOSED** by `4ef3a21..034a4c9`. **F12 and F15 are CLOSED** by
+`892652a..a4b5e21`. See their entries — F15's in particular, which is closed on
+ownership rather than on authentication because authentication is not available
+to it.
 
 Current priority:
 
 1. **F13** — a reflected LINKREQUEST makes us forward our OWN link's traffic to
    the attacker. One packet. The only item here that redirects a legitimate
    peer's traffic rather than merely denying service. Gated on relay mode.
-2. **F12** — one injected packet kills a legitimate OUTBOUND establishment and
-   mislabels the failure PEER-shaped, so the delivery layer burns its whole
-   budget retrying the same path. The initiator-side mirror of the CLOSED F6.
-3. **F15** — one injected packet aborts every sender transfer on a link, and the
-   same branch makes two of our own concurrent transfers destroy each other with
-   no attacker present.
-4. **F11** — advertise-and-stall pins a link against eviction and then locks out
+2. **F11** — advertise-and-stall pins a link against eviction and then locks out
    every other peer. Does not self-clear.
-5. **F7** — a real unbounded leak, in the router rather than the link plane.
-6. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
+3. **F7** — a real unbounded leak, in the router rather than the link plane.
+4. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
    deliberate, pinned by tests, listed so a future fix confronts them rather than
-   deleting them). **F14 was here and is now CLOSED (`381d731`).**
-7. **F8**, then F3/F4/F5.
+   deleting them).
+5. **F8**, then F3/F4/F5.
+6. **F17**, then **F18** — both low, both from the destructive-transition sweep.
+   F17 has no reference-aligned fix (RNS routes resource segments the same way),
+   so taking it means choosing a deliberate divergence; F18 is a one-line length
+   check whose value is removing a class rather than closing a live hole.
+   Deliberately ranked below F3/F4/F5: those are cheaper and F17's price to an
+   attacker is set by `Resource.mapHashLength`.
 
-F12, F13, F15 and F16 (and F14, while it was open) share the root cause
-F1/F2/F6 shared —
-**unauthenticated input drives link-element lifecycle** — but NOT one fix
-surface: they are in four different files and three different element
-populations. Do not plan them as one slice on the strength of the shared cause.
+**F12, F14 and F15 were ranked here and are now CLOSED** (`bd5dd7f`, `381d731`,
+`d0570ef` + `0101a74`).
+
+F13, F16 and F17 share the root cause F1/F2/F6/F12/F15 shared — **input drives
+lifecycle without being checked against the thing it acts on** — but NOT one fix
+surface: they are in different files and different element populations. Do not
+plan them as one slice on the strength of the shared cause. F17 in particular is
+NOT an authentication problem at all, which is the distinction the second sweep
+exists to make: it is an OWNERSHIP problem between two of our own objects.
 
 ### F1 — unauthenticated keepalives hold a link element open forever — ✅ CLOSED (bounded, not authenticated)
 
@@ -537,8 +557,11 @@ it to Critical — its severity sentence and its prescribed fix were both wrong,
 the defect was a REGRESSION this slice introduced rather than a pre-existing one —
 and it was fixed in the same pass. F10 gained a second half (initiator links) in
 the same review; the behaviour was left as it stands, with the reasoning recorded
-both here and at `LinkPlane.interfaceDisconnected`. F9, F11, F12, F13, F15 and F16
-remain OPEN.
+both here and at `LinkPlane.interfaceDisconnected`.
+
+**Status as of `a4b5e21`: F12 and F15 are also CLOSED**, by the
+destructive-transition slice (`892652a..a4b5e21`). **F9, F11, F13 and F16 remain
+OPEN**, and **F17/F18 are added below** by that slice's sweep.
 
 ### F9 — link traffic has no per-packet replay rejection, anywhere in the link path
 
@@ -576,10 +599,26 @@ it. One captured advertisement, replayed on a cycle, keeps `transfers` permanent
 non-empty — which is F11's eviction immunity, without ever holding the session
 key. (Both halves verified by reading; the composition was not separately probed.)
 
+**Third-order consequence, added 2026-08-13 by the destructive-transition sweep,
+and it comes with a reference guard we are missing.** Reference `RNS/Link.py`'s
+`RESOURCE_REQ` branch keeps a per-resource `req_hashlist` of `packet_hash` values
+and skips a request it has already served, commented *"We need to check that this
+request has not been received before in order to avoid sequencing errors."*
+`ResourceTransfer.State` has no such set. So a captured `RESOURCE_REQ` replayed by
+a third party — no key needed, it is just bytes — makes us re-transmit the
+requested parts and re-arm the sender watchdog. Amplification and life extension,
+not destruction, which is why the sweep left it here rather than minting a number
+for it. It does NOT reach the sequencing-error `.failed` exit: that exit keys on
+`partIndex % Resource.hashmapMaxLen`, a function of the request's contents, so it
+is identical on every replay. **This is the first F9 instance where reference
+carries a defence we simply do not have** — the others are places where reference
+is equally exposed.
+
 Closing F9 needs per-packet replay rejection on the link, which does not exist
 anywhere in the link path today, and which has to be designed around the
 keepalive exemption that put the Transport dispatch above the dedup in the first
-place.
+place. The `req_hashlist` above is a cheap, reference-blessed partial that does
+not require solving the general problem.
 
 ### F10 — the local-disconnect re-home grant is claimable by anyone
 
@@ -666,7 +705,23 @@ without the advertiser's cooperation. Pinned by
 The durable fix is a per-link bound on `transfers`. That is its own slice: it has
 to decide what happens to the transfer it displaces.
 
-### F12 — one injected packet kills a legitimate OUTBOUND establishment ⚠️
+### F12 — one injected packet kills a legitimate OUTBOUND establishment — ✅ CLOSED
+
+**CLOSED by `bd5dd7f`** (in `892652a..a4b5e21`): a `Link.validateProof` failure at
+`(.initiator, .pending, .proof, .linkRequestProof)` now returns `.none` instead of
+emitting `.establishmentFailed(.handshakeRejected)`, so neither half of the old
+damage happens — the element is not reaped and the failure is not mislabelled
+PEER-shaped. The already-armed establishment timer decides, and the failure
+arrives as `.timedOut`, which is PATH-shaped and triggers a path request. Probed
+for the sweep: a junk 99-byte proof leaves the element byte-identical and
+`.pending`. This is Task 1's F6 fix applied to its mirror.
+
+Unlike F15, this one IS authenticated: `Link.validateProof` is an Ed25519
+validation against `destinationIdentity`, which is a stronger gate than a decrypt.
+What was wrong was never the gate — it was what the branch did when the gate said
+no.
+
+The original text follows.
 
 **Where:** `LinkSession.received`, case
 `(.initiator, .pending, .proof, .linkRequestProof)`.
@@ -796,7 +851,59 @@ establishment is refused for as long as those elements take to hit their
 establishment deadline. Links that are already up are untouched — that is the
 property the old shape did not have.
 
-### F15 — an unauthenticated RESOURCE_PRF destroys every sender transfer on a link ⚠️
+### F15 — an unauthenticated RESOURCE_PRF destroys every sender transfer on a link — ✅ CLOSED (owned and non-destructive, NOT authenticated)
+
+**CLOSED by `d0570ef` + `0101a74`** (in `892652a..a4b5e21`), and read the
+qualification, because it is not the usual one.
+
+**A resource proof cannot be authenticated at all.** `Packet.pack` has a branch
+dedicated to `RESOURCE_PRF` that leaves resource proofs unencrypted — that is
+reference design, not an oversight here — so there is no decrypt to gate on and
+no signature to check. Anyone who has observed the cleartext `linkID` can still
+put a proof-shaped packet at this branch, and always will be able to. What
+changed is what happens to it:
+
+- **`d0570ef` — ownership routing.** `Resource.proofData` is
+  `hash ‖ fullHash(data ‖ hash)`, so a proof's leading 32 bytes ARE the resource
+  hash. `LinkSession` now delivers a proof to the ONE sender-role transfer whose
+  `resourceHash` matches those bytes, instead of fanning it out to every transfer
+  on the link. This mirrors reference `Link.receive`, which scopes proofs to
+  `outgoing_resources`. A `payload.count >= 32` guard sits in front, because
+  `prefix(32)` yields a SHORT `Data` rather than trapping.
+- **`0101a74` — non-destructiveness.** `ResourceTransfer`'s
+  `(.sender, .proof, .resourceProof)` branch no longer takes an `else` on a proof
+  that fails to validate. It ignores it, matching reference
+  `Resource.validate_proof`, which has no else branch and leaves termination to
+  the sender watchdog. That watchdog (`senderDeadline` in `.awaitingProof`) is now
+  the only SELF-terminator for a sender whose proof never validates, deliberately.
+  It is not the only terminator: the peer can still cancel explicitly with a
+  `RESOURCE_RCL`, and a host can send `.cancel`.
+
+The routing mirrors reference exactly, verified against `RNS/Link.py` rather than
+assumed: its `RESOURCE_PRF` branch takes `packet.data[0:HASHLENGTH//8]` and matches
+it against `outgoing_resources`. One divergence to know about: reference uses a
+`for` loop and acts on every match, ReTiCA uses `first(where:)` and acts on one.
+With 32-byte hashes that never differs — see F18 for the case where it would.
+
+**Do not summarise this as "proofs are now authenticated."** The honest statement
+is that the branch no longer destroys anything, and that when it does act it acts
+only on the transfer named in the packet. The resource hash is a per-transfer
+SECRET carried in an encrypted advertisement — it is a discriminator, not an
+authenticator, and treating it as one is how "failing on a mismatch" turned a
+leaked hash into a kill primitive in the first place.
+
+**The non-adversarial half was the stronger argument and it is fully closed.** Two
+concurrent sender transfers on one link no longer destroy each other. Pinned by
+`aResourceProofReachesOnlyTheTransferThatOwnsIt`,
+`aResourceProofIsNotDeliveredToAReceiverRoleTransfer`,
+`aShortResourceProofPayloadIsDroppedWithoutDelivery` and
+`aTruncatedProofIsRejectedBeforeThePrefixComparison`; all four, plus the role and
+length clauses independently, are mutation-verified in `a4b5e21`.
+
+**The same shape survives one context over — see F17.** `.resource` is the one
+remaining fanned-out context with no resource hash to route on.
+
+The original text follows.
 
 **Where:** `LinkSession.received`'s `(_, .active, .proof, .resourceProof)` /
 `(_, .active, .data, .resourceProof)` raw-forwarding group, and
@@ -854,6 +961,113 @@ this is a design tension, not an oversight: the re-arm must stay hoisted AND mus
 not be free. Any fix has to keep working for RNS's plaintext keepalives, which is
 the constraint that makes the obvious answer ("re-arm only on
 `sawAuthenticatedData`") wrong.
+
+## 3b. Added 2026-08-13 — the destructive-transition sweep
+
+Full branch-by-branch table:
+`docs/superpowers/2026-08-13-destructive-transition-sweep.md`. Both items below
+are LOW priority; they are recorded because the sweep's question surfaced them,
+not because either is urgent.
+
+**The structural finding behind both is worth more than either item.** For
+anything `LinkSession` fans out to every `ResourceTransfer`, `Link.decrypt` and
+the ownership check do DIFFERENT jobs. Every transfer on a link is constructed
+with the same `sessionKey`, so decrypt keeps an OFF-LINK party out and does not
+discriminate between two of OUR OWN objects at all (probed: transfer B decrypts a
+`RESOURCE_REQ` addressed to transfer A without difficulty, and the only thing
+that stops it acting is the `state.resourceHash` comparison). **AUTH bounds the
+attacker set; OWNERSHIP bounds the blast radius.** A destructive branch with only
+the first is the exact shape that lets our own objects destroy each other, which
+is what F15 was.
+
+### F17 — the `.resource` segment fan-out cannot keep two of our own receivers apart
+
+**Where:** `LinkSession.received`'s `(_, .active, .data, .resource)` fan-out, and
+`ResourceTransfer.received`'s `(.receiver, .data, .resource)` branch.
+
+Five contexts still fan out to every transfer. Four of them are safe to fan out:
+`.resourceRequest`, `.resourceHashmapUpdate`, `.resourceInitiatorCancel` and
+`.resourceReceiverCancel` each decrypt and THEN compare against
+`state.resourceHash`, so a non-owner returns `.none`. `.resource` is the
+exception. A segment packet carries no resource hash, its branch calls no
+`Link.decrypt`, and its only discriminator is
+`Resource.mapHash(chunk:randomHash:)` — a hash of width `Resource.mapHashLength`
+— looked up in `knownHashmap`, plus a `receivedParts[idx] == nil` dedup.
+
+**Probe, with the collision constructed rather than searched for:** with two
+receiver-role transfers on one link, transfer B absorbed a chunk belonging to
+transfer A — `receivedParts[1]` filled, index 1 dropped from `outstanding`. B's
+own legitimate part for that index then arrived and was REJECTED by the dedup
+guard, leaving B byte-identical. B can no longer complete correctly and exits
+through one of its `.failed` branches (`Resource.assemble` or `Resource.verify`).
+**No attacker is involved**, and
+`(_, .active, .data, .resourceAdvertisement)` will create two receivers for any
+two distinct advertised hashes.
+
+The ADVERSARIAL version of this was already priced by the previous sweep, which
+deliberately recorded it without an F-number. The self-collision case is the half
+it did not see, and it is F15's non-adversarial half one context over.
+
+**Price it honestly before ranking it.** Collision probability per fanned part is
+set by `Resource.mapHashLength` against the other transfer's hashmap height, so
+both the accidental and the sprayed variants are expensive. Two blast-radius facts
+belong with it: a collision also drops `partTimeoutFactor` to
+`Const.partTimeoutFactorAfterRTT` for the rest of that transfer's life, and if the
+poisoned transfer is a response-Resource its failure reaches
+`.transfer(… .delegate(.failed))` and cancels a legitimate request with it.
+
+**Reference has the same defect and knows it.** Read out of `RNS/Link.py`, not
+assumed: its `RESOURCE` branch is
+`for resource in self.incoming_resources: resource.receive_part(packet)` — no hash
+filter at all — carrying a standing upstream TODO, *"find the most efficient way
+to allow multiple transfers at the same time, sending resource hash on each packet
+is a huge overhead."* Every OTHER resource context in that same file filters:
+`RESOURCE_REQ`, `RESOURCE_HMU`, `RESOURCE_ICL` and `RESOURCE_RCL` decrypt and then
+match `resource.hash`, and `RESOURCE_PRF` matches against `outgoing_resources`.
+So `.resource` is the one context with no reference discriminator to copy, and a
+fix has to be CHOSEN rather than ported: scope a segment to the transfer whose
+`outstanding` contains its index, or carry the resource hash on segments — which
+is the overhead the upstream TODO is about. That is why this is ranked below
+F3/F4/F5 despite being a real correctness defect.
+
+### F18 — `ResourceAdvertisement.unpack` validates the length of none of `h`, `r`, `o`, `m`
+
+**Where:** `ResourceAdvertisement.unpack`. All four are read through the same
+`bin(_:)` helper, which checks only that the MsgPack value is a `.bin`. Only `t`
+has any gate (a magnitude gate against `Resource.maxAdvertisedTransferSize`).
+Probed: an advertisement with all four fields EMPTY round-trips intact, and so
+does one with over-long `h` / `r` / `o`.
+
+**Impact today is nil, and the framing matters more than the finding.** An empty
+`h` becomes a receiver transfer's `resourceHash`, and an empty `owner` prefix
+compares equal to it — so a truncated proof payload would match a decoy. Three
+corrections to how this was first written during the slice, all re-verified by
+probe before being recorded here:
+
+1. **The length guard is the SECOND LOCK that keeps the match from happening. It
+   is not that an attacker gains something today.** `ResourceTransfer.received`
+   has no `(.receiver, …, .resourceProof)` case at all; a receiver handed a proof
+   falls to `default: return .none`. Probed with both `.proof` and `.data` packet
+   types: state byte-identical. It would bite only if a receiver-side proof
+   handler were added, because `first(where:)` returns a SINGLE target and a
+   matched decoy would then shadow the real recipient.
+2. **"Wire-controlled" means PEER-controlled, not off-path.** The advertisement
+   carrying `h` goes through `authDecrypt`, so an empty hash requires the session
+   key (probed: an unencrypted advertisement creates no transfer at all). The
+   proof PACKET is the off-path half — unencrypted, admitted on
+   `destinationHash == state.linkID` alone.
+3. **Only the role-gate pairing holds.** The claim "(b)+(d) and (c)+(d) are
+   jointly exploitable" is half false. Under (c) the predicate is
+   `$0.role == .sender`, which never selects a receiver, so the empty-hash
+   mechanism is irrelevant to it. Probed by running both mutated predicates
+   literally over a decoy-first array.
+
+A length check on `h` at unpack time would remove the class outright. **This
+belongs to whoever owns advertisement validation**, not to the proof-routing code
+— and the same unvalidated-field class already has a second consumer: `o`
+(`originalHash`) keys `incomingSegments`, so two advertisements can share one
+accumulator. That one needs the session key too, so a peer can only disrupt its
+own delivery.
 
 ---
 
@@ -1072,6 +1286,13 @@ most likely to be built on an assumption nobody has priced.
 > INITIATOR branch, which nobody noticed was a mirror until the sweep enumerated
 > both. If you take one lesson from §7 into the next plan, take that one — the
 > plan named the branch it had found, not the property it wanted.
+>
+> **Superseded again 2026-08-13 (`892652a..a4b5e21`): F12 and F15 are CLOSED**, so
+> the top of the list is now F13 alone. The lesson above held a second time — F15's
+> fix produced F17, which is the same property one context over, and the sweep that
+> found it only did so because it stopped asking about the branch (can an attacker
+> reach this?) and asked about the property (does this destroy something it has not
+> checked it owns?).
 >
 > The original text follows unchanged, because §6 says to keep the record of what
 > was believed at planning time.
