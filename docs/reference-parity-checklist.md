@@ -26,7 +26,7 @@ Reticulum/LXMF, ordered by *what a real peer notices*. Tick items as they land.
 |---|---|
 | **Wire format** | Essentially complete, byte-verified against genuine reference output. No algorithmic gap in the crypto primitives. |
 | **Protocol mechanics** | Good for the paths ReTiCA uses — links, resources, requests, announces, path requests, relaying, LXMF opportunistic/direct/propagated. |
-| **Adversarial robustness** | ~11 remotely-reachable aborts closed plus two fail-opens; **4 confirmed traps remain** (Tier 2, Tasks 7-10). |
+| **Adversarial robustness** | ~17 remotely-reachable aborts closed plus two fail-opens; **3 remain** (Tier 2, Tasks 8-10 — and only one of those, Task 8, is a narrowing conversion the gate can see). |
 | **Durability** | Absent. Nothing in the transport core persists. |
 | **Breadth** | 2 of 15 interfaces; no `Channel`/`Buffer`, tickets, tunnels, or non-link proofs. |
 
@@ -77,7 +77,9 @@ cannot see**. That is what tier 1 is about.
 
 ## Tier 2 — remotely reachable crashes still open
 
-*Planned and gated; mostly execution. Plan: `2026-08-12-wire-input-trap-sweep.md` (6/10 done).*
+*Planned and gated; mostly execution. Plan: `2026-08-12-wire-input-trap-sweep.md` (7/10 done).*
+*Gate status: **1 known-open conversion left** (Task 8). Tasks 9 and 10 are not narrowing
+conversions, so the gate cannot see them — their tests are the only regression guard.*
 
 - [x] **Task 6 — `LXMFServiceNode.swift` `Int(raw)` (in `requestReceived`)** — `[[], [], float64(NaN)]` on a `/get`
       aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client.
