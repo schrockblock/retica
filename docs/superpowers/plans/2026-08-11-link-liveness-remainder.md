@@ -10,6 +10,122 @@
 
 **Tech Stack:** Swift 6, The Composable Architecture 1.26, `swift-testing`, `TestClock`.
 
+---
+
+> ## ⚠️ RE-VERIFIED 2026-08-14 at `46e838e` — DO NOT EXECUTE AS WRITTEN
+>
+> Two security slices landed in `LinkSession.swift` and `LinkPlane.swift` after this plan was
+> written (`16db5e7..46e838e`): *unauthenticated input cannot pin, steal, or kill a link element*,
+> then *a destructive transition requires authenticated, owned input*. Every Swift line number
+> below has rotted. All **reference-Python** citations were re-checked and remain exact.
+>
+> **Per-task verdicts:**
+>
+> | Task | Verdict |
+> |---|---|
+> | 1 — `cancelAll` comments | **Keep, rewrite the "Why".** The comments are already general; what they lack is the *mechanism* paragraph. Retarget to `LinkSession.swift:222-244` and `LinkSessionTests.swift:662-671`. |
+> | 2 — cancel establishment timer on `.handshakeRejected` | **DELETE.** All three target sites were removed by `bd5dd7f`/`331843a` (now `return .none`). At the four surviving exits no establishment timer has been armed yet, so `cancelAll()` would be a literal no-op and the double-delivery cannot occur. |
+> | 3 — `lastOutbound` + keepalive gate | **Keep, three fixes required.** See below. |
+> | 4 — responder `0xFE` gate | **Keep**, but Step 4's reassurance is false and it now collides with a landed test. |
+> | 5 — STALE grace state | **REWRITE FROM SCRATCH.** Not salvageable by editing. |
+> | 6 — cancel transfers on close | **Keep**, soften the rationale, add a delegate-ordering constraint. |
+> | 7 — large-request timer | **Keep as-is.** Strongest task in the plan; three line refs to refresh. |
+>
+> ### The omission that governs Tasks 3, 4 and 5
+>
+> `LinkSession` reads wall time from `@Dependency(\.date)` but drives timers from
+> `@Dependency(\.continuousClock)`, and **every existing liveness test pins `$0.date = .constant(epoch)`**.
+> Tasks 3-5 all introduce elapsed-time predicates over `date.now`; under a constant date
+> `now >= lastOutbound + keepaliveInterval` is `0 >= 30` — permanently false, however far the
+> `TestClock` advances. Those gates would therefore suppress *every* keepalive and *every* `0xFE`
+> reply, failing four existing tests, and the plan's Step-1 recipes ("keep the link busy with
+> inbound DATA just under `keepaliveInterval`") are not expressible at all.
+>
+> **This plan never mentions `\.date`.** It is the single largest omission. The substrate now
+> exists — `advancingResponderStore(clock:seconds:)` at `LinkSessionTests.swift:82-110`, added by
+> `b384ed6` — but there is no initiator equivalent. **Insert a preparatory task** establishing an
+> advancing-date substrate for both roles, and resequence 3 and 4 behind it.
+>
+> This is also why `lastData` (`39d44bc`) works and `lastOutbound` will not without that work:
+> `lastData` is only ever an *ordering key* (`LinkPlane.swift:319`), never an interval predicate.
+>
+> ### Task 3 — three specific corrections
+>
+> 1. **The rationale inverts the reference.** This plan says reference "emits none while *either*
+>    direction is busy". `RNS/Link.py:749` is `now >= last_inbound + keepalive **or** now >=
+>    last_outbound + keepalive` — so suppression is the negation: silent only when **both**
+>    directions have carried traffic. Step 5's code transcription is correct; the prose above it is
+>    not, and the prose is what an implementer reads.
+> 2. **The `transmit` signature cannot cover all sites.** There are 14 outbound emission sites at
+>    HEAD; the last of them forwards a `ResourceTransfer` child's transmit using the **child's**
+>    `ifID`, so a helper reading `state.interfaceID` cannot serve it — and that site is the dominant
+>    emitter during a resource upload, exactly the traffic reference's `had_outbound()` counts.
+>    The signature needs an interface parameter.
+> 3. **Reference's third gate is dropped silently.** `RNS/Link.py:750` adds
+>    `and now >= self.last_keepalive + self.keepalive`. ReTiCA's `while true` loop supplies the same
+>    rate limit structurally — say so rather than omitting it.
+>
+> `lastOutbound` and `lastData` are **complementary, not redundant**: different direction, different
+> consumer, different threat model. Note that `lastData`'s doc comment establishes a house rule
+> ("must not be advanceable by an unauthenticated peer") that `lastOutbound` satisfies trivially.
+>
+> ### Task 5 — why it needs redesign, and why my stated suspicion was wrong
+>
+> I suspected reviving a STALE link on *unauthenticated* input would contradict the landed auth
+> slice. **It does not.** That slice defines "destructive" narrowly — `.failed`, `.closed`,
+> `.establishmentFailed`, element removal, transfer removal — and STALE→ACTIVE is constructive.
+> More decisively, the predecessor spec *pins the opposite* with a deliberate interop test: "a
+> plaintext keepalive still refreshes inactivity". Extension-of-life on unauthenticated input was
+> adjudicated and **kept**, because ReTiCA keepalives are plaintext and gating them would tear down
+> links with real RNS peers. Reference agrees — `RNS/Link.py:939` sets STALE→ACTIVE before any
+> decryption.
+>
+> **The real defect is worse.** The dispatch switch matches on `(role, status, packetType, context)`
+> and only ever names `.pending`, `.handshake`, `.active`. A `.stale` status therefore falls to
+> `default: return .none`, and `authDecrypt` is called *only* from inside that switch — so while
+> `.stale`, `sawAuthenticatedData` is **structurally always false**. It is not that unauthenticated
+> revival is permitted; it is that *authenticated* revival is **unreachable**. An implementer who
+> reads the auth slice and dutifully gates revival on authentication produces a link that can never
+> revive at all.
+>
+> **Three cross-file collisions the plan does not list** (it claims to be "confined to
+> `LinkSession.swift`" — at HEAD, adding a `Status` case is not):
+> 1. `LinkPlane.swift:196` counts `status != .active` as the half-open budget — a `.stale` link
+>    would consume it, so stale-but-established links would cause new LINKREQUESTs to be **refused**,
+>    re-opening from a new direction the availability surface `6f05357` hardened.
+> 2. `LinkPlane.swift:289` counts `status == .active` for the responder cap — a `.stale` link is
+>    neither counted nor evictable, so the cap silently under-counts during every grace window.
+> 3. `LinkSession.close` guards `status == .active`, and `LinkPlane.swift:186-188` reasons
+>    explicitly about which statuses make `.close` a no-op — `.stale` would become a third,
+>    unenumerated, un-closeable class, reached by both eviction paths.
+>
+> Plus **eleven** `status == .active` guards in `LinkSession` gate every outbound API, all of which
+> would silently drop during the grace window. Reference does not gate outbound on STALE.
+>
+> ### Task 6 — rationale is one arrow too strong
+>
+> "A caller awaiting conclusion hangs forever" is **not** true of the in-repo consumer:
+> `LXMFRouter` clears its in-flight state on `.linkClosed` and the retry saga recovers. In fact
+> **nothing in `LXMFNode` consumes `.resourceFailed` at all**. Keep the task — reference parity and
+> the missing signal are real — but state the consequence honestly: a silently-dropped transfer
+> that recovers by retry, not a hang.
+>
+> Two additions: (a) `LinkPlane.swift:314-316` now *claims* eviction "reaps its transfers", a
+> reassuring sentence sitting directly on the gap this task closes — correct it; (b) `LinkPlane`'s
+> `.resourceFailed` forwarder guards on the element still existing, and its `.closed` handler
+> removes the element, so `.resourceFailed` must be emitted **before** `.closed` or the plane
+> swallows every one. The task's `LinkSession`-level test would pass while the fix stays invisible
+> above it — a `LinkPlane`-level test is required.
+>
+> ### Recommended sequence
+>
+> Land **7** first (independent, correct, depends on nothing). Then **1** (documentation only).
+> Then **6**, decoupled from Task 5 by targeting only the three existing close paths. Then the new
+> `\.date` substrate task, then **3** and **4** behind it. Send **5** back to design.
+>
+> The plan's two "hard-won rules" below — `Effect.cancel` eagerness and status-readback vacuity —
+> were both re-checked and remain valid and load-bearing. Keep them verbatim in any rewrite.
+
 ## Global Constraints
 
 - Platform floor **iOS 17 / macOS 13 / macCatalyst 17**, per `Package.swift:6-10` (authoritative; earlier plans' "iOS 16" was stale). Do not lower it.

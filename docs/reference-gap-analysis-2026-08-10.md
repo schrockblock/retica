@@ -1,9 +1,26 @@
 # ReTiCA vs reference Reticulum — gap analysis
 
-**Date:** 2026-08-10
+**Date:** 2026-08-10 · **Re-verified 2026-08-14 at `46e838e`**
 **Reference:** `RNS` 1.4.1 (`/Users/ell/development/python/Reticulum`, BLE fork) cross-checked against stock 1.4.2
 (conda env `rns`); `LXMF` 1.1.0 (`.../site-packages/LXMF`).
 **Under review:** `Sources/` at `5912344`.
+
+> ## ⚠️ Read this before trusting any section below
+>
+> **Ten of the defects this document describes have since been FIXED.** Each is annotated inline
+> with its commit, but if you are skimming: §1.1, §1.2, §1.3, §1.4, §1.5, §2.1, §2.2, §2.4, §2.5
+> and §2.6 are all closed. **Still live:** §1.6 (deferred by decision), §1.7, §1.8, §2.3 (narrowed,
+> see below), §2.7, and everything in §3-§9 except where annotated.
+>
+> Eight of those fixes landed *before this document's own last edit* — I executed them and failed
+> to come back and mark them closed. A gap analysis that reports closed holes as open is worse
+> than one merely out of date: it misdirects the next person's effort toward work already done.
+>
+> **Line numbers below predate `46e838e` and have broadly rotted.** Two development slices landed
+> in between (`16db5e7..46e838e`) that this document has not otherwise absorbed. The durable keys
+> are *file + expression + behaviour*; treat every `file:line` as a lead to re-derive, not a fact.
+> One property claim in §2.3 was additionally found to have been **wrong when written**, not merely
+> stale — see the note there.
 
 Method: eight parallel subsystem sweeps (Identity/Crypto, Packet/Destination, Link/Channel/Buffer,
 Resource, Transport×2, Interfaces, LXMF), each required to cite `file:line` on both sides and to
@@ -27,8 +44,12 @@ The gaps are almost entirely in the **stateful, adversarial, and durable** layer
    does not work through or to a ReTiCA node.
 3. **Durability.** Nothing in the transport core is persisted. Paths, identities, dedup memory and
    the LXMF outbound queue all evaporate on cold start.
-4. **Admission control.** No resource-accept policy, no request size caps, no link-accept policy,
-   no path-request rate limiting. Several unbounded-allocation paths reachable by any peer.
+4. **Admission control.** No resource-accept policy, no request size caps, no link-accept *policy*,
+   no path-request rate limiting. ~~Several unbounded-allocation paths reachable by any peer.~~
+   **Narrowed 2026-08-14:** link *quantity* is now bounded (see §2.3), and the decompression,
+   HDLC and MsgPack allocation paths are closed. **One** remotely reachable unbounded allocation
+   remains in the transport core — `LinkSession.State.transfers`, which has no per-link cap — and
+   it is what defeats the new link cap, since a peer holding one link can still grow without limit.
 5. **Two whole subsystems absent:** `Channel`/`Buffer`, and the LXMF ticket system.
 
 Nothing here contradicts the README's own "Not Yet Implemented" section — but the README
@@ -96,7 +117,12 @@ fires and `.inactivityDeadline` (`:634-643`) sends LINKCLOSE mid-flight.
 > effect-emitted actions into `state` until drained — which is what made the first fix's test
 > vacuous.
 
-### 1.2 A local path response wipes the requester's app data and ratchet **[verified]**
+### 1.2 A local path response wipes the requester's app data and ratchet — **FIXED 2026-08-11 (`07e2524`, `4b968ba`)**
+
+> The path response now carries `appData: state.localAppData[dest.hash]` (`Transport.swift:552-555`),
+> backed by the `default_app_data` fallback at `:865-874` which names this exact failure mode.
+> The `ratchet: nil` half survives — but so does it on the *ordinary* announce (`:882`), so there is
+> no richer ratchet for a path response to wipe. That residue is §7's gap, not a §1 defect.
 
 `Transport.swift:492` builds the path-response announce with `ratchet: nil, appData: nil`, stamped
 with a fresh `randomHash` at `now` (`:489-490`). On the requester, `announceEmitted` is therefore
@@ -108,7 +134,11 @@ is overwritten with nils (`:428-431`).
 the cached payload verbatim (`:502, :515`). Reference sends a full announce with rotated ratchet and
 `default_app_data` (`Destination.py:283-304`).
 
-### 1.3 Path responses are re-broadcast — announce amplification **[verified]**
+### 1.3 Path responses are re-broadcast — announce amplification — **FIXED 2026-08-11 (`e555d98`, `58ee431`)**
+
+> `Transport.swift:497` — `if packet.context != .pathResponse,` now gates the whole re-broadcast
+> block (`:497-519`), with the reference gate cited at `:486`. `58ee431` additionally fixed the
+> relayed response's context flag. The doc's old cite `:451` is now unrelated code.
 
 Reference gates announce-table insertion on `packet.context != PATH_RESPONSE`
 (`Transport.py:1944`): a transport node adopts a path response but **never** re-broadcasts it.
@@ -119,7 +149,14 @@ one sees an unseen blob, passes `shouldReplace`, and schedules a network-wide re
 request triggers a flood proportional to the number of ReTiCA relays. Bounded by
 `announceMaxRebroadcasts = 2`; reference emits zero.
 
-### 1.4 Packet-hash dedup window is 1000 entries instead of 500k–1M **[verified]**
+### 1.4 Packet-hash dedup window is 1000 entries instead of 500k–1M — **FIXED 2026-08-11 (`1ba65c5`, `4b968ba`)**
+
+> `Transport.swift:41` — `RingSet(capacity: Transport.seenPacketRingSize)`, with
+> `seenPacketRingSize = 262_144` at `:1074` and the divergence rationale at `:1057-1074`.
+> **Both cost figures below are stale.** 262 144 is a quarter of reference's floor, chosen
+> deliberately rather than ported, and it is only affordable because `RingSet` was boxed to O(1)
+> in the same slice — at the original value with the original structure it measured ~500× *slower*
+> than the 1000 it replaced. See §1.4's own correction history.
 
 `seenPacketHashes = RingSet()` (`Transport.swift:32`) takes `RingSet`'s default `capacity: 1000`
 (`RingSet.swift:10`). Reference keeps `hashlist_maxsize = 1000000` with a two-generation flip holding
@@ -189,7 +226,13 @@ clock's start point is wrong.
 
 ## 2. Remotely reachable resource-exhaustion / crash paths
 
-### 2.1 Decompression bomb via advertised data size **[verified]**
+### 2.1 Decompression bomb via advertised data size — **FIXED 2026-08-12 (`95e8739`, `4b4526d`)**
+
+> Three independent guards now: `ResourceAdvertisement.swift:60` bounds advertised `t`;
+> `ResourceTransfer.swift:394-406` stays in `UInt64` until provably small (split → clamped,
+> non-split → rejected); `Bzip2.swift:34` refuses above `autoCompressMaxSize`. The fix round also
+> closed two *adjacent* traps the original finding missed — `Int(adv.dataSize)` and `Int(n)` —
+> which is what turned this into the class-wide sweep. All three cites below are stale.
 
 `adv.dataSize` is an unbounded `UInt64` off the wire (`ResourceAdvertisement.swift:7, 60`), passed
 as `Int(adv.dataSize)` (`ResourceTransfer.swift:377`) into
@@ -201,7 +244,16 @@ to `AUTO_COMPRESS_MAX_SIZE` (64 MiB) and checks `decompressor.eof` (`Resource.py
 
 Reachable by any peer that can establish a link, which is unconditional (§2.3).
 
-### 2.2 `try!` on X25519 key agreement is a remote abort **[verified]**
+### 2.2 `try!` on X25519 key agreement is a remote abort — **FIXED 2026-08-12 (`d37d32d`, `eeeeff7`)**
+
+> Both routes closed at their boundaries: `Identity.swift:60` rejects a public key that cannot
+> perform key agreement (trial-agreement helper at `:71-73`), and `Announce.swift:64-67` drops an
+> unusable announced ratchet while keeping the announce. The `try!`s themselves remain
+> (`Identity.swift:98, 100, 110, 114`) with an explicit unreachability argument at `:102-109`.
+>
+> **The finding's own premise was wrong** and is corrected in place below: `Identity(publicKey:)`
+> did *not* validate only length — it already constructed the CryptoKit key. The real gap was that
+> CryptoKit accepts a low-order point at construction and throws only at agreement.
 
 `Identity.swift:77-81` force-unwraps three throwing CryptoKit calls, including
 `try! ephemeral.sharedSecretFromKeyAgreement(with: targetPub)`. CryptoKit throws on low-order
@@ -216,29 +268,62 @@ second unvalidated path to the same `try!`, as is `LXMFPropagation+Message.swift
 
 Reference does not abort: pure-Python returns an all-zero secret, PyCA raises catchably.
 
-### 2.3 No admission control on links, resources, or requests
+### 2.3 No admission control on links, resources, or requests — **NARROWED 2026-08-14, not closed**
 
-- **Links:** no `accepts_links` equivalent. `LinkPlane.acceptLinkRequest` is an unconditional command
-  (`LinkPlane.swift:110-115`); its only caller accepts any request for any registered destination
-  holding a private key (`TCPEndpoint.swift:142-147`).
+- **Links — REWRITTEN 2026-08-14; the original bullet was wrong in three ways.**
+  What is genuinely missing versus reference is only the **policy** switch: there is no
+  `accepts_links` equivalent (`Destination.py:320`), so no per-destination allow/deny and no accept
+  callback. Any peer can open a link to any registered destination holding a private key
+  (`TCPEndpoint.swift:152-157`, `BLEEndpoint.swift:180-186`).
+
+  What is now bounded is the **quantity** — and reference does not bound it *at all*
+  (`Transport.py:105-106` are plain lists, appended without a length test), so this is a ReTiCA
+  divergence in our favour rather than a parity gap. `acceptLinkRequest` (`LinkPlane.swift:146-203`)
+  dedupes by `linkID` **before any crypto** (`:164`) and refuses once 32 responder elements are
+  non-`.active` (`:195-198`); `maxResponderLinks` = 256 is enforced at **promotion**
+  (`LinkPlane.swift:288-334`), LRU by authenticated `lastData`, responder-role only, with
+  transfer-bearing links exempt and the newcomer closed if nothing is evictable.
+
+  **Residual, narrowed not closed:** initiator links are uncapped (`LinkPlane.swift:138-144`,
+  though only local sends drive it); and because eviction skips links with non-empty `transfers`
+  (`:318`), a peer can advertise a resource, never send a segment, and become eviction-immune —
+  fill all 256 slots that way and every later promotion is refused on arrival. `LinkPlane.swift:301-307`
+  records this as accepted and names the real fix: bounding transfers per link.
+
+  > **Two corrections worth keeping, because they are instructive.** (1) *"its only caller"* was
+  > **false when written**, not merely stale — `BLEEndpoint` had a second call site even at this
+  > document's own baseline `5912344`. That is the property-claim failure mode: true of the file
+  > the author had open, false repo-wide. (2) The original framing presented the missing cap as a
+  > parity gap; reference has no cap, so the direction was inverted.
 - **Resources:** no `resource_strategy`. Reference defaults to `ACCEPT_NONE` (`Link.py:239`);
-  ReTiCA accepts unconditionally (`LinkSession.swift:396-415`), gated only by hash dedup. No
-  `Resource.reject`/RCL path for unwanted advertisements. No `ready_for_new_resource()` gate, so
-  unlimited concurrent transfers.
+  ReTiCA accepts unconditionally (`LinkSession.swift:495-514`), gated only by hash dedup. No
+  `Resource.reject`/RCL path for unwanted advertisements. No `ready_for_new_resource()` gate
+  (`Link.py:1299`), so unlimited concurrent transfers.
+  **This is now the sharp end of §2.3.** Per-transfer memory *is* bounded (192 MiB advertised,
+  `ResourceAdvertisement.swift:60`; 64 MiB decompressed, `Bzip2.swift:34`), but transfers-per-link
+  is not — so it is both the last remotely reachable unbounded allocation in the transport core
+  **and** the thing that defeats the new link cap, since one held link still buys unbounded growth.
 - **Requests:** no `max_request_size` / `max_response_size` (`Link.py:992-994, 1030-1036`). A
   `.none`-policy handler still pays full reassembly before the drop, because `LinkPlane` consults
-  `RequestPolicy` only after reassembly (`LinkPlane.swift:248-262`).
+  `RequestPolicy` only after reassembly (`LinkPlane.swift:381-395`, `isAllowed` at `:388`).
 - **Path requests:** no ingress or egress rate control (`Interface.py:174-203`). Fresh random tags
   pass the `discoveryPrTags` ring every time, each drawing a cached response or a recursive fan-out.
 
-### 2.4 GROUP destination encryption fails open to plaintext **[verified]**
+### 2.4 GROUP destination encryption fails open to plaintext — **FIXED 2026-08-12 (`e50ae32`)**
+
+> `Destination.swift:55` — `guard let key = groupKey, (try? Token(key: key)) != nil else { return nil }`.
+> The `encrypt` plaintext fallback survives at `:87` but is now unreachable-by-construction, with a
+> comment at `:85-87` forbidding its relaxation.
 
 `Destination.swift:78` returns `plaintext` when `Token(key:)` fails, while `decrypt` at `:91` fails
 closed — an asymmetry that is itself the tell. `init?` at `:50` checks only `groupKey != nil`, never
 its length, and `Token` requires exactly 32 or 64 bytes. A 16- or 24-byte group key silently emits
 cleartext. Reference raises (`Destination.py:620`).
 
-### 2.5 `enforceRatchets` fails open **[verified]**
+### 2.5 `enforceRatchets` fails open — **FIXED 2026-08-12 (`0bb3ac1`)**
+
+> `Identity.swift:143` — the check is now dedented outside the `if let ratchets` block (`:126-137`),
+> matching `RNS/Identity.py:880`, with the reference cite at `:139-142`.
 
 `Identity.swift:108` places the `if enforceRatchets { return nil }` check *inside* `if let ratchets`,
 so `ratchets: nil, enforceRatchets: true` falls through to the static-key branch (`:111-114`) and
@@ -249,7 +334,11 @@ and makes exactly that call whenever a ratchet-enforcing destination has no ratc
 Latent today (nothing passes `enforceRatchets: true`), but a silent security hole the moment
 enforcement is wired up.
 
-### 2.6 HDLC deframer buffer is unbounded **[verified]**
+### 2.6 HDLC deframer buffer is unbounded — **FIXED 2026-08-12 (`de323b2`)**
+
+> All three reference clamps present: `HDLC.swift:80-83` (no FLAG → clear), `:88`
+> (`buffer.count > maxFrameSize * 2` → clear), `:93` (upper frame-length bound on the assembled
+> frame, alongside the pre-existing lower bound).
 
 `HDLCDeframer.ingest` (`HDLC.swift:61-72`) breaks out at `:65` (no FLAG found) and `:66` (opening FLAG
 with no closing FLAG) **without clearing `buffer`**, and bounds frames only from below (`:68`).

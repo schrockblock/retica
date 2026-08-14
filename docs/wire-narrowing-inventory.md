@@ -12,6 +12,18 @@ The two must agree; the script fails if a conversion exists that the allowlist d
 **Line numbers are as of `656555e`** (the commit this inventory was built against). They rot.
 The durable key is *file + expression text*, which is what the allowlist matches on.
 
+> **Re-verified 2026-08-14 at `46e838e`, and the gate earned its keep.** Two security slices
+> landed in between (`16db5e7..46e838e` — unauthenticated-link-elements, then
+> destructive-transitions), neither aimed at this sweep, both touching `LinkSession.swift`,
+> `LinkPlane.swift` and `ResourceTransfer.swift`. The gate reports **117 reviewed conversions
+> across 56 files, 8 known-open, zero unreviewed** — so neither slice introduced a new narrowing
+> conversion, and the count is unchanged.
+>
+> Exactly one recorded location rotted: Task 8's `Int(chunkIndex)` moved from `:442` to `:451`.
+> Because the allowlist keys on expression text rather than line number, the gate never lost
+> track of it — which is the design working as intended. The surrounding logic is unchanged: the
+> contiguity check still evaluates *after* the conversion, so it still does not protect it.
+
 ---
 
 ## Status
@@ -72,7 +84,7 @@ forget one; `--fail-on-open` will tell you if any remain.
   through to `Int(NaN)` and traps; so does any sufficiently large negative. `[[], [], float64(NaN)]`
   on a `/get` aborts. No `/get` handler is registered, so no `RequestPolicy` gate applies.
 
-- [ ] **`Sources/ReTiCATransport/ResourceTransfer.swift:442`** — `Int(chunkIndex)` — **Task 8**
+- [ ] **`Sources/ReTiCATransport/ResourceTransfer.swift:451`** — `Int(chunkIndex)` — **Task 8** *(was `:442`; drifted 2026-08-14 when the destructive-transition slice touched this file. The allowlist keys on expression text, not line number, so the gate stayed correct throughout — this line number is documentation only.)*
   Source: `chunkIndex` is a raw wire `UInt64` from a RESOURCE_HMU msgpack array.
   Guarded: **no.** The predecessor's ledger recorded this as guarded by the contiguity check
   `offset == state.knownHashmap.count` — that check is on `:443` and evaluates *after*. Traps

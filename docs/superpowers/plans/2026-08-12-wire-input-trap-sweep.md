@@ -66,7 +66,7 @@ Each was reproduced as a real abort or measured DoS. Ordered by reach. Each task
 
 - [ ] **Task 7 — `PNAnnounce.swift:56-59`, six `Int(UInt64)`.** A 21-byte app-data blob aborts. `PNAnnounce.isValid` — the *validity predicate* — crashes on the input it exists to reject, which is the sharpest illustration of the class in the codebase.
 
-- [ ] **Task 8 — `ResourceTransfer.swift:442` `Int(chunkIndex) * 74 * 4`.** Signal 5 **twice** — the conversion and the multiply. The predecessor's ledger wrongly recorded this as guarded by the contiguity check on `:443`; `:442` evaluates first. **Bound the product.**
+- [ ] **Task 8 — `ResourceTransfer.swift:451` `Int(chunkIndex) * 74 * 4`.** Signal 5 **twice** — the conversion and the multiply. The predecessor's ledger wrongly recorded this as guarded by the contiguity check on the following line; the conversion evaluates first. **Bound the product.** *(Re-verified 2026-08-14: was `:442`, drifted to `:451` when the destructive-transition slice touched this file. The surrounding logic is unchanged — the `guard offset == state.knownHashmap.count` contiguity check is still on the line **after** the conversion, so it still does not protect it.)*
 
 ---
 
@@ -74,7 +74,7 @@ Each was reproduced as a real abort or measured DoS. Ordered by reach. Each task
 
 - [ ] **Task 9 — unkillable stamp generation.** `LXMFNode.swift:340` → `LXStamper.swift:73-79`: a wire `targetStampCost` of 64 reaches a bare `while true` inside a `.run` effect **with no cancellation ID**. Clamp the cost against a sane ceiling (reference `PROPAGATION_COST` is 16) *and* give the effect a cancellation ID so it can be torn down.
 
-- [ ] **Task 10 — decompression allocates the ceiling, not the content.** `Bzip2.swift:36-38` / `ResourceTransfer.swift:393`: 41 bytes of input can drive a 64 MiB allocation. This is **not** reference parity — `Resource.py:691` uses an *incremental* `BZ2Decompressor(max_length=)` that allocates only what it produces. Move to incremental decompression.
+- [ ] **Task 10 — decompression allocates the ceiling, not the content.** `Bzip2.swift:36-38` / `ResourceTransfer.swift:408`: 41 bytes of input can drive a 64 MiB allocation. *(Re-verified 2026-08-14: `Bzip2.swift:36-38` still exact — `let bufSize = max(expectedSize, 1)` then `[UInt8](repeating: 0, count: bufSize)`. The call site drifted from `:393` to `:408`; `:393` is now just the `segmentExpectedSize` declaration, and the bound added by Task 3's fix round sits at `:402`.)* This is **not** reference parity — `Resource.py:691` uses an *incremental* `BZ2Decompressor(max_length=)` that allocates only what it produces. Move to incremental decompression.
 
 ---
 
