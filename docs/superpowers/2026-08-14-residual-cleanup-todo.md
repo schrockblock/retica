@@ -1,5 +1,32 @@
 # Cleanup TODO — four parked residuals from the destructive-transition slice
 
+## ✅ DONE — all four items, `d9e3a05`. Suite 835 + the one known issue, unchanged.
+
+**Two things a future reader should take from how this went, both about this file
+rather than about the items:**
+
+1. **Item 1's table was incomplete.** It listed five occurrences of the permanence
+   overstatement; there were **six**. The missing one is in **F9's third-order
+   consequence** — *"Replays faster than the window therefore mean the transfer
+   never terminates at all"* — added by the same commit (`c47443b`) as the others.
+   A fresh `git grep -e` over the pair found it; inheriting the table would not
+   have. This file's own instruction to verify rather than comply is what caught
+   it, and the lesson is now recorded in the sweep's §6.
+2. **The corrections needed correcting, exactly as this file predicted.** Five
+   defects were caught in my own new text during self-review, before the commit:
+   a paragraph I orphaned onto the wrong parent, a citation placing the host
+   `.cancel` inside `ResourceTransfer.received` when it is a reducer ACTION, an
+   inline code span broken across a line, and two sentences wider than their
+   evidence (*"nothing ever reclaims the leaked entry"* as a bare universal, and
+   *"closing it means scoping duplicate sends"* — which ignores that a per-chain
+   `segmentedSend` would also close it).
+
+**One same-shape claim was deliberately NOT touched**, flagged here rather than
+edited: F9's *second*-order consequence says one captured advertisement replayed
+on a cycle *"keeps `transfers` permanently non-empty."* Same over-wide flavour, but
+it is a different finding, it states its condition inline, and Item 1 scoped this
+pass to F19's claim. Narrow it in a pass that owns F9.
+
 **Written:** 2026-08-14, at HEAD `c702ddf`.
 **Suite at HEAD:** 835 passing, 1 known issue
 (`holdArmsDeferredReleaseTimerNotImmediateFireDuringFlood`, `TransportTests`,
