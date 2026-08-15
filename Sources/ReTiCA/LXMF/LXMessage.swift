@@ -18,6 +18,43 @@ public struct LXMessage: Equatable, Sendable {
     public let fields: [MsgPackValue.IntPair]     // ordered integer-keyed fields (empty = none)
     public let stamp: Data?                       // optional PoW delivery stamp (payload 5th element)
 
+    /// The exact bytes `unpack` was given, retained so signature validation and forwarding use what
+    /// the sender actually sent rather than what our encoder would have produced. `nil` for messages
+    /// built locally by `create`, which have no wire form yet.
+    ///
+    /// Mirrors reference `message.packed = lxmf_bytes` (lxmf 1.1.0 `LXMessage.py:797`). Without it a
+    /// sender whose MessagePack encoder differs from ours in any single legal way — a `bin16` length
+    /// prefix where we emit `bin8`, say — fails signature validation and the message is dropped.
+    /// Excluded from `==` on purpose: see the `Equatable` conformance below.
+    public let receivedBytes: Data?
+
+    /// Compares message content only. `receivedBytes` is deliberately excluded — it is a cache of how
+    /// this message arrived, not part of what it says, and including it would make a round-tripped
+    /// message unequal to the one it round-tripped from.
+    public static func == (lhs: LXMessage, rhs: LXMessage) -> Bool {
+        lhs.destinationHash == rhs.destinationHash && lhs.sourceHash == rhs.sourceHash
+            && lhs.timestamp == rhs.timestamp && lhs.title == rhs.title
+            && lhs.content == rhs.content && lhs.hash == rhs.hash
+            && lhs.signature == rhs.signature && lhs.fields == rhs.fields && lhs.stamp == rhs.stamp
+    }
+
+    // Explicit memberwise init so `receivedBytes` defaults to `nil` and no existing call site needs
+    // to change. Only `unpack` passes a non-nil value.
+    init(destinationHash: Data, sourceHash: Data, timestamp: Double, title: Data, content: Data,
+         hash: Data, signature: Data, fields: [MsgPackValue.IntPair], stamp: Data?,
+         receivedBytes: Data? = nil) {
+        self.destinationHash = destinationHash
+        self.sourceHash = sourceHash
+        self.timestamp = timestamp
+        self.title = title
+        self.content = content
+        self.hash = hash
+        self.signature = signature
+        self.fields = fields
+        self.stamp = stamp
+        self.receivedBytes = receivedBytes
+    }
+
     /// LXMF app name and delivery aspect. A message's source/destination hashes are the hashes of the
     /// parties' `<identity>.lxmf.delivery` destinations — NOT raw identity hashes. A receiver recalls
     /// the source identity from `sourceHash` (RNS Identity.recall of the delivery-destination hash)
@@ -110,15 +147,27 @@ public struct LXMessage: Equatable, Sendable {
         let hash = Crypto.fullHash(destinationHash + sourceHash + hashPayload)
         return LXMessage(destinationHash: destinationHash, sourceHash: sourceHash,
                          timestamp: timestamp, title: title, content: content,
-                         hash: hash, signature: signature, fields: fields, stamp: stamp)
+                         hash: hash, signature: signature, fields: fields, stamp: stamp,
+                         receivedBytes: data)
     }
 
-    /// Recompute the hashed/signed parts from this message's fields and validate the signature
-    /// against the resolved source identity (the caller resolves it by `sourceHash`).
+    /// Validate the signature against the resolved source identity (the caller resolves it by
+    /// `sourceHash`). For a message off the wire this validates the bytes **as received**, matching
+    /// reference `signed_part` (lxmf 1.1.0 `LXMessage.py:761`); only a locally-created message, which
+    /// has no received form, is validated against re-encoded fields.
+    ///
+    /// A stamped message still re-packs `payload[:4]`, exactly as reference does at
+    /// `LXMessage.py:755` — canonical encoding remains required on that path, by design, not oversight.
     public func validateSignature(source: Identity) -> Bool {
-        let payload = LXMessage.payloadBytes(timestamp: timestamp, title: title, content: content, fields: fields)
-        let hashedPart = destinationHash + sourceHash + payload
-        let hash = Crypto.fullHash(hashedPart)
-        return source.validate(signature: signature, message: hashedPart + hash)
+        let hashedPart: Data
+        if let receivedBytes, stamp == nil {
+            let headerLen = 2 * LXMessage.destinationLength + LXMessage.signatureLength
+            hashedPart = destinationHash + sourceHash + Data(receivedBytes.dropFirst(headerLen))
+        } else {
+            hashedPart = destinationHash + sourceHash
+                + LXMessage.payloadBytes(timestamp: timestamp, title: title,
+                                         content: content, fields: fields)
+        }
+        return source.validate(signature: signature, message: hashedPart + Crypto.fullHash(hashedPart))
     }
 }
