@@ -283,8 +283,11 @@ public struct Transport {
                 // could never fire — nothing ever removes a `localDestinations` entry, so on a
                 // first registration `localAppData[hash]` is already nil, and on a re-registration
                 // the guard is false. Every in-repo caller registers and announces in one `.merge`
-                // (PNNode.swift:88, LXMFServiceNode.swift:127, LXMFNode.swift:91), and `.merge`
-                // delivers in order, so the clear always precedes the announce that repopulates it.
+                // (PNNode.swift `.registerPropagation`, LXMFServiceNode.swift `.registerPropagation`,
+                // LXMFNode.swift `.registerDelivery`), and `.merge` delivers in order, so the clear
+                // always precedes the announce that repopulates it. (Named by enclosing case rather
+                // than by line: the previous revision's `LXMFNode.swift:91` had already rotted to
+                // :201 within one slice.)
                 state.localAppData[destination.hash] = nil
                 state.localDestinations[destination.hash] = destination
                 return .none
@@ -873,7 +876,24 @@ public struct Transport {
                 // such setter, so it auto-captures the last non-nil announce instead. Clearing is
                 // likewise folded into `.registerLocalDestination` rather than exposed as a
                 // standalone `clear_default_app_data()` (RNS/Destination.py:688-692).
-                if let appData { state.localAppData[destinationHash] = appData }
+                //
+                // The capture happens AFTER `packed()` succeeds, and that ordering is load-bearing.
+                // Because the captured value is sticky AND is the fallback for every later announce
+                // and path response, capturing an app data that cannot be packed poisoned the
+                // destination permanently: the oversize announce emitted nothing, the next
+                // `announce(nil)` fell back to the same oversize value and emitted nothing, and the
+                // local path-response branch (:552-557) read the same poisoned entry through the
+                // same `try?` and answered nothing. One over-long display name took the delivery
+                // destination off the network for good — recoverable only by announcing a value
+                // that fits. Verified by probe before the fix (announce and path response both
+                // silent; recovery only via a short name).
+                //
+                // This is the general fix: it covers ANY oversize app data from ANY caller, not
+                // just a long LXMF display name (which `LXMFAnnounceData.pack` also bounds at
+                // source). Reference cannot hit this at all — `Packet.pack` RAISES IOError on MTU
+                // overflow (RNS 1.4.2 Packet.py:234-236) rather than failing silently, and its
+                // `default_app_data` is only ever written by an explicit `set_default_app_data()`,
+                // so there is no auto-capture to poison.
                 let announcedAppData = appData ?? state.localAppData[destinationHash]
                 let now = UInt64(date.now.timeIntervalSince1970)
                 let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
@@ -882,6 +902,7 @@ public struct Transport {
                                                     ratchet: nil, appData: announcedAppData)
                 let packet = Packet.announce(from: dest, payload: payload)
                 guard let raw = try? packet.packed() else { return .none }
+                if let appData { state.localAppData[destinationHash] = appData }
                 return .merge(state.interfaces.keys.map { .send(.delegate(.transmit($0, raw))) })
 
             case let .requestPath(destinationHash):

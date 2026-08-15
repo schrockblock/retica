@@ -2611,6 +2611,108 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
                            contextFlagSet: responsePacket.contextFlag)?.appData == nil)
 }
 
+// MARK: - An unsendable app data must not poison the sticky value
+
+/// App data one byte too large to fit an announce packet. `Packet.mtu` (500) minus the 19-byte
+/// HEADER_1 header minus the 148-byte fixed announce payload leaves 333 bytes; 334 cannot be sent.
+private let oversizeAppData = Data(repeating: 0xAB, count: 334)
+
+/// A short blob that definitely fits, used as the "healthy" value in the poisoning tests.
+private let smallAppData = Data([0xC0, 0xFF, 0xEE])
+
+@MainActor
+private func makeStickyAppDataStore(_ dest: Destination) async -> TestStore<Transport.State, Transport.Action> {
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(InterfaceID("a"), .default))
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.announce(destinationHash: dest.hash, appData: smallAppData))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    return store
+}
+
+/// An announce whose packet cannot be built must leave `localAppData` alone.
+///
+/// The write used to happen BEFORE `packed()`, so an oversize app data was captured even though
+/// nothing went out — and because the captured value is sticky and is the fallback for every later
+/// announce, the destination went permanently silent. Reference cannot reach this state: RNS
+/// `Packet.pack` RAISES on MTU overflow (RNS 1.4.2 Packet.py:234-236) instead of failing silently,
+/// and its `default_app_data` is written only by an explicit `set_default_app_data()`.
+///
+/// Anti-vacuity: the healthy announce is drained first and its sticky capture asserted, so the
+/// post-condition is "unchanged from a known non-nil value", not "still nil".
+@Test @MainActor func anAnnounceThatCannotBePackedLeavesTheStickyAppDataUnchanged() async {
+    let dest = Destination(kind: .single, direction: .in, appName: "test",
+                           aspects: ["poison"], identity: Identity())!
+    let store = await makeStickyAppDataStore(dest)
+    #expect(store.state.localAppData[dest.hash] == smallAppData)
+
+    await store.send(.announce(destinationHash: dest.hash, appData: oversizeAppData))
+    #expect(store.state.localAppData[dest.hash] == smallAppData)
+}
+
+/// The severity half: after an announce that could not be packed, the NEXT announce must still go
+/// out. With the poisoned sticky value, `announce(nil)` fell back to the oversize blob and emitted
+/// nothing — every subsequent announce failed, for the life of the process, with no error anywhere.
+///
+/// Anti-vacuity: this asserts a transmit was received AND that its announce payload carries the
+/// original app data. A fix that merely stopped writing but also stopped announcing would fail the
+/// `#require`, and one that announced with the wrong bytes would fail the payload check.
+@Test @MainActor func anAnnounceAfterOneThatCouldNotBePackedStillTransmits() async throws {
+    let dest = Destination(kind: .single, direction: .in, appName: "test",
+                           aspects: ["poison2"], identity: Identity())!
+    let store = await makeStickyAppDataStore(dest)
+
+    await store.send(.announce(destinationHash: dest.hash, appData: oversizeAppData))
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.announce(destinationHash: dest.hash, appData: nil))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+
+    let raw = try #require(captured.value, "the follow-up announce must still be transmitted")
+    let packet = try #require(Packet(raw: raw))
+    #expect(packet.packetType == .announce)
+    let parsed = try #require(Announce.parse(payload: packet.payload,
+                                             destinationHash: packet.destinationHash,
+                                             contextFlagSet: packet.contextFlag))
+    #expect(parsed.appData == smallAppData)
+}
+
+/// The second reachable consequence, verified rather than reasoned: the local path-response branch
+/// replays `localAppData` through the same `try?`, so a poisoned entry left PATH REQUESTS for our
+/// own destination unanswered too. Probed before the fix — the path response emitted nothing.
+///
+/// The request tag differs from the one used elsewhere in this file so that the `discoveryPrTags`
+/// entry gate cannot swallow it as a duplicate.
+@Test @MainActor func aPathResponseStillAnswersAfterAnAnnounceThatCouldNotBePacked() async throws {
+    let dest = Destination(kind: .single, direction: .in, appName: "test",
+                           aspects: ["poison3"], identity: Identity())!
+    let store = await makeStickyAppDataStore(dest)
+
+    await store.send(.announce(destinationHash: dest.hash, appData: oversizeAppData))
+
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("a"),
+                               makePathRequest(for: dest.hash, tag: Data(repeating: 0x77, count: 16))))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+
+    let raw = try #require(captured.value, "the path request must still be answered")
+    let packet = try #require(Packet(raw: raw))
+    #expect(packet.context == .pathResponse)
+    let parsed = try #require(Announce.parse(payload: packet.payload,
+                                             destinationHash: packet.destinationHash,
+                                             contextFlagSet: packet.contextFlag))
+    #expect(parsed.appData == smallAppData)
+}
+
 /// A PATH_REQUEST for a destination we do not own is not answered.
 @Test @MainActor func pathRequestForNonLocalDestinationIsNotAnswered() async {
     let store = TestStore(initialState: Transport.State()) { Transport() }
