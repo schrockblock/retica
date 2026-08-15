@@ -22,8 +22,26 @@ public struct LXMFAnnounceData: Equatable {
     /// (mirrors `dn.decode("utf-8").replace("\x00", "").strip()` at LXMF.py:165).
     public var displayName: String?
 
-    /// Stamp cost required to deliver to this destination (1...254), or nil.
-    /// Reference gate at LXMRouter.py:1044: `> 0 and < 255`; values 0 and 255 advertise nil.
+    /// Stamp cost advertised by the delivery destination, or nil.
+    ///
+    /// **The range is asymmetric between pack and parse. Read this before using the value.**
+    ///
+    /// - **On pack** this is gated to 1...254: `pack` applies reference's strict
+    ///   `> 0 and < 255` (LXMRouter.py:1044), so 0, 255 and anything outside emit as null.
+    ///   Every value ReTiCA *emits* is therefore in 1...254 or absent.
+    ///
+    /// - **On parse this range is NOT guaranteed.** Reference's `stamp_cost_from_app_data`
+    ///   (LXMF.py:174-185) applies no gate at all — it returns `peer_data[1]` verbatim — so a
+    ///   peer may advertise 0, 255, or 60000 and we surface it as-is. `parse` bounds this only
+    ///   to what an `Int` can hold: 0...Int.max (`parseStampCost` uses `Int(exactly:)`, which
+    ///   rejects > Int.max rather than truncating). Announce app-data is unauthenticated and
+    ///   arrives from any reachable peer, so treat a parsed value as hostile input.
+    ///
+    /// **Callers that store or act on a parsed value MUST validate it themselves.** In
+    /// particular, a stamp cost drives a proof-of-work search whose cost is *exponential* in
+    /// the value (`LXStamper`), so feeding an unvalidated parsed cost into stamp generation
+    /// turns a one-byte announce field into an unbounded CPU burn. An `Int` that looks bounded
+    /// because the emit side is bounded is exactly how that ceiling becomes invisible.
     public var stampCost: Int?
 
     /// Whether the destination supports LXMF compression (`SF_COMPRESSION = 0x00`).

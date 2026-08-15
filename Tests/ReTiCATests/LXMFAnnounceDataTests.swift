@@ -65,8 +65,14 @@ import Foundation
 // MARK: — Pre-0.5.0 legacy format (first byte outside 0x90-0x9F / 0xDC)
 
 /// LXMF before 0.5.0 stored just a raw UTF-8 display name, not a msgpack array.
-/// "Alice" starts with 0x41, which is outside the array-byte gate, so parse must
-/// treat the entire blob as a UTF-8 display name.
+/// "Alice" starts with 0x41, which is outside the array-byte gate (0x90-0x9F, 0xDC), so
+/// parse must treat the entire blob as a UTF-8 display name.
+///
+/// The fixture assumption — that 'A' is outside the gate — is self-guarding rather than
+/// separately asserted: a first byte inside the gate would send this blob down the msgpack
+/// path, where it fails to decode and `displayName` comes back nil, failing the test below.
+/// (A predecessor asserted the byte range as its own test; that asserted a property of a
+/// Swift string literal, not of `parse`, so it could never fail. Folded to this comment.)
 @Test func lxmfAnnounceDataPre050LegacyFormat() {
     let blob = Data("Alice".utf8)
     let result = LXMFAnnounceData.parse(blob)
@@ -76,14 +82,6 @@ import Foundation
         #expect(result.stampCost == nil)
         #expect(result.supportsCompression == true)
     }
-}
-
-/// A name that begins with a byte in 0x90-0x9F (fixarray) would be misread as msgpack.
-/// Verify that a name starting with 0x41 (a safe byte) is correct.
-@Test func lxmfAnnounceDataPre050ByteNotInArrayRange() {
-    // 0x41 = 'A', outside the 0x90-0x9F and 0xDC gate
-    let first = Data("Alice".utf8).first!
-    #expect(!(first >= 0x90 && first <= 0x9F) && first != 0xDC)
 }
 
 // MARK: — Display name null-stripping and whitespace trimming
@@ -166,21 +164,25 @@ import Foundation
     #expect(LXMFAnnounceData.parse(blob) == nil)
 }
 
-/// A stamp cost of UInt64.max must never trap; it must return nil or a bounded value.
-@Test func lxmfAnnounceDataStampCostUInt64MaxNeverTraps() {
+/// A stamp cost of UInt64.max is REJECTED (surfaces as nil), not truncated, and does not trap.
+///
+/// Both halves of the name are asserted:
+/// - "without trapping" — the test reaching its assertions at all is the proof; `Int(_:)` on
+///   UInt64.max aborts the process, so a regression here kills the run rather than failing.
+/// - "rejected" — `stampCost == nil`. This is the load-bearing assertion and the one that
+///   distinguishes `Int(exactly:)` from a truncating conversion, which would yield -1.
+///
+/// The rest of the struct must still parse: an out-of-range cost degrades that one field,
+/// it does not fail the whole announce.
+@Test func lxmfAnnounceDataStampCostUInt64MaxRejectedWithoutTrapping() {
     // fixarray(3) [ null, uint64(UInt64.max), fixarray(0) ]
     // CF FFFFFFFFFFFFFFFF = uint64 UInt64.max
     let blob = Data([0x93, 0xC0, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x90])
     let result = LXMFAnnounceData.parse(blob)
-    // Must not trap. UInt64.max cannot fit in Int (on 64-bit: UInt64.max > Int.max),
-    // so it either returns nil or a value that's within the valid cost range.
-    // Either outcome is acceptable; a crash is not.
-    if let result {
-        // If we got a result, the stamp cost must be either nil or in 1...254.
-        if let cost = result.stampCost {
-            #expect(cost > 0 && cost < 255)
-        }
-    }
+    #expect(result != nil)                       // the announce still parses
+    #expect(result?.stampCost == nil)            // rejected, NOT truncated to -1
+    #expect(result?.displayName == nil)          // [0] is null
+    #expect(result?.supportsCompression == false) // [2] is an empty list → no SF_COMPRESSION
 }
 
 /// Invalid UTF-8 in a bin field yields nil display name (no crash from String init failure).
@@ -210,6 +212,16 @@ import Foundation
     #expect(slice.startIndex == 1)
     let resultFromSlice = LXMFAnnounceData.parse(slice)
     let resultFromFull  = LXMFAnnounceData.parse(packed)
+    // Assert the CONCRETE values, not just slice-equals-full. A bare `a?.x == b?.x` chain
+    // passes when BOTH sides are nil, so a parse that failed on every input would satisfy it
+    // while proving nothing about slice handling. Same vacuity class as the two the review
+    // flagged; found by re-reading for the pattern.
+    #expect(resultFromSlice != nil)
+    #expect(resultFromFull  != nil)
+    #expect(resultFromSlice?.displayName == "Bob")
+    #expect(resultFromSlice?.stampCost == 16)
+    #expect(resultFromSlice?.supportsCompression == true)
+    // ...and that the slice agrees with the zero-based parse on every field.
     #expect(resultFromSlice?.displayName == resultFromFull?.displayName)
     #expect(resultFromSlice?.stampCost   == resultFromFull?.stampCost)
     #expect(resultFromSlice?.supportsCompression == resultFromFull?.supportsCompression)
@@ -238,17 +250,19 @@ import Foundation
 /// array gate. 0xDD (array32) is NOT accepted — match the reference gate, don't
 /// accept any array tag. When first byte is 0xDD the pre-0.5.0 path fires instead.
 @Test func lxmfAnnounceDataArray32ByteNotAcceptedAsMsgpackGate() {
-    // 0xDD is array32; reference gate excludes it, so the whole blob is treated as
-    // a legacy UTF-8 display name. Since 0xDD is not valid UTF-8, displayName will be nil.
-    // The crucial invariant: the result must not be parsed as a 3-element msgpack struct.
+    // 0xDD is array32; the reference gate excludes it, so the whole blob takes the legacy
+    // path and is treated as a raw UTF-8 display name. 0xDD is a 2-byte lead byte (110xxxxx)
+    // followed by 0x00, which is not a continuation byte, so the blob is not valid UTF-8 and
+    // the decoded name is nil.
     let blob = Data([0xDD, 0x00, 0x00, 0x00, 0x03, 0xC0, 0xC0, 0x90])
     let result = LXMFAnnounceData.parse(blob)
-    // It may return a result with nil displayName (legacy path, invalid UTF-8) or nil.
-    // It must NOT return a result whose supportsCompression == false (which would only
-    // happen if it parsed the 0xDD blob as a 3-element array with an empty [2]).
-    if let result {
-        // If we got a result via the legacy path, displayName is nil (invalid UTF-8)
-        // and compression defaults to true.
-        #expect(result.supportsCompression == true)
-    }
+    // The outer non-nil assertion is load-bearing, not ceremony: without it, a future change
+    // making parseLegacyFormat return nil on invalid UTF-8 would skip the whole body and this
+    // test would pass while asserting nothing. It also pins today's behaviour — the legacy
+    // path always yields a struct.
+    #expect(result != nil)
+    #expect(result?.displayName == nil)
+    // The crucial invariant: 0xDD was NOT parsed as a 3-element array. If it had been,
+    // items[2] would be the empty fixarray and compression would read false.
+    #expect(result?.supportsCompression == true)
 }
