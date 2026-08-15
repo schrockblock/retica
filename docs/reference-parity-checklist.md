@@ -130,7 +130,7 @@ the only regression guard — see `docs/wire-narrowing-inventory.md`, "Not detec
 - [x] **Task 10 — decompression allocates the ceiling, not the content** (in `Bzip2.decompress` /
       `Bzip2.decompressReportingAllocation`, reached from `ResourceTransfer.reduce`'s
       `.resourceHashmapUpdate`→assemble branch): 41 bytes could drive a 64 MiB allocation,
-      repeatable per advertisement. **Fixed** — `110559f`. The one-shot
+      repeatable per advertisement. **Fixed** — `7209fb7`. The one-shot
       `BZ2_bzBuffToBuffDecompress` *requires* the destination buffer before any output exists, so
       the wire's `d` field sized the allocation. Now incremental
       (`BZ2_bzDecompressInit`/`BZ2_bzDecompress`/`BZ2_bzDecompressEnd`, already vendored): the buffer
