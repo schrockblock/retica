@@ -26,7 +26,7 @@ Reticulum/LXMF, ordered by *what a real peer notices*. Tick items as they land.
 |---|---|
 | **Wire format** | Essentially complete, byte-verified against genuine reference output. No algorithmic gap in the crypto primitives. |
 | **Protocol mechanics** | Good for the paths ReTiCA uses — links, resources, requests, announces, path requests, relaying, LXMF opportunistic/direct/propagated. |
-| **Adversarial robustness** | ~18 remotely-reachable aborts closed plus two fail-opens and one unkillable-work DoS; **1 remains** (Tier 2, Task 10 — not a narrowing conversion, so the gate cannot see it). |
+| **Adversarial robustness** | ~18 remotely-reachable aborts closed, plus two fail-opens, one unkillable-work DoS and one wire-sized allocation. Tier 2 is **clear**; the wire-input trap sweep is complete. Still absent: admission control, and any bound on `LinkPlane.state.links` / `LinkSession.state.transfers`. |
 | **Durability** | Absent. Nothing in the transport core persists. |
 | **Breadth** | 2 of 15 interfaces; no `Channel`/`Buffer`, tickets, tunnels, or non-link proofs. |
 
@@ -75,11 +75,14 @@ cannot see**. That is what tier 1 is about.
       changed; the 167 cross-validation vectors that byte-compare against genuine Python output
       all still pass.
 
-## Tier 2 — remotely reachable crashes still open
+## Tier 2 — remotely reachable crashes (all closed)
 
-*Planned and gated; mostly execution. Plan: `2026-08-12-wire-input-trap-sweep.md` (9/10 done).*
-*Gate status: **zero known-open conversions** — `--fail-on-open` now exits 0. Tasks 9 and 10
-are not narrowing conversions, so the gate cannot see them — their tests are the only regression guard.*
+*Plan: `2026-08-12-wire-input-trap-sweep.md` — **complete, 10/10**.*
+*Gate status: **zero known-open conversions** — `--fail-on-open` exits 0. But **five of the sweep's
+nine defects were not conversions** (Tasks 3, 4, 5, 9, 10), and the gate is structurally blind to
+every one: it is a lexical checker for one defect shape. Read it as "no unreviewed narrowing
+conversion in `Sources/`", never as "input handling is safe". For those five, the named tests are
+the only regression guard — see `docs/wire-narrowing-inventory.md`, "Not detectable by this check".*
 
 - [x] **Task 6 — `LXMFServiceNode.swift` `Int(raw)` (in `requestReceived`)** — `[[], [], float64(NaN)]` on a `/get`
       aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client.
@@ -124,9 +127,31 @@ are not narrowing conversions, so the gate cannot see them — their tests are t
       generator, `LXStamper.generateStamp`, has **no production caller** — delivery stamps are unwired
       (Tier 3) — and is made cancellable defensively; when they are wired, its cost must be bounded
       where the peer's advertised `stamp_cost` is read. No emitted bytes change. Commit `3e919ed`.
-- [ ] **Task 10 — decompression allocates the ceiling, not the content** — `Bzip2.swift:36-38` /
-      `ResourceTransfer.swift:408`: 41 bytes can drive a 64 MiB allocation. Not reference parity —
-      `Resource.py:691` uses an incremental `BZ2Decompressor(max_length=)`.
+- [x] **Task 10 — decompression allocates the ceiling, not the content** (in `Bzip2.decompress` /
+      `Bzip2.decompressReportingAllocation`, reached from `ResourceTransfer.reduce`'s
+      `.resourceHashmapUpdate`→assemble branch): 41 bytes could drive a 64 MiB allocation,
+      repeatable per advertisement. **Fixed** — `110559f`. The one-shot
+      `BZ2_bzBuffToBuffDecompress` *requires* the destination buffer before any output exists, so
+      the wire's `d` field sized the allocation. Now incremental
+      (`BZ2_bzDecompressInit`/`BZ2_bzDecompress`/`BZ2_bzDecompressEnd`, already vendored): the buffer
+      starts at `max(4096, compressedInput.count)`, doubles as output is produced, and is capped by
+      `expectedSize`. Peak allocation therefore tracks **content** (within 2x from the doubling),
+      never the claim.
+      Reference reading **confirmed, not inherited** — `Resource.assemble` (RNS/Resource.py:690-696,
+      identical in the 1.4.1 fork and stock 1.4.2) does
+      `decompressor.decompress(data, max_length=self.max_decompressed_size)` then `if not
+      decompressor.eof:` → CORRUPT + `cancel()`. So "cap reached with input remaining" is a
+      **failure**, not a truncated success; we return nil, never a partial buffer. One divergence
+      worth recording: reference's cap is always the 64 MiB constant
+      (`max_decompressed_size = AUTO_COMPRESS_MAX_SIZE`, RNS/Resource.py:360), whereas ours is the
+      per-resource `d`, which is *tighter* — and `d` is an **upper bound, not an exact size**, since
+      the split branch passes `min(adv.dataSize, maxEfficientSize)` where `adv.dataSize` is the whole
+      object's. Requiring an exact fit would have capped every multi-segment transfer silently.
+      `Bzip2.compress` is untouched (blockSize100k 9 / workFactor 0 stay byte-exact vs
+      `bz2.compress(x, 9)`), and no emitted byte changes: this is receive-side only. The gate cannot
+      see this defect — `Bzip2AllocationTests` plus
+      `ResourceTransferTests.compressedSplitSegmentRoundTripsWhenDeclaredSizeExceedsSegmentOutput`
+      are its only regression guard.
 
 ## Tier 2b — the amplifier, and a live data-loss vector in its own right
 

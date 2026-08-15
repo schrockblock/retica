@@ -956,6 +956,26 @@ private func driveTransferToTerminalStatus(sender senderState: ResourceTransfer.
     #expect(status == .complete || status == .failed)            // terminal, not a crash
 }
 
+/// The split branch passes `min(adv.dataSize, maxEfficientSize)` as the decompression buffer size,
+/// where `adv.dataSize` is the WHOLE object's size — so for a real segment that number is an UPPER
+/// BOUND, typically far above the segment's own output. Incremental decompression must therefore not
+/// require the output to fill the buffer. `.complete` is byte-exactness, not an approximation of it:
+/// `Resource.verify` is a full-hash check over the decompressed bytes.
+@Test @MainActor func compressedSplitSegmentRoundTripsWhenDeclaredSizeExceedsSegmentOutput() async {
+    let segment = Data(String(repeating: "reticulum compresses this well ", count: 30).utf8)
+    let whole = UInt64(LinkSession.maxEfficientSize) + UInt64(segment.count)   // 2 segments' worth
+    let sender = ResourceTransfer.State(sending: segment, linkID: linkID, sessionKey: key,
+        interfaceID: InterfaceID("i"), prefix: prefix, randomHash: r, sdu: 64,
+        segmentIndex: 2, totalSegments: 2, originalHash: Data(repeating: 0x77, count: 32),
+        totalDataSize: whole)
+    #expect(sender.advertisement!.isCompressed == true)          // takes the decompress path
+    #expect(sender.advertisement!.isSplit == true)               // split branch: d is the whole object
+    #expect(sender.advertisement!.dataSize == whole)
+    #expect(whole > UInt64(segment.count) * 1000)                // the claim dwarfs this segment
+
+    #expect(await driveTransferToReceived(sender: sender, key: key) == segment)
+}
+
 /// `n` (numberOfParts) is the same shape as `d`: a raw wire UInt64 that every downstream use
 /// converts with `Int(...)`. An absurd `n` must not trap when the advertisement is accepted.
 @Test @MainActor func receiverAcceptsAdvertisementWithAbsurdPartCountWithoutTrapping() async {

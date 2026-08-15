@@ -62,10 +62,10 @@ The durable key is *file + expression text*, which is what the allowlist matches
 
 | | |
 |---|---|
-| Conversions found in `Sources/` | **118** across **79** distinct file+expression groups, in 56 files |
-| Reviewed safe | 118 findings / 79 groups |
+| Conversions found in `Sources/` | **117** across **78** distinct file+expression groups, in 56 files |
+| Reviewed safe | 117 findings / 78 groups |
 | **Known-open (confirmed traps)** | **0** — Task 8 FIXED |
-| Defects in this plan that are *not* conversions | 4 — Tasks 3, 4, 5, 9 (see [Not detectable by this check](#not-detectable-by-this-check)) |
+| Defects in this plan that are *not* conversions | **5** — Tasks 3, 4, 5, 9, 10 (see [Not detectable by this check](#not-detectable-by-this-check)) |
 
 Run the gate:
 
@@ -75,7 +75,13 @@ swift Scripts/check-wire-narrowing.swift --report     # every finding, allowlist
 swift Scripts/check-wire-narrowing.swift --fail-on-open   # also fails on known-open sites
 ```
 
-`--fail-on-open` is the narrowing-conversion completion gate: when it exits 0, every narrowing-conversion site in this plan is closed. **It now exits 0.** Tasks 9 and 10 remain but are not narrowing conversions — the gate is structurally blind to both.
+`--fail-on-open` is the narrowing-conversion completion gate: when it exits 0, every narrowing-conversion site in this plan is closed. **It now exits 0**, and the sweep is complete.
+
+**Do not read "zero known-open" as "no remaining input-handling risk."** Five of the sweep's nine
+defects were not conversions at all, and the gate is structurally blind to every one of them: it
+is a lexical checker for a single defect *shape*. A green gate means no unreviewed narrowing
+conversion has entered `Sources/`. It says nothing about unbounded recursion, unbounded loops,
+missing ingress bounds, expensive-work ordering, or allocation sized from a wire-declared number.
 
 ---
 
@@ -174,7 +180,7 @@ abort to `:71` rather than removing it. Not fixed here, per scope.
 
 ## Not detectable by this check
 
-Three of the ten known sites are **not narrowing conversions**, so no narrowing-conversion
+**Five of the sweep's nine defects are not narrowing conversions**, so no narrowing-conversion
 checker can flag them. This is a limit of the defect shape, not a bug in the tool. Verified by
 reading each site:
 
@@ -183,11 +189,18 @@ reading each site:
 | `MsgPack.swift:92/128/153` | 3 | Unbounded parse recursion — **FIXED** (`maxParseDepth = 32`, depth threaded through `parse`/`parseMap`/`parseArray`). Gate does NOT cover it; `MsgPackDepthTests` is the sole regression guard. | none |
 | `Packet.swift:69-100` | 4 | Missing ingress MTU ceiling — **FIXED** (`guard raw.count <= Packet.mtu` added at top of `init?(raw:)`). Reference RNS `Packet.unpack` has no equivalent check (interface-layer `check_frame_len` is the primary bound), so lacking one was not a divergence. The guard is load-bearing at the primary inbound decode `Transport.swift:339`, where the deframers admit 262144 (TCP) / 1196 (BLE) — far above the 500-byte MTU. IFAC is stripped upstream in `Transport.received` before `Packet.init?(raw:)` sees bytes, so the 500-byte post-strip bound is correct for all interfaces. Commit: `e64f0e0`. | none |
 | `PropagationStore.swift:ingest` | 5 | Expensive PoW validation ordered before cheap dedup check — **FIXED**: cheap `transient_id` dedup now runs before `LXStamper.validatePnStamp`. Gate does NOT cover it; `PropagationStoreTests.duplicateIngestBypasesPoW` is the sole regression guard. Commit: `bd832b1`. | none |
+| `LXStamper.search` (via `generatePnStamp` / `generatePeeringKey`) | 9 | Unkillable proof-of-work — a bare `while true` whose iteration count is `2^cost` in a wire-supplied `cost`, inside an uncancellable `.run`. **FIXED**: cost ceilings (refuse, not clamp), `Task.isCancelled` in the loop, and `await Task.yield()` so the cancellation can be delivered. Gate does NOT cover it; `LXStamperCancellationTests` is the sole regression guard. Commit: `3e919ed`. | none |
+| `Bzip2.decompressReportingAllocation` (via `ResourceTransfer.reduce`) | 10 | Allocation sized from a wire-declared number rather than from produced output — `BZ2_bzBuffToBuffDecompress` needs the whole destination buffer up front, so ~41 bytes of input reserved 64 MiB, repeatable per advertisement. **FIXED**: incremental `BZ2_bzDecompress` into a buffer that starts at `max(4096, input.count)` and doubles, capped by `expectedSize`; "cap reached with input remaining" fails closed, matching reference `Resource.assemble`'s `decompressor.eof` check. Gate does NOT cover it; `Bzip2AllocationTests` is the sole regression guard. | none |
 
 Detecting these needs a different instrument — a fuzz/property harness over the decode entry
-points — which is out of scope for this plan. What the gate *does* give Tasks 3-5 is the
-guarantee that their fixes do not introduce a new trapping conversion: Task 3's in-progress
-depth-limit change was scanned and adds none.
+points, plus something that can assert on *cost* (allocation, iterations, depth) rather than on
+values — which is out of scope for this plan. What the gate *does* give Tasks 3-5, 9 and 10 is
+the guarantee that their fixes introduce no new trapping conversion; each was scanned, and
+Task 10's rewrite is why the `UInt32(bufSize)` and one `UInt32(data.count)` entries are gone.
+
+Note the pattern across these five: **none of them is a wrong value.** They are wrong *bounds* —
+on depth, on frame length, on work ordering, on loop termination, on allocation. A checker that
+reads expressions cannot see a bound that was never written down.
 
 ---
 
