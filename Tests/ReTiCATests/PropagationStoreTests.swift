@@ -170,38 +170,51 @@ private func container(_ entries: [Data]) -> Data {
 
 // MARK: - Task 5: cheap-before-expensive ordering
 
-/// Structural guard for the Task-5 ordering fix: a duplicate entry must be rejected by the
-/// transient_id dedup check BEFORE the PoW workblock is computed — not after.
+/// Structural guard for the Task-5 ordering fix: re-ingesting a stored duplicate must derive ZERO
+/// stamp workblocks — the cheap transient_id dedup has to run BEFORE the proof-of-work, not after.
 ///
-/// Mechanism: the store already holds `validEntry`. A second container carries the same entry but
-/// with `minStampCost` set to an impossibly high value (e.g. 255 requires ~2^255 hash iterations
-/// on average — the heat death of the universe). Without the ordering fix, re-ingesting the
-/// duplicate would kick off the PoW computation and the test would hang indefinitely. With the
-/// fix, the duplicate transient_id is recognised before any PoW work and the test completes in
-/// microseconds.
+/// This asserts on WORK DONE, and it has to. Every outcome of ingesting a duplicate is identical
+/// with and without the preflight (nothing is added, the count does not move), so a test that
+/// asserts outcomes passes with the entire preflight deleted — which is exactly what the guard this
+/// replaces did.
 ///
-/// NOTE: this is the sole regression guard for the ordering defect at PropagationStore.swift:ingest.
-/// The defect is invisible to Scripts/check-wire-narrowing.swift (not a narrowing conversion).
-/// See docs/wire-narrowing-inventory.md § Task 5.
-@Test func duplicateIngestBypasesPoW() async {
+/// That predecessor claimed a missing preflight would make the call "hang indefinitely" at
+/// `minStampCost = 255`. The premise was false: `LXStamper.validatePnStamp` VALIDATES rather than
+/// SEARCHES — one workblock plus one hash, O(1) in `targetCost` (LXStamper.swift:validatePnStamp) —
+/// so cost 255 costs exactly what cost 1 costs, about 21 ms. Nothing hangs, and nothing failed:
+/// measured in the fix round, deleting the preflight is caught by exactly two tests out of 907, this
+/// one and `LXMFServiceNodeTests.serviceNodeDoesNotRederiveWorkblockForStoredPacketOfferReplay`. Both
+/// are new. No outcome-based test in the suite notices at all.
+///
+/// The first (novel) ingest is asserted to derive AT LEAST ONE workblock. That half is not padding:
+/// without it, a counting seam that silently observed nothing would make the zero-assertion pass for
+/// the wrong reason, reproducing the vacuity this test exists to remove.
+@Test func duplicateIngestDerivesNoStampWorkblock() async {
     let dest = Data(repeating: 0xAB, count: LXMessage.destinationLength)
     let core = dest + Data("dedup-test-payload".utf8)
-    // Accept the entry once with a realistic cost so the store actually contains it.
-    var bootstrapStore = PropagationStore(minStampCost: 4)
     let tid = LXMFPropagation.transientId(lxmfData: core)
     let stamp = await LXStamper.generatePnStamp(transientId: tid, targetCost: 4)!
     let stamped = core + stamp
-    bootstrapStore.ingest(container: container([stamped]))
-    #expect(bootstrapStore.contains(transientId: tid), "setup: entry must be in store before dedup test")
+    var store = PropagationStore(minStampCost: 4)
 
-    // Now set a cost that is unreachable (255 leading zero bits). If the ordering bug is present,
-    // the next ingest call will never return. With the fix it returns immediately via the cheap
-    // dedup guard and the entry count stays at 1.
-    var highCostStore = bootstrapStore
-    highCostStore.minStampCost = 255
-    let (added, _) = highCostStore.ingest(container: container([stamped]))
-    #expect(added.isEmpty, "duplicate must be skipped without running PoW")
-    #expect(highCostStore.count == 1, "store count unchanged after duplicate ingest")
+    // Novel entry: the stamp is unknown, so it MUST be validated — proving the seam is live.
+    let onFirstIngest = LXStamper.WorkblockCounter()
+    LXStamper.$workblockCounter.withValue(onFirstIngest) {
+        store.ingest(container: container([stamped]))
+    }
+    #expect(store.contains(transientId: tid), "setup: the entry must be accepted and stored")
+    #expect(onFirstIngest.count >= 1,
+            "seam liveness: validating a novel entry must derive at least one workblock")
+
+    // Byte-identical replay: recognised by transient_id before any PoW is spent on it.
+    let onReplay = LXStamper.WorkblockCounter()
+    let (added, _) = LXStamper.$workblockCounter.withValue(onReplay) {
+        store.ingest(container: container([stamped]))
+    }
+    #expect(onReplay.count == 0,
+            "a stored duplicate must be skipped before any stamp workblock is derived")
+    #expect(added.isEmpty, "duplicate must not be re-added")
+    #expect(store.count == 1, "store count unchanged after duplicate ingest")
 }
 
 /// Acceptance-parity test: a known-good stamped container is accepted identically regardless

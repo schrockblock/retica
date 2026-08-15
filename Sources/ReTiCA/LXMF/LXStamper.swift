@@ -8,9 +8,37 @@ public enum LXStamper {
     public static let workblockExpandRounds = 3000     // RNS WORKBLOCK_EXPAND_ROUNDS
     public static let stampSize = 32                   // RNS STAMP_SIZE (HASHLENGTH/8)
 
+    /// Counts `stampWorkblock` derivations within a task-local scope (`$workblockCounter`).
+    ///
+    /// **Why this seam is in production code.** Every cheap-before-expensive fix in the propagation
+    /// path is invisible in every OUTCOME it produces: a duplicate entry is skipped whether or not a
+    /// dedup check ran before the proof-of-work, so `added`, `count` and the actions emitted are
+    /// byte-identical either way. The only difference is work done. Task 5's original guard asserted
+    /// the outcomes and was therefore vacuous — deleting the entire preflight left the whole suite
+    /// green — so the work itself has to be observable, and observable as a BINARY property (zero
+    /// derivations, or not) rather than as a wall-clock measurement that would flake.
+    ///
+    /// `stampWorkblock` is the right thing to count: it is the expensive half of every stamp
+    /// operation (1000 HKDF rounds producing 256 KB for a PN stamp, ~21 ms measured), and counting it
+    /// here catches PoW reached by ANY route, including a future caller that bypasses
+    /// `PropagationStore.ingest` — which is precisely how the first version of the Task 5 fix was
+    /// defeated.
+    public final class WorkblockCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var derivations = 0
+        public init() {}
+        public var count: Int { lock.lock(); defer { lock.unlock() }; return derivations }
+        fileprivate func record() { lock.lock(); derivations += 1; lock.unlock() }
+    }
+
+    /// Unbound (nil) in production: one task-local read per derivation, lost in the ~21 ms the
+    /// derivation costs. Tests bind a `WorkblockCounter` around the call they are measuring.
+    @TaskLocal public static var workblockCounter: WorkblockCounter?
+
     /// Deterministic ~256*expandRounds-byte workblock: concat of hkdf(256, ikm=material,
     /// salt=full_hash(material ‖ msgpack(n))) for n in 0..<expandRounds.
     public static func stampWorkblock(material: Data, expandRounds: Int = workblockExpandRounds) -> Data {
+        workblockCounter?.record()
         var wb = Data()
         for n in 0..<expandRounds {
             let salt = Crypto.fullHash(material + MsgPack.encode(.uint(UInt64(n))))
