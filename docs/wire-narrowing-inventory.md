@@ -217,9 +217,12 @@ measured, not suspected:
 - **Open — junk flood.** The dedup skips only when the entry is already stored, which requires it to
   have been *accepted*, which requires a *valid* stamp. An attacker who never produces a valid stamp
   is never stored, therefore never deduped, and pays the full workblock every time: **21.98 ms per
-  33-byte entry, so 1.56 KiB/s of container bytes saturates one core**. The original task brief's
-  "2.3 KiB/s" figure still stands. Dedup cannot close this — it has nothing to match a
-  never-before-seen entry against.
+  33-byte entry, so 1.56 KiB/s of container bytes saturates one core** — derived: 33 B + ~2 B
+  framing per 21.98 ms. Use this figure, not the task brief's "2.3 KiB/s", which was asserted
+  rather than derived and which nothing since has reproduced; the two were briefly quoted side by
+  side here in a way no reader could reconcile. The conclusion is unchanged either way — both are
+  single-digit KiB/s. Dedup cannot close this: it has nothing to match a never-before-seen entry
+  against.
 - **Open — double validation.** An entry that *is* accepted is validated twice, once in the pre-scan
   and once in `ingest` (measured: 2 workblock derivations per novel entry, by the liveness counter in
   `serviceNodeDoesNotRederiveWorkblockForStoredPacketOfferReplay`). Reference validates once and

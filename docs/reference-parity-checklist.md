@@ -75,9 +75,12 @@ cannot see**. That is what tier 1 is about.
       changed; the 167 cross-validation vectors that byte-compare against genuine Python output
       all still pass.
 
-## Tier 2 — remotely reachable crashes (all closed)
+## Tier 2 — remotely reachable crashes (nine closed, Task 5 only partly)
 
-*Plan: `2026-08-12-wire-input-trap-sweep.md` — **complete, 10/10**.*
+*Plan: `2026-08-12-wire-input-trap-sweep.md` — **10/10 tasks executed; 9/10 defects fully closed**.
+Task 5 is partly closed and is detailed two paragraphs down — this heading deliberately does not
+say "all closed", because an earlier draft did and that is the overclaim the whole-branch review
+had to correct.*
 *Gate status: **zero known-open conversions** — `--fail-on-open` exits 0. But **five of the sweep's
 nine defects were not conversions** (Tasks 3, 4, 5, 9, 10), and the gate is structurally blind to
 every one: it is a lexical checker for one defect shape. Read it as "no unreviewed narrowing

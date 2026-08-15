@@ -18,11 +18,17 @@ public enum LXStamper {
     /// green — so the work itself has to be observable, and observable as a BINARY property (zero
     /// derivations, or not) rather than as a wall-clock measurement that would flake.
     ///
-    /// `stampWorkblock` is the right thing to count: it is the expensive half of every stamp
-    /// operation (1000 HKDF rounds producing 256 KB for a PN stamp, ~21 ms measured), and counting it
+    /// `stampWorkblock` is the right thing to count: it is the whole cost of stamp **validation**
+    /// (1000 HKDF rounds producing 256 KB for a PN stamp, ~21 ms measured), and counting it
     /// here catches PoW reached by ANY route, including a future caller that bypasses
     /// `PropagationStore.ingest` — which is precisely how the first version of the Task 5 fix was
     /// defeated.
+    ///
+    /// It is NOT a general measure of stamp work: for *generation* the `search` loop below dominates
+    /// (~2^targetCost rounds) and is not counted here. Counting derivations is the right guard for
+    /// the ingest path, where validation is all that runs, and would understate a generation path.
+    /// An earlier draft of this comment called it "the expensive half of every stamp operation",
+    /// which is true of validation and false of generation.
     public final class WorkblockCounter: @unchecked Sendable {
         private let lock = NSLock()
         private var derivations = 0
