@@ -44,12 +44,27 @@ public struct LXMFNode {
         public var stampCost: Int?
         /// Whether the peer's announce indicates compression support.
         public var supportsCompression: Bool
-        /// When this entry was last updated (the announce timestamp, not wall clock).
+        /// Wall-clock time this entry was last written, from the `\.date` dependency.
+        /// Matches reference, which stores `time.time()` alongside the cost (LXMRouter.py:1029).
         ///
         /// Stored so a future cleanup pass (reference `STAMP_COST_EXPIRY = 45 days`,
         /// `LXMRouter.clean_outbound_stamp_costs`, LXMRouter.py:1272-1281) can expire stale entries
         /// without a schema change. See `docs/reference-parity-checklist.md` for the filed gap.
+        ///
+        /// Deliberately separate from `LearnedDestination.learnedAt`, which records when the
+        /// *path* was learned and is reset by the transport's own expiry sweep. This one records
+        /// when the *peer's advertised LXMF parameters* were last refreshed; reference keeps the
+        /// two in different structures for the same reason (`outbound_stamp_costs` vs the RNS
+        /// path table), and a peer's stamp cost must not be considered fresh merely because a
+        /// path to it was re-learned.
         public var learnedAt: Date
+
+        public init(displayName: String?, stampCost: Int?, supportsCompression: Bool, learnedAt: Date) {
+            self.displayName = displayName
+            self.stampCost = stampCost
+            self.supportsCompression = supportsCompression
+            self.learnedAt = learnedAt
+        }
     }
 
     @ObservableState
@@ -69,14 +84,23 @@ public struct LXMFNode {
         /// Used to scope packet proving to inbound direct-delivery links only.
         public var deliveryDestinationHash: Data?
 
-        /// Learned peer data from inbound delivery-destination announces (`lxmf.delivery` aspect),
-        /// keyed by delivery destination hash.
+        /// Learned peer data, keyed by `lxmf.delivery` destination hash.
         ///
-        /// Populated by the `.endpoint(.delegate(.pathLearned))` handler whenever the announce
-        /// carries app-data that parses as `LXMFAnnounceData` and NOT as `PNAnnounce`. This mirrors
-        /// `LXMFDeliveryAnnounceHandler.received_announce` in reference LXMF 1.1.0
-        /// (Handlers.py:15-18), which calls `stamp_cost_from_app_data(app_data)` →
-        /// `lxmrouter.update_stamp_cost(destination_hash, stamp_cost)`.
+        /// Populated by the `.endpoint(.delegate(.pathLearned))` handler for an announce whose
+        /// destination hash equals `LXMessage.deliveryHash(identityHash:)` of the announced
+        /// identity, and whose app-data is non-nil and parses as `LXMFAnnounceData`. That
+        /// destination check is what restricts the table to delivery destinations —
+        /// `.pathLearned` itself fires for every announce on the network, and
+        /// `LXMFAnnounceData.parse` accepts every non-empty blob, so neither narrows anything on
+        /// its own. Mirrors `LXMFDeliveryAnnounceHandler.received_announce` in reference LXMF
+        /// 1.1.0 (Handlers.py:15-18) — whose own aspect filter is applied by the identical
+        /// recomputed-hash comparison in `Transport.py:2077-2086` (RNS 1.4.2).
+        ///
+        /// **Unbounded.** One entry per distinct LXMF delivery peer heard, never collected. The
+        /// transport's `maintenanceTick` expires `Transport.State.learned` (and piggybacks
+        /// `announceBlobs` / `announceCache` on that sweep) but has no signal this layer observes,
+        /// so entries here outlive the path that produced them. Filed in
+        /// `docs/reference-parity-checklist.md` Tier 4.
         ///
         /// Apps may read `displayName` to show a sender's name, and in future may read `stampCost`
         /// to generate a delivery stamp. **Do not feed `stampCost` into stamp generation without a
@@ -319,19 +343,34 @@ public struct LXMFNode {
                 if let learned = state.endpoint.learned[h] {
                     effects.append(.send(.router(.learnedIdentity(destinationHash: h, identity: learned.identity))))
                     // Mirror `LXMFDeliveryAnnounceHandler.received_announce` (Handlers.py:15-18,
-                    // LXMF 1.1.0): for every delivery-destination announce, extract the app-data
-                    // and store the peer's display name and stamp cost.
+                    // LXMF 1.1.0): for a delivery-destination announce, extract the app-data and
+                    // store the peer's display name and stamp cost.
                     //
-                    // Filter: accept only if the bytes parse as `LXMFAnnounceData` AND NOT as
-                    // `PNAnnounce`. A propagation-node announce (`lxmf.propagation` aspect) is a
-                    // 7-element msgpack array whose first element is `.bool(false)`; it would
-                    // otherwise parse as a delivery announce with a spurious stampCost (items[1]
-                    // is the timebase uint). Reference sidesteps this by registering a separate
-                    // handler per aspect; we cannot read the aspect here, so we exclude PN shape
-                    // explicitly.
-                    if let appData = learned.appData,
-                       let ann = LXMFAnnounceData.parse(appData),
-                       PNAnnounce.parse(appData) == nil {
+                    // The aspect gate is a DESTINATION check, exactly as reference does it.
+                    // `Transport.py:2077-2086` (RNS 1.4.2) recomputes
+                    // `hash_from_name_and_identity(handler.aspect_filter, announce_identity)` and runs
+                    // the handler only when it equals the announced destination hash;
+                    // `LXMFDeliveryAnnounceHandler.aspect_filter` is `"lxmf.delivery"` (Handlers.py:11).
+                    // `LXMessage.deliveryHash(identityHash:)` is that same computation, and both
+                    // inputs are in hand here.
+                    //
+                    // This gate is load-bearing in BOTH directions, and a payload-shape heuristic
+                    // cannot replace it:
+                    //   • `.pathLearned` fires for EVERY announce on the network, from every
+                    //     application and aspect (Transport.swift, the `shouldReplace` branch), and
+                    //     `LXMFAnnounceData.parse` returns non-nil for every non-empty blob — its
+                    //     legacy path treats arbitrary bytes as a UTF-8 display name. Without this
+                    //     check, `learnedPeers` becomes a table of every destination ever heard,
+                    //     with foreign app-data misread as display names.
+                    //   • Excluding propagation announces by SHAPE leaks: a 6-element PN announce
+                    //     (reference's own "Insufficient peer data, likely from deprecated LXMF
+                    //     version", LXMF.py:228) fails `PNAnnounce.parse` and would be stored with
+                    //     its timebase uint misread as a stamp cost. Same for a PN announce whose
+                    //     metadata element is an array rather than a map. The destination check has
+                    //     no such family of near-misses.
+                    if h == LXMessage.deliveryHash(identityHash: learned.identity.hash),
+                       let appData = learned.appData,
+                       let ann = LXMFAnnounceData.parse(appData) {
                         state.learnedPeers[h] = LXMFNode.LearnedPeer(
                             displayName: ann.displayName,
                             stampCost: ann.stampCost,

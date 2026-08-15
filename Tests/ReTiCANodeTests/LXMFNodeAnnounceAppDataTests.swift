@@ -260,26 +260,31 @@ private func makeAnnounceStore(
 
 // MARK: - Learning peers from inbound delivery announces
 
-/// Helper: make a store with a pre-seeded `LearnedDestination` whose `appData` is controlled by
-/// the caller. Seeding into `endpoint.transport.learned` before the store is built mirrors the way
-/// the transport layer populates `learned` before firing `pathLearned`.
+/// The wall-clock instant every test in this section injects via `\.date`, so `learnedAt` is pinnable.
+private let learnAnnounceDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+/// Helper: make a store with a pre-seeded `LearnedDestination` for `announcedHash`, whose identity
+/// and `appData` are controlled by the caller. Seeding into `endpoint.transport.learned` before the
+/// store is built mirrors the way the transport populates `learned` before firing `pathLearned`.
+///
+/// `announcedHash` and `peerIdentity` are separate parameters on purpose: the production gate
+/// compares `announcedHash` against `LXMessage.deliveryHash(identityHash: peerIdentity.hash)`, so a
+/// test can only exercise that gate if it can set the two independently.
 @MainActor
 private func makeLearnPeerStore(
-    peerHash: Data,
-    peerAppData: Data?,
-    date: Date = Date(timeIntervalSince1970: 1_700_000_000)
+    announcedHash: Data,
+    peerIdentity: Identity,
+    peerAppData: Data?
 ) -> TestStore<LXMFNode.State, LXMFNode.Action> {
-    let identity = Identity()
-    let peerIdentity = Identity()
     var tcp = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
-    tcp.transport.learned[peerHash] = LearnedDestination(
+    tcp.transport.learned[announcedHash] = LearnedDestination(
         identity: peerIdentity, appData: peerAppData, ratchet: nil,
         interfaceID: InterfaceID("tcp"), hops: 1, nextHop: nil, announceEmitted: 0)
-    let store = TestStore(initialState: LXMFNode.State(identity: identity, endpoint: tcp)) {
+    let store = TestStore(initialState: LXMFNode.State(identity: Identity(), endpoint: tcp)) {
         LXMFNode()
     } withDependencies: {
         $0.continuousClock = TestClock()
-        $0.date = .constant(date)
+        $0.date = .constant(learnAnnounceDate)
         $0.uuid = .incrementing
         $0.tcpConnection = TCPConnection(
             open: { _, _ in AsyncStream { _ in } },
@@ -290,90 +295,157 @@ private func makeLearnPeerStore(
     return store
 }
 
-/// A delivery announce with a display name causes `learnedPeers` to be populated with that name.
+/// A delivery announce with a display name populates `learnedPeers` with that name, keyed by the
+/// peer's real `lxmf.delivery` destination hash.
 ///
-/// Anti-vacuity: the assertion is on `state.learnedPeers[peerHash]?.displayName`. A reducer that
-/// does not write `learnedPeers` at all leaves the optional nil, and the `#expect(peer != nil)`
-/// guard then fails, not silently passes.
+/// Anti-vacuity: `#expect(peer != nil)` fails if nothing was stored; `displayName == "Alice"` fails
+/// if the wrong field or a nil was stored. The key is the genuine delivery hash, so this also pins
+/// that the production gate accepts a correctly-keyed announce rather than merely storing anything.
 @MainActor @Test func pathLearnedWithDisplayNameStoresPeerDisplayName() async {
-    let peerHash = Data(repeating: 0xAB, count: 16)
-    let appData = LXMFAnnounceData.pack(displayName: "Alice", stampCost: nil)
-    let store = makeLearnPeerStore(peerHash: peerHash, peerAppData: appData)
+    let peerIdentity = Identity()
+    let deliveryHash = LXMessage.deliveryHash(identityHash: peerIdentity.hash)
+    let store = makeLearnPeerStore(
+        announcedHash: deliveryHash, peerIdentity: peerIdentity,
+        peerAppData: LXMFAnnounceData.pack(displayName: "Alice", stampCost: nil))
 
-    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: peerHash, hops: 1))))
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: deliveryHash, hops: 1))))
 
-    let peer = store.state.learnedPeers[peerHash]
+    let peer = store.state.learnedPeers[deliveryHash]
     #expect(peer != nil)
     if let peer {
         #expect(peer.displayName == "Alice")
     }
 }
 
-/// A delivery announce with a stamp cost causes `learnedPeers` to be populated with that cost.
+/// A delivery announce with a stamp cost populates `learnedPeers` with that cost.
 ///
-/// Anti-vacuity: `peer.stampCost == 7` would fail if the reducer stored nil or stored a different
-/// value; `#expect(peer != nil)` fails if nothing was stored.
+/// Anti-vacuity: `stampCost == 7` fails if nil or a different value was stored.
 @MainActor @Test func pathLearnedWithStampCostStoresPeerStampCost() async {
-    let peerHash = Data(repeating: 0xBC, count: 16)
-    let appData = LXMFAnnounceData.pack(displayName: nil, stampCost: 7)
-    let store = makeLearnPeerStore(peerHash: peerHash, peerAppData: appData)
+    let peerIdentity = Identity()
+    let deliveryHash = LXMessage.deliveryHash(identityHash: peerIdentity.hash)
+    let store = makeLearnPeerStore(
+        announcedHash: deliveryHash, peerIdentity: peerIdentity,
+        peerAppData: LXMFAnnounceData.pack(displayName: nil, stampCost: 7))
 
-    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: peerHash, hops: 1))))
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: deliveryHash, hops: 1))))
 
-    let peer = store.state.learnedPeers[peerHash]
+    let peer = store.state.learnedPeers[deliveryHash]
     #expect(peer != nil)
     if let peer {
         #expect(peer.stampCost == 7)
     }
 }
 
-/// A delivery announce with both a display name and stamp cost stores both fields together.
+/// A delivery announce stores ALL FOUR fields: name, cost, compression support, and the wall-clock
+/// `learnedAt`. This is the per-field pin — the other tests cover one field each, so without this
+/// one a mutation to `supportsCompression` or `learnedAt` would break no test.
 ///
-/// Anti-vacuity: both fields are independently asserted so a half-populated struct fails at
-/// the field that was not written; `#expect(peer != nil)` fails if nothing was stored.
-@MainActor @Test func pathLearnedWithNameAndCostStoresBothFields() async {
-    let peerHash = Data(repeating: 0xCD, count: 16)
-    let appData = LXMFAnnounceData.pack(displayName: "Bob", stampCost: 12)
-    let store = makeLearnPeerStore(peerHash: peerHash, peerAppData: appData)
+/// Anti-vacuity: each field is asserted separately against a value that differs from the
+/// zero/default it would hold if unwritten (`learnedAt` in particular is compared to the injected
+/// date, so storing `Date()` or `.distantPast` fails).
+@MainActor @Test func pathLearnedStoresAllFourLearnedPeerFields() async {
+    let peerIdentity = Identity()
+    let deliveryHash = LXMessage.deliveryHash(identityHash: peerIdentity.hash)
+    let store = makeLearnPeerStore(
+        announcedHash: deliveryHash, peerIdentity: peerIdentity,
+        peerAppData: LXMFAnnounceData.pack(displayName: "Bob", stampCost: 12))
 
-    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: peerHash, hops: 1))))
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: deliveryHash, hops: 1))))
 
-    let peer = store.state.learnedPeers[peerHash]
+    let peer = store.state.learnedPeers[deliveryHash]
     #expect(peer != nil)
     if let peer {
         #expect(peer.displayName == "Bob")
         #expect(peer.stampCost == 12)
+        #expect(peer.supportsCompression == true)   // pack always emits SF_COMPRESSION
+        #expect(peer.learnedAt == learnAnnounceDate)
     }
 }
 
-/// A propagation-node announce (7-element array, first element `.bool(false)`) must NOT be stored
-/// in `learnedPeers` as a delivery peer: `PNAnnounce.parse` succeeds, which the PN-exclusion guard
-/// detects, so the entry is never written.
+/// An announce whose functionality list omits `SF_COMPRESSION` stores `supportsCompression == false`.
 ///
-/// Anti-vacuity: if the PN filter were removed, the PN announce's `items[1]` (the timebase uint)
-/// would be misread as a `stampCost` and the entry would be written — then `#expect(peer == nil)`
-/// would fail. The assertion directly tests the filter's effect.
-@MainActor @Test func pathLearnedWithPNAnnounceDoesNotStoreLearnedPeer() async {
-    let pnHash = Data(repeating: 0xDE, count: 16)
+/// Paired with `pathLearnedStoresAllFourLearnedPeerFields` (which pins the `true` case), this makes
+/// `supportsCompression` a two-sided pin: inverting the stored value flips one of the two and fails.
+/// `LXMFAnnounceData.pack` cannot produce this blob — it always emits `SF_COMPRESSION` — so the
+/// app-data is built directly.
+@MainActor @Test func pathLearnedWithoutCompressionSupportStoresFalse() async {
+    let peerIdentity = Identity()
+    let deliveryHash = LXMessage.deliveryHash(identityHash: peerIdentity.hash)
+    // [display_name, stamp_cost, [9]] — a functionality list without SF_COMPRESSION (0x00).
+    let appData = MsgPack.encode(.array([.bin(Data("Zed".utf8)), .null, .array([.uint(9)])]))
+    let store = makeLearnPeerStore(
+        announcedHash: deliveryHash, peerIdentity: peerIdentity, peerAppData: appData)
+
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: deliveryHash, hops: 1))))
+
+    let peer = store.state.learnedPeers[deliveryHash]
+    #expect(peer != nil)
+    if let peer {
+        #expect(peer.displayName == "Zed")          // proves the blob was parsed, not defaulted
+        #expect(peer.supportsCompression == false)
+    }
+}
+
+/// A propagation-node announce, arriving on the peer's real `lxmf.propagation` destination hash,
+/// must NOT be stored in `learnedPeers`.
+///
+/// The exclusion is now STRUCTURAL, not shape-based: the announced hash is the propagation
+/// destination, which cannot equal `deliveryHash(identityHash:)` of the same identity, so the gate
+/// rejects it regardless of payload. (The previous revision excluded PN announces by testing
+/// `PNAnnounce.parse(appData) == nil`, which leaked for every PN blob that fails that parse — a
+/// 6-element announce, reference's own "Insufficient peer data" case at LXMF.py:228, was stored
+/// with its timebase misread as a stamp cost.)
+///
+/// Anti-vacuity: deleting the destination check stores the entry with `stampCost == 1_700_000_000`,
+/// failing `#expect(... == nil)`.
+@MainActor @Test func pathLearnedWithPNAnnounceOnPropagationHashDoesNotStoreLearnedPeer() async {
+    let peerIdentity = Identity()
+    let propagationHash = Destination.hash(identityHash: peerIdentity.hash,
+                                           appName: LXMessage.appName, aspects: ["propagation"])
     let pnData = PNAnnounce(timebase: 1_700_000_000, nodeState: true,
                             perTransferLimit: 256, perSyncLimit: 10240,
                             targetStampCost: 5, stampCostFlexibility: 1, peeringCost: 3).packed
-    let store = makeLearnPeerStore(peerHash: pnHash, peerAppData: pnData)
+    let store = makeLearnPeerStore(
+        announcedHash: propagationHash, peerIdentity: peerIdentity, peerAppData: pnData)
 
-    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: pnHash, hops: 1))))
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: propagationHash, hops: 1))))
 
-    #expect(store.state.learnedPeers[pnHash] == nil)
+    #expect(store.state.learnedPeers[propagationHash] == nil)
 }
 
-/// A `pathLearned` event with no app-data (nil) must not create a `learnedPeers` entry.
+/// An announce from a NON-LXMF application must not be stored. `.pathLearned` fires for every
+/// announce on the network regardless of aspect, and `LXMFAnnounceData.parse` accepts every
+/// non-empty blob via its legacy raw-UTF-8 path — so without the destination gate a NomadNet node
+/// announce would be recorded as an LXMF peer named "NomadNet Node".
 ///
-/// Anti-vacuity: if the nil-app-data guard were missing, a nil-appData delivery would store a
-/// default-initialized entry and `#expect(peer == nil)` would fail.
+/// This is the larger of the two failure directions and the one no earlier test covered.
+///
+/// Anti-vacuity: deleting the destination check stores an entry whose `displayName` is
+/// "NomadNet Node", failing `#expect(... == nil)`.
+@MainActor @Test func pathLearnedWithForeignAppAnnounceDoesNotStoreLearnedPeer() async {
+    let peerIdentity = Identity()
+    let foreignHash = Destination.hash(identityHash: peerIdentity.hash,
+                                       appName: "nomadnetwork", aspects: ["node"])
+    let store = makeLearnPeerStore(
+        announcedHash: foreignHash, peerIdentity: peerIdentity,
+        peerAppData: Data("NomadNet Node".utf8))
+
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: foreignHash, hops: 1))))
+
+    #expect(store.state.learnedPeers[foreignHash] == nil)
+}
+
+/// A delivery announce with no app-data (nil) must not create a `learnedPeers` entry — the
+/// destination gate passes here, so this isolates the nil-app-data guard specifically.
+///
+/// Anti-vacuity: dropping the guard stores a default-initialized entry, failing `#expect(... == nil)`.
 @MainActor @Test func pathLearnedWithNoAppDataDoesNotStoreLearnedPeer() async {
-    let peerHash = Data(repeating: 0xEF, count: 16)
-    let store = makeLearnPeerStore(peerHash: peerHash, peerAppData: nil)
+    let peerIdentity = Identity()
+    let deliveryHash = LXMessage.deliveryHash(identityHash: peerIdentity.hash)
+    let store = makeLearnPeerStore(
+        announcedHash: deliveryHash, peerIdentity: peerIdentity, peerAppData: nil)
 
-    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: peerHash, hops: 1))))
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: deliveryHash, hops: 1))))
 
-    #expect(store.state.learnedPeers[peerHash] == nil)
+    #expect(store.state.learnedPeers[deliveryHash] == nil)
 }

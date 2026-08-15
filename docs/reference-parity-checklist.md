@@ -281,13 +281,22 @@ exactly the class Tier 1 just closed.*
       `downloadedTransientIds` both reset, so the next PN sync re-downloads everything the node
       still holds and re-delivers it as new. Reference avoids this with `local_deliveries` /
       `locally_processed`. **On iOS the process is killed constantly, so this is the normal path.**
-- [ ] **Learned peer stamp costs are never expired.** Reference expires `outbound_stamp_costs`
-      entries older than `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60` seconds in
-      `clean_outbound_stamp_costs` (`LXMRouter.py:1272-1281`, LXMF 1.1.0). `LXMFNode.State.learnedPeers`
-      stores each entry's `learnedAt` timestamp so expiry can be added without a schema change, but
-      no cleanup runs today. In practice this means a peer's stamp requirement stays cached until
-      the next announce refreshes it or the process restarts — **lower-impact than other durability
-      gaps** because the data is in-memory only and a fresh announce overwrites the entry.
+- [ ] **`LXMFNode.State.learnedPeers` is never collected — the deferred risk is GROWTH, not staleness.**
+      Reference expires `outbound_stamp_costs` entries older than
+      `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60` seconds in `clean_outbound_stamp_costs`
+      (`LXMRouter.py:1272-1281`, LXMF 1.1.0). We store each entry's `learnedAt` so the same expiry
+      can be added without a schema change, but no cleanup runs.
+      **Staleness is the benign half** — a fresh announce overwrites the entry, and nothing spends
+      the value today. **Unbounded growth is the real gap:** one entry per distinct `lxmf.delivery`
+      destination ever heard, retained after the transport has expired the path that produced it.
+      `Transport.maintenanceTick` sweeps `Transport.State.learned` and deliberately piggybacks
+      `announceBlobs` and `announceCache` on it (`Transport.swift`, the `.maintenanceTick` case);
+      `learnedPeers` joins none of them, because it lives in `LXMFNode.State` and no path-expiry
+      delegate crosses the `TransportEndpoint` boundary. Closing this wants either a new
+      `.delegate(.pathExpired)` emitted from both transports, or a sweep driven from `LXMFNode`.
+      *An earlier revision of this entry called the gap low-impact on the grounds that no stale
+      entry causes a wrong outcome. That was true of correctness and silently dropped the growth
+      mode — which the delivery-hash gate bounds to LXMF peers but does not close.*
       *Filed 2026-08-15.*
 
 ## Tier 5 — capability and throughput
