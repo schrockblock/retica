@@ -22,7 +22,7 @@ public struct LXMessage: Equatable, Sendable {
     /// the sender actually sent rather than what our encoder would have produced. `nil` for messages
     /// built locally by `create`, which have no wire form yet.
     ///
-    /// Mirrors reference `message.packed = lxmf_bytes` (lxmf 1.1.0 `LXMessage.py:797`). Without it a
+    /// Mirrors reference `message.packed = lxmf_bytes` (lxmf 1.1.0 `LXMessage.py:798`). Without it a
     /// sender whose MessagePack encoder differs from ours in any single legal way — a `bin16` length
     /// prefix where we emit `bin8`, say — fails signature validation and the message is dropped.
     /// Excluded from `==` on purpose: see the `Equatable` conformance below.
@@ -94,7 +94,7 @@ public struct LXMessage: Equatable, Sendable {
     /// The on-wire bytes: destinationHash ‖ sourceHash ‖ signature ‖ msgpack(payload).
     ///
     /// A message that came off the wire returns **exactly what it received**, mirroring reference
-    /// `message.packed = lxmf_bytes` (lxmf 1.1.0 `LXMessage.py:797`) — a relay must not re-encode
+    /// `message.packed = lxmf_bytes` (lxmf 1.1.0 `LXMessage.py:798`) — a relay must not re-encode
     /// someone else's message, because any legal encoding difference would invalidate their
     /// signature for every downstream hop. Only a locally-created message is packed from its fields.
     public var packed: Data {
@@ -164,11 +164,11 @@ public struct LXMessage: Equatable, Sendable {
 
     /// Validate the signature against the resolved source identity (the caller resolves it by
     /// `sourceHash`). For a message off the wire this validates the bytes **as received**, matching
-    /// reference `signed_part` (lxmf 1.1.0 `LXMessage.py:761`); only a locally-created message, which
+    /// reference `signed_part` (lxmf 1.1.0 `LXMessage.py:764`); only a locally-created message, which
     /// has no received form, is validated against re-encoded fields.
     ///
     /// A stamped message still re-packs `payload[:4]`, exactly as reference does at
-    /// `LXMessage.py:755` — canonical encoding remains required on that path, by design, not oversight.
+    /// `LXMessage.py:758` — canonical encoding remains required on that path, by design, not oversight.
     public func validateSignature(source: Identity) -> Bool {
         let hashedPart: Data
         if let receivedBytes, stamp == nil {

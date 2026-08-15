@@ -199,33 +199,61 @@ exactly the class Tier 1 just closed.*
       **CORRECTED after review, same day — twice, and both ways it moved make it worse:**
 
       1. **This is not merely an amplifier; it loses messages today.** Reference
-         `unpack_from_bytes` re-packs only when `len(unpacked_payload) > 4` (`LXMessage.py:745-750`),
-         so with no stamp `packed_payload` **is** the received slice and `signed_part` (`:761`) is
-         built from it. We always rebuild via `payloadBytes(...)`
-         (`LXMessage.swift:118-122`). So a legitimate sender whose packing differs from ours **in
+         `unpack_from_bytes` re-packs only when `len(unpacked_payload) > 4` (`LXMessage.py:755-758`),
+         so with no stamp `packed_payload` **is** the received slice and `signed_part` (`:764`) is
+         built from it. We always rebuild via `payloadBytes(...)` (`LXMessage.swift`, in
+         `validateSignature`). So a legitimate sender whose packing differs from ours **in
          any single byte** fails validation and `LXMFRouter.received` drops the message — the same
          silent-loss class as the Tier 1 defects, not a hypothetical.
       2. **Fixing `validateSignature` alone would narrow the coupling, not remove it.** Two paths
          survive: (a) the **stamped** path, where reference itself re-packs `payload[:4]`, so
          canonical re-encode is still required there; and (b) our `packed` property recomputes from
          fields, whereas reference stores `message.packed = lxmf_bytes` (`:798`) and
-         **re-transmits the received bytes** — so a ReTiCA propagation node *forwarding* a message
-         still depends on byte-exact re-encode.
+         **re-transmits the received bytes**.
+
+         ~~so a ReTiCA propagation node *forwarding* a message still depends on byte-exact
+         re-encode.~~ **That clause was wrong about the mechanism** — caught by Task 2's review,
+         and left visible here rather than quietly deleted because it is the third overclaim of
+         this shape in a week. ReTiCA's propagation node **never decodes to `LXMessage` at all**:
+         `PropagationStore.swift` and `PropagationNode.swift` contain zero references to it, and
+         the PN stores and serves raw container `Data` keyed by `transient_id`. Something that
+         never decodes cannot re-encode. The real exposure was the **client relay**: an app
+         re-sending a message it received, via `LXMFNode.sendMessage` (`LXMFNode.swift:56`, handled
+         `:133-149`, which takes a *caller-supplied* `LXMessage`), reaches `opportunisticPayload`,
+         `directRepresentation` and `LXMFPropagation.pack` — all four of which read `packed`, so
+         every forwarded message was re-encoded and its signature invalidated for the next hop.
 
       **Fixed in two tasks — both entry points closed:**
 
-      - `validateSignature` (`LXMessage.swift`): **Task 1**, commit recorded in task-1-report.
+      - `validateSignature` (`LXMessage.swift`): **Task 1**, commit **`c0638fc`**.
         Uses `receivedBytes` for non-stamped inbound messages, re-packs for stamped messages
-        exactly as reference does at `LXMessage.py:755` — canonical encoding remains required on
+        exactly as reference does at `LXMessage.py:758` — canonical encoding remains required on
         the stamped path, by design, not oversight.
-      - `packed` (`LXMessage.swift`): **Task 2**, commit recorded in task-2-report. Returns
-        `receivedBytes` when present (mirroring `message.packed = lxmf_bytes`, `LXMessage.py:797`),
+      - `packed` (`LXMessage.swift`): **Task 2**, commit **`bd51a33`**. Returns
+        `receivedBytes` when present (mirroring `message.packed = lxmf_bytes`, `LXMessage.py:798`),
         re-encodes from fields for locally-created messages (`receivedBytes == nil`). The stamped
         path still requires canonical encoding: `withStamp` constructs a new message **without**
         threading `receivedBytes` through (commented at the construction site,
-        `LXMessage.swift:withStamp`) so `packed` falls back to re-encoding and includes the stamp.
-        This is parity, not a remaining gap — reference re-packs `payload[:4]` for the stamp hash
-        and the stamped wire form is never stored; it is assembled fresh at each send.
+        `LXMessage.swift`, in `withStamp`) so `packed` falls back to re-encoding and includes the
+        stamp.
+
+        That is parity, and the reason is structural rather than about storage. *An earlier
+        revision of this line said "the stamped wire form is never stored; it is assembled fresh at
+        each send" — wrong on both halves: reference sets `message.packed = lxmf_bytes` including
+        the stamp (`:798`) and caches in `pack()` (`:381-386`), and `pack()` opens with
+        `if not self.packed:` (`:356`) so it does not reassemble per send.* The actual reason:
+        `get_stamp()` (`:296`) is called from exactly one place, `pack()` at `:372`, and `pack()`
+        no-ops when `self.packed` is already set — so **reference structurally cannot stamp a
+        message it received**, because receiving is what sets `packed`. Our `withStamp` dropping
+        `receivedBytes` therefore cannot diverge from it.
+
+      **Reachability, stated honestly:** no path inside `Sources/` closes the receive→send loop
+      today. `LXMFRouter.received` reconstructs, validates and delivers without packing; every
+      `packed` consumer is reached only from `.send`/`.sendViaPropagation`, which inside the library
+      are fed only `LXMessage.create` products. The fix takes effect one app-level hop away, for
+      callers of `LXMFNode.sendMessage` or `LXMFPropagation.open`. Task 1's half was live; Task 2's
+      is latent-but-reachable. *Remaining gap: no test above `LXMessage` exercises the relay seam —
+      filed below.*
 
 ## Tier 3 — identity and anti-spam interop
 
@@ -301,6 +329,16 @@ exactly the class Tier 1 just closed.*
 - [ ] **No `accepts_links` policy** — no per-destination allow/deny. Quantity is now capped
       (a divergence in our favour; reference has no cap at all), but any peer may still open a link
       to any registered destination.
+- [ ] **The relay seam has no test above `LXMessage`** (filed from Tier 2b, Task 2's review).
+      Byte-preserving forward is pinned only at the `LXMessage` unit level; every `LXMFNode` test
+      passes an `LXMessage.create` product, so the receive→re-send path — the one the Tier 2b fix
+      exists for — is unexercised end to end. Wanted: drive
+      `.router(.received(method: .direct, …, data: nonCanonicalWire))`, take the message off
+      `.delegate(.messageReceived)`, feed it to `.sendMessage(message:alsoViaPropagation: false)`,
+      and assert the emitted `.endpoint(.send(plaintext:))` equals `nonCanonicalWire.dropFirst(16)`.
+      **Trap for whoever writes it:** `LXMessage.==` deliberately excludes `receivedBytes`, so a
+      TestStore *state* assertion on `outboundQueue` compares equal no matter which bytes are
+      carried — assert on the delegate payload, not on state, or the test will be vacuous.
 - [ ] **No path-request rate control** — fresh random tags pass the `discoveryPrTags` ring every
       time, each drawing a cached response or a recursive fan-out.
 - [ ] **Propagation stamp validation is unthrottled — the residue Task 5 could not close.** A peer
