@@ -68,4 +68,66 @@ struct LXMessageReceivedBytesTests {
             #expect(tampered.validateSignature(source: source) == false)
         }
     }
+
+    @Test("forwarding preserves the sender's exact bytes")
+    func forwardingPreservesReceivedBytes() {
+        let source = Identity()
+        let sourceHash = LXMessage.deliveryHash(identityHash: source.hash)
+        let destinationHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+        let title = Data("hi".utf8)
+        let content = Data("hello world".utf8)
+
+        let payload = nonCanonicalPayload(timestamp: 1700000000.5, title: title, content: content)
+        let hashedPart = destinationHash + sourceHash + payload
+        let signature = source.sign(hashedPart + Crypto.fullHash(hashedPart))
+        let wire = destinationHash + sourceHash + signature + payload
+
+        let msg = LXMessage.unpack(wire)
+        #expect(msg != nil)
+        // A relay must hand on what it received. Re-encoding would emit bin8 where the sender used
+        // bin16, changing the bytes and invalidating the signature for every downstream hop.
+        if let msg { #expect(msg.packed == wire) }
+    }
+
+    @Test("a locally-created message still packs from its fields")
+    func locallyCreatedMessagePacksFromFields() {
+        let source = Identity()
+        let msg = LXMessage.create(source: source,
+                                   destinationHash: LXMessage.deliveryHash(identityHash: Identity().hash),
+                                   timestamp: 1700000000.5,
+                                   title: Data("hi".utf8), content: Data("hello world".utf8))
+        #expect(msg.packed.count > 0)
+        #expect(LXMessage.unpack(msg.packed) != nil)
+    }
+
+    @Test("withStamp on a received message packs the stamp, not the pre-stamp bytes")
+    func withStampOnReceivedMessageIncludesStamp() {
+        let source = Identity()
+        let sourceHash = LXMessage.deliveryHash(identityHash: source.hash)
+        let destinationHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+        let title = Data("hi".utf8)
+        let content = Data("hello world".utf8)
+
+        let payload = nonCanonicalPayload(timestamp: 1700000000.5, title: title, content: content)
+        let hashedPart = destinationHash + sourceHash + payload
+        let signature = source.sign(hashedPart + Crypto.fullHash(hashedPart))
+        let wire = destinationHash + sourceHash + signature + payload
+
+        guard let msg = LXMessage.unpack(wire) else {
+            Issue.record("unpack returned nil")
+            return
+        }
+
+        // Generate a stamp and attach it. withStamp must NOT carry receivedBytes through — doing so
+        // would return the pre-stamp bytes from packed and silently discard the stamp.
+        let stamp = Data(repeating: 0xAB, count: 32)
+        let stamped = msg.withStamp(stamp)
+
+        // Round-trip: packed must decode to a message whose stamp field matches.
+        guard let reparsed = LXMessage.unpack(stamped.packed) else {
+            Issue.record("unpack of stamped.packed returned nil")
+            return
+        }
+        #expect(reparsed.stamp == stamp)
+    }
 }

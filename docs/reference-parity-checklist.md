@@ -186,7 +186,7 @@ other admission-control gaps and detailed in `docs/wire-narrowing-inventory.md` 
 item. It is both the thing that turns decode bugs into remote aborts, and a silent-loss vector of
 exactly the class Tier 1 just closed.*
 
-- [ ] **`LXMessage.validateSignature` re-encodes unconditionally.** Reference validates against the
+- [x] **`LXMessage.validateSignature` re-encodes unconditionally.** Reference validates against the
       **received bytes** when there is no stamp; we always re-pack the decoded fields and validate
       against our own output. Consequences: (a) every inbound rich message traverses the
       decode→re-encode path, so any encode-side trap becomes **wire-reachable** — this is exactly
@@ -212,10 +212,20 @@ exactly the class Tier 1 just closed.*
          **re-transmits the received bytes** — so a ReTiCA propagation node *forwarding* a message
          still depends on byte-exact re-encode.
 
-      **Scope any task on this to carry the original bytes on `LXMessage` and use them in _both_
-      places** — validation and forwarding. Fixing only validation leaves the forwarding path
-      exposed and would read as done. *Found 2026-08-14 while landing the decoder widening;
-      pre-existing and untouched.*
+      **Fixed in two tasks — both entry points closed:**
+
+      - `validateSignature` (`LXMessage.swift`): **Task 1**, commit recorded in task-1-report.
+        Uses `receivedBytes` for non-stamped inbound messages, re-packs for stamped messages
+        exactly as reference does at `LXMessage.py:755` — canonical encoding remains required on
+        the stamped path, by design, not oversight.
+      - `packed` (`LXMessage.swift`): **Task 2**, commit recorded in task-2-report. Returns
+        `receivedBytes` when present (mirroring `message.packed = lxmf_bytes`, `LXMessage.py:797`),
+        re-encodes from fields for locally-created messages (`receivedBytes == nil`). The stamped
+        path still requires canonical encoding: `withStamp` constructs a new message **without**
+        threading `receivedBytes` through (commented at the construction site,
+        `LXMessage.swift:withStamp`) so `packed` falls back to re-encoding and includes the stamp.
+        This is parity, not a remaining gap — reference re-packs `payload[:4]` for the stamp hash
+        and the stamped wire form is never stored; it is assembled fresh at each send.
 
 ## Tier 3 — identity and anti-spam interop
 

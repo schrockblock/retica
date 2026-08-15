@@ -92,14 +92,25 @@ public struct LXMessage: Equatable, Sendable {
     }
 
     /// The on-wire bytes: destinationHash ‖ sourceHash ‖ signature ‖ msgpack(payload).
+    ///
+    /// A message that came off the wire returns **exactly what it received**, mirroring reference
+    /// `message.packed = lxmf_bytes` (lxmf 1.1.0 `LXMessage.py:797`) — a relay must not re-encode
+    /// someone else's message, because any legal encoding difference would invalidate their
+    /// signature for every downstream hop. Only a locally-created message is packed from its fields.
     public var packed: Data {
-        destinationHash + sourceHash + signature
-            + LXMessage.payloadBytes(timestamp: timestamp, title: title, content: content,
-                                     fields: fields, stamp: stamp)
+        if let receivedBytes { return receivedBytes }
+        return destinationHash + sourceHash + signature
+            + LXMessage.payloadBytes(timestamp: timestamp, title: title,
+                                     content: content, fields: fields, stamp: stamp)
     }
 
     /// A copy of this message with a delivery stamp attached (hash/signature unchanged — the stamp is
     /// not part of the signed payload). The stamp is produced by `LXStamper.generateStamp(messageId: hash, …)`.
+    ///
+    /// `receivedBytes` is deliberately **not** threaded through. If it were, `packed` would return
+    /// the pre-stamp bytes (whatever arrived on the wire without a stamp) and silently discard the
+    /// newly-attached stamp. A stamped copy has no prior wire form, so `packed` must re-encode from
+    /// fields — which is what falling back to the `receivedBytes == nil` branch of `packed` gives us.
     public func withStamp(_ stamp: Data) -> LXMessage {
         LXMessage(destinationHash: destinationHash, sourceHash: sourceHash, timestamp: timestamp,
                   title: title, content: content, hash: hash, signature: signature, fields: fields, stamp: stamp)
