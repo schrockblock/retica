@@ -257,18 +257,56 @@ exactly the class Tier 1 just closed.*
 
 ## Tier 3 — identity and anti-spam interop
 
-- [ ] **No delivery-announce app data** — `LXMFNode.swift:92` announces `appData: nil`.
+- [x] **No delivery-announce app data** — `LXMFNode.swift:92` announces `appData: nil`.
       Reference packs `msgpack([display_name, stamp_cost, [SF_COMPRESSION]])` (`LXMRouter.py:1034-1050`).
       **ReTiCA users appear unnamed in every reference client** (Sideband, NomadNet), and we can
       never advertise a required stamp cost. *Verified `46e838e`.*
+      **Fixed in four commits (plan `2026-08-15-lxmf-delivery-announce-app-data.md`):**
+      - `08356e4` — `LXMFAnnounceData.pack` / `LXMFAnnounceData.parse` codec, byte-cross-validated
+        against genuine LXMF 1.1.0 output (Tasks 1–2).
+      - `eb0abd5` — `LXMFNode.registerDelivery` now packs real app-data instead of `nil`; reference
+        `get_announce_app_data` (`LXMRouter.py:1034-1050`) always packs, even when both name and cost
+        are absent, so we match that (Task 3). **ReTiCA users are now named in Sideband/NomadNet.**
+      - `dcb543f` + `2ab55ac` — `LXMFNode.State.learnedPeers` records each LXMF delivery peer's
+        `displayName`, `stampCost` and `supportsCompression` on `pathLearned`, gated on
+        `LXMessage.deliveryHash(identityHash:)` to match reference's own destination-hash dispatch
+        (`Transport.py:2077-2086`, RNS 1.4.2; `Handlers.py:11` aspect filter) (Task 4).
+
+      **What this slice does NOT close — stated plainly:**
+
+      - **Delivery stamps remain entirely unwired.** `LXStamper.generateStamp` has no production
+        caller. `LXMFNode.send` never generates a stamp; `LXMFRouter.received` never validates one.
+        Any peer running `enforce_stamps()` drops every ReTiCA message (`LXMRouter.py:1875-1877`).
+        This slice *learns* a peer's advertised stamp cost and stores it in `learnedPeers.stampCost`,
+        but never spends it. The delivery-stamps item below remains open.
+
+      - **`learnedPeers` is still unbounded.** The `deliveryHash` gate narrows the table from "every
+        destination ever heard" to "every LXMF delivery peer ever heard" — a reduction, not a bound.
+        This is already filed under Tier 4 ("LXMFNode.State.learnedPeers is never collected"); the
+        tick here does not close that item.
+
 - [ ] **Delivery stamps not wired** — all PoW primitives exist (`LXStamper.swift`,
       `LXMessage.swift`) but `validateStamp` **has no caller** and `send` never generates one.
       Any peer running `enforce_stamps()` drops every ReTiCA message (`LXMRouter.py:1875-1877`).
-      *Verified `46e838e`.*
-- [ ] **`setNodeMode(false)` never re-announces** — `LXMFServiceNode.swift:111` returns `.none`, so
-      the last announce on the network still says `nodeState: true`. Reference re-announces
-      immediately and peers unpeer on it (`LXMRouter.py:692-694` → `:338-345`, `Handlers.py:98-99`).
-      Peers keep syncing into a node that drops everything.
+      *Verified `46e838e`.* See delivery-announce tick above — learning a peer's cost (Task 4) is
+      a prerequisite; spending it safely (bounded PoW, ceiling enforcement) is the remaining work.
+- [x] **`setNodeMode(false)` never re-announces** — `LXMFServiceNode.swift` `setNodeMode` returned
+      `.none` on disable, so the last announce on the network still said `nodeState: true`. Reference
+      `disable_propagation` (verified against stock LXMF 1.1.0, `LXMRouter.py:692-694`) sets
+      `self.propagation_node = False` then calls `announce_propagation_node()` (`LXMRouter.py:338-345`,
+      in `announce_propagation_node`), which packs `node_state = False` and re-announces. Peers act
+      on that: `Handlers.py:98-99` (`received_announce`) calls `unpeer(destination_hash)` when
+      `propagation_enabled == False`. Reference announces on **both** transitions — `enable_propagation`
+      (`:685`) and `disable_propagation` (`:694`); our `setNodeMode(true)` already re-announced via
+      `registerPropagation`, so only the disable path was missing.
+      **Fixed `32e39ca`** — `setNodeMode` in `LXMFServiceNode`, disable branch: guard on
+      `state.client.propagationDestinationHash` (no-op when `registerPropagation` was never called),
+      then emit `.client(.endpoint(.announce(destinationHash:appData:)))` with `nodeState: false`.
+      Two new tests pin both directions: `serviceNodeDisableReAnnouncesWithNodeStateFalse` (asserts on
+      parsed `PNAnnounce.nodeState`, not on `state.nodeModeEnabled`) and
+      `serviceNodeDisableWithoutPriorRegistrationDoesNotAnnounce` (exhaustive teardown catches any
+      stray announce when no destination is registered). Mutation-verified: three mutations, each
+      breaks exactly the test it should. 952 tests, 121 reviewed conversions, zero known-open.
 - [ ] **LXMF tickets — entirely absent.** Zero `ticket` hits in `Sources/`. No stamp-cost exemption
       in either direction; an inbound `FIELD_TICKET` survives round-trip but is never acted on.
 
