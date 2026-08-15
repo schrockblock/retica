@@ -12,6 +12,46 @@ import ReTiCATransport
 public struct LXMFNode {
     public enum SyncPhase: Equatable { case awaitingList, awaitingMessages }
 
+    /// Data learned from a peer's delivery-destination announce (`lxmf.delivery` aspect).
+    ///
+    /// Mirrors reference's per-destination entry in `outbound_stamp_costs`
+    /// (`LXMRouter.py:1029`, LXMF 1.1.0): `[time.time(), stamp_cost]`. We also carry
+    /// `displayName` and `supportsCompression`, which the reference stores per-`delivery_destination`
+    /// object rather than in a separate dict.
+    ///
+    /// **Expiry:** Reference expires entries older than `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60`
+    /// seconds in `clean_outbound_stamp_costs` (LXMRouter.py:1272-1281). This cleanup is filed as a
+    /// known gap in `docs/reference-parity-checklist.md` (Tier 4/durability, stamp-cost expiry). The
+    /// `learnedAt` timestamp is stored precisely so a future pass can implement the same expiry without
+    /// a schema change.
+    ///
+    /// **Do not spend `stampCost` without a ceiling check.** Announce app-data is unauthenticated;
+    /// any reachable peer can advertise any value. Generating a delivery stamp is an
+    /// **exponential proof-of-work** search — `LXStamper.generateStamp`'s own docstring warns that
+    /// cancellation alone cannot prevent a hostile peer from pinning a core via a large cost. Before
+    /// any caller feeds `stampCost` into stamp generation it MUST validate the value against a
+    /// ceiling (analogous to `LXMFPropagation.maxPropagationStampCost`). Generating delivery stamps
+    /// is out of scope for this slice; this note exists so the next reader does not miss the
+    /// requirement.
+    public struct LearnedPeer: Equatable, Sendable {
+        /// Display name from the peer's announce app-data, or nil if absent.
+        public var displayName: String?
+        /// Stamp cost the peer advertised, or nil.
+        ///
+        /// **Unauthenticated, potentially hostile.** See the note on this struct and on
+        /// `LXMFAnnounceData.stampCost` before acting on this value. Treat it as bounded only by
+        /// `Int.max`; it has NOT been validated against any ceiling here.
+        public var stampCost: Int?
+        /// Whether the peer's announce indicates compression support.
+        public var supportsCompression: Bool
+        /// When this entry was last updated (the announce timestamp, not wall clock).
+        ///
+        /// Stored so a future cleanup pass (reference `STAMP_COST_EXPIRY = 45 days`,
+        /// `LXMRouter.clean_outbound_stamp_costs`, LXMRouter.py:1272-1281) can expire stale entries
+        /// without a schema change. See `docs/reference-parity-checklist.md` for the filed gap.
+        public var learnedAt: Date
+    }
+
     @ObservableState
     public struct State: Equatable {
         public var endpoint: TransportEndpoint.State
@@ -28,6 +68,20 @@ public struct LXMFNode {
         /// Our `lxmf.delivery` destination hash, set when `registerDelivery` is called (nil = not registered).
         /// Used to scope packet proving to inbound direct-delivery links only.
         public var deliveryDestinationHash: Data?
+
+        /// Learned peer data from inbound delivery-destination announces (`lxmf.delivery` aspect),
+        /// keyed by delivery destination hash.
+        ///
+        /// Populated by the `.endpoint(.delegate(.pathLearned))` handler whenever the announce
+        /// carries app-data that parses as `LXMFAnnounceData` and NOT as `PNAnnounce`. This mirrors
+        /// `LXMFDeliveryAnnounceHandler.received_announce` in reference LXMF 1.1.0
+        /// (Handlers.py:15-18), which calls `stamp_cost_from_app_data(app_data)` →
+        /// `lxmrouter.update_stamp_cost(destination_hash, stamp_cost)`.
+        ///
+        /// Apps may read `displayName` to show a sender's name, and in future may read `stampCost`
+        /// to generate a delivery stamp. **Do not feed `stampCost` into stamp generation without a
+        /// ceiling check first** — see `LXMFNode.LearnedPeer` for the security rationale.
+        public var learnedPeers: [Data: LXMFNode.LearnedPeer] = [:]
 
         /// Display name advertised in every delivery-destination announce.
         /// Nil means no name is encoded (the announce still carries the full app-data blob per
@@ -262,8 +316,28 @@ public struct LXMFNode {
 
             case let .endpoint(.delegate(.pathLearned(h, _))):
                 var effects: [Effect<Action>] = [.send(.router(.learnedPath(destinationHash: h)))]
-                if let identity = state.endpoint.learned[h]?.identity {
-                    effects.append(.send(.router(.learnedIdentity(destinationHash: h, identity: identity))))
+                if let learned = state.endpoint.learned[h] {
+                    effects.append(.send(.router(.learnedIdentity(destinationHash: h, identity: learned.identity))))
+                    // Mirror `LXMFDeliveryAnnounceHandler.received_announce` (Handlers.py:15-18,
+                    // LXMF 1.1.0): for every delivery-destination announce, extract the app-data
+                    // and store the peer's display name and stamp cost.
+                    //
+                    // Filter: accept only if the bytes parse as `LXMFAnnounceData` AND NOT as
+                    // `PNAnnounce`. A propagation-node announce (`lxmf.propagation` aspect) is a
+                    // 7-element msgpack array whose first element is `.bool(false)`; it would
+                    // otherwise parse as a delivery announce with a spurious stampCost (items[1]
+                    // is the timebase uint). Reference sidesteps this by registering a separate
+                    // handler per aspect; we cannot read the aspect here, so we exclude PN shape
+                    // explicitly.
+                    if let appData = learned.appData,
+                       let ann = LXMFAnnounceData.parse(appData),
+                       PNAnnounce.parse(appData) == nil {
+                        state.learnedPeers[h] = LXMFNode.LearnedPeer(
+                            displayName: ann.displayName,
+                            stampCost: ann.stampCost,
+                            supportsCompression: ann.supportsCompression,
+                            learnedAt: date.now)
+                    }
                 }
                 return .merge(effects)
 

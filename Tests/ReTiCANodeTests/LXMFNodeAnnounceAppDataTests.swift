@@ -257,3 +257,123 @@ private func makeAnnounceStore(
         }
     }
 }
+
+// MARK: - Learning peers from inbound delivery announces
+
+/// Helper: make a store with a pre-seeded `LearnedDestination` whose `appData` is controlled by
+/// the caller. Seeding into `endpoint.transport.learned` before the store is built mirrors the way
+/// the transport layer populates `learned` before firing `pathLearned`.
+@MainActor
+private func makeLearnPeerStore(
+    peerHash: Data,
+    peerAppData: Data?,
+    date: Date = Date(timeIntervalSince1970: 1_700_000_000)
+) -> TestStore<LXMFNode.State, LXMFNode.Action> {
+    let identity = Identity()
+    let peerIdentity = Identity()
+    var tcp = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+    tcp.transport.learned[peerHash] = LearnedDestination(
+        identity: peerIdentity, appData: peerAppData, ratchet: nil,
+        interfaceID: InterfaceID("tcp"), hops: 1, nextHop: nil, announceEmitted: 0)
+    let store = TestStore(initialState: LXMFNode.State(identity: identity, endpoint: tcp)) {
+        LXMFNode()
+    } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(date)
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(
+            open: { _, _ in AsyncStream { _ in } },
+            send: { _ in },
+            close: { })
+    }
+    store.exhaustivity = .off
+    return store
+}
+
+/// A delivery announce with a display name causes `learnedPeers` to be populated with that name.
+///
+/// Anti-vacuity: the assertion is on `state.learnedPeers[peerHash]?.displayName`. A reducer that
+/// does not write `learnedPeers` at all leaves the optional nil, and the `#expect(peer != nil)`
+/// guard then fails, not silently passes.
+@MainActor @Test func pathLearnedWithDisplayNameStoresPeerDisplayName() async {
+    let peerHash = Data(repeating: 0xAB, count: 16)
+    let appData = LXMFAnnounceData.pack(displayName: "Alice", stampCost: nil)
+    let store = makeLearnPeerStore(peerHash: peerHash, peerAppData: appData)
+
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: peerHash, hops: 1))))
+
+    let peer = store.state.learnedPeers[peerHash]
+    #expect(peer != nil)
+    if let peer {
+        #expect(peer.displayName == "Alice")
+    }
+}
+
+/// A delivery announce with a stamp cost causes `learnedPeers` to be populated with that cost.
+///
+/// Anti-vacuity: `peer.stampCost == 7` would fail if the reducer stored nil or stored a different
+/// value; `#expect(peer != nil)` fails if nothing was stored.
+@MainActor @Test func pathLearnedWithStampCostStoresPeerStampCost() async {
+    let peerHash = Data(repeating: 0xBC, count: 16)
+    let appData = LXMFAnnounceData.pack(displayName: nil, stampCost: 7)
+    let store = makeLearnPeerStore(peerHash: peerHash, peerAppData: appData)
+
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: peerHash, hops: 1))))
+
+    let peer = store.state.learnedPeers[peerHash]
+    #expect(peer != nil)
+    if let peer {
+        #expect(peer.stampCost == 7)
+    }
+}
+
+/// A delivery announce with both a display name and stamp cost stores both fields together.
+///
+/// Anti-vacuity: both fields are independently asserted so a half-populated struct fails at
+/// the field that was not written; `#expect(peer != nil)` fails if nothing was stored.
+@MainActor @Test func pathLearnedWithNameAndCostStoresBothFields() async {
+    let peerHash = Data(repeating: 0xCD, count: 16)
+    let appData = LXMFAnnounceData.pack(displayName: "Bob", stampCost: 12)
+    let store = makeLearnPeerStore(peerHash: peerHash, peerAppData: appData)
+
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: peerHash, hops: 1))))
+
+    let peer = store.state.learnedPeers[peerHash]
+    #expect(peer != nil)
+    if let peer {
+        #expect(peer.displayName == "Bob")
+        #expect(peer.stampCost == 12)
+    }
+}
+
+/// A propagation-node announce (7-element array, first element `.bool(false)`) must NOT be stored
+/// in `learnedPeers` as a delivery peer: `PNAnnounce.parse` succeeds, which the PN-exclusion guard
+/// detects, so the entry is never written.
+///
+/// Anti-vacuity: if the PN filter were removed, the PN announce's `items[1]` (the timebase uint)
+/// would be misread as a `stampCost` and the entry would be written — then `#expect(peer == nil)`
+/// would fail. The assertion directly tests the filter's effect.
+@MainActor @Test func pathLearnedWithPNAnnounceDoesNotStoreLearnedPeer() async {
+    let pnHash = Data(repeating: 0xDE, count: 16)
+    let pnData = PNAnnounce(timebase: 1_700_000_000, nodeState: true,
+                            perTransferLimit: 256, perSyncLimit: 10240,
+                            targetStampCost: 5, stampCostFlexibility: 1, peeringCost: 3).packed
+    let store = makeLearnPeerStore(peerHash: pnHash, peerAppData: pnData)
+
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: pnHash, hops: 1))))
+
+    #expect(store.state.learnedPeers[pnHash] == nil)
+}
+
+/// A `pathLearned` event with no app-data (nil) must not create a `learnedPeers` entry.
+///
+/// Anti-vacuity: if the nil-app-data guard were missing, a nil-appData delivery would store a
+/// default-initialized entry and `#expect(peer == nil)` would fail.
+@MainActor @Test func pathLearnedWithNoAppDataDoesNotStoreLearnedPeer() async {
+    let peerHash = Data(repeating: 0xEF, count: 16)
+    let store = makeLearnPeerStore(peerHash: peerHash, peerAppData: nil)
+
+    await store.send(.endpoint(.delegate(.pathLearned(destinationHash: peerHash, hops: 1))))
+
+    #expect(store.state.learnedPeers[peerHash] == nil)
+}
