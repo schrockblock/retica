@@ -150,7 +150,20 @@ public struct LXMFServiceNode {
                 // bookkeeping is sufficient — all serve behaviour is independently gated on nodeModeEnabled.
                 state.clientIdentities = [:]
                 state.pendingGet = [:]
-                return .none
+                // Re-announce with nodeState = false so peers unpeer immediately rather than continuing
+                // to sync into a node that now drops everything. Reference: LXMRouter.disable_propagation
+                // (LXMRouter.py:692-694) sets self.propagation_node = False then calls
+                // announce_propagation_node() (LXMRouter.py:338-345), which announces with the new
+                // node_state. Peers react in Handlers.py:98-99: unpeer(destination_hash) when
+                // propagation_enabled == False. Guard on propagationDestinationHash: without it there
+                // is no destination to announce on (enable_propagation must have run first).
+                guard let hash = state.client.propagationDestinationHash else { return .none }
+                let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: false,
+                                         perTransferLimit: LXMFPropagation.defaultPropagationTransferLimitKB,
+                                         perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
+                                         targetStampCost: state.pn.store.minStampCost,
+                                         stampCostFlexibility: 0, peeringCost: 0).packed
+                return .send(.client(.endpoint(.announce(destinationHash: hash, appData: appData))))
 
             case .registerPropagation:
                 guard state.nodeModeEnabled,

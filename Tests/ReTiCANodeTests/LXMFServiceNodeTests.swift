@@ -776,6 +776,72 @@ import ComposableArchitecture
     store.exhaustivity = .on   // no stray .router(.received) from the disabled-but-still-open link
 }
 
+// MARK: - Task 5: setNodeMode(false) re-announces with nodeState = false
+
+/// `setNodeMode(false)` must emit an announce on the lxmf.propagation destination with
+/// `nodeState == false`. Without this, the last announce on the network still says `nodeState: true`
+/// and peers keep syncing into a node that now drops everything.
+///
+/// Reference: `LXMRouter.disable_propagation` sets `self.propagation_node = False` then calls
+/// `announce_propagation_node()` (LXMRouter.py:692-694). `announce_propagation_node` calls
+/// `self.propagation_destination.announce(app_data=self.get_propagation_node_app_data())`
+/// (LXMRouter.py:338-345). `get_propagation_node_app_data` packs `node_state = self.propagation_node
+/// and not self.from_static_only` — now `False` — at index 2 of the announce array.
+/// Peers react to that: `Handlers.py:98-99` calls `self.lxmrouter.unpeer(destination_hash, node_timebase)`
+/// when `propagation_enabled == False`.
+///
+/// All line numbers verified against stock LXMF 1.1.0
+/// (`/Users/ell/opt/anaconda3/envs/rns/lib/python3.12/site-packages/LXMF/`) by reading the source.
+///
+/// Test-honesty: asserted on the parsed `PNAnnounce` from the emitted announce bytes, not on
+/// `state.nodeModeEnabled`. An `if let` guarding the only `#expect` passes when the announce is
+/// never emitted; this test uses `try #require` to fail fast instead.
+@MainActor @Test func serviceNodeDisableReAnnouncesWithNodeStateFalse() async throws {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: false)
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+
+    // Arm first so that propagationDestinationHash is set and the disable has somewhere to re-announce.
+    await store.send(.setNodeMode(true))
+    await store.receive { if case .registerPropagation = $0 { return true }; return false }
+    #expect(store.state.client.propagationDestinationHash == propDest.hash)
+
+    // Disarm. The re-announce with nodeState=false must be emitted on the propagation destination.
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.setNodeMode(false))
+    await store.receive { action in
+        if case let .client(.endpoint(.announce(hash, appData))) = action {
+            #expect(hash == propDest.hash, "re-announce must target the propagation destination")
+            captured.setValue(appData)
+            return true
+        }
+        return false
+    }
+
+    let appData = try #require(captured.value, "setNodeMode(false) must emit an announce")
+    let parsed = try #require(PNAnnounce.parse(appData), "re-announce app-data must be a valid PNAnnounce")
+    #expect(parsed.nodeState == false, "re-announce must carry nodeState = false so peers unpeer")
+}
+
+/// `setNodeMode(false)` with no prior `registerPropagation` (i.e., `propagationDestinationHash`
+/// is nil) must NOT emit an announce — there is no destination to announce on yet.
+///
+/// Reference `disable_propagation` (LXMRouter.py:692-694) assumes `self.propagation_destination`
+/// already exists; it is only reachable after `enable_propagation` succeeds. We match that: without
+/// a destination hash there is nothing to announce.
+@MainActor @Test func serviceNodeDisableWithoutPriorRegistrationDoesNotAnnounce() async {
+    let identity = Identity()
+    // Start already-disabled so no prior registerPropagation has run.
+    let store = makeServiceNode(identity, nodeMode: false)
+    #expect(store.state.client.propagationDestinationHash == nil)
+
+    // Flip .on BEFORE the send so any stray announce fails teardown immediately.
+    store.exhaustivity = .on
+    await store.send(.setNodeMode(false))
+    // No announce must be emitted — teardown fails if one is.
+}
+
 // MARK: - Minor-4: requestReceived gated on propagation link
 
 /// A /get request arriving on a NON-propagation link (e.g. the delivery link) must be silently dropped.
