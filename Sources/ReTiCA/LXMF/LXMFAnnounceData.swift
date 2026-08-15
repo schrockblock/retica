@@ -59,6 +59,26 @@ public struct LXMFAnnounceData: Equatable {
 
     // MARK: - Pack
 
+    /// Largest app-data blob, in bytes, that still fits inside a Reticulum announce packet.
+    ///
+    ///     Packet.mtu                               500
+    ///   − HEADER_1 announce header                − 19   flags + hops + 16-byte destination
+    ///                                                    hash + context (`Packet.packed()`)
+    ///   − fixed announce payload                  − 148  64-byte public key + 10-byte name hash
+    ///                                                    + 10-byte random hash + 64-byte
+    ///                                                    signature (`Announce.buildPayload`)
+    ///                                             = 333
+    ///
+    /// **Assumes no ratchet.** `Transport`'s `.announce` case passes `ratchet: nil` today. A
+    /// ratchet is a fifth fixed payload field of `Announce.ratchetSize` (32) bytes, so if ReTiCA
+    /// ever announces one this must drop by 32 — otherwise a name that fits here stops fitting
+    /// on the wire, which is exactly the failure this constant exists to prevent.
+    public static let maxAppDataBytes =
+        Packet.mtu
+        - (Packet.addressLength + 3)
+        - (Announce.keySize + Announce.nameHashLength + Announce.randomHashLength
+           + Announce.signatureLength)
+
     /// Pack delivery-destination announce app-data in the 0.5.0+ msgpack format.
     ///
     /// `displayName` is encoded as msgpack bin (Python `bytes`), not str, matching the
@@ -69,9 +89,15 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// The functionality array always contains `SF_COMPRESSION` (0x00),
     /// mirroring `supported_functionality = [SF_COMPRESSION]` at LXMRouter.py:1047.
+    ///
+    /// **`displayName` is truncated to fit `maxAppDataBytes`** — see `displayNameBudget`. This is
+    /// a DELIBERATE DIVERGENCE: reference `get_announce_app_data` (LXMRouter.py:1034-1050) applies
+    /// no length bound, and an over-long name there makes `RNS.Packet.pack` raise IOError
+    /// (RNS 1.4.2 Packet.py:234-236) so the announce simply fails. ReTiCA's `Transport` `.announce`
+    /// swallows that failure (`try?`), so an unbounded name here silently took the destination off
+    /// the network — a shortened name is strictly better than no announce. Names that already fit
+    /// are byte-identical to before, so the cross-validation vectors are untouched.
     public static func pack(displayName: String?, stampCost: Int?) -> Data {
-        let nameValue: MsgPackValue = displayName.map { .bin(Data($0.utf8)) } ?? .null
-
         let costValue: MsgPackValue
         if let cost = stampCost, cost > 0, cost < 255 {
             costValue = .uint(UInt64(cost))
@@ -81,7 +107,52 @@ public struct LXMFAnnounceData: Equatable {
 
         let functionalityValue: MsgPackValue = .array([.uint(UInt64(sfCompression))])
 
-        return MsgPack.encode(.array([nameValue, costValue, functionalityValue]))
+        guard let displayName else {
+            return MsgPack.encode(.array([.null, costValue, functionalityValue]))
+        }
+
+        var nameBytes = Data(displayName.utf8)
+        let budget = displayNameBudget(costValue: costValue, functionalityValue: functionalityValue)
+        if nameBytes.count > budget {
+            nameBytes = Data(truncated(displayName, toUTF8Bytes: budget).utf8)
+        }
+        return MsgPack.encode(.array([.bin(nameBytes), costValue, functionalityValue]))
+    }
+
+    /// How many UTF-8 bytes of display name fit in `maxAppDataBytes`, given the rest of this
+    /// particular blob (a 1-byte stamp cost encodes shorter than a 2-byte one).
+    ///
+    /// The non-name overhead is MEASURED by encoding the blob with an empty name, not tallied by
+    /// hand, so a change to the msgpack encoder or to the shape of the array cannot silently
+    /// invalidate it.
+    ///
+    /// The extra `- 1` covers the bin header growing from bin8 (2 bytes) to bin16 (3 bytes) above
+    /// 255 name bytes. It is unconditional because this budget only ever binds well above 255
+    /// (its smallest possible value here is 325), so reserving the byte costs nothing real.
+    private static func displayNameBudget(costValue: MsgPackValue,
+                                          functionalityValue: MsgPackValue) -> Int {
+        let overhead = MsgPack.encode(.array([.bin(Data()), costValue, functionalityValue])).count
+        return maxAppDataBytes - overhead - 1
+    }
+
+    /// The longest prefix of `name` that is at most `budget` UTF-8 bytes, cut on an extended
+    /// grapheme cluster boundary.
+    ///
+    /// Iterating `Character`s rather than slicing bytes is load-bearing. Cutting mid-scalar emits
+    /// invalid UTF-8, and reference's `dn.decode("utf-8")` (LXMF.py:165) would then raise — so a
+    /// peer would see NO name at all instead of a shortened one. Cutting mid-cluster (between the
+    /// scalars of an emoji ZWJ sequence, or before a combining mark) is valid UTF-8 but renders as
+    /// a different glyph; `Character` granularity avoids both.
+    private static func truncated(_ name: String, toUTF8Bytes budget: Int) -> String {
+        var out = ""
+        var used = 0
+        for character in name {
+            let width = String(character).utf8.count
+            if used + width > budget { break }
+            out.append(character)
+            used += width
+        }
+        return out
     }
 
     // MARK: - Parse
@@ -162,10 +233,19 @@ public struct LXMFAnnounceData: Equatable {
     /// said "returns nil if ... not a uint in 1...254", which contradicted the rest of this same
     /// comment and the code below. The summary was wider than the body.)
     ///
-    /// That permissiveness is deliberate parity: reference's `stamp_cost_from_app_data`
-    /// (LXMF.py:174-185) returns `peer_data[1]` verbatim with no gate. The `> 0 && < 255` gate
-    /// exists only on the emit side, in `get_announce_app_data` (LXMRouter.py:1044), and ours
-    /// lives correspondingly in `pack`.
+    /// That permissiveness is deliberate parity **on the range only**: reference's
+    /// `stamp_cost_from_app_data` (LXMF.py:174-185) returns `peer_data[1]` verbatim with no gate.
+    /// The `> 0 && < 255` gate exists only on the emit side, in `get_announce_app_data`
+    /// (LXMRouter.py:1044), and ours lives correspondingly in `pack`.
+    ///
+    /// Parity is NOT total, and the two gaps both narrow what we surface:
+    /// - a NEGATIVE cost — reference returns it verbatim (Python ints are signed and unbounded);
+    ///   we return nil for the `.int` branch when `i < 0`.
+    /// - a NON-INTEGER `peer_data[1]` (a string, a float, a list) — reference returns that object
+    ///   as-is and lets the caller trip over it; our `default` arm returns nil.
+    /// Both divergences are in the safe direction and neither is currently observable: no caller
+    /// acts on a parsed cost yet. Revisit if one ever does — a peer that means "no stamp required"
+    /// by sending -1 would be read by us as "field absent", which happens to be the same decision.
     ///
     /// Wire safety: announce app-data is unauthenticated and arrives from any reachable peer.
     /// `Int(exactly:)` converts from UInt64 so `UInt64.max` yields nil rather than trapping, and
