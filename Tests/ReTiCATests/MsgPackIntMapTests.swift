@@ -5,7 +5,8 @@ import Foundation
 // MARK: - CVE-class: map key above Int.max must be REJECTED, not trap
 
 /// Eleven attacker bytes: fixmap-1 with a uint64 key of UInt64.max and a zero value.
-/// Before the fix, `Int(key)` at MsgPack.swift:146 traps — the process aborts.
+/// Before the fix, `Int(key)` in `MsgPack.parseMap` (the guard now at MsgPack.swift:268) traps —
+/// the process aborts.
 /// After the fix it must return nil cleanly.
 ///
 /// Payload: 0x81  0xCF FF FF FF FF FF FF FF FF  0x00
@@ -31,13 +32,14 @@ import Foundation
     }
 }
 
-/// The realistic attack shape. `ResourceAdvertisement.unpack` (ResourceAdvertisement.swift:45)
+/// The realistic attack shape. `ResourceAdvertisement.unpack` (ResourceAdvertisement.swift:44)
 /// calls `MsgPack.decodeValue` FIRST and only then checks `case let .map(pairs)?` — so a hostile
 /// `intMap` nested anywhere inside an otherwise well-formed advertisement is walked by the parser
 /// before any shape validation runs. Validating the top-level shape does not protect the parse.
 ///
-/// The guard at MsgPack.swift:146 lives inside `parseMap`, and every path to `parseMap` goes
-/// through `parse`, so it fires at any depth. These tests prove that rather than arguing it.
+/// The guard (`Int(exactly: key)`, MsgPack.swift:268) lives inside `parseMap`, and every path to
+/// `parseMap` goes through `parse`, so it fires at any depth. These tests prove that rather than
+/// arguing it.
 @Test func msgPackIntMapAboveIntMaxIsRejectedWhenNestedInArray() {
     // fixarray1 [ fixmap1 { uint64(UInt64.max): 0 } ]
     let payload = Data([0x91, 0x81, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])

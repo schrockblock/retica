@@ -1,5 +1,21 @@
 import Foundation
 
+// A 64-bit `Int` is load-bearing for wire safety, not a platform detail.
+//
+// `parse` converts wire-supplied 32-bit lengths with `Int(be(b, i + 1, 4))` (the bin32 / str32 /
+// map32 / array32 counts). Those yield 0...4294967295, which fits a 64-bit `Int` and TRAPS on a
+// 32-bit one — four remotely reachable aborts, reached by five attacker-chosen bytes each. The
+// allowlist blesses them on exactly this assumption.
+//
+// The assumption used to be justified by citing `Package.swift`'s platform list, which is the wrong
+// evidence: `platforms:` declares MINIMUM DEPLOYMENT VERSIONS for the platforms named, not the set
+// of platforms that may build this package. A consumer adding a watchOS target (`arm64_32`, 32-bit
+// `Int`) compiles fine and silently arms all four. This is the actual guarantee, and it fails the
+// BUILD rather than the process.
+#if !_pointerBitWidth(_64)
+#error("ReTiCA requires a 64-bit platform: MsgPack.parse converts wire-supplied 32-bit lengths with Int(be(b, i + 1, 4)), which traps when Int is 32-bit (e.g. watchOS arm64_32). See Scripts/wire-narrowing-allowlist.txt.")
+#endif
+
 /// Minimal MessagePack codec covering every type reference `RNS/vendor/umsgpack.py` can emit
 /// except `ext`/`fixext`, which no RNS or LXMF code path packs (see the `parse` switch).
 ///
@@ -243,7 +259,7 @@ public enum MsgPack {
             for _ in 0..<count {
                 // Reject any map key that exceeds Int.max. A bare Int(key) traps on
                 // such values (UInt64 > Int.max), and truncating to a negative Int
-                // would relocate the trap to encodeIntMap's UInt64(p.key) at :140,
+                // would relocate the trap to encodeIntMap's UInt64(p.key) at :156,
                 // reached via LXMessage.unpack's re-encode path (LXMessage.swift:108).
                 // Rejection is the correct semantic: a key outside the representable
                 // range is malformed input. This sets the precedent for Task 7
