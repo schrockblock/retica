@@ -101,6 +101,20 @@ other admission-control gaps and detailed in `docs/wire-narrowing-inventory.md` 
       aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client.
       **Fixed** — `59f900e`: NaN/negative/infinite float → 0 (serve nothing); negative int → 0
       (not nil/unlimited). Also closes the `.int` fall-through divergence opened by `177da8c`.
+      `aca7453` later closed the same fall-through for `.float` (msgpack `0xCA`), found by the
+      whole-branch review — the identical defect one `case` over, in a switch whose own comment
+      already documented the shape for `.int`.
+      **Still open, same class, three more types.** `.string`, `.bin` and `.bool` also fall to
+      `default: break` → `nil` = **no cap**. I verified by running stock CPython 3.12 that
+      reference's `float(data[2])` (`LXMRouter.py:1528`, LXMF 1.1.0) accepts all of them —
+      `float("500")`, `float(b"500")`, `float(bytearray(b"500"))` → `500.0`, `float(True)` → `1.0` —
+      so reference applies a cap where we apply none. Note the fall-through is *correct* parity for
+      types `float()` genuinely rejects (a list, a map): reference's bare `except: pass` also leaves
+      the limit unset there. The gap is exactly the four types it accepts. Low severity (no
+      legitimate client sends them, and the cost is serving uncapped rather than a crash), but this
+      is now the **third** time this switch has fail-opened by fall-through — the fix worth making is
+      structural: enumerate exhaustively so a new `MsgPackValue` case cannot silently mean
+      "unlimited".
 - [x] **Task 7 — `PNAnnounce.swift:56-59`, six `Int(UInt64)` (in `PNAnnounce.parse`)** — a 21-byte
       app-data blob aborts. `PNAnnounce.isValid`, the *validity predicate*, crashed on the input it
       exists to reject. **Fixed** — all six `Int(x)` replaced with `Int(exactly:)` guard-returning
