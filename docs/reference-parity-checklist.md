@@ -123,7 +123,7 @@ are not narrowing conversions, so the gate cannot see them — their tests are t
       `requestFailed` branches (the key is only usable in an `/offer` on that link). The third
       generator, `LXStamper.generateStamp`, has **no production caller** — delivery stamps are unwired
       (Tier 3) — and is made cancellable defensively; when they are wired, its cost must be bounded
-      where the peer's advertised `stamp_cost` is read. No emitted bytes change. Commit: see Task 9 report.
+      where the peer's advertised `stamp_cost` is read. No emitted bytes change. Commit `3e919ed`.
 - [ ] **Task 10 — decompression allocates the ceiling, not the content** — `Bzip2.swift:36-38` /
       `ResourceTransfer.swift:408`: 41 bytes can drive a 64 MiB allocation. Not reference parity —
       `Resource.py:691` uses an incremental `BZ2Decompressor(max_length=)`.
