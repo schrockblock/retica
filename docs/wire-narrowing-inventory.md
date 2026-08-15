@@ -188,7 +188,7 @@ reading each site:
 |---|---|---|---|
 | `MsgPack.swift:92/128/153` | 3 | Unbounded parse recursion — **FIXED** (`maxParseDepth = 32`, depth threaded through `parse`/`parseMap`/`parseArray`). Gate does NOT cover it; `MsgPackDepthTests` is the sole regression guard. | none |
 | `Packet.swift:69-100` | 4 | Missing ingress MTU ceiling — **FIXED** (`guard raw.count <= Packet.mtu` added at top of `init?(raw:)`). Reference RNS `Packet.unpack` has no equivalent check (interface-layer `check_frame_len` is the primary bound), so lacking one was not a divergence. The guard is load-bearing at the primary inbound decode `Transport.swift:339`, where the deframers admit 262144 (TCP) / 1196 (BLE) — far above the 500-byte MTU. IFAC is stripped upstream in `Transport.received` before `Packet.init?(raw:)` sees bytes, so the 500-byte post-strip bound is correct for all interfaces. Commit: `e64f0e0`. | none |
-| `PropagationStore.swift:ingest` | 5 | Expensive PoW validation ordered before cheap dedup check — **FIXED**: cheap `transient_id` dedup now runs before `LXStamper.validatePnStamp`. Gate does NOT cover it; `PropagationStoreTests.duplicateIngestBypasesPoW` is the sole regression guard. Commit: `bd832b1`. | none |
+| `PropagationStore.swift:ingest` | 5 | Expensive PoW validation ordered before cheap dedup check — **PARTLY FIXED**: cheap `transient_id` dedup now runs before `LXStamper.validatePnStamp`, on both the store path and (since the fix round) the `LXMFServiceNode` packet path. Closes a **replay** flood; does **not** close the junk flood the task was scoped to — see below. Gate does NOT cover it. Guards: `PropagationStoreTests.duplicateIngestDerivesNoStampWorkblock` and `LXMFServiceNodeTests.serviceNodeDoesNotRederiveWorkblockForStoredPacketOfferReplay`, both counting workblock derivations. Commits: `bd832b1`, plus the fix round. | none |
 | `LXStamper.search` (via `generatePnStamp` / `generatePeeringKey`) | 9 | Unkillable proof-of-work — a bare `while true` whose iteration count is `2^cost` in a wire-supplied `cost`, inside an uncancellable `.run`. **FIXED**: cost ceilings (refuse, not clamp), `Task.isCancelled` in the loop, and `await Task.yield()` so the cancellation can be delivered. Gate does NOT cover it; `LXStamperCancellationTests` is the sole regression guard. Commit: `3e919ed`. | none |
 | `Bzip2.decompressReportingAllocation` (via `ResourceTransfer.reduce`) | 10 | Allocation sized from a wire-declared number rather than from produced output — `BZ2_bzBuffToBuffDecompress` needs the whole destination buffer up front, so ~41 bytes of input reserved 64 MiB, repeatable per advertisement. **FIXED**: incremental `BZ2_bzDecompress` into a buffer that starts at `max(4096, input.count)` and doubles, capped by `expectedSize`; "cap reached with input remaining" fails closed, matching reference `Resource.assemble`'s `decompressor.eof` check. Gate does NOT cover it; `Bzip2AllocationTests` is the sole regression guard. | none |
 
@@ -201,6 +201,41 @@ Task 10's rewrite is why the `UInt32(bufSize)` and one `UInt32(data.count)` entr
 Note the pattern across these five: **none of them is a wrong value.** They are wrong *bounds* —
 on depth, on frame length, on work ordering, on loop termination, on allocation. A checker that
 reads expressions cannot see a bound that was never written down.
+
+### Task 5, precisely: a replay flood is closed, the junk flood is not
+
+Task 5 was scoped to stop a peer burning a propagation node's CPU on proof-of-work for entries
+something cheaper should have rejected. What it actually closed is narrower, and the difference is
+measured, not suspected:
+
+- **Closed — replay.** Re-offering entries the node already holds no longer costs a workblock each.
+  `PropagationStore.ingest` recognises a stored `transient_id` first, and `LXMFServiceNode`'s packet
+  pre-scan now does the same before deciding prove-vs-`ERROR_INVALID_STAMP`. Until the fix round the
+  pre-scan carried no dedup at all and ran *first*, so the store's check was reached only after the
+  work it was meant to save had already been spent: **21.67 ms** on the pre-scan against **0.0021 ms**
+  on the ingest replay, a **10 328x** bypass on the production packet path.
+- **Open — junk flood.** The dedup skips only when the entry is already stored, which requires it to
+  have been *accepted*, which requires a *valid* stamp. An attacker who never produces a valid stamp
+  is never stored, therefore never deduped, and pays the full workblock every time: **21.98 ms per
+  33-byte entry, so 1.56 KiB/s of container bytes saturates one core**. The original task brief's
+  "2.3 KiB/s" figure still stands. Dedup cannot close this — it has nothing to match a
+  never-before-seen entry against.
+- **Open — double validation.** An entry that *is* accepted is validated twice, once in the pre-scan
+  and once in `ingest` (measured: 2 workblock derivations per novel entry, by the liveness counter in
+  `serviceNodeDoesNotRederiveWorkblockForStoredPacketOfferReplay`). Reference validates once and
+  passes the validated `lxmf_data` onward (`LXMRouter.py:2243-2249`, LXMF 1.1.0), so this is a parity
+  regression. It is bounded by the attacker's own PoW cost and was left in preference to giving the
+  store a second ingest entry point that trusts its caller's validation.
+
+**Reference has a defence here that we lack, and it is not a cheaper check.** Reference dedups
+*after* validating too (`LXMRouter.lxmf_propagation`, `LXMRouter.py:2496`), so the preflight above is
+an addition to reference rather than parity with it. What reference has instead is a **throttle**: an
+offer is refused with `ERROR_THROTTLED` while a stamp batch from another peer is still validating
+(`propagation_sequential_validation` / `validating_pn_stamps_from`, `LXMRouter.py:2274` and `:2398`).
+That bounds concurrent validation work; nothing in ReTiCA does.
+
+Filed, to be planned with the related admission-control gaps: the junk flood, the double validation,
+the unbounded `LinkSession.state.transfers`, and `PNNode` defaulting `storageLimitBytes` to nil.
 
 ---
 

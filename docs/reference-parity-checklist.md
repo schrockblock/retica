@@ -84,6 +84,16 @@ every one: it is a lexical checker for one defect shape. Read it as "no unreview
 conversion in `Sources/`", never as "input handling is safe". For those five, the named tests are
 the only regression guard — see `docs/wire-narrowing-inventory.md`, "Not detectable by this check".*
 
+*One of the ten is **only partly closed**, and the tier heading should not be read as covering it.
+**Task 5** (proof-of-work ordered before a cheap check, in the propagation ingest path) closed a
+**replay** flood — measured 10 328x on the production packet path, which routed around the first
+version of the fix entirely — but did **not** close the **junk flood** it was scoped to: dedup skips
+only entries already stored, which requires a previously valid stamp, so an attacker who never
+produces one still costs 21.98 ms per 33-byte entry and **1.56 KiB/s saturates a core**. Reference's
+defence there is a throttle, not a cheaper check (`propagation_sequential_validation`,
+`LXMRouter.py:2274`), and we have no equivalent. Measured, not suspected; filed under Tier 7 with the
+other admission-control gaps and detailed in `docs/wire-narrowing-inventory.md` § "Task 5, precisely".*
+
 - [x] **Task 6 — `LXMFServiceNode.swift` `Int(raw)` (in `requestReceived`)** — `[[], [], float64(NaN)]` on a `/get`
       aborts. **No `/get` handler is registered, so no `RequestPolicy` gate applies** — any client.
       **Fixed** — `59f900e`: NaN/negative/infinite float → 0 (serve nothing); negative int → 0
@@ -266,6 +276,17 @@ exactly the class Tier 1 just closed.*
       to any registered destination.
 - [ ] **No path-request rate control** — fresh random tags pass the `discoveryPrTags` ring every
       time, each drawing a cached response or a recursive fan-out.
+- [ ] **Propagation stamp validation is unthrottled — the residue Task 5 could not close.** A peer
+      that never produces a valid stamp is never stored, so the dedup preflight never matches it and
+      it pays a full 256 KB workblock every time: **21.98 ms per 33-byte entry, 1.56 KiB/s saturates
+      one core**. Reachable by anyone who can open a link to the propagation destination
+      (`nodeModeEnabled` + `isPropagationLink`, no identity check). Reference bounds this with
+      `propagation_sequential_validation` / `validating_pn_stamps_from` — an offer is refused with
+      `ERROR_THROTTLED` while another peer's batch is validating (`LXMRouter.py:2274`, `:2398`) — and
+      also spreads validation across processes (`validate_pn_stamps_job_multip`, `LXStamper.py:106`).
+      We have neither. Plan together with: the double validation of every accepted entry (a parity
+      regression — reference validates once, `LXMRouter.py:2243-2249`), the unbounded
+      `LinkSession.state.transfers`, and `PNNode` defaulting `storageLimitBytes` to nil.
 
 ---
 
