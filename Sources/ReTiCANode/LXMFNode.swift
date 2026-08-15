@@ -29,6 +29,17 @@ public struct LXMFNode {
         /// Used to scope packet proving to inbound direct-delivery links only.
         public var deliveryDestinationHash: Data?
 
+        /// Display name advertised in every delivery-destination announce.
+        /// Nil means no name is encoded (the announce still carries the full app-data blob per
+        /// reference parity — see `LXMFAnnounceData.pack` and `get_announce_app_data` in
+        /// LXMF 1.1.0 LXMRouter.py:1034-1050 which always calls `msgpack.packb(peer_data)`).
+        public var displayName: String?
+
+        /// Delivery stamp cost advertised in every delivery-destination announce.
+        /// Nil or out-of-range values (outside 1...254) are emitted as null per reference's
+        /// `> 0 and < 255` gate (LXMRouter.py:1044).
+        public var deliveryStampCost: Int?
+
         public init(identity: Identity, endpoint: TransportEndpoint.State) {
             self.identity = identity
             self.endpoint = endpoint
@@ -50,6 +61,11 @@ public struct LXMFNode {
         case endpoint(TransportEndpoint.Action)
         case router(LXMFRouter.Action)
         case registerDelivery
+        /// Update the display name (and optionally the delivery stamp cost) announced in the
+        /// delivery-destination app data. Re-announces immediately so peers see the new name
+        /// without waiting for the next scheduled announce cycle.
+        /// Requires `registerDelivery` to have been called first; silently ignored otherwise.
+        case setDisplayName(String?, stampCost: Int?)
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
         case setPropagationNode(destinationHash: Data)
         case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
@@ -98,8 +114,23 @@ public struct LXMFNode {
                                           aspects: LXMessage.deliveryAspects, identity: state.identity)
                 else { return .none }
                 state.deliveryDestinationHash = d.hash
+                // Always pack app-data — reference `get_announce_app_data` (LXMRouter.py:1034-1050)
+                // returns `msgpack.packb(peer_data)` for every registered delivery destination, even
+                // when display_name and stamp_cost are both None. The nil-checks on those fields
+                // control only the *contents* of the packed list, never whether to emit one.
+                let appData = LXMFAnnounceData.pack(displayName: state.displayName,
+                                                    stampCost: state.deliveryStampCost)
                 return .merge(.send(.endpoint(.registerLocalDestination(d))),
-                              .send(.endpoint(.announce(destinationHash: d.hash, appData: nil))))
+                              .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
+
+            case let .setDisplayName(name, stampCost):
+                state.displayName = name
+                state.deliveryStampCost = stampCost
+                // Re-announce so peers see the updated name without waiting for the next scheduled
+                // announce cycle. No-op when registerDelivery was never called (deliveryDestinationHash nil).
+                guard let hash = state.deliveryDestinationHash else { return .none }
+                let appData = LXMFAnnounceData.pack(displayName: name, stampCost: stampCost)
+                return .send(.endpoint(.announce(destinationHash: hash, appData: appData)))
 
             case let .send(destinationHash, title, content, method):
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
