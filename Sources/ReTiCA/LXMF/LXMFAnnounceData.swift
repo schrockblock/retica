@@ -6,9 +6,11 @@ import Foundation
 /// `compression_support_from_app_data` (LXMF.py:151-200) for parsing.
 ///
 /// **Wire format (0.5.0+):** msgpack array `[display_name, stamp_cost, [SF_COMPRESSION]]`
-/// where `display_name` is bin (Python `bytes`) or null, `stamp_cost` is a uint in 1...254
-/// or null, and the third element is an array of supported functionality codes.
-/// `SF_COMPRESSION = 0x00`.
+/// where `display_name` is bin (Python `bytes`) or null, `stamp_cost` is a uint or null, and
+/// the third element is an array of supported functionality codes. `SF_COMPRESSION = 0x00`.
+/// Conforming peers emit a `stamp_cost` only in 1...254, but **that is a property of what
+/// reference sends, not of what it accepts** — nothing on the parse side enforces it, so do not
+/// read the range as a wire invariant. See `stampCost`.
 ///
 /// **Legacy format (pre-0.5.0):** the entire blob is a raw UTF-8 display name. Identified
 /// by the first byte being outside the msgpack array gate (0x90-0x9F fixarray or 0xDC array16).
@@ -153,17 +155,23 @@ public struct LXMFAnnounceData: Equatable {
     }
 
     /// Extract the stamp cost from `items[1]`.
-    /// Returns nil if `len < 2` or the element is not a uint in 1...254.
-    /// Reference: `len < 2 → nil`; reference returns the raw value without the gate,
-    /// but only values 1...254 are ever packed (gate in `get_announce_app_data`).
-    /// On parse we mirror what reference would store: accept any uint, but only 1...254
-    /// can survive the round-trip gate, so values outside it are returned as-is for
-    /// cross-validation by Task 2; the gate itself lives in `pack`.
     ///
-    /// Wire safety: stamp cost is packed as a small uint (≤ 254) in `pack`. An attacker
-    /// could send an out-of-range value. `Int(exactly:)` is used to convert from UInt64
-    /// so that UInt64.max (> Int.max) does not trap. Values > 254 are stored as-is; the
-    /// caller can decide whether to honour them. The task-1 requirement is no trap.
+    /// Returns nil only when `items.count < 2`, when the element is not a uint, or when the
+    /// uint exceeds `Int.max`. **It does NOT gate the range** — an out-of-range cost such as
+    /// 0, 255 or 60000 is returned as-is, not rejected. (An earlier version of this first line
+    /// said "returns nil if ... not a uint in 1...254", which contradicted the rest of this same
+    /// comment and the code below. The summary was wider than the body.)
+    ///
+    /// That permissiveness is deliberate parity: reference's `stamp_cost_from_app_data`
+    /// (LXMF.py:174-185) returns `peer_data[1]` verbatim with no gate. The `> 0 && < 255` gate
+    /// exists only on the emit side, in `get_announce_app_data` (LXMRouter.py:1044), and ours
+    /// lives correspondingly in `pack`.
+    ///
+    /// Wire safety: announce app-data is unauthenticated and arrives from any reachable peer.
+    /// `Int(exactly:)` converts from UInt64 so `UInt64.max` yields nil rather than trapping, and
+    /// nothing here truncates. The resulting `Int` is bounded only by `Int.max`, so **callers
+    /// must validate before acting on it** — see the note on the `stampCost` property, which
+    /// explains why feeding an unvalidated value into stamp generation is an unbounded CPU burn.
     private static func parseStampCost(from items: [MsgPackValue]) -> Int? {
         guard items.count >= 2 else { return nil }
         switch items[1] {
