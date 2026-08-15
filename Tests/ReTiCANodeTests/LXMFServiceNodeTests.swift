@@ -1284,6 +1284,66 @@ import ComposableArchitecture
     #expect(store.state.pn.store.count == 1, "store must still contain exactly one entry")
 }
 
+/// A byte-identical replay of an already-stored packet offer must derive ZERO stamp workblocks.
+///
+/// This is the production packet path, and it used to route around the Task-5 dedup entirely: the
+/// pre-scan below `linkDataReceived` validated EVERY entry to decide prove-vs-ERROR_INVALID_STAMP,
+/// and it ran before `.ingestContainer` ever reached the fixed `PropagationStore.ingest`. The store's
+/// preflight then deduped for free, having already been paid for — measured 21.67 ms on the pre-scan
+/// against 0.0021 ms on the ingest replay it was supposed to save.
+///
+/// Asserted as a counting property rather than a timing one, and in both directions: the first,
+/// novel offer must derive at least one workblock (the seam is live, and this is a TestStore, so a
+/// task-local that failed to reach the reducer would otherwise read zero everywhere and pass
+/// vacuously); the replay must derive none.
+///
+/// The replay must STILL be proved — `serviceNodeProvesDuplicatePacketOffer` owns that property, and
+/// the two together say the fix changed the work and not the behaviour.
+@MainActor @Test func serviceNodeDoesNotRederiveWorkblockForStoredPacketOfferReplay() async {
+    let identity = Identity()
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        minStampCost: 4)   // > 0, so the stamp pre-scan runs
+    initial.nodeModeEnabled = true
+    let store = makeServiceNodeStore(initial)
+
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC1, count: 16)
+    // A genuinely stamped entry: the pre-scan must be able to accept it, or the replay never stores.
+    let core = Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("replay-offer".utf8)
+    let stamp = await LXStamper.generatePnStamp(
+        transientId: LXMFPropagation.transientId(lxmfData: core), targetCost: 4)!
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [core + stamp])
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID,
+                                                                  destinationHash: propDest.hash)))))
+
+    let onFirstOffer = LXStamper.WorkblockCounter()
+    await LXStamper.$workblockCounter.withValue(onFirstOffer) {
+        await store.send(.client(.endpoint(.delegate(.linkDataReceived(
+            linkID: linkID, data: container, packetHash: Data(repeating: 0xF7, count: 32))))))
+        await store.receive { if case .client(.endpoint(.provePacketOverLink)) = $0 { return true }
+                              return false }
+    }
+    #expect(store.state.pn.store.count == 1, "setup: the stamped offer must be stored")
+    #expect(onFirstOffer.count >= 1,
+            "seam liveness: a novel offer must derive at least one workblock on this path")
+
+    let onReplay = LXStamper.WorkblockCounter()
+    await LXStamper.$workblockCounter.withValue(onReplay) {
+        await store.send(.client(.endpoint(.delegate(.linkDataReceived(
+            linkID: linkID, data: container, packetHash: Data(repeating: 0xF8, count: 32))))))
+        await store.receive { if case .client(.endpoint(.provePacketOverLink)) = $0 { return true }
+                              return false }
+    }
+    #expect(onReplay.count == 0,
+            "a stored offer replayed byte-for-byte must not re-derive a stamp workblock")
+    #expect(store.state.pn.store.count == 1, "replay must not add a second entry")
+}
+
 // MARK: - FIX 4: awaitingList handles ERROR_NO_IDENTITY from reference PN
 
 /// When the phase-1 /get response is `LXMPeer.ERROR_NO_IDENTITY` (0xF0) — sent by a reference PN

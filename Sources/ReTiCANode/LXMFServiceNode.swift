@@ -159,7 +159,40 @@ public struct LXMFServiceNode {
                 guard let (_, entries) = LXMFPropagation.parseContainer(data) else { return .none }
                 if state.pn.store.minStampCost > 0 {
                     let anyRejected = entries.contains {
-                        LXStamper.validatePnStamp(transientData: $0, targetCost: state.pn.store.minStampCost) == nil
+                        // Cheap dedup BEFORE the proof-of-work, and it has to be here rather than only
+                        // in `PropagationStore.ingest`: this pre-scan runs first, so a replay used to
+                        // pay a full 256 KB workblock per entry here and then hit ingest's dedup for
+                        // free — measured 21.67 ms versus 0.0021 ms, a 10 328x bypass of the fix that
+                        // was supposed to prevent exactly this. Reachable by any peer that can open a
+                        // link to the propagation destination; the branch is gated on nodeModeEnabled
+                        // and isPropagationLink only, with no identity check.
+                        //
+                        // Byte-identical replays only (`containsIdenticalStampedEntry`, not a
+                        // stampless-core match). An entry that pairs a stored core with a different
+                        // 32-byte tail carries a genuinely invalid stamp and must still earn
+                        // ERROR_INVALID_STAMP plus teardown — a core-only match would silently
+                        // convert that rejection into a prove. Such an entry therefore still pays the
+                        // workblock; that is the junk-flood residue filed with the admission-control
+                        // gap, not something dedup can close.
+                        //
+                        // One accepted edge: a stored entry was validated at whatever minStampCost
+                        // was in force when it was accepted, so raising minStampCost afterwards lets
+                        // a replay of a now-under-cost entry be proved rather than rejected.
+                        // Deliberate — we already hold the entry, so "I have this" is the true
+                        // answer, and re-validating what we have already stored buys nothing.
+                        //
+                        // STILL OPEN, deliberately: an entry that is ACCEPTED is validated TWICE —
+                        // once here and once inside PropagationStore.ingest. Measured at 2 workblock
+                        // derivations per novel entry by
+                        // serviceNodeDoesNotRederiveWorkblockForStoredPacketOfferReplay's liveness
+                        // counter. Reference validates once and passes the validated lxmf_data
+                        // onward (LXMF 1.1.0 LXMRouter.py:2243-2249), so this is a parity regression.
+                        // Not fixed here: threading validated entries into ingest would give the
+                        // store a second entry point that trusts its caller's validation, and an
+                        // attacker can only reach this path at all by doing the ~2^cost work of a
+                        // valid stamp themselves. Filed with the admission-control gap.
+                        !state.pn.store.containsIdenticalStampedEntry($0)
+                            && LXStamper.validatePnStamp(transientData: $0, targetCost: state.pn.store.minStampCost) == nil
                     }
                     if anyRejected {
                         // Reference LXMRouter.py:2258-2260: send the error as a plain data packet, then teardown.

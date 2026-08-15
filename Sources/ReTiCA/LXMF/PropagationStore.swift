@@ -51,6 +51,31 @@ public struct PropagationStore: Equatable {
 
     public func contains(transientId: Data) -> Bool { stored[transientId] != nil }
 
+    /// The dedup key a stamped container entry (`lxmf_data ‖ stamp[32]`) would get, computed WITHOUT
+    /// deriving a stamp workblock — the cheap half of `ingest`'s admission test. nil when the entry is
+    /// too short to carry a stamp (`validatePnStamp` rejects such an entry regardless).
+    ///
+    /// Public because a caller that pre-screens a container before handing it to `ingest`
+    /// (`LXMFServiceNode`'s packet path) has to apply the SAME rule, and a second hand-written copy of
+    /// "strip the trailing 32 bytes, hash the rest" is the thing that drifts.
+    public func preflightTransientId(ofStampedEntry transientData: Data) -> Data? {
+        guard transientData.count > LXStamper.stampSize else { return nil }
+        return LXMFPropagation.transientId(lxmfData: Data(transientData.dropLast(LXStamper.stampSize)))
+    }
+
+    /// True iff this exact stamped entry — core AND stamp bytes — is already stored: a byte-identical
+    /// replay of something this store already accepted, and therefore already validated.
+    ///
+    /// Strict on purpose. The looser test (stampless-core transient_id alone, which is what `ingest`
+    /// uses) also matches an entry pairing a stored core with a DIFFERENT 32-byte tail — a genuinely
+    /// invalid stamp. A caller whose observable behaviour depends on stamp validity (ERROR_INVALID_STAMP
+    /// plus link teardown) must still validate that one. `ingest` can use the looser test because there
+    /// the only consequence is skipping work on an entry it was going to skip anyway.
+    public func containsIdenticalStampedEntry(_ transientData: Data) -> Bool {
+        guard let tid = preflightTransientId(ofStampedEntry: transientData) else { return false }
+        return stored[tid]?.lxmfData == transientData
+    }
+
     /// Ingest a propagation container. Returns `(added, evicted)` where:
     /// - `added` are transient_ids newly accepted and retained after eviction,
     /// - `evicted` are transient_ids accepted then immediately evicted to stay under `storageLimitBytes`.
@@ -69,18 +94,30 @@ public struct PropagationStore: Equatable {
             let destData: Data
             if minStampCost > 0 {
                 // Cheap pre-filter: compute transient_id without PoW and reject duplicates before
-                // spending any effort. transient_id = full_hash(stampless_core), where the core is
-                // lxmfData with the trailing 32-byte stamp stripped (matching validatePnStamp).
-                // Entries too short to carry a stamp (≤ stampSize bytes) are skipped here — they
+                // spending any effort. Entries too short to carry a stamp are skipped here — they
                 // would be rejected by validatePnStamp regardless.
                 //
-                // NOTE: this ordering defect (expensive PoW before cheap dedup) is NOT detectable
-                // by Scripts/check-wire-narrowing.swift — it is a work-ordering issue, not a
-                // narrowing conversion. PropagationStoreTests.duplicateIngestBypasesPoW is the
-                // sole regression guard. See docs/wire-narrowing-inventory.md § Task 5.
-                guard lxmfData.count > LXStamper.stampSize else { continue }
-                let preflightCore = Data(lxmfData.dropLast(LXStamper.stampSize))
-                let preflightTid = LXMFPropagation.transientId(lxmfData: preflightCore)
+                // WHAT THIS CLOSES, AND WHAT IT DOES NOT. It closes a REPLAY flood: re-offering
+                // entries we already hold no longer costs a workblock each. It does NOT close the
+                // junk flood the task was originally scoped to, and cannot: the check skips only
+                // when `stored[preflightTid] != nil`, which requires a previously ACCEPTED — hence
+                // validly stamped — entry. An attacker who never produces a valid stamp is never
+                // stored, never deduped, and pays the full workblock every time. Measured 21.98 ms
+                // per 33-byte entry: 1.56 KiB/s of container bytes still saturates one core. That
+                // residue is filed for admission control (docs/wire-narrowing-inventory.md,
+                // "Task 5, precisely: a replay flood is closed, the junk flood is not");
+                // reference's defence is not a cheaper check but a THROTTLE — an offer is postponed
+                // while a stamp batch is validating (LXMF 1.1.0 LXMRouter.py:2274, :2398) — which we
+                // do not have. Note reference dedups AFTER validating too (LXMRouter.py:2496), so
+                // this preflight is an addition to reference, not parity with it.
+                //
+                // NOT detectable by Scripts/check-wire-narrowing.swift — a work-ordering issue, not a
+                // narrowing conversion. Guarded by PropagationStoreTests.duplicateIngestDerivesNoStamp-
+                // Workblock, which counts workblock derivations because every OUTCOME here is
+                // identical with and without this preflight; and, for the packet path that reaches
+                // ingest through LXMFServiceNode, by
+                // LXMFServiceNodeTests.serviceNodeDoesNotRederiveWorkblockForStoredPacketOfferReplay.
+                guard let preflightTid = preflightTransientId(ofStampedEntry: lxmfData) else { continue }
                 if stored[preflightTid] != nil { continue }   // duplicate: skip before PoW
 
                 // Require a valid PN stamp at or above minStampCost. validatePnStamp strips the trailing
