@@ -318,8 +318,19 @@ Two of the entries above (`MsgPack.swift:71`, `PNAnnounce.packed`) are exactly t
    with the gate still clean and the *type checker* still happy. **`Tests/ReTiCATests/LXStamperCancellationTests.swift`
    and `Tests/ReTiCANodeTests/StampWorkBoundsTests.swift` are the sole regression guard**, and their
    failure modes differ by part: deleting the ceiling fails an assertion, deleting the cancellation
-   check trips a `.timeLimit`, and deleting the yield **hangs the test process outright** — the
-   starved executor cannot even schedule the task that enforces the time limit.
+   check trips a `.timeLimit`, and deleting the yield leaves the effect in-flight — the cancel is
+   requested but never *delivered*, so `TestStore` reports "Expected effects to finish, but there
+   are still effects in-flight".
+   *(Corrected 2026-08-14: an earlier draft said deleting the yield "hangs the test process
+   outright — the starved executor cannot even schedule the task that enforces the time limit."
+   Measured false. A reviewer deleted only the yield and the test **did** terminate, failing after
+   615 s, and `.timeLimit` **did** fire. The executor is wedged only until the search finishes on
+   its own — ~10 min at cost 20 in a debug build, unbounded at a refused cost — after which every
+   queued assertion drains at once. The original observation stopped at 260 s and generalised.)*
+   *(Also worth recording, because it bounds the claim: on a **concurrent** executor the yield is
+   not needed for delivery — `Task.cancel()` sets the flag from another thread and
+   `Task.isCancelled` reads it without suspending. The yield is required under a **serial**
+   executor, and to avoid monopolising a cooperative-pool thread.)*
 2. **Removal of a remote guard.** The allowlist keys on expression text, so deleting the clamp
    that makes a conversion safe leaves the expression — and therefore the gate — unchanged.
    Demonstrated: at `4b4526d^` the unclamped `n` handling still passes, because
