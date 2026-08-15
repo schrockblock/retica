@@ -20,7 +20,7 @@ import ComposableArchitecture
     let msg = LXMessage.create(source: sender,
                                destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("mesh".utf8))
-    let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
+    let (container, tid) = await LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)!
 
     // B's lxmf.propagation destination (the dest A will sync to).
     let bPropDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,

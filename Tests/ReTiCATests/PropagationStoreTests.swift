@@ -183,13 +183,13 @@ private func container(_ entries: [Data]) -> Data {
 /// NOTE: this is the sole regression guard for the ordering defect at PropagationStore.swift:ingest.
 /// The defect is invisible to Scripts/check-wire-narrowing.swift (not a narrowing conversion).
 /// See docs/wire-narrowing-inventory.md § Task 5.
-@Test func duplicateIngestBypasesPoW() {
+@Test func duplicateIngestBypasesPoW() async {
     let dest = Data(repeating: 0xAB, count: LXMessage.destinationLength)
     let core = dest + Data("dedup-test-payload".utf8)
     // Accept the entry once with a realistic cost so the store actually contains it.
     var bootstrapStore = PropagationStore(minStampCost: 4)
     let tid = LXMFPropagation.transientId(lxmfData: core)
-    let stamp = LXStamper.generatePnStamp(transientId: tid, targetCost: 4)
+    let stamp = await LXStamper.generatePnStamp(transientId: tid, targetCost: 4)!
     let stamped = core + stamp
     bootstrapStore.ingest(container: container([stamped]))
     #expect(bootstrapStore.contains(transientId: tid), "setup: entry must be in store before dedup test")
@@ -207,13 +207,14 @@ private func container(_ entries: [Data]) -> Data {
 /// Acceptance-parity test: a known-good stamped container is accepted identically regardless
 /// of the ordering of cheap vs expensive checks. Demonstrates that the Task-5 reordering
 /// changes *when* effort is spent, not *what* is accepted.
-@Test func stampedContainerAcceptanceIsUnchangedByOrdering() {
+@Test func stampedContainerAcceptanceIsUnchangedByOrdering() async {
     let dest = Data(repeating: 0xCC, count: LXMessage.destinationLength)
     let cores = (1...3).map { i in dest + Data("parity-payload-\(i)".utf8) }
-    let entries = cores.map { core -> Data in
+    var entries: [Data] = []
+    for core in cores {
         let tid = LXMFPropagation.transientId(lxmfData: core)
-        let stamp = LXStamper.generatePnStamp(transientId: tid, targetCost: 4)
-        return core + stamp
+        let stamp = await LXStamper.generatePnStamp(transientId: tid, targetCost: 4)!
+        entries.append(core + stamp)
     }
     var store = PropagationStore(minStampCost: 4)
     let (added, evicted) = store.ingest(container: container(entries))
@@ -230,14 +231,14 @@ private func container(_ entries: [Data]) -> Data {
 
 /// Ingest rejects an entry whose stamp is absent or under the min cost; accepts one with a valid stamp.
 /// Cost 4 keeps the PoW search fast (avg ~16 hash iterations over the 1000-round PN workblock).
-@Test func ingestRejectsUnderCostStamp() {
+@Test func ingestRejectsUnderCostStamp() async {
     var store = PropagationStore(minStampCost: 4)
     let dest = Data(repeating: 0xAA, count: LXMessage.destinationLength)
     // Valid entry: destHash ‖ ciphertext ‖ generatePnStamp(transientId, targetCost: 4).
     // transientId is computed over the stampless core (dest ‖ ciphertext), matching validatePnStamp.
     let validCore = dest + Data("valid-ciphertext".utf8)
     let validTid = LXMFPropagation.transientId(lxmfData: validCore)
-    let validStamp = LXStamper.generatePnStamp(transientId: validTid, targetCost: 4)
+    let validStamp = await LXStamper.generatePnStamp(transientId: validTid, targetCost: 4)!
     let validEntry = validCore + validStamp
     // Bad entry: destHash ‖ ciphertext ‖ 32 zero bytes — the zero stamp is not a valid cost-4 PN stamp
     // (full_hash(workblock ‖ zeros) overwhelmingly lacks 4 leading zero bits), so it must be rejected.

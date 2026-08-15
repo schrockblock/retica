@@ -65,7 +65,7 @@ The durable key is *file + expression text*, which is what the allowlist matches
 | Conversions found in `Sources/` | **118** across **79** distinct file+expression groups, in 56 files |
 | Reviewed safe | 118 findings / 79 groups |
 | **Known-open (confirmed traps)** | **0** — Task 8 FIXED |
-| Defects in this plan that are *not* conversions | 3 — Tasks 3, 4, 5 (see [Not detectable by this check](#not-detectable-by-this-check)) |
+| Defects in this plan that are *not* conversions | 4 — Tasks 3, 4, 5, 9 (see [Not detectable by this check](#not-detectable-by-this-check)) |
 
 Run the gate:
 
@@ -307,8 +307,19 @@ Two of the entries above (`MsgPack.swift:71`, `PNAnnounce.packed`) are exactly t
 
 ### False negatives — what it will not catch
 
-1. **Non-conversion defects.** Unbounded recursion, missing length ceilings, work-ordering DoS.
-   Tasks 3, 4 and 5 are all invisible to it.
+1. **Non-conversion defects.** Unbounded recursion, missing length ceilings, work-ordering DoS,
+   unbounded *work*. Tasks 3, 4, 5 and 9 are all invisible to it.
+
+   Task 9 is the sharpest illustration in the file: the defect was a bare `while true` in
+   `LXStamper.search` (reached via `generatePnStamp` / `generatePeeringKey`) whose iteration count is
+   exponential in a cost read straight off an unauthenticated announce — no conversion anywhere, so
+   the gate reports nothing before or after the fix. Worse, the fix's three parts (a cost ceiling,
+   `Task.isCancelled` in the loop, `await Task.yield()` in the loop) are each individually deletable
+   with the gate still clean and the *type checker* still happy. **`Tests/ReTiCATests/LXStamperCancellationTests.swift`
+   and `Tests/ReTiCANodeTests/StampWorkBoundsTests.swift` are the sole regression guard**, and their
+   failure modes differ by part: deleting the ceiling fails an assertion, deleting the cancellation
+   check trips a `.timeLimit`, and deleting the yield **hangs the test process outright** — the
+   starved executor cannot even schedule the task that enforces the time limit.
 2. **Removal of a remote guard.** The allowlist keys on expression text, so deleting the clamp
    that makes a conversion safe leaves the expression — and therefore the gate — unchanged.
    Demonstrated: at `4b4526d^` the unclamped `n` handling still passes, because

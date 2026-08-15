@@ -28,13 +28,13 @@ import Foundation
     #expect(Data(msg.packed.dropFirst(96)) == Data(refPacked.dropFirst(96)))   // 5-element payload byte-parity
 }
 
-@Test func generatedStampRoundTrips() throws {
+@Test func generatedStampRoundTrips() async throws {
     let source = Identity()
     let cost = 4
     let base = LXMessage.create(source: source,
                                 destinationHash: LXMessage.deliveryHash(identityHash: Identity().hash),
                                 timestamp: 1700000000.5, title: Data("t".utf8), content: Data("c".utf8))
-    let stamped = base.withStamp(LXStamper.generateStamp(messageId: base.hash, targetCost: cost))
+    let stamped = base.withStamp(await LXStamper.generateStamp(messageId: base.hash, targetCost: cost)!)
     let recovered = LXMessage.unpack(stamped.packed)
     #expect(recovered?.stamp == stamped.stamp)
     #expect(recovered?.hash == base.hash)                                  // hash unchanged by stamping

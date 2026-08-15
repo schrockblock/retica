@@ -53,6 +53,10 @@ public struct PNNode {
         }
     }
 
+    /// Cancellation identity for the peering-key search, keyed on the link it is being generated for —
+    /// the key is only ever useful in an `/offer` on that link, so the link dying makes the work dead.
+    enum CancelID: Hashable { case peeringKey(Data) }
+
     @Dependency(\.date) var date
     public init() {}
 
@@ -96,6 +100,12 @@ public struct PNNode {
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
 
             case let .syncToPeer(destinationHash, peeringCost):
+                // `peeringCost` is the PEER's demand, read from its announce. Reference declines to peer
+                // above `MAX_PEERING_COST` rather than clamping (LXMRouter.py:2005-2010), and declining
+                // is the only honest answer: a key generated at a cost below what the peer requires is
+                // one it rejects (LXMPeer.py:228-233), so clamping would spend the work and still fail —
+                // silently. Cost is exponential, so an unbounded value pins a core indefinitely.
+                guard peeringCost <= LXMFPropagation.maxPeeringCost else { return .none }
                 state.pendingSyncPeers[destinationHash] = peeringCost
                 return .send(.endpoint(.openLink(destinationHash: destinationHash)))
 
@@ -166,6 +176,9 @@ public struct PNNode {
             case let .endpoint(.delegate(.linkEstablished(linkID, dest))):
                 guard let cost = state.pendingSyncPeers[dest] else { return .none }   // inbound responder link → ignore
                 state.pendingSyncPeers[dest] = nil
+                // Second gate, at the point the unbounded search would actually start. `pendingSyncPeers`
+                // is public state, so `syncToPeer`'s refusal is not the only way a cost can get here.
+                guard cost <= LXMFPropagation.maxPeeringCost else { return .none }   // decline to peer
                 guard let peerIdentity = state.endpoint.transport.learned[dest]?.identity else { return .none }
                 state.offerLinks[linkID] = state.node.store.transientIds
                 let peeringId = peerIdentity.hash + state.identity.hash              // responder-first (matches P4a)
@@ -173,9 +186,11 @@ public struct PNNode {
                 return .merge(
                     .send(.endpoint(.identifyOverLink(linkID: linkID, identity: selfIdentity))),
                     .run { send in
-                        let key = LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: cost)
+                        guard let key = await LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: cost)
+                        else { return }                              // cancelled mid-search
                         await send(.offerKeyReady(linkID: linkID, key: key))
-                    })
+                    }
+                    .cancellable(id: CancelID.peeringKey(linkID), cancelInFlight: true))
 
             case let .offerKeyReady(linkID, key):
                 guard let offeredIds = state.offerLinks[linkID] else { return .none }
@@ -197,13 +212,17 @@ public struct PNNode {
                 let container = LXMFPropagation.container(timestamp: date.now.timeIntervalSince1970, entries: entries)
                 return .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: container)))
 
+            // Both of these are where the peering-key search is actually reclaimed: the key exists only
+            // to go into an `/offer` on this link, so once the link is gone the search is dead work.
+            // `Effect.cancel(id:)` is built ONLY on these branches — binding it above the switch would
+            // cancel on every action (that exact defect, 86ee622).
             case let .endpoint(.delegate(.linkClosed(linkID, _))):
                 clearLink(&state, linkID)
-                return .none
+                return .cancel(id: CancelID.peeringKey(linkID))
 
             case let .endpoint(.delegate(.requestFailed(linkID, _))):
                 clearLink(&state, linkID)
-                return .none
+                return .cancel(id: CancelID.peeringKey(linkID))
 
             case let .endpoint(.delegate(.linkFailed(dest, _))):
                 state.pendingSyncPeers[dest] = nil          // outbound openLink failed before a link existed

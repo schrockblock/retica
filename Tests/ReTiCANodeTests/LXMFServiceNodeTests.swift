@@ -450,8 +450,8 @@ import ComposableArchitecture
     // A real stamped container at the cost the node enforces.
     let msg = LXMessage.create(source: sIdentity, destinationHash: cDeliveryHash,
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi C".utf8))
-    let (container, tid) = LXMFPropagation.pack(message: msg, recipientIdentity: cIdentity,
-                                                timestamp: 1700000000.5, stampCost: 4)
+    let (container, tid) = await LXMFPropagation.pack(message: msg, recipientIdentity: cIdentity,
+                                                timestamp: 1700000000.5, stampCost: 4)!
 
     func makeNode(_ host: String, _ sent: LockIsolated<[Data]>)
         -> (TestStore<LXMFServiceNode.State, LXMFServiceNode.Action>, AsyncStream<TCPEvent>.Continuation) {

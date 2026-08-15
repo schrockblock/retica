@@ -32,6 +32,47 @@ public enum LXMFPropagation {
     /// Default propagation stamp cost for client→PN offers (RNS PROPAGATION_COST = 16).
     public static let defaultPropagationStampCost = 16
 
+    /// Highest peering cost we will do proof-of-work for, from `LXMRouter.MAX_PEERING_COST = 26`
+    /// (lxmf 1.1.0 LXMRouter.py:51; reference's own default `PEERING_COST` is 18, LXMRouter.py:50).
+    ///
+    /// Exact reference parity, including the *shape* of the response: `LXMRouter.peer`
+    /// (LXMRouter.py:2005-2010) **refuses to peer** above this rather than clamping — "Not peering
+    /// with …, since its peering cost of {peering_cost} exceeds local maximum of {max_peering_cost}".
+    /// Clamping would be wrong here, not merely different: the cost is the *peer's* demand, so a
+    /// key generated at a lower cost is one the peer will reject (`LXMPeer.py:228-233` compares the
+    /// key's value against `self.peering_cost`). Declining is a clean refusal; clamping is a silent
+    /// failure. Cost is exponential — a peering cost of 64 is ~2^64 expected hash iterations.
+    public static let maxPeeringCost = 26
+
+    /// Highest propagation stamp cost we will do proof-of-work for when a propagation node advertises
+    /// one in its announce app-data.
+    ///
+    /// **This is a deliberate divergence from reference — reference has no such cap.**
+    /// `LXMRouter.get_outbound_propagation_cost` (LXMRouter.py:421-442) returns the announced
+    /// `pn_config[5][0]` verbatim, and `pn_announce_data_is_valid` (LXMF.py:238-239) only checks the
+    /// field is int-able, not that it is sane. Reference survives a hostile value by making the search
+    /// *cancellable* (`LXStamper.cancel_work`, LXStamper.py:146-175, driven from `cancel_outbound`),
+    /// not by bounding it — so an uncancelled reference client burns a core just as we would.
+    /// `PROPAGATION_COST_MIN = 13` (LXMRouter.py:52) is a **floor on a node's own configured cost**
+    /// (applied at LXMRouter.py:137), not a ceiling on what a peer may demand of us.
+    ///
+    /// We implement cancellation *and* this cap, because an unkillable core burn triggered by an
+    /// unauthenticated announce is not acceptable on a mobile client even for the seconds before a
+    /// user notices and cancels.
+    ///
+    /// **Why 20.** It is the largest cost whose worst-case work does not exceed the worst case
+    /// reference already sanctions for a peering key: `MAX_PEERING_COST = 26` over the 25-round
+    /// peering workblock is ~2^26 × 6.4 KB of hashing, and the propagation workblock is 1000 rounds
+    /// (~256 KB, 40× larger), so the equal-work cost is 26 - log2(40) ≈ 20.7. It also clears the
+    /// highest cost a reference node can legitimately demand by its own defaults —
+    /// `PROPAGATION_COST + PROPAGATION_COST_FLEX` = 16 + 3 = 19 (LXMRouter.py:53-54).
+    ///
+    /// Refusal, not clamping, for the same reason as `maxPeeringCost`: a stamp generated below the
+    /// node's advertised cost is one that node's own ingest will reject (`PropagationStore.ingest`
+    /// enforces `minStampCost`; reference LXMRouter.py:2242 likewise), so clamping would spend the
+    /// work and still lose the message, silently.
+    public static let maxPropagationStampCost = 20
+
     /// Per-MESSAGE propagation transfer limit in KILOBYTES, announced as PN app-data field [3]
     /// (`LXMRouter.PROPAGATION_LIMIT = 256`, LXMRouter.py:55).
     ///

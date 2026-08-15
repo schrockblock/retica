@@ -26,7 +26,7 @@ Reticulum/LXMF, ordered by *what a real peer notices*. Tick items as they land.
 |---|---|
 | **Wire format** | Essentially complete, byte-verified against genuine reference output. No algorithmic gap in the crypto primitives. |
 | **Protocol mechanics** | Good for the paths ReTiCA uses — links, resources, requests, announces, path requests, relaying, LXMF opportunistic/direct/propagated. |
-| **Adversarial robustness** | ~18 remotely-reachable aborts closed plus two fail-opens; **2 remain** (Tier 2, Tasks 9-10 — neither is a narrowing conversion the gate can see). |
+| **Adversarial robustness** | ~18 remotely-reachable aborts closed plus two fail-opens and one unkillable-work DoS; **1 remains** (Tier 2, Task 10 — not a narrowing conversion, so the gate cannot see it). |
 | **Durability** | Absent. Nothing in the transport core persists. |
 | **Breadth** | 2 of 15 interfaces; no `Channel`/`Buffer`, tickets, tunnels, or non-link proofs. |
 
@@ -77,7 +77,7 @@ cannot see**. That is what tier 1 is about.
 
 ## Tier 2 — remotely reachable crashes still open
 
-*Planned and gated; mostly execution. Plan: `2026-08-12-wire-input-trap-sweep.md` (8/10 done).*
+*Planned and gated; mostly execution. Plan: `2026-08-12-wire-input-trap-sweep.md` (9/10 done).*
 *Gate status: **zero known-open conversions** — `--fail-on-open` now exits 0. Tasks 9 and 10
 are not narrowing conversions, so the gate cannot see them — their tests are the only regression guard.*
 
@@ -95,9 +95,35 @@ are not narrowing conversions, so the gate cannot see them — their tests are t
       conversion *and* the multiply. **Fixed** — `guard chunkIndex <= UInt64(Int.max) / hmProduct`
       added before the conversion, bounding the product. Reject semantics: a large chunkIndex
       violates the contiguity invariant. Commit: see Task 8 report.
-- [ ] **Task 9 — unkillable stamp generation** — `LXMFNode.swift:340` → `LXStamper.swift:73-79`: a
-      wire `targetStampCost` reaches a bare `while true` in a `.run` effect with **no cancellation
-      ID**. Clamp the cost *and* give the effect an ID.
+- [x] **Task 9 — unkillable proof-of-work driven by an unauthenticated wire value** — **two** sites,
+      not the one the plan named: `LXStamper.generatePnStamp` (cost from `LXMFNode.propagationStampCost`,
+      i.e. a wire PN announce) and `LXStamper.generatePeeringKey` (cost from the peer's advertised
+      peering cost, via `PNNode.syncToPeer` → `PNNode`'s `linkEstablished` branch). Both were a bare
+      `while true` inside an uncancellable `.run`. **Fixed** — three independent guards, each of which
+      the others do not cover:
+      1. **Cost ceilings.** `LXMFPropagation.maxPeeringCost = 26` is exact reference parity
+         (`LXMRouter.MAX_PEERING_COST`, LXMRouter.py:51) *including the shape* — `LXMRouter.peer`
+         (LXMRouter.py:2005-2010) refuses to peer rather than clamping, and clamping would be a silent
+         failure (a key below the peer's demand is one it rejects, LXMPeer.py:228-233). We refuse in
+         both `PNNode.syncToPeer` and the `linkEstablished` branch where the search starts.
+         `maxPropagationStampCost = 20` is a **documented divergence**: reference bounds this nowhere
+         (`LXMRouter.get_outbound_propagation_cost`, LXMRouter.py:421-442, returns the announced value
+         verbatim; `pn_announce_data_is_valid`, LXMF.py:238-239, only checks it is int-able), relying on
+         cancellation alone. 20 is the equal-work counterpart of reference's sanctioned 26 over the 40x
+         larger PN workblock, and clears `PROPAGATION_COST + PROPAGATION_COST_FLEX` = 19.
+      2. **Cooperative cancellation in the loop.** `LXStamper.search` now tests `Task.isCancelled` each
+         round and returns nil, mirroring `LXStamper.job_simple` (LXStamper.py:199-206). A `CancelID`
+         alone does not stop a synchronous loop — it only suppresses delivery of its result.
+      3. **The loop yields.** A search that never suspends occupies its executor outright, so the
+         cancellation can never be *delivered*: measured at **267 s** for a cost-26 peering search
+         inside a `TestStore` that had explicitly cancelled it. Reference sidesteps this by generating
+         in separate threads/processes; `await Task.yield()` every 32 rounds is the equivalent here.
+      Cancelled at: `LXMFNode.cancelPropagationStamps` (explicit) and `LXMFNode.setPropagationNode`
+      (the in-flight stamp was sized to the old node's cost); `PNNode`'s `linkClosed` and
+      `requestFailed` branches (the key is only usable in an `/offer` on that link). The third
+      generator, `LXStamper.generateStamp`, has **no production caller** — delivery stamps are unwired
+      (Tier 3) — and is made cancellable defensively; when they are wired, its cost must be bounded
+      where the peer's advertised `stamp_cost` is read. No emitted bytes change. Commit: see Task 9 report.
 - [ ] **Task 10 — decompression allocates the ceiling, not the content** — `Bzip2.swift:36-38` /
       `ResourceTransfer.swift:408`: 41 bytes can drive a 64 MiB allocation. Not reference parity —
       `Resource.py:691` uses an incremental `BZ2Decompressor(max_length=)`.
@@ -223,5 +249,5 @@ exactly the class Tier 1 just closed.*
 | Slice | Covers | Plan | Status |
 |---|---|---|---|
 | Interop & crashes | Tier 1 | `2026-08-14-lxmf-interop-data-loss.md` | **in progress** |
-| Wire-input trap sweep | Tier 2 | `2026-08-12-wire-input-trap-sweep.md` | 8/10 |
+| Wire-input trap sweep | Tier 2 | `2026-08-12-wire-input-trap-sweep.md` | 9/10 |
 | Link liveness remainder | — | `2026-08-11-link-liveness-remainder.md` | ⚠️ do-not-execute; needs rework |

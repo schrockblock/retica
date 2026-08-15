@@ -55,6 +55,7 @@ public struct LXMFNode {
         case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
         case sendMessage(message: LXMessage, alsoViaPropagation: Bool)
         case syncFromPropagationNode
+        case cancelPropagationStamps
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -70,6 +71,15 @@ public struct LXMFNode {
     /// than it — so 0 means "serve nothing". A generous positive value (1000 KB ≈ 1 MB) defers to the
     /// PN, which caps at min(client, its own limit). Never send 0.
     public static let propagationTransferLimitKB: UInt64 = 1000
+
+    /// Cancellation identity for the propagation stamp search.
+    ///
+    /// One id for all in-flight searches rather than one per message: `.sendViaPropagation` builds the
+    /// `LXMessage` internally, so a caller wanting to abandon *that* send has no message hash to name.
+    /// Reference's `LXStamper.cancel_work` is keyed per message (LXStamper.py:146), driven from
+    /// `cancel_outbound(message_id)`; ours is coarser by exactly that much. Effects are registered
+    /// **without** `cancelInFlight`, so two concurrent sends coexist and are reclaimed together.
+    enum CancelID: Hashable { case propagationStamp }
 
     @Dependency(\.date) var date
     public init() {}
@@ -97,39 +107,57 @@ public struct LXMFNode {
                 return .send(.router(.send(message: msg, desiredMethod: method)))
 
             case let .setPropagationNode(destinationHash):
-                return .send(.router(.setOutboundPropagationNode(destinationHash)))
+                // Every in-flight stamp was sized to the PREVIOUS node's advertised cost, and a stamp
+                // below a node's enforced minimum is dropped by its ingest — so finishing that search
+                // could only burn a core for a message the new node would reject. Constructed on this
+                // branch only: `Effect.cancel(id:)` performs the cancellation when it is BUILT, so
+                // hoisting it out of the switch would cancel on every action (fixed once already, 86ee622).
+                return .merge(.cancel(id: CancelID.propagationStamp),
+                              .send(.router(.setOutboundPropagationNode(destinationHash))))
 
             case let .sendViaPropagation(destinationHash, title, content):
-                guard let recipient = state.endpoint.learned[destinationHash]?.identity
+                guard let recipient = state.endpoint.learned[destinationHash]?.identity,
+                      let cost = propagationStampCost(state)
                 else { return .none }
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
                 let ts = date.now.timeIntervalSince1970
-                let cost = propagationStampCost(state)
                 return .run { send in
-                    let (packed, _) = LXMFPropagation.pack(
+                    guard let (packed, _) = await LXMFPropagation.pack(
                         message: msg, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                    else { return }                                  // cancelled mid-search
                     await send(.router(.sendViaPropagation(message: msg, propagationPacked: packed)))
                 }
+                .cancellable(id: CancelID.propagationStamp)
 
             case let .sendMessage(message, alsoViaPropagation):
                 var effects: [Effect<Action>] = [
                     .send(.router(.send(message: message, desiredMethod: .opportunistic)))
                 ]
                 if alsoViaPropagation,
-                   let recipient = state.endpoint.learned[message.destinationHash]?.identity {
+                   let recipient = state.endpoint.learned[message.destinationHash]?.identity,
+                   let cost = propagationStampCost(state) {
                     let ts = date.now.timeIntervalSince1970
-                    let cost = propagationStampCost(state)
                     effects.append(.run { send in
-                        let (packed, _) = LXMFPropagation.pack(
+                        guard let (packed, _) = await LXMFPropagation.pack(
                             message: message, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                        else { return }                              // cancelled mid-search
                         await send(.router(.sendViaPropagation(message: message, propagationPacked: packed)))
-                    })
+                    }
+                    .cancellable(id: CancelID.propagationStamp))
                 }
                 return .merge(effects)
 
             case .syncFromPropagationNode:
                 return .send(.router(.syncFromPropagationNode))
+
+            case .cancelPropagationStamps:
+                // The app's explicit reclaim: backgrounding, sign-out, or abandoning a send. Even an
+                // accepted cost is minutes of hashing, so this must exist — `LXStamper.search` reads
+                // `Task.isCancelled` each round, which is what makes the cancel stop the CPU and not
+                // merely discard its result. Reference exposes the same lever as
+                // `LXMRouter.cancel_outbound` → `LXStamper.cancel_work` (LXStamper.py:146-175).
+                return .cancel(id: CancelID.propagationStamp)
 
             // --- Propagation sync: phase-1 (IDENTIFY + list request) ---
             case let .router(.delegate(.requestMessageList(linkID))):
@@ -332,11 +360,20 @@ public struct LXMFNode {
         }
     }
 
-    private func propagationStampCost(_ state: State) -> Int {
+    /// The propagation stamp cost to work at, or **nil meaning "do not send via this node"**.
+    ///
+    /// `ann.targetStampCost` comes from the propagation node's announce app-data, which is
+    /// unauthenticated: any peer can advertise 64, and the search is exponential in the cost, so 64 is
+    /// ~2^64 hash rounds over a 256 KB workblock. Reference reads the same field with no ceiling
+    /// (`LXMRouter.get_outbound_propagation_cost`, LXMRouter.py:421-442; `pn_announce_data_is_valid`
+    /// only checks it is int-able, LXMF.py:238-239) — see `LXMFPropagation.maxPropagationStampCost`
+    /// for the ceiling and why refusing beats clamping.
+    private func propagationStampCost(_ state: State) -> Int? {
         guard let pn = state.router.outboundPropagationNode,
               let appData = state.endpoint.learned[pn]?.appData,
               let ann = PNAnnounce.parse(appData)
         else { return LXMFPropagation.defaultPropagationStampCost }
+        guard ann.targetStampCost <= LXMFPropagation.maxPropagationStampCost else { return nil }
         return ann.targetStampCost
     }
 }

@@ -9,14 +9,21 @@ extension LXMFPropagation {
     /// `recipientIdentity` and appending a propagation stamp. Returns the container bytes (with the stamped
     /// entry) and the (single) entry's transient_id (computed over the stampless entry — the stable dedup
     /// key). The encryption is hedged, so the bytes differ per call — callers that retry must reuse the result.
+    ///
+    /// Returns nil **only** when the enclosing `Task` was cancelled during the stamp search
+    /// (`LXStamper.generatePnStamp`), which for a cost of any size is unbounded work. It does not
+    /// validate `stampCost`: the ceiling belongs at the boundary where the *wire* value is read
+    /// (`LXMFNode.propagationStampCost`), mirroring reference, which decides in
+    /// `LXMRouter.get_outbound_propagation_cost` rather than inside `LXStamper`.
     public static func pack(message: LXMessage, recipientIdentity: Identity, timestamp: Double,
-                            stampCost: Int = LXMFPropagation.defaultPropagationStampCost)
-        -> (propagationPacked: Data, transientId: Data) {
+                            stampCost: Int = LXMFPropagation.defaultPropagationStampCost) async
+        -> (propagationPacked: Data, transientId: Data)? {
         let tail = Data(message.packed.dropFirst(LXMessage.destinationLength))
         let encrypted = recipientIdentity.encrypt(tail)
         let entry = lxmfData(destinationHash: message.destinationHash, encryptedData: encrypted)  // stampless
         let tid = transientId(lxmfData: entry)                                                    // over stampless
-        let stamp = LXStamper.generatePnStamp(transientId: tid, targetCost: stampCost)
+        guard let stamp = await LXStamper.generatePnStamp(transientId: tid, targetCost: stampCost)
+        else { return nil }
         let stampedEntry = entry + stamp
         return (container(timestamp: timestamp, entries: [stampedEntry]), tid)
     }

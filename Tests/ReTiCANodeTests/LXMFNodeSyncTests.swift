@@ -24,7 +24,7 @@ import ComposableArchitecture
     // The stored message (from S to A) and its propagation entry + transient id.
     let storedMsg = LXMessage.create(source: sIdentity, destinationHash: aDeliveryHash,
                                      timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hi A".utf8))
-    let (container, tid) = LXMFPropagation.pack(message: storedMsg, recipientIdentity: aIdentity, timestamp: 1700000000.5, stampCost: 4)
+    let (container, tid) = await LXMFPropagation.pack(message: storedMsg, recipientIdentity: aIdentity, timestamp: 1700000000.5, stampCost: 4)!
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped entry — what PN stores and serves
 
     func makeNode(_ host: String, _ identity: Identity, _ sent: LockIsolated<[Data]>)
@@ -234,8 +234,8 @@ import ComposableArchitecture
     // Build a real stored message so recoverPacked succeeds and we get a real transient_id.
     let storedMsg = LXMessage.create(source: sIdentity, destinationHash: aDeliveryHash,
                                      timestamp: 1700000000.5, title: Data("t".utf8), content: Data("purge-me".utf8))
-    let (container, tid) = LXMFPropagation.pack(message: storedMsg, recipientIdentity: aIdentity,
-                                                 timestamp: 1700000000.5, stampCost: 4)
+    let (container, tid) = await LXMFPropagation.pack(message: storedMsg, recipientIdentity: aIdentity,
+                                                 timestamp: 1700000000.5, stampCost: 4)!
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped entry
 
     var initialState = LXMFNode.State(

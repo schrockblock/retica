@@ -14,20 +14,20 @@ import Foundation
     #expect(LXStamper.stampValue(workblock: wb, stamp: stamp) == f.stampValue)
 }
 
-@Test func lxStamperGeneratesValidStamp() throws {
+@Test func lxStamperGeneratesValidStamp() async throws {
     // Low cost keeps the search + 768 KB workblock cheap.
     let messageId = Crypto.fullHash(Data("stamp-gen-material".utf8))
     let cost = 4
-    let stamp = LXStamper.generateStamp(messageId: messageId, targetCost: cost)
+    let stamp = await LXStamper.generateStamp(messageId: messageId, targetCost: cost)!
     #expect(stamp.count == LXStamper.stampSize)
     let wb = LXStamper.stampWorkblock(material: messageId)
     #expect(LXStamper.stampValid(stamp: stamp, targetCost: cost, workblock: wb) == true)
 }
 
-@Test func generatePnStampRoundTripsValidatePnStamp() {
+@Test func generatePnStampRoundTripsValidatePnStamp() async {
     let lxmData = Data("pn-stamp-gen-material".utf8)
     let transientId = Crypto.fullHash(lxmData)
-    let stamp = LXStamper.generatePnStamp(transientId: transientId, targetCost: 4)
+    let stamp = await LXStamper.generatePnStamp(transientId: transientId, targetCost: 4)!
     #expect(stamp.count == LXStamper.stampSize)
     let result = LXStamper.validatePnStamp(transientData: lxmData + stamp, targetCost: 4)
     #expect(result != nil)

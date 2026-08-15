@@ -5,13 +5,13 @@ import Foundation
 /// recoverPacked is the inverse of pack's encryption step: for an entry packed to R, it reproduces the
 /// original message.packed bytes (so the router's received(.direct) path can consume it), and open() is
 /// just unpack(recoverPacked). A wrong recipient identity fails to decrypt → nil.
-@Test func recoverPackedReproducesPackedBytesAndOpenRoundTrips() {
+@Test func recoverPackedReproducesPackedBytesAndOpenRoundTrips() async {
     let sender = Identity()
     let recipient = Identity()
     let msg = LXMessage.create(source: sender,
                                destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("hello".utf8))
-    let (container, _) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
+    let (container, _) = await LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)!
     let entries = LXMFPropagation.parseContainer(container)!.entries
     #expect(entries.count == 1)
     let entry = entries[0]
@@ -35,13 +35,13 @@ import Foundation
     #expect(LXMFPropagation.strippedCore(lxmfData: core).count == core.count - 32)  // size-based drop
 }
 
-@Test func packAttachesValidPnStamp() {
+@Test func packAttachesValidPnStamp() async {
     let sender = Identity()
     let recipient = Identity()
     let msg = LXMessage.create(source: sender,
                                destinationHash: LXMessage.deliveryHash(identityHash: recipient.hash),
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("stamp-test".utf8))
-    let (container, returnedTid) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)
+    let (container, returnedTid) = await LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)!
     let entries = LXMFPropagation.parseContainer(container)!.entries
     #expect(entries.count == 1)
     let stampedEntry = entries[0]

@@ -39,11 +39,11 @@ import Foundation
     #expect(LXStamper.validatePnStamp(transientData: Data(tampered), targetCost: f.pnCost) == nil)
 }
 
-@Test func lxStamperGeneratePeeringKeyValidatesAtTargetCost() {
+@Test func lxStamperGeneratePeeringKeyValidatesAtTargetCost() async {
     let peeringId = Data((0..<32).map { UInt8($0) })
-    let key = LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: 16)   // fast sub-second search
+    let key = await LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: 16)!   // fast sub-second search
     #expect(LXStamper.validatePeeringKey(peeringId: peeringId, peeringKey: key, targetCost: 16))
     // Cost 0: any generated key validates trivially.
-    let key0 = LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: 0)
+    let key0 = await LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: 0)!
     #expect(LXStamper.validatePeeringKey(peeringId: peeringId, peeringKey: key0, targetCost: 0))
 }

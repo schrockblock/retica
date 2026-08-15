@@ -50,14 +50,14 @@ import Foundation
 }
 
 /// pack() then open() round-trips one of our own messages through hedged recipient encryption.
-@Test func propagationPackOpenRoundTrips() throws {
+@Test func propagationPackOpenRoundTrips() async throws {
     let f = try LXMFPropagationFixtures.load()
     let recipient = Identity(privateKey: Data(hexString: f.recipientPrivateKey)!)!
     let source = Identity(privateKey: Data(hexString: f.sourcePrivateKey)!)!
     let msg = LXMessage.create(source: source, destinationHash: Data(hexString: f.destinationHash)!,
                                timestamp: 1700000000.5, title: Data("t".utf8), content: Data("round trip".utf8))
-    let (packed, transientId) = LXMFPropagation.pack(message: msg, recipientIdentity: recipient,
-                                                     timestamp: 1700000000.5, stampCost: 4)
+    let (packed, transientId) = await LXMFPropagation.pack(message: msg, recipientIdentity: recipient,
+                                                     timestamp: 1700000000.5, stampCost: 4)!
     let parsed = LXMFPropagation.parseContainer(packed)!
     #expect(parsed.entries.count == 1)
     let stamplessEntry = Data(parsed.entries[0].dropLast(LXStamper.stampSize))
