@@ -257,16 +257,26 @@ exactly the class Tier 1 just closed.*
 
 ## Tier 3 — identity and anti-spam interop
 
-- [x] **No delivery-announce app data** — `LXMFNode.swift:92` announces `appData: nil`.
+- [x] **No delivery-announce app data** — `LXMFNode.registerDelivery` *announced* `appData: nil`.
       Reference packs `msgpack([display_name, stamp_cost, [SF_COMPRESSION]])` (`LXMRouter.py:1034-1050`).
-      **ReTiCA users appear unnamed in every reference client** (Sideband, NomadNet), and we can
+      **ReTiCA users appeared unnamed in every reference client** (Sideband, NomadNet), and we could
       never advertise a required stamp cost. *Verified `46e838e`.*
       **Fixed in four commits (plan `2026-08-15-lxmf-delivery-announce-app-data.md`):**
       - `08356e4` — `LXMFAnnounceData.pack` / `LXMFAnnounceData.parse` codec, byte-cross-validated
         against genuine LXMF 1.1.0 output (Tasks 1–2).
       - `eb0abd5` — `LXMFNode.registerDelivery` now packs real app-data instead of `nil`; reference
         `get_announce_app_data` (`LXMRouter.py:1034-1050`) always packs, even when both name and cost
-        are absent, so we match that (Task 3). **ReTiCA users are now named in Sideband/NomadNet.**
+        are absent, so we match that (Task 3).
+        **ReTiCA *can* now be named in Sideband/NomadNet — the app must supply the name.**
+        ~~ReTiCA users are now named in Sideband/NomadNet.~~ That claim was false as shipped and is
+        struck rather than deleted, because it is the fourth "summary wider than its evidence" in a
+        week and the pattern is worth more than the correction. `State.displayName` defaults to nil,
+        so `registerDelivery` alone emits `93c0c09100`, and a whole-branch probe fed exactly those
+        bytes to genuine LXMF 1.1.0 and got `display_name: null` — a reference client still shows the
+        node unnamed. Naming requires seeding `State.displayName` or calling `.setDisplayName`, and
+        **no caller in this workspace does yet**: grepping ReTiCaMsgr returns zero hits for
+        `setDisplayName`, which calls only `.registerDelivery` (`AppFeature.swift:102`). The slice
+        delivered the **capability**; the **outcome** needs one app-side line.
       - `dcb543f` + `2ab55ac` — `LXMFNode.State.learnedPeers` records each LXMF delivery peer's
         `displayName`, `stampCost` and `supportsCompression` on `pathLearned`, gated on
         `LXMessage.deliveryHash(identityHash:)` to match reference's own destination-hash dispatch
