@@ -830,16 +830,54 @@ import ComposableArchitecture
 /// Reference `disable_propagation` (LXMRouter.py:692-694) assumes `self.propagation_destination`
 /// already exists; it is only reachable after `enable_propagation` succeeds. We match that: without
 /// a destination hash there is nothing to announce.
+///
+/// The store starts with node mode ENABLED but never registered, which is the only way to reach the
+/// `guard let hash` this test is about. Starting disabled would now stop at the idempotence guard
+/// added above it, and the test would pass without ever evaluating the property it names.
 @MainActor @Test func serviceNodeDisableWithoutPriorRegistrationDoesNotAnnounce() async {
     let identity = Identity()
-    // Start already-disabled so no prior registerPropagation has run.
-    let store = makeServiceNode(identity, nodeMode: false)
+    let store = makeServiceNode(identity, nodeMode: true)   // enabled, but registerPropagation never ran
     #expect(store.state.client.propagationDestinationHash == nil)
 
     // Flip .on BEFORE the send so any stray announce fails teardown immediately.
     store.exhaustivity = .on
-    await store.send(.setNodeMode(false))
+    await store.send(.setNodeMode(false)) {
+        $0.nodeModeEnabled = false
+    }
     // No announce must be emitted — teardown fails if one is.
+}
+
+/// `setNodeMode(false)` on a node that is ALREADY disabled must emit nothing. Reference's
+/// `disable_propagation` has no such guard, but parity with an unguarded function is not a bound:
+/// each call here broadcasts an unpeer announce on every connected interface, and `Transport` paces
+/// only RELAYED announces, so N redundant calls put N announces on the air.
+///
+/// Test-honesty: the first disable is drained under `.off` and its announce is required to have
+/// happened (otherwise the second half would be asserting the absence of something that never
+/// occurred for an unrelated reason). Exhaustivity is then flipped to `.on` so the SECOND disable's
+/// stray announce, if any, fails teardown.
+@MainActor @Test func serviceNodeRedundantDisableDoesNotReAnnounce() async throws {
+    let identity = Identity()
+    let store = makeServiceNode(identity, nodeMode: false)
+
+    await store.send(.setNodeMode(true))
+    await store.receive { if case .registerPropagation = $0 { return true }; return false }
+
+    // First disable: an announce IS expected. Pin it, so the second half is a real absence.
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.setNodeMode(false))
+    await store.receive { action in
+        if case let .client(.endpoint(.announce(_, appData))) = action { captured.setValue(appData); return true }
+        return false
+    }
+    let first = try #require(captured.value, "the first disable must announce")
+    #expect(PNAnnounce.parse(first)?.nodeState == false)
+    await store.skipReceivedActions(strict: false)
+
+    // Second disable: already off, so nothing at all.
+    store.exhaustivity = .on
+    await store.send(.setNodeMode(false))
+    // Teardown fails if a redundant announce was emitted.
 }
 
 // MARK: - Minor-4: requestReceived gated on propagation link

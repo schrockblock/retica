@@ -139,10 +139,42 @@ public struct LXMFServiceNode {
                 return state.client.linkDestinations[linkID] == served
             }
 
+            /// The propagation-node announce app data. ONE construction, two callers
+            /// (`.registerPropagation` with `nodeState: true`, `setNodeMode(false)` with `false`) —
+            /// they differ in that flag and nothing else.
+            ///
+            /// Extracted because the two were verbatim copies. Every field below is read from a
+            /// single source of truth rather than mirrored, and the reason is concrete: a mirrored
+            /// copy is what let this node advertise `targetStampCost: 0` while `PropagationStore`
+            /// enforced 16. Duplicating the whole construction re-armed exactly that hazard on the
+            /// second copy.
+            ///
+            /// The limits are a REQUEST our peers honour, not a promise we keep: a peer stores them
+            /// on its `LXMPeer` record for US and filters its own outbound offer against them
+            /// (LXMPeer.py:370). 0 meant "no message may ever be sent to me" — and reference marks
+            /// each oversized message handled, so it dropped everything, permanently.
+            func pnAnnounceAppData(_ state: State, nodeState: Bool) -> Data {
+                PNAnnounce(timebase: Int(date.now.timeIntervalSince1970),
+                           nodeState: nodeState,
+                           perTransferLimit: LXMFPropagation.defaultPropagationTransferLimitKB,
+                           perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
+                           // The value `PropagationStore.ingest` actually enforces.
+                           targetStampCost: state.pn.store.minStampCost,
+                           stampCostFlexibility: 0, peeringCost: 0).packed
+            }
+
             switch action {
             case let .setNodeMode(enabled):
-                state.nodeModeEnabled = enabled
-                if enabled { return .send(.registerPropagation) }
+                if enabled { state.nodeModeEnabled = true; return .send(.registerPropagation) }
+                // Disabling is idempotent. Without this guard N calls with the mode already off
+                // produced N unpeer announces on every interface, and `Transport` does not pace
+                // locally-originated announces. Reference's `disable_propagation`
+                // (LXMRouter.py:692-694) is equally unguarded — but parity with an unguarded
+                // function is not a bound, and the serve-side state cleared below cannot have been
+                // repopulated meanwhile: both writers (`linkIdentified` → `clientIdentities`,
+                // `requestReceived` → `pendingGet`) are themselves gated on `nodeModeEnabled`.
+                guard state.nodeModeEnabled else { return .none }
+                state.nodeModeEnabled = false
                 // Do NOT clear propagationDestinationHash on disable. The lxmf.propagation destination
                 // cannot be unregistered, so links to it are still accepted. Keeping the classification
                 // hint ensures arriving propagation data is recognised and DROPPED (because nodeModeEnabled
@@ -158,12 +190,8 @@ public struct LXMFServiceNode {
                 // propagation_enabled == False. Guard on propagationDestinationHash: without it there
                 // is no destination to announce on (enable_propagation must have run first).
                 guard let hash = state.client.propagationDestinationHash else { return .none }
-                let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: false,
-                                         perTransferLimit: LXMFPropagation.defaultPropagationTransferLimitKB,
-                                         perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
-                                         targetStampCost: state.pn.store.minStampCost,
-                                         stampCostFlexibility: 0, peeringCost: 0).packed
-                return .send(.client(.endpoint(.announce(destinationHash: hash, appData: appData))))
+                return .send(.client(.endpoint(.announce(
+                    destinationHash: hash, appData: pnAnnounceAppData(state, nodeState: false)))))
 
             case .registerPropagation:
                 guard state.nodeModeEnabled,
@@ -171,24 +199,11 @@ public struct LXMFServiceNode {
                                           aspects: ["propagation"], identity: state.client.identity)
                 else { return .none }
                 state.client.propagationDestinationHash = d.hash
-                let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: true,
-                                         // These are a REQUEST our peers honour, not a promise we keep:
-                                         // a peer stores them on its LXMPeer record for US and filters
-                                         // its own outbound offer (LXMPeer.py:370). 0 meant "no message
-                                         // may ever be sent to me" — and reference marks each oversized
-                                         // message handled, so it dropped everything, permanently.
-                                         // Shared constants, not literals: the mirrored-copy drift that
-                                         // produced the stamp-cost bug applies equally here.
-                                         perTransferLimit: LXMFPropagation.defaultPropagationTransferLimitKB,
-                                         perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
-                                         // Single source of truth: the value PropagationStore.ingest
-                                         // actually enforces. A mirrored copy is what let PNNode
-                                         // advertise 0 while enforcing 16.
-                                         targetStampCost: state.pn.store.minStampCost,
-                                         stampCostFlexibility: 0, peeringCost: 0).packed
                 return .merge(
                     .send(.client(.endpoint(.registerLocalDestination(d)))),
-                    .send(.client(.endpoint(.announce(destinationHash: d.hash, appData: appData)))))
+                    .send(.client(.endpoint(.announce(
+                        destinationHash: d.hash,
+                        appData: pnAnnounceAppData(state, nodeState: true))))))
 
             // --- Inbound offers (only on the link to the destination we serve) ---
             case let .client(.endpoint(.delegate(.resourceReceived(linkID, data)))):
