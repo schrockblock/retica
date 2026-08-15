@@ -86,6 +86,48 @@ public struct LXMFServiceNode {
         return items.compactMap { if case let .bin(d) = $0 { return d } else { return nil } }
     }
 
+    /// The `/get` per-transfer cap in bytes, from a floating-point `data[2]` in kilobytes.
+    ///
+    /// Shared by the `.double` (float64, 0xCB) and `.float` (float32, 0xCA) branches of the
+    /// transfer-limit switch, deliberately: they had drifted apart once already — `.float` was simply
+    /// missing, so a float32 cap fell to `default: break` and became nil = NO CAP, strictly more
+    /// permissive than reference. One function means one set of guards to get right.
+    ///
+    /// Guard every non-finite and negative value BEFORE converting: `Int(Double)` traps on NaN and on
+    /// anything outside Int's range, and `raw >= x` is FALSE for NaN — so the NaN bound has to be an
+    /// explicit isNaN test, not a comparison.
+    ///
+    /// Reference keeps the cap as a FLOAT and never converts it to an int:
+    ///   client_transfer_limit = float(data[2])*1000      (LXMF 1.1.0 LXMRouter.py:1528, in a
+    ///                                                     bare `try/except: pass`)
+    ///   if limit != None and next_size > limit: pass     (LXMRouter.py:1547 — skip)
+    /// Verified by reading the installed LXMF 1.1.0 source and modelling :1525-1547; `int()` appears
+    /// nowhere, so no ValueError/OverflowError is ever raised there and the behaviour is decided
+    /// entirely by float comparison. That matters because EVERY comparison against NaN is false,
+    /// which flips the outcome:
+    ///   - -inf / large finite negative / -0.0 / 0: `next_size > limit` is true, so reference skips
+    ///     every message and serves nothing. Our 0 matches exactly.
+    ///   - large finite positive, +inf, and any kb whose *1000 overflows to +inf: `next_size > limit`
+    ///     is false, so reference serves everything. The Int.max clamp matches exactly — +inf
+    ///     included. (By a different route: reference never overflows because Python floats saturate
+    ///     to inf and inf loses the comparison; we saturate the cap instead. Same outcome.)
+    ///   - NaN: `next_size > nan` is FALSE, so reference takes the else branch and serves EVERYTHING —
+    ///     a NaN cap silently disables the cap. We serve NOTHING. DELIBERATE DIVERGENCE, and the one
+    ///     place this path does not match reference: treating a hostile NaN as "no cap" lets any
+    ///     client opt out of the limit it just asked for, so we take the restrictive direction. No
+    ///     legitimate client sends NaN, so there is no interop cost. Pinned by
+    ///     serviceNodeParsesNaNTransferLimitAsZero (float64) and serviceNodeParsesNaNFloat32-
+    ///     TransferLimitAsZero (float32).
+    /// -0.0 reaches 0 via the conversion, not the negative arm: IEEE 754 makes `-0.0 < 0` false.
+    /// Reference's `next_size > -0.0` is true → serves nothing, so 0 is also the parity-correct
+    /// answer. Pinned by the -0.0 tests.
+    private static func transferLimitBytes(kilobytes kb: Double) -> Int {
+        let raw = kb * 1000
+        if raw.isNaN || raw < 0 { return 0 }
+        if raw >= Double(Int.max) { return Int.max }
+        return Int(raw)
+    }
+
     public var body: some ReducerOf<Self> {
         Scope(state: \.client, action: \.client) { LXMFNode() }
         Scope(state: \.pn, action: \.pn) { PropagationNode() }
@@ -256,43 +298,25 @@ public struct LXMFServiceNode {
                     case let .uint(kb):
                         transferLimitBytes = kb > UInt64(Int.max / 1000) ? Int.max : Int(kb) * 1000
                     case let .double(kb):
-                        // Guard every non-finite and negative value BEFORE converting: Int(Double)
-                        // traps on NaN and on anything outside Int's range, and `raw >= x` is FALSE
-                        // for NaN — so the NaN bound has to be an explicit isNaN test, not a comparison.
+                        // float64 (0xCB). Every guard lives in transferLimitBytes(kilobytes:), shared
+                        // with the .float branch below so the two cannot drift apart again.
+                        transferLimitBytes = LXMFServiceNode.transferLimitBytes(kilobytes: kb)
+                    case let .float(kb):
+                        // float32 (0xCA) — the arm this switch was missing. Reference reads data[2]
+                        // through `float()` (LXMF 1.1.0 LXMRouter.py:1528), which handles a float32
+                        // exactly as it handles a float64, so falling to `default: break` left
+                        // transferLimitBytes nil = NO CAP: strictly more permissive than reference,
+                        // the identical failure the `.int` note below records one case over. Both
+                        // arrived the same way — the decoder gained a type and this switch never grew
+                        // the arm for it.
                         //
-                        // Reference keeps the cap as a FLOAT and never converts it to an int:
-                        //   client_transfer_limit = float(data[2])*1000      (LXMRouter.py:1528, in a
-                        //                                                    bare `try/except: pass`)
-                        //   if limit != None and next_size > limit: pass     (LXMRouter.py:1547 — skip)
-                        // Verified by reading the installed LXMF 1.1.0 source and modelling :1525-1547;
-                        // `int()` appears nowhere, so no ValueError/OverflowError is ever raised here and
-                        // the behaviour is decided entirely by float comparison. That matters because
-                        // EVERY comparison against NaN is false, which flips the outcome:
-                        //   - -inf / large finite negative / -0.0 / 0: `next_size > limit` is true, so
-                        //     reference skips every message and serves nothing. Our 0 matches exactly.
-                        //   - large finite positive, +inf, and any kb whose *1000 overflows to +inf:
-                        //     `next_size > limit` is false, so reference serves everything. The Int.max
-                        //     clamp below matches exactly — +inf included. (It matches by a different
-                        //     route: reference never overflows because Python floats saturate to inf and
-                        //     inf loses the comparison; we saturate the cap instead. Same outcome.)
-                        //   - NaN: `next_size > nan` is FALSE, so reference takes the else branch and
-                        //     serves EVERYTHING — a NaN cap silently disables the cap. We serve NOTHING.
-                        //     DELIBERATE DIVERGENCE, and the one place this switch does not match
-                        //     reference: treating a hostile NaN as "no cap" lets any client opt out of
-                        //     the limit it just asked for, so we take the restrictive direction. No
-                        //     legitimate client sends NaN, so there is no interop cost. Pinned by
-                        //     serviceNodeParsesNaNTransferLimitAsZero.
-                        // -0.0 reaches 0 via the conversion, not the negative arm: IEEE 754 makes
-                        // `-0.0 < 0` false. Reference's `next_size > -0.0` is true → serves nothing, so
-                        // 0 is also the parity-correct answer. Pinned by the -0.0 test.
-                        let raw = kb * 1000
-                        if raw.isNaN || raw < 0 {
-                            transferLimitBytes = 0
-                        } else if raw >= Double(Int.max) {
-                            transferLimitBytes = Int.max
-                        } else {
-                            transferLimitBytes = Int(raw)
-                        }
+                        // Widen to Double BEFORE the *1000: Float arithmetic overflows a large float32
+                        // to +-inf, whereas Float -> Double is lossless and Python's `float()` is a
+                        // double, so this matches reference's arithmetic exactly. It is not a bug fix
+                        // and no test pins it: the two routes return the same Int for every input
+                        // (an overflow to +-inf lands on the clamp or the negative arm, which give the
+                        // same answers as the finite comparisons do).
+                        transferLimitBytes = LXMFServiceNode.transferLimitBytes(kilobytes: Double(kb))
                     case let .int(kb):
                         // A wire-decoded signed integer (e.g. int8(-1) = 0xFF). Before the decoder
                         // widening (177da8c) this type failed the msgpack parse and the whole request

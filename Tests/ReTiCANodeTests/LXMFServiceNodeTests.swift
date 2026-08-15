@@ -1161,6 +1161,76 @@ import ComposableArchitecture
     }
 }
 
+// MARK: - float32 (0xCA) transfer limit — the Task-6 defect, one msgpack type over
+//
+// `MsgPackValue.float` fell to `default: break`, leaving transferLimitBytes nil = NO CAP: strictly
+// more permissive than reference, which reads data[2] through `float()` (LXMF 1.1.0
+// LXMRouter.py:1528) and applies a float32 cap like any other. One test per branch of
+// transferLimitBytes(kilobytes:), mirroring the float64 set above — a single compound "handles
+// float32" test would have let the adversarial branches go unasserted.
+//
+// That a wire 0xCA really decodes to `.float` (rather than being widened to `.double` somewhere) is
+// pinned by MsgPackSignedTests.msgPackFloat32Decodes; these tests inherit that and cover what the
+// /get consumer does with it.
+
+/// The plain case: `float32(500.0)` must produce a 500000-byte cap, not nil (unlimited).
+/// This is the one that fails on the unfixed switch; the rest pin the guards it shares with float64.
+@MainActor @Test func serviceNodeParsesFloat32TransferLimit() async {
+    let result = await getTransferLimit(limitElement: .float(Float(500.0)))
+    #expect(result != nil, "messagesRequested must fire")
+    if let outerResult = result {
+        #expect(outerResult == 500_000, "float32(500.0) must parse to 500000 bytes, not nil (unlimited)")
+    }
+}
+
+/// `float32(NaN)` must not trap. `Int(Double.nan)` aborts the process, and `raw >= x` is false for
+/// NaN, so the bound has to be an explicit isNaN test rather than a comparison. Same deliberate
+/// divergence as the float64 case: reference's `next_size > nan` is false, so reference would serve
+/// EVERYTHING; we serve nothing rather than let a client silently opt out of the cap it asked for.
+@MainActor @Test func serviceNodeParsesNaNFloat32TransferLimitAsZero() async {
+    let result = await getTransferLimit(limitElement: .float(Float.nan))
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == 0, "float32(NaN) limit must parse as 0 (serve nothing), not nil or trap")
+    }
+}
+
+/// `float32(-inf)` must not trap. Reference computes `float('-inf')*1000 = -inf` and keeps it as a
+/// float; `next_size > -inf` is true, so it serves nothing. We treat it as 0 — genuine parity.
+@MainActor @Test func serviceNodeParsesNegInfFloat32TransferLimitAsZero() async {
+    let result = await getTransferLimit(limitElement: .float(-Float.infinity))
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == 0, "float32(-inf) limit must parse as 0 (serve nothing), not nil or trap")
+    }
+}
+
+/// `float32(+inf)` clamps to `Int.max` (effectively unlimited) and must not trap: `Int(Double)` traps
+/// above Int's range. Reference's `next_size > inf` is false, so it serves everything — parity by a
+/// different route (it never converts the cap; we saturate it).
+@MainActor @Test func serviceNodeParsesPosInfFloat32TransferLimitAsUnlimited() async {
+    let result = await getTransferLimit(limitElement: .float(Float.infinity))
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == Int.max, "float32(+inf) must clamp to Int.max, not trap")
+    }
+}
+
+/// A large negative float32 must be 0 (serve nothing), not nil (unlimited) and not a trap.
+/// Reference: `float(-1e18)*1000` is less than any message size, so nothing is served.
+///
+/// Note what this does NOT prove. `-1e18` is finite as a Float but `Float * 1000` would overflow to
+/// -inf, so the widening to Double changes which arm runs (`raw < 0` rather than the infinity arm) —
+/// and no test can tell, because both arms return 0. The two routes agree on every input, so the
+/// widening is a parity-of-arithmetic choice, not a behaviour this or any assertion pins.
+@MainActor @Test func serviceNodeParsesLargeNegativeFloat32TransferLimitAsZero() async {
+    let result = await getTransferLimit(limitElement: .float(Float(-1e18)))
+    #expect(result != nil, "messagesRequested must fire (process must not crash)")
+    if let outerResult = result {
+        #expect(outerResult == 0, "large-negative float32 limit must parse as 0, not nil or trap")
+    }
+}
+
 // MARK: - FIX 2: stamp rejection — ERROR_INVALID_STAMP on under-cost packet offer
 
 /// A PACKET-framed offer whose stamp fails validation (absent or below minStampCost) must NOT be
