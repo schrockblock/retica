@@ -1,0 +1,32 @@
+{
+  "name_cost": {
+    "display_name": "Alice",
+    "stamp_cost": 8,
+    "supports_compression": true,
+    "packed": "93c405416c696365089100"
+  },
+  "both_nil": {
+    "display_name": null,
+    "stamp_cost": null,
+    "supports_compression": true,
+    "packed": "93c0c09100"
+  },
+  "name_only": {
+    "display_name": "Bob",
+    "stamp_cost": null,
+    "supports_compression": true,
+    "packed": "93c403426f62c09100"
+  },
+  "cost_only": {
+    "display_name": null,
+    "stamp_cost": 16,
+    "supports_compression": true,
+    "packed": "93c0109100"
+  },
+  "legacy": {
+    "display_name": "Legacy User",
+    "stamp_cost": null,
+    "supports_compression": true,
+    "packed": "4c65676163792055736572"
+  }
+}
