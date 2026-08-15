@@ -129,59 +129,48 @@ private func makeAnnounceStore(
     }
 }
 
-// MARK: - setDisplayName updates state and re-announces
+// MARK: - setDisplayName is a setter; announceDelivery is the broadcast
 
-/// `.setDisplayName` must update `state.displayName` AND emit a new `announce` effect carrying
-/// the updated name in `appData`. A name change nobody hears is not a name change.
+/// `.setDisplayName` must update `state.displayName` and `state.deliveryStampCost` and emit
+/// NOTHING. The broadcast is `.announceDelivery`'s job: an unthrottled fan-out on every interface
+/// must not be the side effect of a state write, or a `TextField` binding announces per keystroke.
 ///
-/// Anti-vacuity: the assertion is on the `appData` bytes of the re-announce action. Checking only
-/// `state.displayName` would pass even if the announce carried `appData: nil` or stale bytes.
-@MainActor @Test func setDisplayNameUpdatesStateAndReAnnounces() async {
+/// Anti-vacuity: exhaustivity is flipped to `.on` before the send, so a re-announce effect (the
+/// pre-split behaviour) fails teardown. Both state fields are asserted, so a setter that writes
+/// only one also fails.
+@MainActor @Test func setDisplayNameUpdatesStateAndDoesNotAnnounce() async {
     let identity = Identity()
     let store = makeAnnounceStore(identity: identity)
 
-    // Register first so deliveryDestinationHash is set.
+    // Register first, so deliveryDestinationHash is set and an announce COULD be emitted.
     await store.send(.registerDelivery)
     await store.skipReceivedActions(strict: false)
 
-    let capturedAppData = LockIsolated<Data?>(nil)
-    await store.send(.setDisplayName("Bob", stampCost: nil))
+    store.exhaustivity = .on
+    await store.send(.setDisplayName("Bob", stampCost: 10)) {
+        $0.displayName = "Bob"
+        $0.deliveryStampCost = 10
+    }
     #expect(store.state.displayName == "Bob")
-    #expect(store.state.deliveryStampCost == nil)
-
-    await store.receive { action in
-        if case let .endpoint(.announce(_, appData)) = action {
-            capturedAppData.setValue(appData)
-            return true
-        }
-        return false
-    }
-
-    let blob = capturedAppData.value
-    #expect(blob != nil)
-    if let blob {
-        let parsed = LXMFAnnounceData.parse(blob)
-        #expect(parsed != nil)
-        if let parsed {
-            #expect(parsed.displayName == "Bob")
-        }
-    }
+    #expect(store.state.deliveryStampCost == 10)
+    // Teardown under .on: an announce effect here would be unconsumed and fail.
 }
 
-/// `.setDisplayName` must update BOTH `state.displayName` and `state.deliveryStampCost` when a
-/// cost is supplied, and the re-announce `appData` must carry both fields.
-@MainActor @Test func setDisplayNameWithStampCostUpdatesStateAndReAnnounces() async {
+/// `.announceDelivery` must emit an announce whose `appData` carries the name and cost currently
+/// in state — i.e. the values a preceding `.setDisplayName` wrote.
+///
+/// Anti-vacuity: the assertion is on the `appData` bytes of the announce action, not on state.
+/// `try #require` fails fast if no announce was emitted, rather than skipping the field checks.
+@MainActor @Test func announceDeliveryEmitsTheCurrentNameAndStampCost() async throws {
     let identity = Identity()
     let store = makeAnnounceStore(identity: identity)
 
     await store.send(.registerDelivery)
     await store.skipReceivedActions(strict: false)
+    await store.send(.setDisplayName("Carol", stampCost: 10))
 
     let capturedAppData = LockIsolated<Data?>(nil)
-    await store.send(.setDisplayName("Carol", stampCost: 10))
-    #expect(store.state.displayName == "Carol")
-    #expect(store.state.deliveryStampCost == 10)
-
+    await store.send(.announceDelivery)
     await store.receive { action in
         if case let .endpoint(.announce(_, appData)) = action {
             capturedAppData.setValue(appData)
@@ -190,54 +179,41 @@ private func makeAnnounceStore(
         return false
     }
 
-    let blob = capturedAppData.value
-    #expect(blob != nil)
-    if let blob {
-        let parsed = LXMFAnnounceData.parse(blob)
-        #expect(parsed != nil)
-        if let parsed {
-            #expect(parsed.displayName == "Carol")
-            #expect(parsed.stampCost == 10)
-        }
-    }
+    let blob = try #require(capturedAppData.value, ".announceDelivery must emit app data")
+    let parsed = try #require(LXMFAnnounceData.parse(blob))
+    #expect(parsed.displayName == "Carol")
+    #expect(parsed.stampCost == 10)
 }
 
-/// `.setDisplayName` before `registerDelivery` must update state but must NOT emit an announce
-/// (there is no registered delivery destination to announce on).
+/// `.announceDelivery` before `registerDelivery` must NOT emit an announce (there is no registered
+/// delivery destination to announce on).
 ///
 /// Anti-vacuity: exhaustivity is flipped to `.on` before the send so any stray `.announce` action
-/// in the effect queue fails teardown. The state mutation is declared inside the `send` trailing
-/// closure to satisfy `.on` exhaustivity — it is the observable outcome we expect, not a
-/// side-effect we're trying to hide.
-@MainActor @Test func setDisplayNameBeforeRegisterDeliveryDoesNotReAnnounce() async {
+/// in the effect queue fails teardown.
+@MainActor @Test func announceDeliveryBeforeRegisterDeliveryEmitsNothing() async {
     let identity = Identity()
-    let store = makeAnnounceStore(identity: identity)
+    let store = makeAnnounceStore(identity: identity, displayName: "Dave")
 
     // Do NOT call registerDelivery — deliveryDestinationHash must remain nil.
     store.exhaustivity = .on
-    await store.send(.setDisplayName("Dave", stampCost: nil)) {
-        $0.displayName = "Dave"
-    }
-    // Teardown under .on: any stray announce action would fail here because it was
-    // not consumed. The trailing closure above accounts for the state mutation; any
-    // emitted effect would remain in the queue and fail teardown.
-    #expect(store.state.displayName == "Dave")
+    await store.send(.announceDelivery)
+    // Teardown under .on: any emitted announce would remain in the queue and fail.
 }
 
-/// `.setDisplayName` with nil clears the name. The re-announce `appData` blob is still emitted
-/// (always-pack parity) but `displayName` parses as nil.
-@MainActor @Test func setDisplayNameNilClearsNameButStillEmitsBlob() async {
+/// `.setDisplayName(nil, ...)` clears the name, and the following `.announceDelivery` still emits
+/// the full app-data blob (always-pack parity) with `displayName` parsing as nil.
+@MainActor @Test func announceDeliveryAfterClearingTheNameStillEmitsBlob() async throws {
     let identity = Identity()
     // Start with a name pre-set so clearing is observable.
     let store = makeAnnounceStore(identity: identity, displayName: "Eve")
 
     await store.send(.registerDelivery)
     await store.skipReceivedActions(strict: false)
-
-    let capturedAppData = LockIsolated<Data?>(nil)
     await store.send(.setDisplayName(nil, stampCost: nil))
     #expect(store.state.displayName == nil)
 
+    let capturedAppData = LockIsolated<Data?>(nil)
+    await store.send(.announceDelivery)
     await store.receive { action in
         if case let .endpoint(.announce(_, appData)) = action {
             capturedAppData.setValue(appData)
@@ -246,16 +222,10 @@ private func makeAnnounceStore(
         return false
     }
 
-    let blob = capturedAppData.value
-    #expect(blob != nil)
-    if let blob {
-        #expect(!blob.isEmpty)
-        let parsed = LXMFAnnounceData.parse(blob)
-        #expect(parsed != nil)
-        if let parsed {
-            #expect(parsed.displayName == nil)
-        }
-    }
+    let blob = try #require(capturedAppData.value, ".announceDelivery must emit app data")
+    #expect(!blob.isEmpty)
+    let parsed = try #require(LXMFAnnounceData.parse(blob))
+    #expect(parsed.displayName == nil)
 }
 
 // MARK: - Learning peers from inbound delivery announces

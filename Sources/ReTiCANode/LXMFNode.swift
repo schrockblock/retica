@@ -139,11 +139,22 @@ public struct LXMFNode {
         case endpoint(TransportEndpoint.Action)
         case router(LXMFRouter.Action)
         case registerDelivery
-        /// Update the display name (and optionally the delivery stamp cost) announced in the
-        /// delivery-destination app data. Re-announces immediately so peers see the new name
-        /// without waiting for the next scheduled announce cycle.
-        /// Requires `registerDelivery` to have been called first; silently ignored otherwise.
+        /// Update the display name and delivery stamp cost carried in the delivery-destination
+        /// app data. **State only — this sends nothing.** Follow it with `.announceDelivery`
+        /// when the edit is settled.
+        ///
+        /// The two are separate on purpose. This action previously broadcast on every interface as
+        /// a side effect of the setter, and `Transport` does not pace locally-originated announces
+        /// (its per-interface gate applies to RELAYED announces only), so a settings `TextField`
+        /// bound straight through to this action would have put one announce on the air per
+        /// keystroke. Reference draws the same line: `delivery_destination.display_name = x` is a
+        /// plain assignment and `LXMRouter.announce(destination_hash)` is a separate explicit call.
         case setDisplayName(String?, stampCost: Int?)
+        /// Announce the delivery destination now, carrying the current `displayName` and
+        /// `deliveryStampCost`. Broadcasts on EVERY connected interface with no throttle, so call
+        /// it when a change is settled — not on every keystroke of an edit.
+        /// Requires `registerDelivery` to have been called first; silently ignored otherwise.
+        case announceDelivery
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
         case setPropagationNode(destinationHash: Data)
         case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
@@ -202,12 +213,18 @@ public struct LXMFNode {
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
 
             case let .setDisplayName(name, stampCost):
+                // Setter only — see the action's declaration for why the broadcast is a separate
+                // action. Emitting an announce from here made an unthrottled network broadcast the
+                // side effect of a state write, which a per-keystroke binding turns into a flood.
                 state.displayName = name
                 state.deliveryStampCost = stampCost
-                // Re-announce so peers see the updated name without waiting for the next scheduled
-                // announce cycle. No-op when registerDelivery was never called (deliveryDestinationHash nil).
+                return .none
+
+            case .announceDelivery:
+                // No-op when registerDelivery was never called (deliveryDestinationHash nil).
                 guard let hash = state.deliveryDestinationHash else { return .none }
-                let appData = LXMFAnnounceData.pack(displayName: name, stampCost: stampCost)
+                let appData = LXMFAnnounceData.pack(displayName: state.displayName,
+                                                    stampCost: state.deliveryStampCost)
                 return .send(.endpoint(.announce(destinationHash: hash, appData: appData)))
 
             case let .send(destinationHash, title, content, method):
