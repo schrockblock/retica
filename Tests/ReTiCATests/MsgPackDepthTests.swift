@@ -7,7 +7,11 @@ import Testing
 /// The mutual recursion between those three functions has no depth limit. A crafted payload of
 /// nested container headers (e.g. a run of `0x91` fixarray-of-1 tags) recurses until the
 /// thread's native stack is exhausted, crashing the process with SIGBUS/SIGSEGV — a single-frame
-/// remote kill because 431 bytes of nesting fits within one `Link.mdu`.
+/// remote kill because `Link.mdu` = 431 plaintext bytes buys 431 nesting levels at one byte each,
+/// and the packet ingress cap does NOT reduce that (it caps at exactly `Link.mdu`). Measured
+/// thresholds are lower than 431 on a small stack, so a single frame suffices there — see the
+/// bisected table in `MsgPack.maxParseDepth`'s docstring. `0x81` (fixmap-of-1) is the cheaper
+/// attack than `0x91`: same byte count, ~1.9x the stack per level.
 ///
 /// **Detection scope:** `Scripts/check-wire-narrowing.swift` covers narrowing-conversion
 /// defects only; recursion depth is a different shape and is invisible to it. These tests are
@@ -25,9 +29,10 @@ struct MsgPackDepthTests {
     // MARK: — Bomb tests (reject deeply nested containers)
 
     /// 500 × `0x91` (fixarray-of-1 header). Each tag recurses once through `parse` →
-    /// `parseArray` → `parse`. Without the depth guard this crashes the process (SIGBUS at ~431
-    /// levels on a 512 KiB background-thread stack in a debug build). With the guard it must
-    /// return `nil`.
+    /// `parseArray` → `parse`. Without the depth guard this crashes the whole `swift test` process
+    /// — verified: "exited with unexpected signal code 10" (SIGBUS). 500 is comfortably past the
+    /// bisected 331-level array threshold for this harness's 512 KiB pool-thread stack in debug.
+    /// With the guard it must return `nil`.
     @Test("a deeply-nested fixarray bomb is rejected as nil")
     func nestingArrayBombIsRejected() {
         let bomb = Data(repeating: 0x91, count: 500)

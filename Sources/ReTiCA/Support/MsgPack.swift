@@ -41,9 +41,28 @@ public enum MsgPack {
     /// - Above deepest known structure (3): 29 levels of headroom for application data in
     ///   `LXMessage.fields` values (telemetry, coordinates, attachments), which ReTiCA does not
     ///   define and cannot bound.
-    /// - Below stack exhaustion: the bomb test crashes at ~431 depth on a 512 KiB background
-    ///   thread stack in a debug build, and at ~10 000 depth in a release build. 32 is
-    ///   substantially below both; a 32-deep legitimate payload is never near the stack limit.
+    /// - Below stack exhaustion by a wide margin in every configuration. An earlier version of this
+    ///   comment said "crashes at ~431 depth ... and at ~10 000 in a release build". Both figures
+    ///   were wrong: **431 was the payload size the bomb test happened to use, not a measured
+    ///   threshold**, and the release figure was unsourced. Bisected minima (first crashing depth,
+    ///   production parser with only this bound neutered, Swift 6.3.1 arm64):
+    ///
+    ///   | stack | `0x91` array debug | array release | `0x81` map debug | map release |
+    ///   |---|---|---|---|---|
+    ///   | 512 KiB (`swift test` pool thread) | 331 | 3721 | 235 | 1970 |
+    ///   | 1 MB (iOS main) | 655 | 7361 | 466 | 3897 |
+    ///   | 8 MB (macOS main) | 5176 | 58099 | 3682 | 30758 |
+    ///
+    ///   `0x81` (fixmap-of-1) is the attacker's shape, not `0x91`: same one byte per level but ~1.9x
+    ///   the stack, because `parseMap` peeks the key with a full recursive `parse` before its loop.
+    ///   32 is 7x below the worst cell and a 32-deep legitimate payload is nowhere near the limit.
+    ///
+    /// - **Production parses on the main actor, not a 512 KiB worker.** TCA's `Store` is
+    ///   `@MainActor`; effect bodies run off-main but `await send(...)` hops back, and every
+    ///   `MsgPack.decodeValue` call site in `Transport`/`LinkSession`/`ResourceTransfer` sits in a
+    ///   synchronous `Reduce` body. The 512 KiB row above is the test harness. (A host that parks
+    ///   the main thread with `dispatchMain()` instead of `RunLoop.main.run()` would get 512 KiB —
+    ///   measured, and it is what made a first probe of this report the wrong answer.)
     ///
     /// **Reference divergence:** Python's `umsgpack` (RNS/vendor/umsgpack.py) imposes NO
     /// explicit depth limit — it is equally recursive but survives via CPython's catchable
@@ -54,6 +73,23 @@ public enum MsgPack {
     /// **Detection gap:** `Scripts/check-wire-narrowing.swift` covers narrowing-conversion
     /// defects only; unbounded recursion is a different shape and is INVISIBLE to it.
     /// The `MsgPackDepthTests` suite is the **sole** regression guard for this defect.
+    ///
+    /// **Do not expect the packet ingress cap to backstop this bound.** The sweep that added both
+    /// claimed the ingress MTU check was "what makes the recursion a one-frame kill" — measured, and
+    /// false in two directions:
+    ///
+    /// - A single inbound link data packet carries at most `Link.mdu` = **431** plaintext bytes
+    ///   (500 MTU − 19 header − 48 token overhead, floored to the AES block multiple, −1 minimum
+    ///   PKCS7 pad; relayed HEADER_2 gives only 415). At one byte per level that is 431 levels —
+    ///   which on a 512 KiB stack in debug is already **1.8x past** the 235-level map threshold. The
+    ///   ingress cap does not prevent that; only this bound does.
+    /// - On the **resource** path it gives no bound at all: `LinkSession` decodes a *reassembled
+    ///   multi-packet* resource, capped only by `Resource.maxAdvertisedTransferSize` (192 MiB), i.e.
+    ///   ~192 million levels. This bound is the sole defence there.
+    ///
+    /// The ingress cap is still load-bearing — without it the deframers admit 262 144 B, ~262 000
+    /// levels, enough to exhaust even an 8 MB release stack — but it is a second line, not a
+    /// backstop that would make this bound redundant.
     public static let maxParseDepth = 32
 
     /// Encode a `Double` as MessagePack float64: `0xCB ‖ big-endian IEEE-754 bits` (9 bytes).

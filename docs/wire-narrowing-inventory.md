@@ -218,11 +218,14 @@ measured, not suspected:
   have been *accepted*, which requires a *valid* stamp. An attacker who never produces a valid stamp
   is never stored, therefore never deduped, and pays the full workblock every time: **21.98 ms per
   33-byte entry, so 1.56 KiB/s of container bytes saturates one core** — derived: 33 B + ~2 B
-  framing per 21.98 ms. Use this figure, not the task brief's "2.3 KiB/s", which was asserted
-  rather than derived and which nothing since has reproduced; the two were briefly quoted side by
-  side here in a way no reader could reconcile. The conclusion is unchanged either way — both are
-  single-digit KiB/s. Dedup cannot close this: it has nothing to match a never-before-seen entry
-  against.
+  framing per 21.98 ms. The task brief's **2.3 KiB/s** is the *same measurement at a different entry
+  size* — 49 B per 21.7 ms (`2026-08-12-wire-input-trap-sweep.md`, Task 5) — not a competing or
+  unsourced figure. Both are correct; the throughput scales with entry size because the cost is
+  per-*entry*, not per-byte. Quote whichever entry size you mean and say which.
+  (An earlier revision of this bullet asserted 2.3 was "asserted rather than derived, and nothing
+  since has reproduced it". That was wrong — it is derived, and the arithmetic checks. Recorded
+  because the error was in a *correction*, which is where this repo's doc defects concentrate.)
+  Dedup cannot close this: it has nothing to match a never-before-seen entry against.
 - **Open — double validation.** An entry that *is* accepted is validated twice, once in the pre-scan
   and once in `ingest` (measured: 2 workblock derivations per novel entry, by the liveness counter in
   `serviceNodeDoesNotRederiveWorkblockForStoredPacketOfferReplay`). Reference validates once and
