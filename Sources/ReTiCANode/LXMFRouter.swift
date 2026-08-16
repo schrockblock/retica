@@ -97,7 +97,7 @@ public struct LXMFRouter {
         public init() {}
     }
 
-    public enum DeliveryMethod: Equatable { case opportunistic, direct }
+    public enum DeliveryMethod: Equatable, Sendable { case opportunistic, direct }
     public enum LinkStatus: Equatable { case awaitingPath; case establishing; case active(linkID: Data) }
 
     public enum ResendInfo: Equatable {

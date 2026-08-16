@@ -161,6 +161,10 @@ public struct LXMFNode {
         case sendMessage(message: LXMessage, alsoViaPropagation: Bool)
         case syncFromPropagationNode
         case cancelPropagationStamps
+        /// Cancel any in-flight delivery-stamp searches. Call when the app backgrounds, the user
+        /// abandons a send, or the destination is no longer reachable. Mirrors `cancelPropagationStamps`
+        /// for the delivery-stamp `CancelID.deliveryStamp` effect set.
+        case cancelDeliveryStamps
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -177,6 +181,34 @@ public struct LXMFNode {
     /// PN, which caps at min(client, its own limit). Never send 0.
     public static let propagationTransferLimitKB: UInt64 = 1000
 
+    /// Highest delivery stamp cost we will do proof-of-work for when a peer advertises one in its
+    /// `lxmf.delivery` announce app-data.
+    ///
+    /// **This is a deliberate divergence from reference — reference has no such cap.**
+    /// `LXMRouter.handle_outbound` (LXMRouter.py:1752-1757, LXMF 1.1.0) reads `stamp_cost` from
+    /// `outbound_stamp_costs[destination_hash][1]` verbatim (populated from peer announces,
+    /// LXMRouter.py:1027-1029), and `pack()` then calls `get_stamp()` (LXMessage.py:372), which
+    /// runs the brute-force search. Reference survives a hostile value by making the search
+    /// *cancellable* (`LXStamper.cancel_work`), not by bounding it — so an uncancelled reference
+    /// client burns a core just as we would. We implement cancellation *and* this cap, because an
+    /// unkillable core burn triggered by an unauthenticated announce is not acceptable on a mobile
+    /// client even for the seconds before a user notices and cancels.
+    ///
+    /// **Why 20.** The delivery workblock uses the standard 3000 rounds (~768 KB). The propagation
+    /// workblock uses 1000 rounds (~256 KB). The peering workblock uses 25 rounds (~6.4 KB).
+    /// Reference's own maximum for peering is `MAX_PEERING_COST = 26` (LXMRouter.py:51), which
+    /// represents ~2^26 × 6.4 KB of hashing. Equal work at the delivery workblock (768 KB, 3×
+    /// larger) is 26 − log₂(3) ≈ 24.4; we use 20, which gives a comfortable margin below even
+    /// the propagation ceiling (`maxPropagationStampCost = 20` at ~2^20 × 256 KB). That ceiling
+    /// already clears the highest cost a reference node legitimately demands by its own defaults
+    /// (`PROPAGATION_COST + PROPAGATION_COST_FLEX` = 16 + 3 = 19). A delivery cost above 20 is
+    /// ~2^20 expected hash iterations at ~768 KB/workblock, roughly a million rounds — already
+    /// minutes of mobile CPU — which makes a legitimate cost at the ceiling rare in practice.
+    ///
+    /// Refusal, not clamping: a stamp generated below the peer's advertised cost is one that peer
+    /// will drop — a silent failure after all that work. Refusing is clean.
+    public static let maxDeliveryStampCost = 20
+
     /// Cancellation identity for the propagation stamp search.
     ///
     /// One id for all in-flight searches rather than one per message: `.sendViaPropagation` builds the
@@ -184,7 +216,7 @@ public struct LXMFNode {
     /// Reference's `LXStamper.cancel_work` is keyed per message (LXStamper.py:146), driven from
     /// `cancel_outbound(message_id)`; ours is coarser by exactly that much. Effects are registered
     /// **without** `cancelInFlight`, so two concurrent sends coexist and are reclaimed together.
-    enum CancelID: Hashable { case propagationStamp }
+    enum CancelID: Hashable { case propagationStamp; case deliveryStamp }
 
     @Dependency(\.date) var date
     public init() {}
@@ -230,7 +262,19 @@ public struct LXMFNode {
             case let .send(destinationHash, title, content, method):
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
-                return .send(.router(.send(message: msg, desiredMethod: method)))
+                guard let cost = deliveryStampCost(state, destinationHash: destinationHash) else {
+                    return .send(.router(.send(message: msg, desiredMethod: method)))
+                }
+                return .run { send in
+                    let stamped: LXMessage
+                    if let stamp = await LXStamper.generateStamp(messageId: msg.hash, targetCost: cost) {
+                        stamped = msg.withStamp(stamp)
+                    } else {
+                        stamped = msg   // cancelled mid-search — send unstamped rather than not at all
+                    }
+                    await send(.router(.send(message: stamped, desiredMethod: method)))
+                }
+                .cancellable(id: CancelID.deliveryStamp)
 
             case let .setPropagationNode(destinationHash):
                 // Every in-flight stamp was sized to the PREVIOUS node's advertised cost, and a stamp
@@ -284,6 +328,13 @@ public struct LXMFNode {
                 // merely discard its result. Reference exposes the same lever as
                 // `LXMRouter.cancel_outbound` → `LXStamper.cancel_work` (LXStamper.py:146-175).
                 return .cancel(id: CancelID.propagationStamp)
+
+            case .cancelDeliveryStamps:
+                // The app's explicit reclaim for in-flight delivery-stamp searches. Even an accepted
+                // cost at `maxDeliveryStampCost` is minutes of CPU. `LXStamper.search` reads
+                // `Task.isCancelled` each round, so cancellation stops the CPU burn — it does not
+                // merely discard the result. Mirrors `cancelPropagationStamps` for the delivery path.
+                return .cancel(id: CancelID.deliveryStamp)
 
             // --- Propagation sync: phase-1 (IDENTIFY + list request) ---
             case let .router(.delegate(.requestMessageList(linkID))):
@@ -536,5 +587,28 @@ public struct LXMFNode {
         else { return LXMFPropagation.defaultPropagationStampCost }
         guard ann.targetStampCost <= LXMFPropagation.maxPropagationStampCost else { return nil }
         return ann.targetStampCost
+    }
+
+    /// The delivery stamp cost to apply when sending to `destinationHash`, or **nil meaning
+    /// "no stamp"** (either no cost is known or the announced cost exceeds the ceiling).
+    ///
+    /// `peer.stampCost` comes from the `lxmf.delivery` announce app-data, which is unauthenticated:
+    /// any reachable peer can advertise any value. The search is exponential — 64 is ~2^64 rounds
+    /// over a 768 KB (3000-round) workblock — so the ceiling is mandatory. See
+    /// `LXMFNode.maxDeliveryStampCost` for the ceiling and why refusing beats clamping.
+    ///
+    /// A cost of 0 is treated as "no stamp required", matching reference's own emit gate at
+    /// `get_announce_app_data` (LXMRouter.py:1044): it only emits a stamp_cost when `> 0 and < 255`,
+    /// so 0 in `outbound_stamp_costs` means "peer said no cost", and `handle_outbound`
+    /// (LXMRouter.py:1752-1757) only calls `get_stamp()` when `stamp_cost != None` — a 0 stored
+    /// there would still trigger the search, but no conforming peer emits 0, so in practice 0 means
+    /// the field was absent. We map it explicitly: cost=0 → no stamp.
+    private func deliveryStampCost(_ state: State, destinationHash: Data) -> Int? {
+        guard let peer = state.learnedPeers[destinationHash],
+              let cost = peer.stampCost,
+              cost > 0
+        else { return nil }
+        guard cost <= LXMFNode.maxDeliveryStampCost else { return nil }
+        return cost
     }
 }
