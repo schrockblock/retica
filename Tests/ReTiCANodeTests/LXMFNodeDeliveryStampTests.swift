@@ -233,8 +233,15 @@ private func makeDeliveryStampStore(
 /// only finish within the time limit if the in-flight effect is cancelled and the search loop
 /// responds to `Task.isCancelled`. This proves cancellability without relying on timing.
 ///
-/// The `.timeLimit` is a safety net, not a timing assertion: a cancelled search finishes in well
-/// under a second. Without the limit an unkillable loop would block the suite.
+/// The `.timeLimit` is not a timing assertion — a cancelled search finishes in well under a second.
+///
+/// **Nor is it the safety net an earlier version of this comment claimed.** It said "without the
+/// limit an unkillable loop would block the suite", implying the limit prevents that. It does not:
+/// a vacuity audit deleted `Task.yield()` from `LXStamper.search` and this test **hung for 26
+/// minutes** until killed. A loop that never suspends is uninterruptible, so swift-testing cannot
+/// enforce a time limit against it — the limit can only fire on a task that yields. The test still
+/// *catches* a missing yield (it never passes), but it does so by hanging the run rather than
+/// failing it. If you are debugging a stalled suite, this is a place to look first.
 ///
 /// `store.exhaustivity = .on` before `finish` is load-bearing: `TestStore`'s "an effect is still
 /// running" diagnostic is suppressed under `.off`, so the flip is what catches a leaked effect.

@@ -346,15 +346,48 @@ private func makeInboundStampStore(
 ///
 /// This is the property that distinguishes `withStampValidation` from `withStamp`, which
 /// deliberately drops `receivedBytes` because it changes the payload.
+///
+/// **The fixture must be NON-CANONICAL, and an earlier version of this test was vacuous for
+/// exactly that reason.** It built the wire form with `LXMessage.create(...).packed`, so
+/// `receivedBytes` held bytes *our own encoder* had produced — and dropping `receivedBytes` then
+/// re-encodes to the identical bytes, because our encoder is deterministic. Both assertions held
+/// whether the property was preserved or dropped. A vacuity audit proved it: under a mutation that
+/// drops `receivedBytes`, the old test passed while a foreign-encoded probe failed on both
+/// assertions (113 vs 114 bytes, signature invalid).
+///
+/// So the title is encoded `bin16` (`0xC5`) where `MsgPack.encode` emits `bin8` (`0xC4`) for a
+/// length under 256 — spec-legal, decodes identically, and something our encoder provably cannot
+/// reproduce. Same technique as the `receivedBytes` tests in `LXMessageReceivedBytesTests`; it is
+/// re-inlined here because that helper lives in a different test target.
 @Test func withStampValidationPreservesReceivedBytesSoSignatureStillValidates() async throws {
     let sender = Identity()
     let recipientDeliveryHash = Data(repeating: 0xBB, count: 16)
-    let built = LXMessage.create(source: sender, destinationHash: recipientDeliveryHash,
-                                 timestamp: 1700000000, title: Data("t".utf8), content: Data("c".utf8))
-    let onWire = try #require(LXMessage.unpack(built.packed))
+    let sourceHash = LXMessage.deliveryHash(identityHash: sender.hash)
+    let title = Data("t".utf8)
+    let content = Data("c".utf8)
+
+    // Hand-built payload: fixarray(4) [double, bin16(title), bin(content), map()].
+    var payload = Data([0x94])
+    payload += MsgPack.encode(.double(1700000000))
+    payload += Data([0xC5, UInt8(title.count >> 8), UInt8(title.count & 0xFF)]) + title
+    payload += MsgPack.encode(.bin(content))
+    payload += MsgPack.encode(.map([]))
+
+    let hashedPart = recipientDeliveryHash + sourceHash + payload
+    let signature = sender.sign(hashedPart + Crypto.fullHash(hashedPart))
+    let wire = recipientDeliveryHash + sourceHash + signature + payload
+
+    // Guard the fixture itself: if our encoder ever emitted bin16 here, the test would silently
+    // revert to the vacuous shape it was written to escape.
+    let canonical = LXMessage.create(source: sender, destinationHash: recipientDeliveryHash,
+                                     timestamp: 1700000000, title: title, content: content)
+    #expect(canonical.packed.count != wire.count, "fixture is no longer non-canonical")
+
+    let onWire = try #require(LXMessage.unpack(wire))
     #expect(onWire.validateSignature(source: sender))          // precondition
+    #expect(onWire.packed == wire)                             // precondition: receivedBytes in play
 
     let validated = onWire.withStampValidation(valid: false)
-    #expect(validated.packed == onWire.packed)                 // sender's exact bytes retained
+    #expect(validated.packed == wire)                          // sender's exact bytes retained
     #expect(validated.validateSignature(source: sender))       // still verifiable downstream
 }
