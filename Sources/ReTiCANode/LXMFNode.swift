@@ -122,6 +122,21 @@ public struct LXMFNode {
         /// `> 0 and < 255` gate (LXMRouter.py:1044).
         public var deliveryStampCost: Int?
 
+        /// Whether to DROP inbound messages whose stamp fails validation (or is absent) when a
+        /// `deliveryStampCost` is configured.
+        ///
+        /// **Defaults to `false`**, matching reference (`enforce_stamps=False` in `LXMRouter.__init__`,
+        /// LXMRouter.py:99). With enforcement off, an invalid or absent stamp is logged but the
+        /// message is delivered — exactly `LXMRouter.lxmf_delivery`'s else-branch at line 1878.
+        ///
+        /// Set to `true` to drop messages with invalid stamps, mirroring reference's `enforce_stamps()`
+        /// call (LXMRouter.py:696-697). **Ticket divergence:** reference `validate_stamp`
+        /// (LXMessage.py:273-283) also accepts a stamp equal to `truncated_hash(ticket + message_id)`
+        /// regardless of cost ("inbound tickets", Tier 3, unticketed in ReTiCA). With enforcement on,
+        /// a ticket-holding peer that reference accepts, we reject. This divergence is harmless with
+        /// enforcement off (the default). Whoever enables enforcement should account for this gap.
+        public var enforceDeliveryStamps: Bool = false
+
         public init(identity: Identity, endpoint: TransportEndpoint.State) {
             self.identity = identity
             self.endpoint = endpoint
@@ -483,6 +498,32 @@ public struct LXMFNode {
                 return .merge(effects)
 
             case let .router(.delegate(.messageDelivered(message, validated))):
+                // Stamp validation mirrors `LXMRouter.lxmf_delivery` (LXMRouter.py:1861-1880, LXMF 1.1.0).
+                //
+                // Only validates when WE have configured a stamp cost (`State.deliveryStampCost != nil`).
+                // The cost is OURS — `delivery_destinations[message.destination_hash].stamp_cost`, which
+                // maps to `State.deliveryStampCost` we set via `setDisplayName(_, stampCost:)` — so it is
+                // trusted configuration, not a wire value. Validation is O(1) in the cost: one workblock
+                // derivation + one leading-zero-bit check (LXMessage.py:288-289). No ceiling applies here
+                // (the ceiling in `deliveryStampCost(_:destinationHash:)` is OUTBOUND-only, protecting
+                // against a hostile peer's unauthenticated announce driving an exponential search).
+                //
+                // Ticket divergence: reference also accepts `truncated_hash(ticket + message_id)` stamps
+                // (LXMessage.py:273-283, "inbound tickets"). ReTiCA has no tickets (Tier 3, unticketed).
+                // With enforcement off (default) the gap is invisible — both deliver. With enforcement on
+                // a ticket-holding peer reference accepts, we reject. Documented in `enforceDeliveryStamps`.
+                if let cost = state.deliveryStampCost {
+                    let stampValid = message.validateStamp(targetCost: cost)
+                    if !stampValid {
+                        // Enforcement off (default): deliver anyway, matching reference's
+                        // "allow anyway, since stamp enforcement is disabled" branch (LXMRouter.py:1878-1879).
+                        // Enforcement on: drop, matching `return False` (LXMRouter.py:1877).
+                        if state.enforceDeliveryStamps {
+                            return .none    // drop — app receives nothing
+                        }
+                        // fall through to deliver
+                    }
+                }
                 return .send(.delegate(.messageReceived(message: message, signatureValidated: validated)))
 
             case let .router(.delegate(.deliveryFailed(hash))):

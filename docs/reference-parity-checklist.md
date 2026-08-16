@@ -295,11 +295,18 @@ exactly the class Tier 1 just closed.*
         This is already filed under Tier 4 ("LXMFNode.State.learnedPeers is never collected"); the
         tick here does not close that item.
 
-- [ ] **Delivery stamps not wired** — all PoW primitives exist (`LXStamper.swift`,
-      `LXMessage.swift`) but `validateStamp` **has no caller** and `send` never generates one.
-      Any peer running `enforce_stamps()` drops every ReTiCA message (`LXMRouter.py:1875-1877`).
-      *Verified `46e838e`.* See delivery-announce tick above — learning a peer's cost (Task 4) is
-      a prerequisite; spending it safely (bounded PoW, ceiling enforcement) is the remaining work.
+- [x] **Delivery stamps wired** — outbound generation and inbound validation are both wired.
+      *Task 1 (2026-08-16 slice)*: `LXMFNode.deliverySend` generates a stamp when the peer's
+      `lxmf.delivery` announce carries a cost ≤ `maxDeliveryStampCost = 20`; the search is
+      cancellable via `CancelID.deliveryStamp`; a cancelled or refused search sends unstamped
+      rather than dropping. *Task 2 (2026-08-16 slice)*: `LXMFNode` validates the stamp on every
+      inbound `messageDelivered` when `State.deliveryStampCost != nil`; `State.enforceDeliveryStamps`
+      (default `false`, matching reference `LXMRouter.__init__` LXMRouter.py:99) gates the drop.
+      With enforcement on, an invalid/absent stamp is dropped (`return .none`), matching reference
+      `lxmf_delivery`'s `return False` (LXMRouter.py:1877). With enforcement off (default), the
+      message is delivered, matching reference's else-branch (LXMRouter.py:1878-1879). 980 tests,
+      zero known-open. **Remaining gap**: `enforceDeliveryStamps` defaults false and no caller
+      currently sets it to true; enabling it exposes the ticket divergence (see Tier 3 tickets item).
 - [x] **`setNodeMode(false)` never re-announces** — `LXMFServiceNode.swift` `setNodeMode` returned
       `.none` on disable, so the last announce on the network still said `nodeState: true`. Reference
       `disable_propagation` (verified against stock LXMF 1.1.0, `LXMRouter.py:692-694`) sets
