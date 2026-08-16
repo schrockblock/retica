@@ -73,6 +73,17 @@ public struct LXMFAnnounceData: Equatable {
     /// ratchet is a fifth fixed payload field of `Announce.ratchetSize` (32) bytes, so if ReTiCA
     /// ever announces one this must drop by 32 — otherwise a name that fits here stops fitting
     /// on the wire, which is exactly the failure this constant exists to prevent.
+    ///
+    /// **Dropping the constant is necessary but not sufficient, and an earlier note here said
+    /// otherwise.** It claimed a ratchet would "merely fail to announce rather than poison state,
+    /// because the capture-after-pack fix is independent". That is wider than the evidence: the fix
+    /// stops a *new* unsendable value being captured, but nothing clears one already captured.
+    /// `Transport.state.localAppData` is written in exactly two places — cleared on
+    /// `.registerLocalDestination`, and set after a successful pack — so a name captured while it
+    /// fit (≤ 333 B) becomes unsendable the moment a ratchet adds 32 bytes, and from then on
+    /// `announce(nil)` and local path responses go silent again with no self-heal. A re-review
+    /// probe characterised exactly that state: seeded oversize sticky entry → zero transmits.
+    /// So when ratchets land: drop this by 32 **and** re-validate or clear existing captures.
     public static let maxAppDataBytes =
         Packet.mtu
         - (Packet.addressLength + 3)

@@ -882,8 +882,9 @@ public struct Transport {
                 // and path response, capturing an app data that cannot be packed poisoned the
                 // destination permanently: the oversize announce emitted nothing, the next
                 // `announce(nil)` fell back to the same oversize value and emitted nothing, and the
-                // local path-response branch (:552-557) read the same poisoned entry through the
-                // same `try?` and answered nothing. One over-long display name took the delivery
+                // local path-response branch (the `.header2` path response built in the
+                // path-request handler) read the same poisoned entry through the same `try?` and
+                // answered nothing. One over-long display name took the delivery
                 // destination off the network for good — recoverable only by announcing a value
                 // that fits. Verified by probe before the fix (announce and path response both
                 // silent; recovery only via a short name).

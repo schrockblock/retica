@@ -165,6 +165,13 @@ public struct LXMFServiceNode {
 
             switch action {
             case let .setNodeMode(enabled):
+                // ENABLE is deliberately NOT idempotence-guarded, and that asymmetry is a judgement
+                // call rather than an oversight: a redundant enable has a defensible "refresh my
+                // announce" reading, whereas a redundant disable has none. The cost is real though
+                // — ReTiCaMsgr drives this from a settings toggle, and N redundant enables emit N
+                // unpaced announces on every interface. Revisit together with a general rate limit
+                // on locally-originated announces, which `Transport` does not have (it paces only
+                // RELAYED announces).
                 if enabled { state.nodeModeEnabled = true; return .send(.registerPropagation) }
                 // Disabling is idempotent. Without this guard N calls with the mode already off
                 // produced N unpeer announces on every interface, and `Transport` does not pace
