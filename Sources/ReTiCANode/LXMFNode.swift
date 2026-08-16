@@ -322,6 +322,22 @@ public struct LXMFNode {
                 var effects: [Effect<Action>] = [
                     deliverySend(state, message: message, method: .opportunistic)
                 ]
+                // KNOWN GAP, deliberately deferred: the propagation copy packs the ORIGINAL,
+                // UNSTAMPED `message`, so a recipient who enforces delivery stamps drops it even
+                // though the opportunistic copy above carries one. Same failure class as the
+                // `.sendMessage`-had-no-stamp gap this task just closed, one layer down.
+                //
+                // The barrier is EFFECT SEQUENCING, not `transient_id` stability — an earlier note
+                // here said the latter and a re-review corrected it, so it is recorded rather than
+                // silently replaced. It is true that stamping first changes `message.packed` and
+                // therefore the `transient_id` that `LXMFPropagation.pack` derives from it. But that
+                // does NOT destabilise retries: `ResendInfo.propagated` re-sends the already-packed
+                // `propagationPacked` bytes and never re-calls `pack`, so stamping once and packing
+                // once would still give a stable id. The real cost is that both the delivery-stamp
+                // search and `pack`'s own propagation-stamp search are async and potentially
+                // minutes long, so doing both means turning these two CONCURRENT effects into a
+                // sequential chain — with its own cancellation ordering and partial-failure cases.
+                // That deserves its own design and tests; it is not a line to slip in here.
                 if alsoViaPropagation,
                    let recipient = state.endpoint.learned[message.destinationHash]?.identity,
                    let cost = propagationStampCost(state) {
