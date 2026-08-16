@@ -274,9 +274,13 @@ exactly the class Tier 1 just closed.*
         so `registerDelivery` alone emits `93c0c09100`, and a whole-branch probe fed exactly those
         bytes to genuine LXMF 1.1.0 and got `display_name: null` — a reference client still shows the
         node unnamed. Naming requires seeding `State.displayName` or calling `.setDisplayName`, and
-        **no caller in this workspace does yet**: grepping ReTiCaMsgr returns zero hits for
-        `setDisplayName`, which calls only `.registerDelivery` (`AppFeature.swift:102`). The slice
-        delivered the **capability**; the **outcome** needs one app-side line.
+        no caller in this workspace did yet: grepping ReTiCaMsgr returned zero hits for `setDisplayName`.
+        The slice delivered the **capability**; the **outcome** needed one app-side line.
+        **Task 3 (2026-08-16 slice):** ReTiCaMsgr now calls `.setDisplayName("ReTiCaMsgr", stampCost: nil)`
+        before `.registerDelivery` in `AppFeature.interfaceConnected` so the registration announce carries
+        the name. **PROVISIONAL constant** — ReTiCaMsgr has no user-facing name entry UI; `"ReTiCaMsgr"`
+        is a placeholder until a name field is added. Reference clients (Sideband, NomadNet) will now
+        show the node as `"ReTiCaMsgr"` rather than unnamed. ReTiCaMsgr commit `0a3d026`.
       - `dcb543f` + `2ab55ac` — `LXMFNode.State.learnedPeers` records each LXMF delivery peer's
         `displayName`, `stampCost` and `supportsCompression` on `pathLearned`, gated on
         `LXMessage.deliveryHash(identityHash:)` to match reference's own destination-hash dispatch
@@ -299,22 +303,48 @@ exactly the class Tier 1 just closed.*
       *Task 1 (2026-08-16 slice)*: `LXMFNode.deliverySend` generates a stamp when the peer's
       `lxmf.delivery` announce carries a cost ≤ `maxDeliveryStampCost = 20`; the search is
       cancellable via `CancelID.deliveryStamp`; a cancelled or refused search sends unstamped
-      rather than dropping. *Task 2 (2026-08-16 slice)*: `LXMFNode` validates the stamp on every
-      inbound `messageDelivered` when `State.deliveryStampCost != nil`, and carries the outcome on
-      the message as `LXMessage.stampValid`/`stampChecked` — mirroring reference, which stores the
-      same pair on the object (`LXMessage.py:157-158`) and assigns it at `LXMRouter.py:1865-1869`.
+      rather than dropping. Commits: `09c44a0` (initial generation), `8a84fd3` (fix ceiling and
+      send path — `LXMFNode.deliverySend` is the correct call site, not `LXMFNode.send`).
+      *Task 2 (2026-08-16 slice)*: `LXMFNode` validates the stamp on every inbound
+      `messageDelivered` when `State.deliveryStampCost != nil`, and carries the outcome on the
+      message as `LXMessage.stampValid`/`stampChecked` — mirroring reference, which stores the same
+      pair on the object (`LXMessage.py:157-158`) and assigns it at `LXMRouter.py:1865-1869`.
       `State.enforceDeliveryStamps` (default `false`, matching `LXMRouter.__init__` LXMRouter.py:99)
       gates the drop: with enforcement on an invalid/absent stamp is dropped (`return .none`,
       reference `return False` at LXMRouter.py:1877); with enforcement off the message is delivered
       flagged checked-and-invalid (reference's else-branch, LXMRouter.py:1878-1879).
+      Commits: `b652df8` (validation), `9a3b64f` (surface stamp result via `stampValid`/`stampChecked`).
 
       **Scope of this tick, stated precisely.** What is wired is *validation and reporting*: every
       inbound message now arrives carrying an honest tri-state (never-checked / checked-valid /
-      checked-invalid) that an app can render. What **no shipping configuration exercises** is
-      *enforcement*: `enforceDeliveryStamps` defaults false and **no caller in this repo or in
-      ReTiCaMsgr sets it true**, so the drop branch is reachable only from tests today. Enabling it
-      also exposes the ticket divergence (see the Tier 3 tickets item) — reference accepts
-      ticket-backed stamps that we reject.
+      checked-invalid) that an app can render.
+
+      **What this tick does NOT close:**
+
+      - **Enforcement is test-only.** `enforceDeliveryStamps` defaults false and **no caller in
+        this repo or in ReTiCaMsgr sets it true**, so the drop branch is reachable only from tests
+        today. Enabling it also exposes the ticket divergence below — reference accepts
+        ticket-backed stamps that we reject (`LXMessage.py:273-283` checks `truncated_hash(ticket +
+        message_id)` regardless of cost; we have no ticket path).
+
+      - **The outbound ceiling means we decline to stamp for demanding peers.** `maxDeliveryStampCost = 20`
+        (`LXMFNode.swift`): when a peer's announced `stamp_cost` exceeds 20 we send unstamped.
+        Reference has no default delivery stamp cost and accepts 1–254 (`register_delivery_identity`,
+        `LXMRouter.py:348`; `set_inbound_stamp_cost`, `LXMRouter.py:378-388`), so any conforming
+        peer advertising 21–254 will receive our messages unstamped. If that peer enforces stamps,
+        it drops them. **Which peers this affects:** peers that call `set_inbound_stamp_cost` with a
+        value above 20 — an uncommon but legitimate configuration, not a hostile one.
+
+      - **The propagation copy carries no delivery stamp.** `.sendMessage(alsoViaPropagation: true)`
+        in `LXMFNode` packs the unstamped message into the propagation container (`LXMFPropagation.pack`
+        is called on the original `LXMessage`). A stamp-enforcing recipient that receives the message
+        only via a propagation node still drops it. Deferred deliberately: wiring it requires
+        collapsing two concurrent async stamp searches (delivery + propagation) into a sequential
+        chain with its own cancellation ordering. Documented in `LXMFNode.swift` at the `.sendMessage`
+        call site (commit `d3e19d2`).
+
+      - **LXMF tickets remain absent** (Tier 3's fourth item — separate entry below). Enabling
+        enforcement exposes this gap explicitly.
 
       982 tests; **zero known-open *conversions*** (this checklist's gate metric — not a claim that
       the suite carries no known-issue annotations: `TransportTests.swift:3943` has a structural
