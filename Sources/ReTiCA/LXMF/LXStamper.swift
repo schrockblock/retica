@@ -73,11 +73,16 @@ public enum LXStamper {
     /// Search random 32-byte stamps until one is valid for `targetCost` over `messageId`'s workblock.
     /// Nil if the enclosing `Task` was cancelled before a valid stamp was found — see `search`.
     ///
-    /// NOTE: this generator has **no production caller** today (delivery stamps are unwired — see the
-    /// Tier 3 "no delivery-announce app data" item in `docs/reference-parity-checklist.md`). It is made
-    /// cancellable here so that wiring delivery stamps later cannot reintroduce an unkillable loop. When
-    /// that wiring lands, the *cost* must also be bounded at the point the peer's advertised
-    /// `stamp_cost` is read — cancellability alone does not stop a hostile peer pinning a core.
+    /// **Production caller: `LXMFNode.deliverySend`**, reached from both `.send` and `.sendMessage`.
+    /// (This note previously read "no production caller today"; that held until delivery stamps were
+    /// wired.) The two requirements it anticipated are now met at that call site, and both remain
+    /// load-bearing:
+    ///   * the effect is registered `.cancellable(id: CancelID.deliveryStamp)`, so the `search` loop
+    ///     below can be reclaimed; and
+    ///   * the cost is bounded by `LXMFNode.maxDeliveryStampCost` **before** the search starts, at the
+    ///     point the peer's unauthenticated advertised `stamp_cost` is read
+    ///     (`LXMFNode.deliveryStampCost`) — cancellability alone does not stop a hostile peer
+    ///     pinning a core.
     public static func generateStamp(messageId: Data, targetCost: Int) async -> Data? {
         await search(workblock: stampWorkblock(material: messageId), targetCost: targetCost)
     }

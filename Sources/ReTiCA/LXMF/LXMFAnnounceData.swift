@@ -254,9 +254,25 @@ public struct LXMFAnnounceData: Equatable {
     ///   we return nil for the `.int` branch when `i < 0`.
     /// - a NON-INTEGER `peer_data[1]` (a string, a float, a list) — reference returns that object
     ///   as-is and lets the caller trip over it; our `default` arm returns nil.
-    /// Both divergences are in the safe direction and neither is currently observable: no caller
-    /// acts on a parsed cost yet. Revisit if one ever does — a peer that means "no stamp required"
-    /// by sending -1 would be read by us as "field absent", which happens to be the same decision.
+    ///
+    /// **These divergences became observable when delivery stamps were wired** (this note used to
+    /// say "no caller acts on a parsed cost yet — revisit if one ever does"; that revisit trigger
+    /// has now fired). The caller is `LXMFNode.deliveryStampCost`, via `LXMFNode.LearnedPeer`.
+    ///
+    /// Concretely, for a NEGATIVE advertised cost the two stacks now do different things:
+    /// - **Reference** carries it through `handle_outbound` into `LXMessage.get_stamp`, which skips
+    ///   generation only when the cost is `None` (LXMessage.py:307). The search's validity test is
+    ///   `target = 1 << (256 - cost)` (LXStamper.py:74) — for a negative cost that target exceeds
+    ///   every possible 256-bit hash, so the FIRST random stamp passes and reference attaches a
+    ///   trivially-valid stamp at essentially zero cost.
+    /// - **We** surface nil, so `deliveryStampCost` returns nil and no stamp is attached.
+    ///
+    /// This stays in the safe direction, and it is not a known deliverability loss: a negative cost
+    /// is unreachable from a CONFORMING peer in the first place — `set_inbound_stamp_cost` coerces
+    /// any cost `< 1` to `None` (LXMRouter.py:378-388) and `get_announce_app_data` emits a value
+    /// only when `> 0 and < 255` (LXMRouter.py:1044) — so a peer advertising one is already
+    /// non-conforming, and has no conforming route to then enforce a positive cost against us. The
+    /// difference is only in how much free work each stack does for a malformed announce.
     ///
     /// Wire safety: announce app-data is unauthenticated and arrives from any reachable peer.
     /// `Int(exactly:)` converts from UInt64 so `UInt64.max` yields nil rather than trapping, and
