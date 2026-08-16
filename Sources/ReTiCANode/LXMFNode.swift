@@ -503,17 +503,32 @@ public struct LXMFNode {
                 // Only validates when WE have configured a stamp cost (`State.deliveryStampCost != nil`).
                 // The cost is OURS — `delivery_destinations[message.destination_hash].stamp_cost`, which
                 // maps to `State.deliveryStampCost` we set via `setDisplayName(_, stampCost:)` — so it is
-                // trusted configuration, not a wire value. Validation is O(1) in the cost: one workblock
-                // derivation + one leading-zero-bit check (LXMessage.py:288-289). No ceiling applies here
-                // (the ceiling in `deliveryStampCost(_:destinationHash:)` is OUTBOUND-only, protecting
-                // against a hostile peer's unauthenticated announce driving an exponential search).
+                // trusted configuration, not a wire value. No ceiling applies here (the ceiling in
+                // `deliveryStampCost(_:destinationHash:)` is OUTBOUND-only, protecting against a hostile
+                // peer's unauthenticated announce driving an exponential search).
+                //
+                // COST: O(1) in the cost parameter, but NOT free — ~3000 HKDF rounds deriving a 768 KB
+                // workblock per inbound message (order 60 ms; see `LXMessage.validateStamp`), incurred
+                // regardless of `signatureValidated`. Reference has the identical property
+                // (LXMessage.py:288-289). This sits downstream of the router's `seen` dedup, so a
+                // replayed message does not repeat the work, but a flood of distinct messages pays it
+                // per message.
                 //
                 // Ticket divergence: reference also accepts `truncated_hash(ticket + message_id)` stamps
                 // (LXMessage.py:273-283, "inbound tickets"). ReTiCA has no tickets (Tier 3, unticketed).
                 // With enforcement off (default) the gap is invisible — both deliver. With enforcement on
                 // a ticket-holding peer reference accepts, we reject. Documented in `enforceDeliveryStamps`.
+                //
+                // The RESULT is carried on the message (`stampValid`/`stampChecked`), mirroring
+                // reference's assignment pair at LXMRouter.py:1865-1869 — not added as a delegate
+                // parameter, because reference keeps it on the object too (LXMessage.py:157-158) and the
+                // message already reaches the app via `.messageReceived`. A message arriving with
+                // `stampChecked == false` was never validated (no cost configured), which is a different
+                // statement from "validated and failed"; the app can tell those apart.
+                var delivered = message
                 if let cost = state.deliveryStampCost {
                     let stampValid = message.validateStamp(targetCost: cost)
+                    delivered = message.withStampValidation(valid: stampValid)
                     if !stampValid {
                         // Enforcement off (default): deliver anyway, matching reference's
                         // "allow anyway, since stamp enforcement is disabled" branch (LXMRouter.py:1878-1879).
@@ -521,10 +536,10 @@ public struct LXMFNode {
                         if state.enforceDeliveryStamps {
                             return .none    // drop — app receives nothing
                         }
-                        // fall through to deliver
+                        // fall through to deliver, flagged checked-and-invalid
                     }
                 }
-                return .send(.delegate(.messageReceived(message: message, signatureValidated: validated)))
+                return .send(.delegate(.messageReceived(message: delivered, signatureValidated: validated)))
 
             case let .router(.delegate(.deliveryFailed(hash))):
                 return .send(.delegate(.deliveryFailed(messageHash: hash)))

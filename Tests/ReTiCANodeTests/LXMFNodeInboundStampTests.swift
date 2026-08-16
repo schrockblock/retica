@@ -35,13 +35,22 @@ import ComposableArchitecture
 ///   derivation and one leading-zero-bit check (LXMessage.py:288-289). There is no ceiling needed here.
 /// - A nil `deliveryStampCost` means "no cost configured" — no validation is attempted.
 ///
-/// **Delegate signature kept unchanged.** Reference sets both `stamp_valid` and `stamp_checked` but
-/// `LXMFNode.Delegate.messageReceived(message:signatureValidated:)` carries one flag already consumed
-/// by `ReTiCaMsgr/AppFeature.swift:170` as `validated` for persisted Message rows. Adding a stamp
-/// parameter is a **breaking change** that requires updating the sibling project. Since stamp
-/// enforcement is handled entirely inside `LXMFNode` (drop on enforcement; deliver on lax), the app
-/// does not need per-message stamp status surfaced through the delegate to render correctly. This can
-/// be evolved if the app later needs to distinguish "checked and valid" from "never checked".
+/// **The result is carried on the message, not in the delegate signature** — mirroring reference,
+/// which stores `stamp_valid`/`stamp_checked` on the `LXMessage` object (LXMessage.py:157-158) and
+/// assigns them in `lxmf_delivery` (LXMRouter.py:1865-1869) rather than passing them anywhere. The
+/// message already reaches the app through `.delegate(.messageReceived(message:signatureValidated:))`,
+/// so surfacing the tri-state needed **no** delegate change and **no** sibling-project change.
+///
+/// An earlier revision of this file claimed a delegate parameter would have been a *breaking change*
+/// for ReTiCaMsgr and used that to justify not surfacing the result at all. That justification was
+/// wrong twice over and is recorded here rather than quietly deleted: (a) reference does not use a
+/// callback signature for this, so the premise was never the relevant question; (b) ReTiCaMsgr's
+/// reducer ends in a wildcard `case .node, .binding: return .none` (`AppFeature.swift:276`), so an
+/// additive `Delegate` case would have compiled unchanged anyway. The check that had been run was
+/// whether the *existing* case is consumed, which is a different question from whether an *additive*
+/// change compiles. The result of that error was a feature inert in every shipping configuration:
+/// with enforcement off (the default, and the only configuration any caller produces) the reducer
+/// emitted byte-identical output whether validation ran or not.
 ///
 /// **Ticket divergence (documented, not implemented):** Reference `validate_stamp`
 /// (LXMessage.py:273-283) accepts a stamp equal to `truncated_hash(ticket + message_id)` regardless
@@ -115,62 +124,71 @@ private func makeInboundStampStore(
 /// `if required_stamp_cost != None:` (LXMRouter.py:1862) gates the entire validation block.
 ///
 /// Anti-vacuity: `received` (not `skipReceivedActions`) is used so the test FAILS if the action
-/// is never emitted. The `LockIsolated<Bool>` flag records that the matching closure actually ran.
-@MainActor @Test func inboundStamp_noCostConfigured_messageIsDelivered() async {
+/// is never emitted. The `stampChecked == false` assertion is the one that distinguishes this from
+/// every other case — it fails if the cost gate is removed and validation runs unconditionally.
+@MainActor @Test func inboundStamp_noCostConfigured_messageIsDeliveredNeverChecked() async {
     let store = makeInboundStampStore(deliveryStampCost: nil)
     let message = messageWithNoStamp()
-    let deliveredHash = LockIsolated<Data?>(nil)
+    let got = LockIsolated<(hash: Data, checked: Bool, valid: Bool)?>(nil)
     await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
     await store.receive { action in
         if case let .delegate(.messageReceived(m, _)) = action {
-            deliveredHash.setValue(m.hash)
+            got.setValue((m.hash, m.stampChecked, m.stampValid))
             return true
         }
         return false
     }
-    #expect(deliveredHash.value == message.hash)
+    #expect(got.value?.hash == message.hash)
+    #expect(got.value?.checked == false)   // never checked — the tri-state's third leg
+    #expect(got.value?.valid == false)
 }
 
-/// Even a message with a valid stamp and no cost configured is delivered (stamp is irrelevant
-/// when no cost is set).
-@MainActor @Test func inboundStamp_noCostConfigured_stampedMessageIsDelivered() async {
+/// Even a message with a valid stamp and no cost configured is delivered, and is flagged
+/// **never checked** — not "valid". We did not verify that stamp, and saying we did would be a lie
+/// the app would render as a trust signal.
+@MainActor @Test func inboundStamp_noCostConfigured_stampedMessageIsDeliveredNeverChecked() async {
     let store = makeInboundStampStore(deliveryStampCost: nil)
     let message = await messageWithValidStamp(cost: 1)
-    let deliveredHash = LockIsolated<Data?>(nil)
+    let got = LockIsolated<(hash: Data, checked: Bool, valid: Bool)?>(nil)
     await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
     await store.receive { action in
         if case let .delegate(.messageReceived(m, _)) = action {
-            deliveredHash.setValue(m.hash)
+            got.setValue((m.hash, m.stampChecked, m.stampValid))
             return true
         }
         return false
     }
-    #expect(deliveredHash.value == message.hash)
+    #expect(got.value?.hash == message.hash)
+    #expect(got.value?.checked == false)
+    #expect(got.value?.valid == false)     // a genuinely-valid stamp we chose not to check
 }
 
 // MARK: - Cost configured + valid stamp → delivered
 
-/// With a configured cost, a message carrying a valid stamp is delivered. This is the happy path.
+/// With a configured cost, a message carrying a valid stamp is delivered and flagged
+/// **checked-and-valid**. This is the happy path, and the `stampValid == true` assertion is what
+/// makes it detect a removed or broken validation call — without it the test passed whether or not
+/// `validateStamp` ever ran.
 ///
 /// Anti-vacuity: the matching closure runs only when `.delegate(.messageReceived)` is emitted;
-/// `deliveredHash` stays nil if the message is dropped, causing the `#expect` to fail.
-@MainActor @Test func inboundStamp_costConfigured_validStamp_messageIsDelivered() async {
+/// `got` stays nil if the message is dropped, causing every `#expect` to fail.
+@MainActor @Test func inboundStamp_costConfigured_validStamp_messageIsDeliveredCheckedValid() async {
     let cost = 1
     let store = makeInboundStampStore(deliveryStampCost: cost, enforceDeliveryStamps: false)
     let message = await messageWithValidStamp(cost: cost)
-    let deliveredHash = LockIsolated<Data?>(nil)
-    let deliveredValidated = LockIsolated<Bool?>(nil)
+    let got = LockIsolated<(hash: Data, sigValidated: Bool, checked: Bool, valid: Bool)?>(nil)
     await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: true))))
     await store.receive { action in
         if case let .delegate(.messageReceived(m, v)) = action {
-            deliveredHash.setValue(m.hash)
-            deliveredValidated.setValue(v)
+            got.setValue((m.hash, v, m.stampChecked, m.stampValid))
             return true
         }
         return false
     }
-    #expect(deliveredHash.value == message.hash)
-    #expect(deliveredValidated.value == true)   // signatureValidated threads through unchanged
+    #expect(got.value?.hash == message.hash)
+    #expect(got.value?.sigValidated == true)   // signatureValidated threads through unchanged
+    #expect(got.value?.checked == true)
+    #expect(got.value?.valid == true)          // fails if validateStamp is stubbed false
 }
 
 // MARK: - Cost configured + invalid stamp + enforcement OFF → still delivered
@@ -189,39 +207,47 @@ private func makeInboundStampStore(
 ///
 /// An `enforceDeliveryStamps = false` guard that drops instead of delivers is the wrong inversion.
 ///
+/// The message is delivered flagged **checked-and-failed** — distinct from the never-checked case
+/// above. That distinction is the whole reason reference carries two booleans rather than one.
+///
 /// Anti-vacuity: the test ONLY passes if `.delegate(.messageReceived)` is emitted. If the code
-/// dropped the message, `store.receive` would time out or the `#expect` would fail.
-@MainActor @Test func inboundStamp_costConfigured_invalidStamp_enforcementOff_messageIsDelivered() async {
+/// dropped the message, `store.receive` would time out or the `#expect`s would fail on nil.
+@MainActor @Test func inboundStamp_costConfigured_invalidStamp_enforcementOff_messageIsDeliveredCheckedInvalid() async {
     let store = makeInboundStampStore(deliveryStampCost: 8, enforceDeliveryStamps: false)
     let message = messageWithInvalidStamp()
-    let delivered = LockIsolated<Bool>(false)
+    let got = LockIsolated<(checked: Bool, valid: Bool)?>(nil)
     await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
     await store.receive { action in
-        if case .delegate(.messageReceived) = action {
-            delivered.setValue(true)
+        if case let .delegate(.messageReceived(m, _)) = action {
+            got.setValue((m.stampChecked, m.stampValid))
             return true
         }
         return false
     }
-    #expect(delivered.value == true)
+    #expect(got.value?.checked == true)    // checked — NOT the never-checked state
+    #expect(got.value?.valid == false)
 }
 
 /// Same as above but with a nil stamp (absent, not just wrong bytes). Reference `validate_stamp`
 /// returns False immediately when `self.stamp == None` (LXMessage.py:285-286), so the absent-stamp
 /// path must not accidentally bypass the enforcement check in a way that drops the message.
-@MainActor @Test func inboundStamp_costConfigured_noStamp_enforcementOff_messageIsDelivered() async {
+///
+/// An absent stamp is `checked` too: we ran the check and it failed for want of a stamp. Reference
+/// sets `stamp_checked = True` on this branch as well (LXMRouter.py:1868-1869).
+@MainActor @Test func inboundStamp_costConfigured_noStamp_enforcementOff_messageIsDeliveredCheckedInvalid() async {
     let store = makeInboundStampStore(deliveryStampCost: 8, enforceDeliveryStamps: false)
     let message = messageWithNoStamp()
-    let delivered = LockIsolated<Bool>(false)
+    let got = LockIsolated<(checked: Bool, valid: Bool)?>(nil)
     await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
     await store.receive { action in
-        if case .delegate(.messageReceived) = action {
-            delivered.setValue(true)
+        if case let .delegate(.messageReceived(m, _)) = action {
+            got.setValue((m.stampChecked, m.stampValid))
             return true
         }
         return false
     }
-    #expect(delivered.value == true)
+    #expect(got.value?.checked == true)
+    #expect(got.value?.valid == false)
 }
 
 // MARK: - Cost configured + invalid stamp + enforcement ON → dropped
@@ -261,19 +287,74 @@ private func makeInboundStampStore(
 /// of "enforcement on" and "valid stamp" — it would be dropped by a naive "enforce means always
 /// drop" implementation.
 ///
-/// Anti-vacuity: same as other delivered tests — `deliveredHash` stays nil if dropped, failing `#expect`.
+/// Anti-vacuity: same as other delivered tests — `got` stays nil if dropped, failing every `#expect`.
 @MainActor @Test func inboundStamp_costConfigured_validStamp_enforcementOn_messageIsDelivered() async {
     let cost = 1
     let store = makeInboundStampStore(deliveryStampCost: cost, enforceDeliveryStamps: true)
     let message = await messageWithValidStamp(cost: cost)
-    let deliveredHash = LockIsolated<Data?>(nil)
+    let got = LockIsolated<(hash: Data, checked: Bool, valid: Bool)?>(nil)
     await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
     await store.receive { action in
         if case let .delegate(.messageReceived(m, _)) = action {
-            deliveredHash.setValue(m.hash)
+            got.setValue((m.hash, m.stampChecked, m.stampValid))
             return true
         }
         return false
     }
-    #expect(deliveredHash.value == message.hash)
+    #expect(got.value?.hash == message.hash)
+    #expect(got.value?.checked == true)
+    #expect(got.value?.valid == true)
+}
+
+// MARK: - The validation result must not disturb wire bytes or equality
+
+/// `withStampValidation` records a local conclusion; it must not change what the message *says*.
+///
+/// Three properties, each of which would break something real if violated:
+///  • `packed` byte-identical — the validation result is not a wire field. The cross-validation
+///    vectors (`lxMessageMatchesReferenceLXMF`) byte-compare against genuine lxmf 1.1.0 output and
+///    would fail if a 6th payload element or any other byte appeared.
+///  • `==` unaffected — following the `receivedBytes` precedent (see the `Equatable` conformance on
+///    `LXMessage`). A validated inbound message must still equal the constructed message it carries,
+///    or unrelated tests comparing received-to-expected start failing.
+///  • the message ID (`hash`) is untouched, so dedup and delivery correlation still work.
+///
+/// Anti-vacuity: the assertions compare a validated copy against the ORIGINAL, so a `withStampValidation`
+/// that silently returned `self` would pass the first three but fail the last two (`checked`/`valid`).
+@Test func withStampValidationChangesNoWireByteAndNoEquality() async {
+    let original = await messageWithValidStamp(cost: 1)
+    let validated = original.withStampValidation(valid: true)
+    let failed = original.withStampValidation(valid: false)
+
+    #expect(validated.packed == original.packed)      // no emitted byte changes
+    #expect(failed.packed == original.packed)
+    #expect(validated.hash == original.hash)          // message ID untouched
+    #expect(validated == original)                    // excluded from `==`, per receivedBytes precedent
+    #expect(failed == original)
+    #expect(validated == failed)                      // differing only in an excluded field
+
+    // ...but the flags themselves did change, so the copy is not a no-op.
+    #expect(original.stampChecked == false)
+    #expect(validated.stampChecked == true)
+    #expect(validated.stampValid == true)
+    #expect(failed.stampChecked == true)
+    #expect(failed.stampValid == false)
+}
+
+/// A message that came off the wire keeps its `receivedBytes` through validation, so `packed` still
+/// returns the sender's exact bytes and the signature still validates for any downstream hop.
+///
+/// This is the property that distinguishes `withStampValidation` from `withStamp`, which
+/// deliberately drops `receivedBytes` because it changes the payload.
+@Test func withStampValidationPreservesReceivedBytesSoSignatureStillValidates() async throws {
+    let sender = Identity()
+    let recipientDeliveryHash = Data(repeating: 0xBB, count: 16)
+    let built = LXMessage.create(source: sender, destinationHash: recipientDeliveryHash,
+                                 timestamp: 1700000000, title: Data("t".utf8), content: Data("c".utf8))
+    let onWire = try #require(LXMessage.unpack(built.packed))
+    #expect(onWire.validateSignature(source: sender))          // precondition
+
+    let validated = onWire.withStampValidation(valid: false)
+    #expect(validated.packed == onWire.packed)                 // sender's exact bytes retained
+    #expect(validated.validateSignature(source: sender))       // still verifiable downstream
 }

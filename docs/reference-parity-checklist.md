@@ -300,13 +300,25 @@ exactly the class Tier 1 just closed.*
       `lxmf.delivery` announce carries a cost ≤ `maxDeliveryStampCost = 20`; the search is
       cancellable via `CancelID.deliveryStamp`; a cancelled or refused search sends unstamped
       rather than dropping. *Task 2 (2026-08-16 slice)*: `LXMFNode` validates the stamp on every
-      inbound `messageDelivered` when `State.deliveryStampCost != nil`; `State.enforceDeliveryStamps`
-      (default `false`, matching reference `LXMRouter.__init__` LXMRouter.py:99) gates the drop.
-      With enforcement on, an invalid/absent stamp is dropped (`return .none`), matching reference
-      `lxmf_delivery`'s `return False` (LXMRouter.py:1877). With enforcement off (default), the
-      message is delivered, matching reference's else-branch (LXMRouter.py:1878-1879). 980 tests,
-      zero known-open. **Remaining gap**: `enforceDeliveryStamps` defaults false and no caller
-      currently sets it to true; enabling it exposes the ticket divergence (see Tier 3 tickets item).
+      inbound `messageDelivered` when `State.deliveryStampCost != nil`, and carries the outcome on
+      the message as `LXMessage.stampValid`/`stampChecked` — mirroring reference, which stores the
+      same pair on the object (`LXMessage.py:157-158`) and assigns it at `LXMRouter.py:1865-1869`.
+      `State.enforceDeliveryStamps` (default `false`, matching `LXMRouter.__init__` LXMRouter.py:99)
+      gates the drop: with enforcement on an invalid/absent stamp is dropped (`return .none`,
+      reference `return False` at LXMRouter.py:1877); with enforcement off the message is delivered
+      flagged checked-and-invalid (reference's else-branch, LXMRouter.py:1878-1879).
+
+      **Scope of this tick, stated precisely.** What is wired is *validation and reporting*: every
+      inbound message now arrives carrying an honest tri-state (never-checked / checked-valid /
+      checked-invalid) that an app can render. What **no shipping configuration exercises** is
+      *enforcement*: `enforceDeliveryStamps` defaults false and **no caller in this repo or in
+      ReTiCaMsgr sets it true**, so the drop branch is reachable only from tests today. Enabling it
+      also exposes the ticket divergence (see the Tier 3 tickets item) — reference accepts
+      ticket-backed stamps that we reject.
+
+      982 tests; **zero known-open *conversions*** (this checklist's gate metric — not a claim that
+      the suite carries no known-issue annotations: `TransportTests.swift:3943` has a structural
+      `skipInFlightEffects` known issue unrelated to this work).
 - [x] **`setNodeMode(false)` never re-announces** — `LXMFServiceNode.swift` `setNodeMode` returned
       `.none` on disable, so the last announce on the network still said `nodeState: true`. Reference
       `disable_propagation` (verified against stock LXMF 1.1.0, `LXMRouter.py:692-694`) sets

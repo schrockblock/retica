@@ -28,9 +28,42 @@ public struct LXMessage: Equatable, Sendable {
     /// Excluded from `==` on purpose: see the `Equatable` conformance below.
     public let receivedBytes: Data?
 
-    /// Compares message content only. `receivedBytes` is deliberately excluded — it is a cache of how
-    /// this message arrived, not part of what it says, and including it would make a round-tripped
-    /// message unequal to the one it round-tripped from.
+    /// Whether the delivery stamp was found valid. **Meaningless unless `stampChecked` is true** —
+    /// read the two together (see `stampChecked` for the tri-state).
+    ///
+    /// Mirrors reference `self.stamp_valid = False` (lxmf 1.1.0 `LXMessage.py:157`), set by
+    /// `LXMRouter.lxmf_delivery` at `LXMRouter.py:1865/1868`. **Not a wire field** — it is a local
+    /// validation result, never encoded by `packed` and never parsed by `unpack`, exactly as in
+    /// reference where the pair lives on the object and never enters `pack()`.
+    public let stampValid: Bool
+
+    /// Whether stamp validation was actually attempted. False when no `deliveryStampCost` is
+    /// configured, so nothing was checked.
+    ///
+    /// Mirrors reference `self.stamp_checked = False` (lxmf 1.1.0 `LXMessage.py:158`), set to True on
+    /// **both** branches of `LXMRouter.py:1865-1869`. Together with `stampValid` this preserves the
+    /// three states reference exists to distinguish, which a single boolean cannot:
+    ///
+    /// | `stampChecked` | `stampValid` | meaning                                       |
+    /// |----------------|--------------|-----------------------------------------------|
+    /// | `false`        | `false`      | **never checked** — no cost configured        |
+    /// | `true`         | `true`       | checked, stamp valid                          |
+    /// | `true`         | `false`      | checked, stamp invalid or absent              |
+    ///
+    /// Collapsing the last two into one boolean would report an unchecked message as having failed.
+    public let stampChecked: Bool
+
+    /// Compares message content only. `receivedBytes`, `stampValid` and `stampChecked` are
+    /// deliberately excluded.
+    ///
+    /// `receivedBytes` is a cache of how this message arrived, not part of what it says, and
+    /// including it would make a round-tripped message unequal to the one it round-tripped from.
+    /// **`stampValid`/`stampChecked` are excluded for the same reason and by the same precedent**:
+    /// they record what *we* concluded about the message, not what the message *says*. Two messages
+    /// with identical content are equal whether or not one of them has been through validation.
+    /// Including them would make a validated inbound message unequal to the constructed message it
+    /// carries, and the ripple would land in unrelated tests that compare a received message to an
+    /// expected one.
     public static func == (lhs: LXMessage, rhs: LXMessage) -> Bool {
         lhs.destinationHash == rhs.destinationHash && lhs.sourceHash == rhs.sourceHash
             && lhs.timestamp == rhs.timestamp && lhs.title == rhs.title
@@ -39,10 +72,12 @@ public struct LXMessage: Equatable, Sendable {
     }
 
     // Explicit memberwise init so `receivedBytes` defaults to `nil` and no existing call site needs
-    // to change. Only `unpack` passes a non-nil value.
+    // to change. Only `unpack` passes a non-nil value. `stampValid`/`stampChecked` default to false
+    // (= "never checked"), matching reference's initialisers at `LXMessage.py:157-158`; only
+    // `withStampValidation` passes anything else.
     init(destinationHash: Data, sourceHash: Data, timestamp: Double, title: Data, content: Data,
          hash: Data, signature: Data, fields: [MsgPackValue.IntPair], stamp: Data?,
-         receivedBytes: Data? = nil) {
+         receivedBytes: Data? = nil, stampValid: Bool = false, stampChecked: Bool = false) {
         self.destinationHash = destinationHash
         self.sourceHash = sourceHash
         self.timestamp = timestamp
@@ -53,6 +88,8 @@ public struct LXMessage: Equatable, Sendable {
         self.fields = fields
         self.stamp = stamp
         self.receivedBytes = receivedBytes
+        self.stampValid = stampValid
+        self.stampChecked = stampChecked
     }
 
     /// LXMF app name and delivery aspect. A message's source/destination hashes are the hashes of the
@@ -117,10 +154,38 @@ public struct LXMessage: Equatable, Sendable {
     }
 
     /// Validate the attached stamp against `targetCost` (workblock derived from this message's hash).
+    ///
+    /// **Not free, despite being O(1) in `targetCost`.** The cost parameter only sets how many
+    /// leading zero bits are required of a single hash; the expensive part is deriving the workblock,
+    /// which is a fixed ~3000 HKDF rounds producing 768 KB (`LXStamper.stampWorkblock`) on every
+    /// call, at any cost. Order ~60 ms, extrapolated from the ~21 ms measured for the 1000-round
+    /// (256 KB) propagation workblock at `LXStamper.swift:22-23`. Reference has the identical
+    /// property (`LXMessage.py:288-289` derives the workblock then checks bits), so this is parity,
+    /// not a regression — but anyone sizing an inbound flood should budget it rather than assume a
+    /// cheap bit-test.
     public func validateStamp(targetCost: Int) -> Bool {
         guard let stamp else { return false }
         return LXStamper.stampValid(stamp: stamp, targetCost: targetCost,
                                     workblock: LXStamper.stampWorkblock(material: hash))
+    }
+
+    /// A copy carrying the outcome of a stamp validation: `stampChecked` becomes true and
+    /// `stampValid` records the result.
+    ///
+    /// Mirrors reference's assignment pair in `LXMRouter.lxmf_delivery` (lxmf 1.1.0,
+    /// `LXMRouter.py:1865-1869`), which sets `stamp_checked = True` on **both** branches and varies
+    /// only `stamp_valid`. Reference mutates the message in place; we return a copy because
+    /// `LXMessage` is a value type.
+    ///
+    /// **`receivedBytes` IS threaded through here**, unlike in `withStamp`. The distinction is that
+    /// `withStamp` changes what the message *is* (a new payload element, so the retained wire bytes
+    /// would be stale and `packed` must re-encode), whereas this records what we *concluded about*
+    /// it — the wire form is unchanged, so dropping `receivedBytes` would force a re-encode of a
+    /// received message and could invalidate its signature for any downstream hop.
+    public func withStampValidation(valid: Bool) -> LXMessage {
+        LXMessage(destinationHash: destinationHash, sourceHash: sourceHash, timestamp: timestamp,
+                  title: title, content: content, hash: hash, signature: signature, fields: fields,
+                  stamp: stamp, receivedBytes: receivedBytes, stampValid: valid, stampChecked: true)
     }
 
     /// Parse wire bytes back into a message (structure + recomputed hash). The payload is a 4-element
