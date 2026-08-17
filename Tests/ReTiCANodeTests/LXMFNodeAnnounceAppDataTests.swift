@@ -185,6 +185,72 @@ private func makeAnnounceStore(
     #expect(parsed.stampCost == 10)
 }
 
+// MARK: - The stamp cost is range-sanitised at the setter
+
+/// The setter stores a cost only in **1...254** — reference's `set_inbound_stamp_cost` range
+/// (LXMRouter.py:378-392, LXMF 1.1.0): `< 1` becomes None, `< 255` is stored, `>= 255` is rejected.
+///
+/// This matters because `State.deliveryStampCost` is what the *inbound* half validates against
+/// (`LXMFNode.swift`, the `messageDelivered` branch), while the *announce* applies its own
+/// `> 0 && < 255` gate (`LXMFAnnounceData.swift:113`). An unsanitised setter let the two disagree:
+/// see `lxmfNodeDoesNotEnforceStampsAfterACostOfZero` and
+/// `lxmfNodeDoesNotReportAStampValidAfterANegativeCost` for the two measured consequences.
+///
+/// Anti-vacuity: every boundary is asserted individually and each of 0 / 255 is preceded by nil,
+/// so a setter that stored the raw value fails on the 0 case, the 255 case, or both. The 1 and 254
+/// cases fail any over-eager sanitiser that clamped the range too tightly.
+@MainActor @Test func setDisplayNameStoresOnlyStampCostsInTheReferenceRange() async {
+    let store = makeAnnounceStore(identity: Identity())
+
+    await store.send(.setDisplayName(nil, stampCost: 1))
+    #expect(store.state.deliveryStampCost == 1)          // lower bound: accepted
+    await store.send(.setDisplayName(nil, stampCost: 254))
+    #expect(store.state.deliveryStampCost == 254)        // upper bound: accepted
+
+    await store.send(.setDisplayName(nil, stampCost: nil))
+    #expect(store.state.deliveryStampCost == nil)        // clean slate
+    await store.send(.setDisplayName(nil, stampCost: 0))
+    #expect(store.state.deliveryStampCost == nil)        // < 1 → None
+    await store.send(.setDisplayName(nil, stampCost: -1))
+    #expect(store.state.deliveryStampCost == nil)        // < 1 → None
+    await store.send(.setDisplayName(nil, stampCost: 255))
+    #expect(store.state.deliveryStampCost == nil)        // >= 255 → rejected, nothing to keep
+}
+
+/// A rejected (`>= 255`) cost leaves the previously configured cost in place — and the next
+/// announce still carries that previous cost.
+///
+/// This is reference's exact shape: `set_inbound_stamp_cost` returns False on `>= 255` **without
+/// assigning** (LXMRouter.py:389-390, LXMF 1.1.0), so the destination keeps the cost it had.
+/// Clearing instead would let one out-of-range settings value silently downgrade a node that had
+/// deliberately configured a cost.
+///
+/// Anti-vacuity: asserts on the announce's `appData` bytes as well as on state. Without the setter
+/// sanitisation, 255 is stored and `LXMFAnnounceData.pack`'s own `> 0 && < 255` gate emits null —
+/// so the parsed cost would be nil and both assertions would fail.
+@MainActor @Test func setDisplayNameKeepsThePreviousStampCostWhenANewOneIsRejected() async throws {
+    let store = makeAnnounceStore(identity: Identity())
+    await store.send(.registerDelivery)
+    await store.skipReceivedActions(strict: false)
+
+    await store.send(.setDisplayName("Frank", stampCost: 12))
+    await store.send(.setDisplayName("Frank", stampCost: 255))
+    #expect(store.state.deliveryStampCost == 12)
+
+    let capturedAppData = LockIsolated<Data?>(nil)
+    await store.send(.announceDelivery)
+    await store.receive { action in
+        if case let .endpoint(.announce(_, appData)) = action {
+            capturedAppData.setValue(appData)
+            return true
+        }
+        return false
+    }
+    let blob = try #require(capturedAppData.value, ".announceDelivery must emit app data")
+    let parsed = try #require(LXMFAnnounceData.parse(blob))
+    #expect(parsed.stampCost == 12)
+}
+
 /// `.announceDelivery` before `registerDelivery` must NOT emit an announce (there is no registered
 /// delivery destination to announce on).
 ///

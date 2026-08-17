@@ -324,6 +324,89 @@ private func makeInboundStampStore(
     #expect(got.value?.valid == true)
 }
 
+// MARK: - Out-of-range configured costs never reach the validator
+
+/// A configured cost of **0** must not enforce anything. The announce already advertises "no cost
+/// required" for 0 (`LXMFAnnounceData.pack`'s `> 0 && < 255` gate, LXMFAnnounceData.swift:113), so
+/// enforcing on 0 meant advertising one contract and applying another: `validateStamp` returns false
+/// for an *absent* stamp at any cost, so with enforcement on we dropped every message from every
+/// conforming peer — the whole inbox, silently.
+///
+/// Fixed at the setter, matching reference `set_inbound_stamp_cost`'s `stamp_cost < 1 → None`
+/// (LXMRouter.py:385-386, LXMF 1.1.0).
+///
+/// **The cost must be set through the ACTION, not the state helper** — the sanitisation lives in the
+/// setter, so seeding `State.deliveryStampCost` directly would test nothing.
+///
+/// Anti-vacuity: enforcement is ON and the message carries no stamp, so the pre-fix behaviour was a
+/// drop; `store.receive` fails (rather than silently skipping) if the message never arrives.
+@MainActor @Test func lxmfNodeDoesNotEnforceStampsAfterACostOfZero() async {
+    let store = makeInboundStampStore(deliveryStampCost: nil, enforceDeliveryStamps: true)
+    await store.send(.setDisplayName(nil, stampCost: 0))
+    #expect(store.state.deliveryStampCost == nil)
+
+    let message = messageWithNoStamp()
+    let got = LockIsolated<(hash: Data, checked: Bool)?>(nil)
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.receive { action in
+        if case let .delegate(.messageReceived(m, _)) = action {
+            got.setValue((m.hash, m.stampChecked))
+            return true
+        }
+        return false
+    }
+    #expect(got.value?.hash == message.hash)     // delivered, not dropped
+    #expect(got.value?.checked == false)         // and never checked — no cost is configured
+}
+
+/// A configured cost of **-1** must not make garbage validate. `LXStamper.stampValid` is
+/// `stampValue >= targetCost` (LXStamper.swift:57-58) and a leading-zero-bit count is never
+/// negative, so at -1 *every* stamp passes: the app was told `stampValid == true` for an all-0xFF
+/// stamp. Of everything a bad cost can do, reporting a forged stamp as verified is the worst,
+/// because the app renders it as a trust signal.
+///
+/// Fixed at the setter (`< 1 → None`, LXMRouter.py:385-386, LXMF 1.1.0), so no validation runs at
+/// all and the message arrives flagged never-checked.
+///
+/// Anti-vacuity: asserts BOTH flags. `checked == false` fails if the sanitisation is removed
+/// (validation would run), and `valid == false` fails if it is removed in the specific way that
+/// matters (the forged stamp reported valid).
+@MainActor @Test func lxmfNodeDoesNotReportAStampValidAfterANegativeCost() async {
+    let store = makeInboundStampStore(deliveryStampCost: nil, enforceDeliveryStamps: false)
+    await store.send(.setDisplayName(nil, stampCost: -1))
+    #expect(store.state.deliveryStampCost == nil)
+
+    let message = messageWithInvalidStamp(atCost: 8)
+    let got = LockIsolated<(checked: Bool, valid: Bool)?>(nil)
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.receive { action in
+        if case let .delegate(.messageReceived(m, _)) = action {
+            got.setValue((m.stampChecked, m.stampValid))
+            return true
+        }
+        return false
+    }
+    #expect(got.value?.checked == false)
+    #expect(got.value?.valid == false)           // the forged stamp is NOT reported verified
+}
+
+/// The positive control for the two tests above: a cost set through the same action, in range, is
+/// stored and IS enforced. Without this, a sanitiser that simply cleared the field on every call
+/// would satisfy both of them.
+///
+/// Anti-vacuity: enforcement is on and the stamp is invalid, so the assertion is a DROP — caught by
+/// flipping exhaustivity `.on` before teardown, which is what makes a spurious delivery fail.
+@MainActor @Test func lxmfNodeEnforcesAStampCostSetThroughTheSetter() async {
+    let store = makeInboundStampStore(deliveryStampCost: nil, enforceDeliveryStamps: true)
+    await store.send(.setDisplayName(nil, stampCost: 8))
+    #expect(store.state.deliveryStampCost == 8)
+
+    await store.send(.router(.delegate(.messageDelivered(message: messageWithInvalidStamp(atCost: 8),
+                                                         signatureValidated: false))))
+    store.exhaustivity = .on
+    await store.finish(timeout: .seconds(2))
+}
+
 // MARK: - The validation result must not disturb wire bytes or equality
 
 /// `withStampValidation` records a local conclusion; it must not change what the message *says*.

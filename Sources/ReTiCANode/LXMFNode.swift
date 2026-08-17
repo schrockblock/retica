@@ -316,7 +316,37 @@ public struct LXMFNode {
                 // action. Emitting an announce from here made an unthrottled network broadcast the
                 // side effect of a state write, which a per-keystroke binding turns into a flood.
                 state.displayName = name
-                state.deliveryStampCost = stampCost
+                // Range-sanitise the cost HERE, because this is the only write to the field that the
+                // whole inbound half keys on. Reference does it in the same place —
+                // `set_inbound_stamp_cost` (LXMRouter.py:378-392, LXMF 1.1.0):
+                //
+                //     if stamp_cost == None:  stamp_cost = None; return True
+                //     elif type(stamp_cost) == int:
+                //         if   stamp_cost < 1:   stamp_cost = None
+                //         elif stamp_cost < 255: stamp_cost = stamp_cost
+                //         else:                  return False      # rejected, previous value KEPT
+                //
+                // Storing the raw value made the announce and the enforcement disagree, because
+                // `LXMFAnnounceData.pack` already applies reference's `> 0 and < 255` emit gate
+                // (LXMFAnnounceData.swift:113). Measured, on this reducer:
+                //   • cost 0  — announced as "no cost required", yet `validateStamp(targetCost: 0)`
+                //     is reached for every inbound message and returns false for an ABSENT stamp
+                //     (`guard let stamp else { return false }`, LXMessage.swift:167), so with
+                //     enforcement on we dropped every message from every conforming peer.
+                //   • cost -1 — `stampValid` is `stampValue >= targetCost` (LXStamper.swift:57-58)
+                //     and a bit count is never negative, so an all-0xFF stamp validated. We reported
+                //     `stampValid == true` to the app: a false trust signal, the worst outcome here.
+                //
+                // The `>= 255` case keeps the previous cost rather than clearing it, exactly as
+                // reference's `return False` leaves `delivery_destination.stamp_cost` untouched.
+                // Silently disabling a configured cost because a later call was out of range would
+                // be a downgrade an attacker-influenced settings value could trigger.
+                switch stampCost {
+                case .none:                             state.deliveryStampCost = nil
+                case let .some(c) where c < 1:          state.deliveryStampCost = nil
+                case let .some(c) where c < 255:        state.deliveryStampCost = c
+                default:                                break    // rejected; previous value kept
+                }
                 return .none
 
             case .announceDelivery:
