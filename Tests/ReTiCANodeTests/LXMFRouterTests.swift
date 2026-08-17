@@ -1661,32 +1661,10 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 /// NOT be suppressed, and the duplicateDropped assertion would fail.
 @Test @MainActor func routerRehydratingOverCapacityKeepsNewestEvictsOldest() async {
     let capacity = 10_000
-    // Build capacity+1 distinct hashes. Use index-derived 32-byte blobs so each is unique.
-    // Index 0 is "oldest" (will be evicted); index capacity is "newest" (must be retained).
-    var hashes: [Data] = (0...capacity).map { i in
-        var d = Data(count: 32)
-        d[0] = UInt8((i >> 24) & 0xFF)
-        d[1] = UInt8((i >> 16) & 0xFF)
-        d[2] = UInt8((i >> 8)  & 0xFF)
-        d[3] = UInt8(i & 0xFF)
-        return d
-    }
-    let oldestHash = hashes[0]         // will be evicted — must be delivered as new
-    let newestHash = hashes[capacity]  // must remain — must be dropped as duplicate
-
-    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
-    store.exhaustivity = .off
-    // Supply oldest-first, matching the app's ORDER BY storedAt ordering.
-    await store.send(.rehydrateDedup(seenHashes: hashes, downloadedTransientIds: []))
-
-    // Build a minimal message whose .hash equals newestHash to probe whether it is seen.
-    // Because we can't construct a real LXMessage with an arbitrary hash, use a different approach:
-    // we seed the seen set directly and then verify via the .received path by injecting a real
-    // LXMessage and separately inserting the message's hash into our rehydration payload.
-    // Simplest approach: probe the two boundary hashes via their effect on `.received`.
-
-    // Probe newest: construct a real message, rehydrate its hash, then send the message.
-    // We do this with a fresh store so the over-capacity batch doesn't interfere.
+    // The two boundary hashes have to belong to REAL messages, because the only way to observe
+    // whether a hash is in `seen` is to receive that message and watch for duplicateDropped vs
+    // messageDelivered — `seen` is not public. So the batch is built around two real messages with
+    // synthetic fillers between them, rather than from synthetic hashes alone.
     let sender = Identity()
     let newestMsg = makeMessage(source: sender, content: "newest")
     let oldestMsg = makeMessage(source: sender, content: "oldest")
