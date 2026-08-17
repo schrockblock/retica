@@ -425,14 +425,19 @@ exactly the class Tier 1 just closed.*
 
       - **1 failing test, `pairedModePublishesWithEncryptionAndEncryptedReadPerms`**
         (`Tests/ReTiCAInterfacesTests/FCBDriverAdapterTests.swift:183`, 2 issues at `:191` and
-        `:193`) — the FCB BLE driver adapter, an unrelated target with no LXMF dependency. Measured:
-        it **passes in isolation** (`--filter pairedModePublishes…`, 0.21 s) and **passes with its
-        whole file** (`--filter FCBDriverAdapterTests`, 16/16), and fails only under the full
-        parallel run — where it failed on **every** full run attempted, including one at base
+        `:193`) — the FCB BLE driver adapter, an unrelated target with no LXMF dependency.
+        **Measured over five full runs: it failed in four and passed in the fifth.** It also
+        **passes in isolation** (`--filter pairedModePublishes…`, 0.21 s) and **passes with its whole
+        file** (`--filter FCBDriverAdapterTests`, 16/16). One of the four failures was at base
         `57beaa6` with the delivery-stamp work stashed (982 tests, same two issues, same known
-        issue). So it is load- or scheduling-sensitive rather than randomly flaky, and it is not a
-        regression from any LXMF change; calling it "a genuine intermittent" was close enough to be
-        useful and not precise enough to act on.
+        issue), so it is **not** a regression from any LXMF change.
+        So: a genuine intermittent, strongly correlated with full-suite load — which is what this
+        line said before a branch-review pass had it as "load-sensitive rather than randomly flaky,
+        fails on every full run". That sharpening was written after three failing runs and no
+        passing one, and the fifth run falsified it within the hour. Recorded rather than quietly
+        edited, because it is the same failure mode as the known-issue paragraph above: a claim
+        stated wider than the evidence that produced it. **Do not re-sharpen this without a run
+        count.**
 
       A run whose only failure is that FCB test is a green run for this checklist's purposes.
 - [x] **`setNodeMode(false)` never re-announces** — `LXMFServiceNode.swift` `setNodeMode` returned
