@@ -1584,3 +1584,145 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.pendingDeliveries[msg.hash] == nil)           // resolved → retry cancelled
     #expect(store.state.linkResourceInFlight[linkID] == nil)
 }
+
+// MARK: - Dedup rehydration (Task 1: LXMFRouter dedup survives restart)
+
+/// A hash rehydrated via `.rehydrateDedup` is treated as already-seen: when a message with that hash
+/// arrives it is DROPPED as a duplicate (delegating `.duplicateDropped`), not delivered again.
+/// Vacuity check: would this assertion fail if rehydration did nothing? YES — without rehydration
+/// the message would be delivered and we would receive `.messageDelivered`, not `.duplicateDropped`.
+@Test @MainActor func routerRehydratedHashDropsAsDuplicate() async {
+    let sender = Identity()
+    let msg = makeMessage(source: sender)
+    // Rehydrate: supply msg.hash as a previously-seen delivery. The hash is the raw 32-byte ID
+    // as stored by the app, not a pre-digested form — rehydration inserts through the same RingSet
+    // path as a live receive.
+    var initial = LXMFRouter.State()
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.rehydrateDedup(seenHashes: [msg.hash], downloadedTransientIds: []))
+    // Now "receive" the same message. It should be dropped as a duplicate, not delivered.
+    await store.send(.received(method: .opportunistic, destinationHash: msg.destinationHash,
+                               data: msg.opportunisticPayload))
+    await store.receive { action in
+        if case let .delegate(.duplicateDropped(h)) = action {
+            #expect(h == msg.hash)
+            return true
+        }
+        return false
+    }
+    // Sanity: a different message through the same store IS delivered (the ring is not universally full).
+    let other = makeMessage(source: sender, content: "other message")
+    await store.send(.received(method: .opportunistic, destinationHash: other.destinationHash,
+                               data: other.opportunisticPayload))
+    await store.receive { if case .delegate(.messageDelivered) = $0 { return true }; return false }
+}
+
+/// A transient ID rehydrated via `.rehydrateDedup` appears in the `haves` set on the next PN offer,
+/// NOT in `wants` — so the PN is told to purge it rather than the client re-downloading it.
+/// Vacuity check: would this assertion fail if rehydration did nothing? YES — without rehydration
+/// `downloadedTransientIds` stays empty and the ID would appear in `wants`, not `haves`.
+@Test @MainActor func routerRehydratedTransientIdIsNotRerequested() async {
+    let pn = Data(repeating: 0xBB, count: 16)
+    let linkID = Data(repeating: 0xC0, count: 16)
+    let alreadyHeld = Data(repeating: 0x44, count: 32)
+    let newId = Data(repeating: 0x55, count: 32)
+    var initial = LXMFRouter.State()
+    initial.outboundPropagationNode = pn
+    initial.directLinks[pn] = .active(linkID: linkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    // Rehydrate: alreadyHeld was downloaded in a previous session.
+    await store.send(.rehydrateDedup(seenHashes: [], downloadedTransientIds: [alreadyHeld]))
+    // PN offers alreadyHeld + a new ID.
+    await store.send(.offeredMessageList(transientIds: [alreadyHeld, newId]))
+    await store.receive { action in
+        if case let .delegate(.requestMessages(lid, wants, haves)) = action {
+            #expect(lid == linkID)
+            // alreadyHeld must appear in haves (tell PN to purge), not wants (re-download).
+            #expect(haves == [alreadyHeld], "rehydrated ID must be in haves, not wants")
+            #expect(wants == [newId], "only genuinely new IDs should be wanted")
+            return true
+        }
+        return false
+    }
+}
+
+/// Rehydrating MORE than RingSet's capacity (10 000) keeps the NEWEST hashes and evicts the oldest,
+/// matching the live insert order. The newest hash must be seen (duplicate suppressed); the oldest
+/// hash must be gone (treated as new and delivered).
+///
+/// Caller contract: supply hashes oldest-first (ascending storedAt, matching ORDER BY in the app's
+/// query), so that eviction during rehydration is deterministic across launches.
+///
+/// Vacuity check for the eviction assertion: if rehydration kept all hashes (no eviction), the old
+/// hash would also be suppressed, and the delivery assertion would fail.
+/// Vacuity check for the newest-kept assertion: if rehydration did nothing, the newest hash would
+/// NOT be suppressed, and the duplicateDropped assertion would fail.
+@Test @MainActor func routerRehydratingOverCapacityKeepsNewestEvictsOldest() async {
+    let capacity = 10_000
+    // Build capacity+1 distinct hashes. Use index-derived 32-byte blobs so each is unique.
+    // Index 0 is "oldest" (will be evicted); index capacity is "newest" (must be retained).
+    var hashes: [Data] = (0...capacity).map { i in
+        var d = Data(count: 32)
+        d[0] = UInt8((i >> 24) & 0xFF)
+        d[1] = UInt8((i >> 16) & 0xFF)
+        d[2] = UInt8((i >> 8)  & 0xFF)
+        d[3] = UInt8(i & 0xFF)
+        return d
+    }
+    let oldestHash = hashes[0]         // will be evicted — must be delivered as new
+    let newestHash = hashes[capacity]  // must remain — must be dropped as duplicate
+
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store.exhaustivity = .off
+    // Supply oldest-first, matching the app's ORDER BY storedAt ordering.
+    await store.send(.rehydrateDedup(seenHashes: hashes, downloadedTransientIds: []))
+
+    // Build a minimal message whose .hash equals newestHash to probe whether it is seen.
+    // Because we can't construct a real LXMessage with an arbitrary hash, use a different approach:
+    // we seed the seen set directly and then verify via the .received path by injecting a real
+    // LXMessage and separately inserting the message's hash into our rehydration payload.
+    // Simplest approach: probe the two boundary hashes via their effect on `.received`.
+
+    // Probe newest: construct a real message, rehydrate its hash, then send the message.
+    // We do this with a fresh store so the over-capacity batch doesn't interfere.
+    let sender = Identity()
+    let newestMsg = makeMessage(source: sender, content: "newest")
+    let oldestMsg = makeMessage(source: sender, content: "oldest")
+
+    // Over-capacity batch: oldestMsg.hash first, then capacity-1 fillers, then newestMsg.hash last.
+    var batch: [Data] = [oldestMsg.hash]
+    batch += (0..<(capacity - 1)).map { i in
+        var d = Data(count: 32)
+        d[0] = 0xFF; d[1] = UInt8((i >> 16) & 0xFF); d[2] = UInt8((i >> 8) & 0xFF); d[3] = UInt8(i & 0xFF)
+        return d
+    }
+    batch.append(newestMsg.hash)
+    #expect(batch.count == capacity + 1)
+
+    let store2 = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
+    store2.exhaustivity = .off
+    await store2.send(.rehydrateDedup(seenHashes: batch, downloadedTransientIds: []))
+
+    // newestMsg.hash was at the tail — it survives eviction — receiving it must drop as duplicate.
+    await store2.send(.received(method: .opportunistic, destinationHash: newestMsg.destinationHash,
+                                data: newestMsg.opportunisticPayload))
+    await store2.receive { action in
+        if case let .delegate(.duplicateDropped(h)) = action {
+            #expect(h == newestMsg.hash, "newest hash must survive the over-capacity rehydration")
+            return true
+        }
+        return false
+    }
+
+    // oldestMsg.hash was at the head — it was evicted — receiving it must deliver as new.
+    await store2.send(.received(method: .opportunistic, destinationHash: oldestMsg.destinationHash,
+                                data: oldestMsg.opportunisticPayload))
+    await store2.receive { action in
+        if case .delegate(.messageDelivered) = action {
+            return true
+        }
+        return false
+    }
+}

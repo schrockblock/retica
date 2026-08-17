@@ -109,6 +109,26 @@ public struct LXMFRouter {
     public struct PropagationItem: Equatable { public var messageHash: Data; public var propagationPacked: Data }
 
     public enum Action: Equatable {
+        /// Restore dedup state from a previous session so a cold-start does not re-deliver messages
+        /// the router already processed, and does not re-request transient IDs already downloaded
+        /// from a propagation node.
+        ///
+        /// **`seenHashes` — ordering is load-bearing.**
+        /// Supply hashes **oldest-first** (ascending `storedAt`, matching the app's `ORDER BY storedAt`
+        /// query). `seen` is a bounded `RingSet(capacity: 10_000)`: inserting more entries than the
+        /// capacity evicts the oldest ones. If entries are supplied newest-first the wrong 10 000 are
+        /// retained — the newest are evicted and the oldest survive, which is the opposite of what is
+        /// wanted. Oldest-first ensures that eviction during rehydration matches what would have
+        /// happened had those inserts been live.
+        ///
+        /// **`downloadedTransientIds` — unbounded growth is known, accepted, and deliberate.**
+        /// This set grows without bound: every transient ID ever downloaded from a propagation node
+        /// accumulates here. A cap would trade disk space against re-downloading old messages from the
+        /// PN (any evicted ID would look "new" again on the next offer), and there is no field data yet
+        /// to price that trade. The decision is deferred until real usage reveals how large the set
+        /// grows in practice. Revisit trigger: a user report that the table is growing uncomfortably
+        /// large, or operational data showing a representative steady-state size.
+        case rehydrateDedup(seenHashes: [Data], downloadedTransientIds: [Data])
         case learnedIdentity(destinationHash: Data, identity: Identity)
         case received(method: DeliveryMethod, destinationHash: Data, data: Data)
         case send(message: LXMessage, desiredMethod: DeliveryMethod)
@@ -302,6 +322,15 @@ public struct LXMFRouter {
                 return .none
             }
             switch action {
+            case let .rehydrateDedup(seenHashes, transientIds):
+                // Insert hashes one by one through the RingSet's normal insert path.
+                // Caller must supply oldest-first: the RingSet evicts at capacity, so insertion order
+                // determines which hashes survive. Oldest-first ensures the newest 10 000 are retained,
+                // matching what would have happened had the same inserts been live.
+                for hash in seenHashes { state.seen.insert(hash) }
+                state.downloadedTransientIds.formUnion(transientIds)
+                return .none
+
             case let .learnedIdentity(destinationHash, identity):
                 state.knownIdentities[destinationHash] = identity
                 return .none
