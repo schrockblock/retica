@@ -89,11 +89,29 @@ private func messageWithNoStamp() -> LXMessage {
                             timestamp: 1700000000, title: Data("t".utf8), content: Data("c".utf8))
 }
 
-/// A message with a stamp that will fail validation (all-0xFF bytes, astronomically unlikely to be valid
-/// at any realistic cost).
-private func messageWithInvalidStamp() -> LXMessage {
-    let base = messageWithNoStamp()
-    return base.withStamp(Data(repeating: 0xFF, count: LXStamper.stampSize))
+/// A message carrying a stamp that is **deterministically** invalid at `cost`.
+///
+/// **The seeded identity is the whole point.** The first version of this helper built the message
+/// from a fresh random `Identity()`, so the message hash — and therefore the stamp workblock —
+/// changed every run, and "all-0xFF is invalid" was a *probabilistic* claim: at the cost 8 its
+/// callers use, an all-0xFF stamp is genuinely valid with p = 2⁻⁸, i.e. one suite run in 256 would
+/// have seen two tests report the opposite of their names. A fixed 64-byte private key makes
+/// `LXMessage.create`'s hash fixed (`hash = fullHash(destHash ‖ sourceHash ‖ payload)`,
+/// LXMessage.swift:121-124 — the hedged signature is *not* an input), so the workblock is fixed and
+/// the stamp's invalidity is a settled fact rather than a 1-in-256 gamble.
+///
+/// The `#expect` below is the guard that keeps it settled: if anything upstream changes the hash
+/// derivation, this fails loudly instead of flaking.
+private func messageWithInvalidStamp(atCost cost: Int) -> LXMessage {
+    // 64 fixed bytes = X25519(32) ‖ Ed25519(32); any 32 bytes are a valid raw scalar for both.
+    let seed = Data(repeating: 0x11, count: 32) + Data(repeating: 0x22, count: 32)
+    let sender = Identity(privateKey: seed)!
+    let recipientDeliveryHash = Data(repeating: 0xBB, count: 16)
+    let base = LXMessage.create(source: sender, destinationHash: recipientDeliveryHash,
+                                timestamp: 1700000000, title: Data("t".utf8), content: Data("c".utf8))
+    let message = base.withStamp(Data(repeating: 0xFF, count: LXStamper.stampSize))
+    #expect(!message.validateStamp(targetCost: cost), "fixture stamp is no longer invalid at \(cost)")
+    return message
 }
 
 @MainActor
@@ -214,7 +232,7 @@ private func makeInboundStampStore(
 /// dropped the message, `store.receive` would time out or the `#expect`s would fail on nil.
 @MainActor @Test func inboundStamp_costConfigured_invalidStamp_enforcementOff_messageIsDeliveredCheckedInvalid() async {
     let store = makeInboundStampStore(deliveryStampCost: 8, enforceDeliveryStamps: false)
-    let message = messageWithInvalidStamp()
+    let message = messageWithInvalidStamp(atCost: 8)
     let got = LockIsolated<(checked: Bool, valid: Bool)?>(nil)
     await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
     await store.receive { action in
@@ -265,7 +283,7 @@ private func makeInboundStampStore(
 /// and the exhaustivity check would fire. So the two tests are each other's mutation catchers.
 @MainActor @Test func inboundStamp_costConfigured_invalidStamp_enforcementOn_messageIsDropped() async {
     let store = makeInboundStampStore(deliveryStampCost: 8, enforceDeliveryStamps: true)
-    let message = messageWithInvalidStamp()
+    let message = messageWithInvalidStamp(atCost: 8)
     await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))
