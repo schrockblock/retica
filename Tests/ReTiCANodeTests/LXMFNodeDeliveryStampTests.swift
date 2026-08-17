@@ -245,14 +245,68 @@ private func makeDeliveryStampStore(
 ///
 /// `store.exhaustivity = .on` before `finish` is load-bearing: `TestStore`'s "an effect is still
 /// running" diagnostic is suppressed under `.off`, so the flip is what catches a leaked effect.
-@MainActor @Test(.timeLimit(.minutes(1))) func lxmfNodeCancelsInFlightDeliveryStampGeneration() async {
+///
+/// **This test also pins that the abandoned message is REPORTED FAILED**, which the version of it
+/// that shipped with the slice did not. That version sent `.cancelDeliveryStamps`, flipped `.on`,
+/// and finished clean — and finishing clean *was* the drop: no `.router(.send)`, no delegate,
+/// nothing. It passed while the code's own docstring claimed a cancelled search "yields an unstamped
+/// send, not a dropped message". Asserting the `.deliveryFailed` is what makes the drop deliberate.
+@MainActor @Test(.timeLimit(.minutes(1))) func lxmfNodeCancelsInFlightDeliveryStampGeneration() async throws {
     let store = makeDeliveryStampStore(advertisedStampCost: LXMFNode.maxDeliveryStampCost)
     await store.send(.send(destinationHash: peerDestHash, title: Data("t".utf8),
                            content: Data("c".utf8), method: .opportunistic))
+    let searching = try #require(store.state.inFlightDeliveryStamps.first)   // the search is running
     // Cancel via the delivery-stamp cancel action (delivery stamps use CancelID.deliveryStamp).
     await store.send(.cancelDeliveryStamps)
+    let failed = LockIsolated<Data?>(nil)
+    await store.receive { action in
+        if case let .delegate(.deliveryFailed(hash)) = action {
+            failed.setValue(hash)
+            return true
+        }
+        return false
+    }
+    #expect(failed.value == searching)          // the abandoned message, named
+    #expect(store.state.inFlightDeliveryStamps.isEmpty)
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(10))
+}
+
+/// A cancel that arrives AFTER the search finished fails nothing. The message is already the
+/// router's problem; re-failing it would tell the app a delivered message was lost.
+///
+/// This is the counterpart assertion to `lxmfNodeCancelsInFlightDeliveryStampGeneration`, and it is
+/// what makes the "fail everything in flight" rule narrow rather than indiscriminate: without the
+/// `.router(.send)` removal, the hash would sit in `inFlightDeliveryStamps` forever and every
+/// subsequent app backgrounding would emit a spurious `.deliveryFailed` for it.
+///
+/// Anti-vacuity: cost 8 (~256 rounds, sub-second) so the search genuinely COMPLETES before the
+/// cancel — `#require(sent.stamp)` proves that rather than assuming it — and the post-cancel
+/// `receive` is a `predicate` that would match any `.deliveryFailed` at all.
+@MainActor @Test(.timeLimit(.minutes(1))) func lxmfNodeCancelDoesNotFailAMessageWhoseStampAlreadyLanded() async throws {
+    let store = makeDeliveryStampStore(advertisedStampCost: 8)
+    let captured = LockIsolated<LXMessage?>(nil)
+    await store.send(.send(destinationHash: peerDestHash, title: Data("t".utf8),
+                           content: Data("c".utf8), method: .opportunistic))
+    await store.receive { action in
+        if case let .router(.send(m, _)) = action {
+            captured.setValue(m)
+            return true
+        }
+        return false
+    }
+    let sent = try #require(captured.value)
+    _ = try #require(sent.stamp)                             // the search really did complete
+    #expect(store.state.inFlightDeliveryStamps.isEmpty)      // ...and was retired
+    // Drain the router's own cascade, THEN cancel exhaustively — so the cancel is the only thing
+    // `.on` is judging. It must change no state and emit no `.deliveryFailed`. Ordering matters:
+    // an earlier draft cancelled once under `.off` first, which cleared the list and left the
+    // exhaustive cancel with nothing to get wrong.
+    await store.send(.router(.delivered(messageHash: sent.hash)))
+    await store.skipReceivedActions(strict: false)
+    store.exhaustivity = .on
+    await store.send(.cancelDeliveryStamps)                  // exhaustive: must be a complete no-op
+    await store.finish(timeout: .seconds(2))
 }
 
 // MARK: - .sendMessage — the path the app actually calls

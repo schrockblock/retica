@@ -137,6 +137,26 @@ public struct LXMFNode {
         /// enforcement off (the default). Whoever enables enforcement should account for this gap.
         public var enforceDeliveryStamps: Bool = false
 
+        /// Hashes of messages whose delivery-stamp search is currently in flight, oldest first.
+        ///
+        /// **This exists because a cancelled search cannot report its own failure.**
+        /// `LXStamper.search` returns nil only when `Task.isCancelled`, and TCA's
+        /// `Send.callAsFunction` opens with `guard !Task.isCancelled else { return }`
+        /// (ComposableArchitecture Effect.swift:191-194) — so *every* `await send(...)` inside a
+        /// cancelled `.run` body is a no-op, including one that tries to report the cancellation.
+        /// Measured, not deduced: a probe emitting `.delegate(.deliveryFailed)` from the nil branch
+        /// of `deliverySend` produced no action at all.
+        ///
+        /// The failure is therefore emitted by the `.cancelDeliveryStamps` reducer branch, which is
+        /// not itself cancelled, over this list. Reference works the same way: `cancel_outbound`
+        /// only flags the message and calls `LXStamper.cancel_work` (LXMRouter.py:1719-1725,
+        /// LXMF 1.1.0); the `failed_callback` is invoked later by `process_deferred_stamps` on the
+        /// router's own thread, once `get_stamp()` has returned None (LXMRouter.py:2620-2630).
+        ///
+        /// Entries are appended when a search starts and removed when `.router(.send)` carries the
+        /// message onward, so a search that already completed is never failed retroactively.
+        public internal(set) var inFlightDeliveryStamps: [Data] = []
+
         public init(identity: Identity, endpoint: TransportEndpoint.State) {
             self.identity = identity
             self.endpoint = endpoint
@@ -183,6 +203,14 @@ public struct LXMFNode {
         /// Cancel any in-flight delivery-stamp searches. Call when the app backgrounds, the user
         /// abandons a send, or the destination is no longer reachable. Mirrors `cancelPropagationStamps`
         /// for the delivery-stamp `CancelID.deliveryStamp` effect set.
+        ///
+        /// **Every message still searching is FAILED, not sent unstamped.** One
+        /// `.delegate(.deliveryFailed(messageHash:))` is emitted per entry in
+        /// `State.inFlightDeliveryStamps` — the app must treat those messages as not sent. Reference
+        /// does the same (`process_deferred_stamps` → `failed_callback`, LXMRouter.py:2620-2625,
+        /// LXMF 1.1.0). The alternative — sending unstamped — is not available: the cancellation that
+        /// ends the search also suppresses every action the search's effect could still emit, so
+        /// "send it unstamped instead" cannot be implemented from inside that effect at all.
         case cancelDeliveryStamps
         case delegate(Delegate)
 
@@ -301,7 +329,7 @@ public struct LXMFNode {
             case let .send(destinationHash, title, content, method):
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
-                return deliverySend(state, message: msg, method: method)
+                return deliverySend(&state, message: msg, method: method)
 
             case let .setPropagationNode(destinationHash):
                 // Every in-flight stamp was sized to the PREVIOUS node's advertised cost, and a stamp
@@ -335,7 +363,7 @@ public struct LXMFNode {
                 // (transient_id vs message hash), different CancelID. See `deliverySend` for why a
                 // caller-supplied stamp is never overwritten.
                 var effects: [Effect<Action>] = [
-                    deliverySend(state, message: message, method: .opportunistic)
+                    deliverySend(&state, message: message, method: .opportunistic)
                 ]
                 // KNOWN GAP, deliberately deferred: the propagation copy packs the ORIGINAL,
                 // UNSTAMPED `message`, so a recipient who enforces delivery stamps drops it even
@@ -383,7 +411,26 @@ public struct LXMFNode {
                 // cost at `maxDeliveryStampCost` is minutes of CPU. `LXStamper.search` reads
                 // `Task.isCancelled` each round, so cancellation stops the CPU burn — it does not
                 // merely discard the result. Mirrors `cancelPropagationStamps` for the delivery path.
-                return .cancel(id: CancelID.deliveryStamp)
+                //
+                // ...and then FAILS every message that was still searching. This branch is the only
+                // place that can: the cancelled effect's own `await send` is swallowed by
+                // `Send.callAsFunction`'s `guard !Task.isCancelled` (Effect.swift:191-194), so a
+                // message abandoned here would otherwise vanish with no delegate at all — leaving the
+                // app showing "sending" forever for a message that will never be sent. Reference
+                // reports it from the equally-uncancelled router loop (`process_deferred_stamps` →
+                // `failed_callback`, LXMRouter.py:2620-2625, LXMF 1.1.0).
+                //
+                // No race with a search that just finished: the effect can only deliver
+                // `.router(.send)` by hopping to the MainActor, and both that hop's cancellation
+                // check and this reduction run there — so the completed case has already emptied
+                // `inFlightDeliveryStamps` via the `.router(.send)` branch, and the not-yet-delivered
+                // case is dropped by the same guard that necessitates this code.
+                //
+                // `.cancel(id:)` cancels when it is CONSTRUCTED, so it stays on this branch (86ee622).
+                let abandoned = state.inFlightDeliveryStamps
+                state.inFlightDeliveryStamps = []
+                return .merge([Effect<Action>.cancel(id: CancelID.deliveryStamp)]
+                              + abandoned.map { .send(.delegate(.deliveryFailed(messageHash: $0))) })
 
             // --- Propagation sync: phase-1 (IDENTIFY + list request) ---
             case let .router(.delegate(.requestMessageList(linkID))):
@@ -540,6 +587,14 @@ public struct LXMFNode {
                     }
                 }
                 return .send(.delegate(.messageReceived(message: delivered, signatureValidated: validated)))
+
+            case let .router(.send(handedOn, _)):
+                // The search for this message is over — it is the router's problem now, so it can no
+                // longer be failed by `.cancelDeliveryStamps`. Reached on BOTH `deliverySend` paths:
+                // the unstamped fast path (which never appended) and the completed search. Removing an
+                // absent hash is a no-op, which is why no branch is needed here.
+                state.inFlightDeliveryStamps.removeAll { $0 == handedOn.hash }
+                return .none
 
             case let .router(.delegate(.deliveryFailed(hash))):
                 return .send(.delegate(.deliveryFailed(messageHash: hash)))
@@ -714,22 +769,31 @@ public struct LXMFNode {
     /// LXMessage.py:313, LXMF 1.1.0). Messages from `LXMessage.create` always have `stamp == nil`,
     /// so this check is a no-op on the `.send` path.
     ///
-    /// A cancelled search yields an **unstamped send, not a dropped message** — refusing (or
-    /// failing) to stamp must never refuse to send. The recipient may drop it if it enforces
-    /// stamps; that is its choice, and it beats silently losing the message on our side.
-    private func deliverySend(_ state: State, message: LXMessage,
+    /// Refusing to stamp never refuses to send: a cost of 0, or one above `maxDeliveryStampCost`,
+    /// takes the guard below and hands the message on **unstamped**. The recipient may drop it if it
+    /// enforces stamps; that is its choice, and it beats losing the message on our side.
+    ///
+    /// **A CANCELLED search is different, and it does drop the message.** `LXStamper.search` returns
+    /// nil only when `Task.isCancelled`, and TCA suppresses every action sent from a cancelled effect
+    /// (`Send.callAsFunction`, Effect.swift:191-194), so "send it unstamped instead" is not
+    /// implementable from in here — the substitute send would be swallowed exactly like the real one.
+    /// This docstring previously claimed the opposite ("an unstamped send, not a dropped message"),
+    /// and the `else { stamped = message }` branch that appeared to implement it was dead code.
+    /// The cancellation is reported instead by `.cancelDeliveryStamps`, which emits
+    /// `.delegate(.deliveryFailed)` for every hash in `State.inFlightDeliveryStamps` — appended here.
+    private func deliverySend(_ state: inout State, message: LXMessage,
                               method: LXMFRouter.DeliveryMethod) -> Effect<Action> {
         guard message.stamp == nil,
               let cost = deliveryStampCost(state, destinationHash: message.destinationHash)
         else { return .send(.router(.send(message: message, desiredMethod: method))) }
+        if !state.inFlightDeliveryStamps.contains(message.hash) {
+            state.inFlightDeliveryStamps.append(message.hash)
+        }
         return .run { send in
-            let stamped: LXMessage
-            if let stamp = await LXStamper.generateStamp(messageId: message.hash, targetCost: cost) {
-                stamped = message.withStamp(stamp)
-            } else {
-                stamped = message   // cancelled mid-search — send unstamped rather than not at all
-            }
-            await send(.router(.send(message: stamped, desiredMethod: method)))
+            // nil ⟹ cancelled (the only way `search` returns nil). Nothing to send: see above.
+            guard let stamp = await LXStamper.generateStamp(messageId: message.hash, targetCost: cost)
+            else { return }
+            await send(.router(.send(message: message.withStamp(stamp), desiredMethod: method)))
         }
         .cancellable(id: CancelID.deliveryStamp)
     }
