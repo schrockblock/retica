@@ -281,6 +281,17 @@ exactly the class Tier 1 just closed.*
         the name. **PROVISIONAL constant** — ReTiCaMsgr has no user-facing name entry UI; `"ReTiCaMsgr"`
         is a placeholder until a name field is added. Reference clients (Sideband, NomadNet) will now
         show the node as `"ReTiCaMsgr"` rather than unnamed. ReTiCaMsgr commit `0a3d026`.
+        **The name does NOT identify the user, and this tick should not be read as if it did.** The
+        constant is the same string for *every* ReTiCaMsgr install, so in a Sideband contact list all
+        ReTiCA peers are mutually indistinguishable — the field now says which *app* is running, not
+        who is running it. That is still better than blank (reference clients render an unnamed peer
+        as a bare hash), but "ReTiCA users are now named" remains false in the sense a reader cares
+        about. Saying only "PROVISIONAL" left that inference available; this sentence closes it.
+        **Pinned since the branch-review pass** by `interfaceConnectedSetsTheDisplayNameBeforeRegisteringDelivery`
+        (ReTiCaMsgr `AppFeatureTests`), which asserts the name *and* that it precedes
+        `.registerDelivery`. Before that test, deleting the `.setDisplayName` line left the whole
+        ReTiCaMsgr suite green: `grep displayName AppFeatureTests.swift` returned zero hits, and both
+        `interfaceConnected…` tests use predicate-`receive`, which skips non-matching actions.
       - `dcb543f` + `2ab55ac` — `LXMFNode.State.learnedPeers` records each LXMF delivery peer's
         `displayName`, `stampCost` and `supportsCompression` on `pathLearned`, gated on
         `LXMessage.deliveryHash(identityHash:)` to match reference's own destination-hash dispatch
@@ -302,9 +313,29 @@ exactly the class Tier 1 just closed.*
 - [x] **Delivery stamps wired** — outbound generation and inbound validation are both wired.
       *Task 1 (2026-08-16 slice)*: `LXMFNode.deliverySend` generates a stamp when the peer's
       `lxmf.delivery` announce carries a cost ≤ `maxDeliveryStampCost = 20`; the search is
-      cancellable via `CancelID.deliveryStamp`; a cancelled or refused search sends unstamped
-      rather than dropping. Commits: `09c44a0` (initial generation), `8a84fd3` (fix ceiling and
-      send path — `LXMFNode.deliverySend` is the correct call site, not `LXMFNode.send`).
+      cancellable via `CancelID.deliveryStamp`; a **refused** cost (0, or above the ceiling) sends
+      unstamped rather than dropping. Commits: `09c44a0` (initial generation), `8a84fd3` (fix ceiling
+      and send path — `LXMFNode.deliverySend` is the correct call site, not `LXMFNode.send`).
+      **A CANCELLED search does not send unstamped — it fails the message, and must.** This entry,
+      and the docstring it was copied from, previously claimed the opposite. TCA suppresses every
+      action sent from a cancelled effect (`Send.callAsFunction`'s `guard !Task.isCancelled`,
+      ComposableArchitecture `Effect.swift:191-194`), so the substitute unstamped send was a no-op
+      and the `else` branch implementing it was dead code — `.cancelDeliveryStamps`, which documents
+      itself as "call when the app backgrounds", silently discarded every in-flight message with no
+      delegate at all. Now `.cancelDeliveryStamps` emits `.delegate(.deliveryFailed(messageHash:))`
+      for every entry in `State.inFlightDeliveryStamps`, matching reference, which reports the same
+      cancellation from its own uncancelled router loop (`process_deferred_stamps` →
+      `failed_callback`, `LXMRouter.py:2620-2625`; generation failure → `fail_message`, `:2627-2630`).
+      Fixed `de50cce`.
+      *Task 2 addendum (branch-review pass, `1cd6a2d`)*: the cost the inbound half validates against
+      is now **range-sanitised at the setter**, matching `set_inbound_stamp_cost` (LXMRouter.py:378-392,
+      LXMF 1.1.0): nil and `< 1` clear it, `1...254` store it, `>= 255` is rejected with the previous
+      value kept. It had been stored raw while `LXMFAnnounceData.pack` applied reference's
+      `> 0 && < 255` emit gate, so the announce and the enforcement disagreed — cost 0 advertised
+      "no cost required" and then failed every unstamped message (dropped, under enforcement), and
+      cost -1 reported an all-0xFF stamp as **valid** to the app, because `stampValid` is
+      `stampValue >= targetCost` and a bit count is never negative. Unreachable from ReTiCaMsgr
+      today (it passes `stampCost: nil`), so this was a public-API footgun rather than a live bug.
       *Task 2 (2026-08-16 slice)*: `LXMFNode` validates the stamp on every inbound
       `messageDelivered` when `State.deliveryStampCost != nil`, and carries the outcome on the
       message as `LXMessage.stampValid`/`stampChecked` — mirroring reference, which stores the same
@@ -321,9 +352,18 @@ exactly the class Tier 1 just closed.*
 
       **What this tick does NOT close:**
 
-      - **Enforcement is test-only.** `enforceDeliveryStamps` defaults false and **no caller in
-        this repo or in ReTiCaMsgr sets it true**, so the drop branch is reachable only from tests
-        today. Enabling it also exposes the ticket divergence below — reference accepts
+      - **The whole INBOUND half is dead in the shipping app — not just enforcement.** An earlier
+        revision of this bullet said only that *enforcement* was test-only, which understated it.
+        ReTiCaMsgr's sole `setDisplayName` call passes `stampCost: nil`
+        (`AppFeature.swift:109`), so `State.deliveryStampCost` is nil, the `if let cost` gate in the
+        `messageDelivered` branch never opens, `validateStamp` never runs, and **every delivered
+        message reaches the app with `stampChecked == false`** — the never-checked leg of the
+        tri-state, on every message, always. What Task 2 shipped is a correct mechanism with no
+        caller. Turning it on is one argument at that call site (plus a UI to choose the value).
+
+      - **Enforcement is test-only, additionally.** `enforceDeliveryStamps` defaults false and **no
+        caller in this repo or in ReTiCaMsgr sets it true**, so the drop branch is reachable only
+        from tests today. Enabling it also exposes the ticket divergence below — reference accepts
         ticket-backed stamps that we reject (`LXMessage.py:273-283` checks `truncated_hash(ticket +
         message_id)` regardless of cost; we have no ticket path).
 
@@ -335,20 +375,66 @@ exactly the class Tier 1 just closed.*
         it drops them. **Which peers this affects:** peers that call `set_inbound_stamp_cost` with a
         value above 20 — an uncommon but legitimate configuration, not a hostile one.
 
-      - **The propagation copy carries no delivery stamp.** `.sendMessage(alsoViaPropagation: true)`
-        in `LXMFNode` packs the unstamped message into the propagation container (`LXMFPropagation.pack`
-        is called on the original `LXMessage`). A stamp-enforcing recipient that receives the message
-        only via a propagation node still drops it. Deferred deliberately: wiring it requires
-        collapsing two concurrent async stamp searches (delivery + propagation) into a sequential
-        chain with its own cancellation ordering. Documented in `LXMFNode.swift` at the `.sendMessage`
-        call site (commit `d3e19d2`).
+      - **No propagation-bound message carries a delivery stamp — via EITHER path.**
+        `.sendMessage(alsoViaPropagation: true)` packs the unstamped message into the propagation
+        container (`LXMFPropagation.pack` is called on the original `LXMessage`), and so does
+        **`.sendViaPropagation(destinationHash:title:content:)`**, which builds its own message with
+        `LXMessage.create` (never stamped) and hands it straight to `pack`. The bullet previously
+        named only the first; the second has the identical gap and no mitigation, so a
+        stamp-enforcing recipient reached only through a propagation node drops the message either
+        way. Deferred deliberately: wiring it requires collapsing two concurrent async stamp searches
+        (delivery + propagation) into a sequential chain with its own cancellation ordering.
+        Documented in `LXMFNode.swift` at the `.sendMessage` call site (commit `d3e19d2`).
+
+      - **A peer's advertised stamp cost is forgotten at every app launch.** `LXMFNode.State.learnedPeers`
+        is populated only from a live announce (`pathLearned`), is never persisted, and is never
+        expired. Reference does both: it writes `outbound_stamp_costs` to
+        `storagepath/outbound_stamp_costs` on every update (`save_outbound_stamp_costs`,
+        `LXMRouter.py:1287-1296`, called at `:1032`), reloads it at startup (`:267-277`), and expires
+        entries older than `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60` (`:39`, swept at `:1272-1281`).
+        **The consequence is exactly the failure this slice exists to fix:** after every launch —
+        and on iOS the process is killed constantly — ReTiCA sends *unstamped* to every peer until it
+        happens to re-hear that peer's announce, and a peer running `enforce_stamps()` drops all of
+        it. The generation logic is correct and simply has nothing to spend. Growth/expiry is filed
+        under Tier 4; **persistence is the half that undermines the tick above**, and neither is done.
 
       - **LXMF tickets remain absent** (Tier 3's fourth item — separate entry below). Enabling
         enforcement exposes this gap explicitly.
 
-      982 tests; **zero known-open *conversions*** (this checklist's gate metric — not a claim that
-      the suite carries no known-issue annotations: `TransportTests.swift:3943` has a structural
-      `skipInFlightEffects` known issue unrelated to this work).
+      988 tests; **zero known-open *conversions*** (this checklist's gate metric).
+
+      **What a green `swift test` actually prints, measured — because this line has now been wrong
+      twice in opposite directions.** A full run reports `988 tests in 7 suites failed ... with 3
+      issues (including 1 known issue)`. Both non-conversion items are expected and neither is a
+      regression:
+
+      - **1 known issue, at `TransportTests.swift:3943`** — in
+        `holdArmsDeferredReleaseTimerNotImmediateFireDuringFlood`. The original wording of this line,
+        "a structural `skipInFlightEffects` known issue", was **right**, and a whole-branch review
+        correction that replaced it with "no known-issue annotations exist; `:3943` is an ordinary
+        teardown call" was **wrong** — on the strength of `grep -rin knownissue Tests Sources`
+        returning nothing. That grep result is accurate and the inference from it is not: the
+        annotation lives in TCA, not in our source. `TestStore._skipInFlightEffects` reports the
+        cancelled-effects message with `overrideExhaustivity: .off(showSkippedAssertions: true)`
+        whenever exhaustivity is `.on` (`TestStore.swift:2172-2187`), and that branch of
+        `reportIssueHelper` wraps the report in `withExpectedIssue` (`TestStore.swift:2204-2218`) —
+        which is precisely a known issue. The test flips `.on` and calls `skipInFlightEffects()` at
+        `:3942-3943`, so it takes that path by construction. **Structural, unrelated to LXMF work,
+        and not suppressible from here.** Verify a claim like this by *running the suite*, not by
+        grepping our own tree for someone else's annotation.
+
+      - **1 failing test, `pairedModePublishesWithEncryptionAndEncryptedReadPerms`**
+        (`Tests/ReTiCAInterfacesTests/FCBDriverAdapterTests.swift:183`, 2 issues at `:191` and
+        `:193`) — the FCB BLE driver adapter, an unrelated target with no LXMF dependency. Measured:
+        it **passes in isolation** (`--filter pairedModePublishes…`, 0.21 s) and **passes with its
+        whole file** (`--filter FCBDriverAdapterTests`, 16/16), and fails only under the full
+        parallel run — where it failed on **every** full run attempted, including one at base
+        `57beaa6` with the delivery-stamp work stashed (982 tests, same two issues, same known
+        issue). So it is load- or scheduling-sensitive rather than randomly flaky, and it is not a
+        regression from any LXMF change; calling it "a genuine intermittent" was close enough to be
+        useful and not precise enough to act on.
+
+      A run whose only failure is that FCB test is a green run for this checklist's purposes.
 - [x] **`setNodeMode(false)` never re-announces** — `LXMFServiceNode.swift` `setNodeMode` returned
       `.none` on disable, so the last announce on the network still said `nodeState: true`. Reference
       `disable_propagation` (verified against stock LXMF 1.1.0, `LXMRouter.py:692-694`) sets
@@ -455,6 +541,57 @@ exactly the class Tier 1 just closed.*
       carried — assert on the delegate payload, not on state, or the test will be vacuous.
 - [ ] **No path-request rate control** — fresh random tags pass the `discoveryPrTags` ring every
       time, each drawing a cached response or a recursive fan-out.
+- [ ] **Delivery-stamp searches are not serialised — N queued sends multiply an N-times-unbounded
+      CPU burn.** `LXMFNode.deliverySend` registers its search `.cancellable(id: CancelID.deliveryStamp)`
+      **without** `cancelInFlight`, deliberately, so two concurrent sends coexist and are reclaimed
+      together. **Measured on this machine** (arm64 Mac, 8 cores, cost 12, `LXStamper.generateStamp`
+      via a `TaskGroup`): four concurrent searches finished in **1.04 s wall for 2.46 s of summed
+      work**, and the wall time equalled the slowest single search to three decimals — i.e. no
+      serialisation whatsoever. Reference does not permit this: `process_deferred_stamps`
+      takes `stamp_gen_lock` and returns immediately if it is already held (`LXMRouter.py:2573-2580`,
+      LXMF 1.1.0; the lock is created at `:181`), so at most one delivery stamp is generated at a
+      time, whatever the queue depth.
+      **Why the existing ceiling does not cover this.** `maxDeliveryStampCost = 20`'s rationale
+      bounds *one* search. N messages to N stamp-demanding peers is N of them, and on a 2-core phone
+      that saturates the same cooperative pool the transport runs on — the exact starvation
+      `LXStamper.search`'s `Task.yield()` exists to prevent for a single search.
+      Two related facts worth recording while this is open. **"cost 20 ≈ 8 minutes" is a geometric
+      mean, not a bound** — the search is memoryless, so the 95th percentile is ~3× that (≈ 24
+      minutes). The same probe showed how wide that is in practice: a *single* cost-12 search took
+      **6.32 s** while four concurrent searches at the identical cost drew **0.17 / 0.62 / 0.63 /
+      1.04 s**. And **there is no timeout** — only the app calling `.cancelDeliveryStamps` (which now
+      fails those messages, see Tier 3) ever ends a search that has not succeeded.
+      *Filed 2026-08-16 (whole-branch review of the delivery-stamps slice); not fixed in it.*
+- [ ] **`.sendMessage(alsoViaPropagation: true)` races on `pendingDeliveries[hash]`, and the
+      delivery-stamps slice changed who wins.** Both `LXMFRouter`'s `.send` (`LXMFRouter.swift:332`
+      opportunistic, `:340` direct) and `.sendViaPropagation` (`:363`) call
+      `arm(&state, message.hash, …)`, which overwrites `state.pendingDeliveries[hash]`
+      unconditionally (`:189-191`) and arms `retryTimer` with `cancelInFlight: true` (`:175`) — so the
+      second arrival replaces the first's `ResendInfo` *and* cancels its retry timer. `.delivered`
+      then reads that single entry to choose the delegate: `.propagated` → `.propagationAccepted`,
+      otherwise `.deliveryConfirmed` (`:495-502`). Whichever effect lands last decides what the app
+      is told.
+      **The collision predates the slice; its resolution did not.** The delivery copy used to be an
+      immediate `.send`, so propagation — always an async `LXMFPropagation.pack` search — reliably
+      arrived second and `.propagationAccepted` reliably won. Now the delivery copy is *also* an
+      async search whenever the recipient advertised an in-range cost, so the winner is whichever
+      proof-of-work finishes first. **Exact reachability condition:** `alsoViaPropagation` is true
+      (`!state.propagationNodeHex.isEmpty`, ReTiCaMsgr `AppFeature.swift:168`) **and** the recipient
+      is in `learnedPeers` with a `stampCost` in 1…`maxDeliveryStampCost` — `deliverySend`'s guard
+      falls back to a synchronous `.send` in every other case, so an unstamped send keeps the old
+      deterministic ordering. Verified by reading each cited site, not inferred.
+      *Filed 2026-08-16 (whole-branch review of the delivery-stamps slice); not fixed in it.*
+- [ ] **`validate_retica_delivery_stamp.py` cannot be re-run from a fresh checkout.**
+      `Tests/ReTiCATests/Vectors/validate_retica_delivery_stamp.py` reads its input from
+      `/tmp/ReTiCA/retica_raw_stamp.json` and **no committed test writes that file**, so the recorded
+      2026-08-16 verdict ("reference ACCEPTS ReTiCA's stamp") cannot be reproduced without hand-writing
+      a throwaway `@Test` first. Its docstring says the gap is "filed: see
+      docs/reference-parity-checklist.md" — it was not, until now. Closing it wants a committed
+      sub-second `@Test` at **cost 10** (2¹⁰ rounds over the 768 KB workblock) that emits the
+      artefact to a path inside the repo's own scratch, plus a note that `/tmp/ReTiCA/` is shared
+      between agents and has already caused one collision. **Generation cost is exponential: never
+      generate above ~10 in a test.** Validation is O(1) and safe at any cost.
+      *Filed 2026-08-16 (whole-branch review of the delivery-stamps slice).*
 - [ ] **Propagation stamp validation is unthrottled — the residue Task 5 could not close.** A peer
       that never produces a valid stamp is never stored, so the dedup preflight never matches it and
       it pays a full 256 KB workblock every time: **21.98 ms per 33-byte entry, 1.56 KiB/s saturates
