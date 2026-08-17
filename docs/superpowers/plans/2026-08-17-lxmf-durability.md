@@ -62,7 +62,7 @@ Claude-Session: https://claude.ai/code/session_01AtkFmSeVgRBk3zwfDCqUwy
 
 - [ ] **Step 2: Note the asymmetry between the two sets, and handle it deliberately.**
   - `seen` is a **bounded** `RingSet(capacity: 10_000)` and is **not public**. Rehydration must go through an action, not by exposing the field — and replaying more than the capacity must evict in the same order it would have live. Say in the code what order the caller must supply.
-  - `downloadedTransientIds` is a **public, unbounded `Set<Data>`**. Persisting it as-is grows forever. Decide a bound and justify it against reference's own behaviour — check what `locally_processed` / the PN download bookkeeping does about growth before choosing, and if reference is also unbounded, say so and bound ours anyway with the reason.
+  - `downloadedTransientIds` is a **public, unbounded `Set<Data>`**. **RULED 2026-08-17: leave it unbounded — do NOT add a cap.** Disk space is the bound for now; the intent is to learn how it grows in the wild before choosing a limit, because any cap trades storage against re-downloading old messages from a propagation node and there is no field data yet to price that trade. Record it in the code as a **known, accepted, deliberate** unbounded growth path with that reasoning, so the next reader does not "fix" it — and note the revisit trigger: real usage data, or a report of the table growing uncomfortably.
 
 - [ ] **Step 3: Write the failing tests.** At minimum: a rehydrated hash is treated as already-seen (the message is dropped as a duplicate, not delivered); a rehydrated transient ID is not re-requested in the next sync (it appears in `haves`, not `wants` — see `:400-401`); rehydrating more than `RingSet` capacity keeps the newest and evicts the oldest.
 
@@ -101,9 +101,9 @@ Claude-Session: https://claude.ai/code/session_01AtkFmSeVgRBk3zwfDCqUwy
 
 - [ ] **Step 1: Follow `PropagationEntryRow` exactly** — table definition, migration, and the `.onLaunch` read that sends the rehydrate action. Do not invent a second persistence style.
 
-- [ ] **Step 2: Decide when writes happen, and say why.** Reference saves `outbound_stamp_costs` on a background thread at each update (`LXMRouter.py:1031-1032`). Writing on every delivered message may be too chatty; batching risks losing the tail on a kill. **On iOS the kill is the normal path**, so bias toward durability and justify the choice.
+- [ ] **Step 2: Write on every delivered message. RULED 2026-08-17 — do not batch.** Durability wins over write volume here because on iOS the kill is the normal path, so a batch window is a routine loss window, not a rare one. This matches reference, which saves `outbound_stamp_costs` at each update (`LXMRouter.py:1031-1032`) rather than on a timer. This is a **deliberate starting point, chosen to be pulled back later** if write traffic proves to be a problem — say so in the code, and note what the pull-back would look like (batch with a flush on background/terminate) so the next person is not re-deriving it.
 
-- [ ] **Step 3:** Prune persisted rows to the same bounds the in-memory structures use, or the DB outgrows the state it mirrors.
+- [ ] **Step 3: Prune only what the in-memory structure itself bounds.** `seen` is a `RingSet(capacity: 10_000)`, so its table must be pruned to match or the DB outgrows the state it mirrors. **`downloadedTransientIds` is deliberately NOT pruned** — see Task 1 Step 2's ruling. Do not "helpfully" cap it here; that would quietly reintroduce the trade the ruling declined to make, in the layer least likely to be re-read.
 
 - [ ] **Step 4: Write the failing tests** — a message delivered before "restart" is not re-delivered after; a peer's stamp cost survives a restart and is spent. Build the restart as a *new store from the same database*, the way `propagationStoreRehydratesOnLaunch` does.
 
@@ -118,8 +118,9 @@ Claude-Session: https://claude.ai/code/session_01AtkFmSeVgRBk3zwfDCqUwy
 - [ ] **Step 2:** Tick the two Tier 4 items this slice closes, recording fixing commit SHAs **inline** — never "see the task report", since `.superpowers/sdd/` is gitignored.
 
 - [ ] **Step 3: State plainly what is NOT closed**, each checked against a run:
-  - **transport-core persistence** remains absent — no path table, announce cache, or packet-hash ring, so after a restart there are no known paths until announces arrive
-  - whether anything now bounds the persisted tables, and what happens when they fill
+  - **transport-core persistence** remains absent — no path table, announce cache, or packet-hash ring, so after a restart there are no known paths until announces arrive. Ruled out of scope 2026-08-17: losing them costs delay, not correctness.
+  - **the `downloadedTransientIds` table is deliberately unbounded** — disk is the only limit, accepted so that real usage can inform a cap rather than a guess. State it as an accepted risk with its revisit trigger, not as an oversight.
+  - **writes happen per delivered message**, chosen for durability over volume; record that pulling back to batching is the expected next move if write traffic bites.
   - **Six documentation overclaims in this repo in three weeks have been the same shape** — a summary sentence wider than the evidence beneath it, several inside *corrections*. Write the tick so its qualifications are load-bearing.
 
 ---
