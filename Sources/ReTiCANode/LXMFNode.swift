@@ -19,11 +19,11 @@ public struct LXMFNode {
     /// `displayName` and `supportsCompression`, which the reference stores per-`delivery_destination`
     /// object rather than in a separate dict.
     ///
-    /// **Expiry:** Reference expires entries older than `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60`
-    /// seconds in `clean_outbound_stamp_costs` (LXMRouter.py:1272-1281). This cleanup is filed as a
-    /// known gap in `docs/reference-parity-checklist.md` (Tier 4/durability, stamp-cost expiry). The
-    /// `learnedAt` timestamp is stored precisely so a future pass can implement the same expiry without
-    /// a schema change.
+    /// **Expiry:** Entries older than `LXMFNode.stampCostExpiry` (45 days, reference
+    /// `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60`, LXMRouter.py:39) are swept when
+    /// `.rehydrateLearnedPeers` restores the table at launch — reference's
+    /// `clean_outbound_stamp_costs` (LXMRouter.py:1272-1285), which runs once per startup,
+    /// immediately after the table is loaded (LXMRouter.py:276-277).
     ///
     /// **Do not spend `stampCost` without a ceiling check.** Announce app-data is unauthenticated;
     /// any reachable peer can advertise any value. Generating a delivery stamp is an
@@ -51,9 +51,10 @@ public struct LXMFNode {
         /// Wall-clock time this entry was last written, from the `\.date` dependency.
         /// Matches reference, which stores `time.time()` alongside the cost (LXMRouter.py:1029).
         ///
-        /// Stored so a future cleanup pass (reference `STAMP_COST_EXPIRY = 45 days`,
-        /// `LXMRouter.clean_outbound_stamp_costs`, LXMRouter.py:1272-1281) can expire stale entries
-        /// without a schema change. See `docs/reference-parity-checklist.md` for the filed gap.
+        /// Consumed by `.rehydrateLearnedPeers`, which sweeps entries older than
+        /// `LXMFNode.stampCostExpiry` (reference `STAMP_COST_EXPIRY = 45 days`,
+        /// `LXMRouter.clean_outbound_stamp_costs`, LXMRouter.py:1272-1285) when it restores the
+        /// table at launch.
         ///
         /// Deliberately separate from `LearnedDestination.learnedAt`, which records when the
         /// *path* was learned and is reset by the transport's own expiry sweep. This one records
@@ -100,11 +101,15 @@ public struct LXMFNode {
         /// 1.1.0 (Handlers.py:15-18) — whose own aspect filter is applied by the identical
         /// recomputed-hash comparison in `Transport.py:2077-2086` (RNS 1.4.2).
         ///
-        /// **Unbounded.** One entry per distinct LXMF delivery peer heard, never collected. The
-        /// transport's `maintenanceTick` expires `Transport.State.learned` (and piggybacks
-        /// `announceBlobs` / `announceCache` on that sweep) but has no signal this layer observes,
-        /// so entries here outlive the path that produced them. Filed in
-        /// `docs/reference-parity-checklist.md` Tier 4.
+        /// **Expiry-bounded.** Entries older than `LXMFNode.stampCostExpiry` (45 days) are swept
+        /// when `.rehydrateLearnedPeers` restores the table at launch — reference's
+        /// `clean_outbound_stamp_costs`, which runs once per startup (LXMRouter.py:276-277) and
+        /// never on a timer, so entries learned live during a session are swept at the NEXT launch.
+        /// The table is therefore bounded by the distinct `lxmf.delivery` peers heard within one
+        /// expiry window. The transport's own sweep does not reach this table: `maintenanceTick`
+        /// expires `Transport.State.learned` (and piggybacks `announceBlobs` / `announceCache`) but
+        /// has no signal this layer observes, so entries here outlive the path that produced them —
+        /// the expiry above is what collects them.
         ///
         /// Apps may read `displayName` to show a sender's name, and in future may read `stampCost`
         /// to generate a delivery stamp. **Do not feed `stampCost` into stamp generation without a
@@ -177,6 +182,21 @@ public struct LXMFNode {
     public enum Action: Equatable {
         case endpoint(TransportEndpoint.Action)
         case router(LXMFRouter.Action)
+        /// Restore `learnedPeers` from a previous session so that after a cold start we stamp
+        /// outbound messages at the costs peers last advertised, instead of sending unstamped to
+        /// every peer until each announce is re-heard — which a peer running `enforce_stamps()`
+        /// drops. The app sends this on launch, mirroring `.rehydrateDedup` for the router's dedup
+        /// sets (library holds state, app persists and replays).
+        ///
+        /// **Sweeps expired entries in the same pass.** Reference loads `outbound_stamp_costs`
+        /// from disk at startup and immediately runs `clean_outbound_stamp_costs`
+        /// (LXMRouter.py:276-277, 1272-1285), dropping entries older than
+        /// `STAMP_COST_EXPIRY = 45 days` (LXMRouter.py:39). It runs no periodic sweep — the launch
+        /// is the sweep. This action is that launch: an entry whose `learnedAt` is more than
+        /// `LXMFNode.stampCostExpiry` before the current `\.date` is dropped, not restored. The
+        /// comparison keeps an entry exactly one expiry old, matching reference's strict
+        /// `time.time() > entry[0] + STAMP_COST_EXPIRY`.
+        case rehydrateLearnedPeers([Data: LearnedPeer])
         case registerDelivery
         /// Update the display name and delivery stamp cost carried in the delivery-destination
         /// app data. **State only — this sends nothing.** Follow it with `.announceDelivery`
@@ -276,6 +296,16 @@ public struct LXMFNode {
     /// will drop — a silent failure after all that work. Refusing is clean.
     public static let maxDeliveryStampCost = 20
 
+    /// Age at which a `learnedPeers` entry is swept. Matches reference's
+    /// `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60` (LXMRouter.py:39, LXMF 1.1.0).
+    ///
+    /// The sweep runs when `.rehydrateLearnedPeers` restores the table at launch — reference
+    /// sweeps `outbound_stamp_costs` once per startup, immediately after loading it from disk
+    /// (LXMRouter.py:276-277), and runs no periodic timer. On iOS the launch is the routine path,
+    /// so a launch-time sweep fires routinely; entries learned live during a session are swept at
+    /// the next one.
+    public static let stampCostExpiry: TimeInterval = 45 * 24 * 60 * 60
+
     /// Cancellation identity for the propagation stamp search.
     ///
     /// One id for all in-flight searches rather than one per message: `.sendViaPropagation` builds the
@@ -297,6 +327,19 @@ public struct LXMFNode {
                 return state.linkDestinations[linkID] == served
             }
             switch action {
+            case let .rehydrateLearnedPeers(peers):
+                // Restore + sweep in one pass, matching reference's startup sequence: load the
+                // table from disk, then clean_outbound_stamp_costs (LXMRouter.py:276-277,
+                // 1272-1285). Reference runs no periodic sweep; on iOS the launch (hence this
+                // action) is the routine path, so a launch-time sweep fires routinely. The keep
+                // condition `now <= learnedAt + expiry` is reference's strict inequality inverted:
+                // an entry exactly one expiry old survives.
+                let now = date.now
+                for (hash, peer) in peers where now <= peer.learnedAt + LXMFNode.stampCostExpiry {
+                    state.learnedPeers[hash] = peer
+                }
+                return .none
+
             case .registerDelivery:
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
                                           aspects: LXMessage.deliveryAspects, identity: state.identity)
