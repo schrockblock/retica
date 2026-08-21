@@ -41,7 +41,7 @@ public struct TCPClientInterface {
     @Dependency(\.tcpConnection) var tcpConnection
     @Dependency(\.continuousClock) var clock
 
-    private enum CancelID { case connection }
+    private enum CancelID { case connection, reconnect }
 
     public init() {}
 
@@ -52,17 +52,34 @@ public struct TCPClientInterface {
                 state.status = .connecting
                 let host = state.host
                 let port = state.port
-                return .run { send in
-                    for await event in tcpConnection.open(host, port) {
-                        await send(.connectionEvent(event))
+                return .merge(
+                    // A dial supersedes any armed reconnect; otherwise the backoff fires on top of
+                    // the connection it was scheduled to replace.
+                    .cancel(id: CancelID.reconnect),
+                    .run { send in
+                        for await event in tcpConnection.open(host, port) {
+                            await send(.connectionEvent(event))
+                        }
+                        // The stream can END without a terminal event — `.cancelled` finishes it
+                        // silently. Without this the `for await` just exits: status stays
+                        // `.connecting`, no `interfaceDisconnected` is emitted, and since the
+                        // reconnect is armed ONLY by `.disconnected`, nothing ever retries. Every
+                        // stream end is now observable, so the dead end cannot reopen.
+                        // `Task.isCancelled` distinguishes a real end from `.disconnect`/supersede.
+                        if !Task.isCancelled {
+                            await send(.connectionEvent(.disconnected(reason: "connection stream ended")))
+                        }
                     }
-                }
-                .cancellable(id: CancelID.connection, cancelInFlight: true)
+                    .cancellable(id: CancelID.connection, cancelInFlight: true)
+                )
 
             case .disconnect:
                 state.status = .disconnected
                 return .merge(
                     .cancel(id: CancelID.connection),
+                    // An explicit disconnect must also disarm a pending reconnect, or the interface
+                    // silently re-dials 5s after the user asked it to stop.
+                    .cancel(id: CancelID.reconnect),
                     .run { _ in await tcpConnection.close() }
                 )
 
@@ -75,12 +92,17 @@ public struct TCPClientInterface {
                 return .merge(frames.map { .send(.delegate(.packetReceived($0))) })
 
             case .connectionEvent(.disconnected):
+                // Only the FIRST drop arms a reconnect. A single failure can now surface more than
+                // once (e.g. `.waiting` yields a drop and the stream then ends), and arming per
+                // event would stack overlapping backoffs that each dial a connection.
+                let alreadyDown = state.status == .disconnected
                 state.status = .disconnected
-                guard state.reconnectOnDrop else { return .none }
+                guard state.reconnectOnDrop, !alreadyDown else { return .none }
                 return .run { send in
                     try await clock.sleep(for: TCPClientInterface.reconnectDelay)
                     await send(.connect)
                 }
+                .cancellable(id: CancelID.reconnect, cancelInFlight: true)
 
             case let .send(raw):
                 let framed = HDLC.frame(raw)
