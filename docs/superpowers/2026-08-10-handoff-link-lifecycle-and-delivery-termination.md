@@ -109,8 +109,9 @@ The standing invariant, now holding on every traced route:
   that reconnects gets a new `InterfaceID` by construction, so a path learned
   before the reconnect names a dead interface.
 
-  **Do not read this as "BLE-only by design."** `TCPEndpoint.openLink` has no
-  such gate and the gap is reachable — see F8.
+  **This was once BLE-only, and that was the defect, not the design.**
+  `TCPEndpoint.openLink` lacked the gate until `c4d00b2`; both endpoints gate now.
+  See F8, including why the miss was worse than the cost argument suggested.
 
 ### 1b. Link-element reaping (one slice)
 
@@ -184,7 +185,14 @@ separately, not one the slice introduced.
 **F1, F2 and F6 are CLOSED** by `4ef3a21..034a4c9`. **F12 and F15 are CLOSED** by
 `892652a..a4b5e21`. See their entries — F15's in particular, which is closed on
 ownership rather than on authentication because authentication is not available
-to it.
+to it. **F8 is CLOSED** by `c4d00b2` (2026-08-21) — read its entry before trusting
+the severity this list gave it, which was too low for the wrong reason.
+
+**F20 was added 2026-08-21** from device testing: nothing persists the peer identity
+cache, so a cold launch can render a peer list it cannot message. Not ranked
+against the adversarial items below — it is a durability/reference-parity gap, not
+a security one — but it is what a user actually hits, so do not let its absence
+from the ranking read as "low".
 
 Current priority:
 
@@ -204,7 +212,7 @@ Current priority:
 5. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
    deliberate, pinned by tests, listed so a future fix confronts them rather than
    deleting them).
-6. **F8**, then F3/F4/F5.
+6. ~~**F8**~~ (CLOSED, `c4d00b2`), then F3/F4/F5.
 7. **F17**, then **F18** — both low, both from the destructive-transition sweep.
    F17 is an actual behaviour defect (two of our own transfers destroy each
    other) with no reference-aligned fix — RNS routes resource segments the same
@@ -545,7 +553,31 @@ invariant from §1 failing — in a router-side map instead of `LinkPlane.State.
 Worth noting for §6: the whole-branch review found the link-plane half and the
 router-side half went unexamined because the slice was framed around `LinkPlane`.
 
-### F8 — `TCPEndpoint.openLink` has no `reachableLearned` gate
+### F8 — `TCPEndpoint.openLink` has no `reachableLearned` gate — ✅ CLOSED
+
+**CLOSED by `c4d00b2`** (2026-08-21), found again from a device report: "tapping a
+detected-announce row always fails after ~15 seconds". The gate now mirrors BLE's
+and the open fails fast as `.pathStale`. Two things worth keeping from the fix.
+
+**The severity below UNDERSTATES it, and the understatement is the lesson.** This
+entry priced the defect as "costs a full establishment timeout and one attempt
+from the budget" — a cost argument. The real damage is that
+`.establishmentTimedOut` is classified PATH-shaped and routes to
+`pathLostAndClosed`, so **a dead SOCKET was laundered into a dead ROUTE**: the
+router discarded a perfectly good path and requested a new one because the
+interface underneath it was gone. On device that made a connection failure
+indistinguishable from a routing failure, which is what sent the investigation
+after the wrong subsystem.
+
+**Two fixtures had to be corrected to land it, and they are the more transferable
+finding.** `PNNodeTests` and `StampWorkBoundsTests` seeded `transport.learned`
+while leaving `transport.interfaces` empty — a state the runtime cannot reach,
+since a path is only ever learned over an interface that existed. They passed
+because nothing read both tables together; the moment something did, they broke.
+That is the "seeded state proves nothing about reachability" trap, and a guard
+that reads TWO tables is exactly where it surfaces.
+
+**Original entry follows.**
 
 **Added on the revision pass.** §1a's BLE bullet should not be read as
 "BLE-only by design."
@@ -567,6 +599,74 @@ applies verbatim to TCP.
 and `.linkEstablished`. Harmless today — the stale timer is swallowed by
 `.pathRequestDeadline`'s `.awaitingPath` guard — but it is the one park exit that
 does not cancel, and the asymmetry is a trap for a future edit to that guard.
+
+### F20 — nothing persists the peer IDENTITY cache, so a restart can see a peer it cannot message
+
+**Added 2026-08-21 from device testing. NOT yet fixed** — recorded here so it is
+tested deliberately rather than rediscovered as "the send button is greyed out".
+
+**What reference actually does. Every citation below was opened and read, because
+two earlier drafts of this paragraph got it wrong in opposite directions.**
+Reference keeps identities and paths in separate stores with DIFFERENT rules:
+
+- **Identity cache — persisted AND restored by every node.**
+  `Reticulum.__init__` calls `RNS.Identity.load_known_destinations()`
+  unconditionally (`Reticulum.py:344`), before `Transport.start`. The save side is
+  gated only on `is_connected_to_shared_instance` (`Identity.py:349`, and again at
+  `:615`) — never on transport. Entries map destination hash →
+  `[timestamp, packet_hash, public_key, app_data, …]`.
+- **Path table — saved by every node, but LOADED only by transport nodes.**
+  `save_path_table` is gated only on shared-instance (`Transport.py:3336`) and runs
+  from `persist_data` in `exit_handler` (`:3526`), but the LOAD sits behind
+  `if RNS.Reticulum.transport_enabled()` (`:306`). So a leaf client writes
+  `destination_table` on exit and **never reads it back**.
+
+**Net effect for a leaf client like ReTiCaMsgr: identities survive a restart;
+paths do not, and are re-requested on demand.** That is the parity target.
+
+**Two drafts of this paragraph were wrong, and the way they were wrong is worth
+keeping.** The first said "reference persists this and we do not", with no gate at
+all — wider than the evidence. The second over-corrected to "both the save and the
+load are transport-gated" and cited `Transport.py:243` for the save; `:243` is the
+**packet hashlist**, and the save is not transport-gated at all. Only opening the
+line disproved it. An implementer who trusted either draft would have built the
+wrong store.
+
+ReTiCA persists neither: `Transport.State.learned` has no rehydrate action at all
+(a grep for `rehydrate` in `Transport.swift` returns nothing), and it fuses both
+concerns into one struct, so there is no identity store to persist independently.
+
+**Why it bites now.** `LXMFNode.learnedPeers` *is* persistable and ReTiCaMsgr now
+rehydrates it, but `LearnedPeer` carries only `displayName`, `stampCost`,
+`supportsCompression` and `learnedAt` — **no identity and no path**. So after a
+cold launch the app can render a full list of known peers while holding nothing it
+can act on. Both consumers need what is missing:
+
+- Opportunistic send encrypts to the recipient's identity
+  (`LXMFNode`'s `state.endpoint.learned[destinationHash]?.identity`).
+- `openLink` resolves the same table, and now also requires the interface
+  (see F8).
+
+So the honest statement is that the announce list survives a restart and the
+ability to USE it does not. **Do not "fix" this by seeding the app's
+`reachablePeers` so the Send button lights up** — the button is currently telling
+the truth, and making it lie would convert a visible block into a silent failure.
+
+**The shape the fix probably takes**, from the split above: restore IDENTITIES
+only and let path discovery re-run. That also resolves a question the draft left
+open — restoring a path is not merely unnecessary but close to meaningless here,
+because F8's gate now requires the entry's `interfaceID` to exist in
+`transport.interfaces`, and an interface ID minted in a previous process will not.
+`LXMFRouter.establish` already parks in `.awaitingPath` and requests a path when
+one is unknown, so re-learning is the supported route, not a workaround.
+
+**Still open, and NOT settled by the above:** whether a restored identity should be
+trusted without a fresh signed announce (reference caches the public key and the
+announce `packet_hash` together, which suggests it keeps the provenance); how
+expiry should work, given `learnedPeers` already sweeps at 45 days on a different
+clock (see `LearnedPeer.learnedAt`, which is deliberately NOT the path's
+`learnedAt`); and whether splitting `LearnedDestination` into an identity half and
+a path half is worth the churn to the call sites that read it as one.
 
 ---
 
