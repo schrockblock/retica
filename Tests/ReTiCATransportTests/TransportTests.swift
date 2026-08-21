@@ -4237,6 +4237,124 @@ private func distinctPayload(_ i: Int) -> Data {
 /// a production-sized ring means every insert after the first `seenPacketRingSize` takes the
 /// eviction path; the whole loop must finish in seconds, because `RingSet` is O(1) per insert
 /// (circular buffer + boxed storage, no `removeFirst` memmove and no per-copy CoW).
+// MARK: - rehydrateLearnedDestinations
+
+/// A destination injected via `.rehydrateLearnedDestinations` is routable — `.send` routes
+/// a packet to it — without waiting for an announce. This is the headline test for the slice.
+/// The destination sits in `learned` and the interface is connected, so `reachableLearned`
+/// returns the entry and routing succeeds.
+@Test @MainActor func rehydratedDestinationIsReachableWithoutAnnounce() async {
+    let remote = Identity()
+    let ifID = InterfaceID("i0")
+    let destHash = Destination.hash(
+        identityHash: remote.hash, appName: "app", aspects: ["svc"])
+    let learnedAt = Date(timeIntervalSince1970: 1_000)     // well within the 7-day window
+    let entry = LearnedDestination(
+        identity: remote, appData: nil, ratchet: nil, interfaceID: ifID,
+        hops: 2, nextHop: destHash, announceEmitted: 500, learnedAt: learnedAt)
+
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        // now = 2 days after learnedAt — fresh enough to survive the expiry sweep
+        $0.transportDate = DateGenerator { Date(timeIntervalSince1970: learnedAt.timeIntervalSince1970 + 2 * 24 * 3600) }
+    }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(ifID))
+    await store.send(.rehydrateLearnedDestinations([destHash: entry]))
+
+    // Destination is known; send must route a .transmit, not .sendFailed(.notLearned).
+    await store.send(.send(destinationHash: destHash, plaintext: Data("hello".utf8)))
+    await store.receive { action in
+        if case .delegate(.transmit(ifID, _)) = action { return true }
+        return false
+    }
+    store.exhaustivity = .on
+}
+
+/// A restored entry must NOT replace a live entry that is at least as fresh. The network can
+/// populate `learned` before the async database read arrives; an unconditional write would move
+/// `learnedAt` backwards and restore stale routing data.
+@Test @MainActor func rehydrateDoesNotOverwriteFresherLiveEntry() async {
+    let remote = Identity()
+    let ifID = InterfaceID("i0")
+    let destHash = Destination.hash(
+        identityHash: remote.hash, appName: "app", aspects: ["svc"])
+    let older = Date(timeIntervalSince1970: 1_000)
+    let newer = Date(timeIntervalSince1970: 2_000)
+    let now   = Date(timeIntervalSince1970: 10_000)       // well within the 7-day window
+
+    let liveEntry = LearnedDestination(
+        identity: remote, appData: nil, ratchet: nil, interfaceID: ifID,
+        hops: 1, nextHop: destHash, announceEmitted: 999, learnedAt: newer)
+    let storedEntry = LearnedDestination(
+        identity: remote, appData: nil, ratchet: nil, interfaceID: ifID,
+        hops: 5, nextHop: destHash, announceEmitted: 100, learnedAt: older)
+
+    var initial = Transport.State()
+    initial.learned[destHash] = liveEntry    // live entry already in place
+
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.transportDate = DateGenerator { now }
+    }
+    store.exhaustivity = .off
+    await store.send(.rehydrateLearnedDestinations([destHash: storedEntry]))
+
+    // The live entry (hops: 1, learnedAt: newer) must survive unchanged.
+    #expect(store.state.learned[destHash]?.hops == 1)
+    #expect(store.state.learned[destHash]?.learnedAt == newer)
+    store.exhaustivity = .on
+}
+
+/// An entry whose `learnedAt` is older than `pathExpiry` (7 days) is NOT restored — it would
+/// be swept by the next `maintenanceTick` anyway, and restoring it would briefly expose
+/// stale routing data to senders.
+@Test @MainActor func rehydrateDropsExpiredEntry() async {
+    let remote = Identity()
+    let ifID = InterfaceID("i0")
+    let destHash = Destination.hash(
+        identityHash: remote.hash, appName: "app", aspects: ["svc"])
+    let learnedAt = Date(timeIntervalSince1970: 0)
+    // now is one second past the expiry window (pathExpiry + 1 seconds after learnedAt).
+    let now = Date(timeIntervalSince1970: Transport.pathExpiry + 1)
+    let expired = LearnedDestination(
+        identity: remote, appData: nil, ratchet: nil, interfaceID: ifID,
+        hops: 2, nextHop: destHash, announceEmitted: 10, learnedAt: learnedAt)
+
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = DateGenerator { now }
+    }
+    store.exhaustivity = .off
+    await store.send(.rehydrateLearnedDestinations([destHash: expired]))
+
+    #expect(store.state.learned[destHash] == nil)
+    store.exhaustivity = .on
+}
+
+/// An entry whose `learnedAt` is in the future is NOT restored. A future timestamp would
+/// make the entry look unexpired indefinitely — it can never age past `pathExpiry` because its
+/// distance from `now` only shrinks as time passes. `Date + TimeInterval` is Double arithmetic
+/// and saturates rather than trapping, so there is no crash to catch; the test is the guard.
+@Test @MainActor func rehydrateDropsFutureDatedEntry() async {
+    let remote = Identity()
+    let ifID = InterfaceID("i0")
+    let destHash = Destination.hash(
+        identityHash: remote.hash, appName: "app", aspects: ["svc"])
+    let now = Date(timeIntervalSince1970: 1_000)
+    // learnedAt is 1 second in the future relative to now.
+    let future = Date(timeIntervalSince1970: 1_001)
+    let futureDated = LearnedDestination(
+        identity: remote, appData: nil, ratchet: nil, interfaceID: ifID,
+        hops: 2, nextHop: destHash, announceEmitted: 10, learnedAt: future)
+
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = DateGenerator { now }
+    }
+    store.exhaustivity = .off
+    await store.send(.rehydrateLearnedDestinations([destHash: futureDated]))
+
+    #expect(store.state.learned[destHash] == nil)
+    store.exhaustivity = .on
+}
+
 ///
 /// For scale: the value-typed `RingSet` this replaced cost 67-82 ms per insert at this capacity
 /// under TCA's per-action `State` copy — this loop would have taken ~10 hours.

@@ -210,6 +210,29 @@ public struct Transport {
         case startMaintenance
         case stopMaintenance
         case maintenanceTick
+        /// Restore `learned` from a previous session so that after a cold start the node can
+        /// route to known destinations without waiting for announces to re-arrive.
+        ///
+        /// **Sweeps expired entries in the same pass.** `maintenanceTick` uses a mode-dependent
+        /// expiry (1 day for AP, 6 hours for roaming, 7 days otherwise — `Transport.pathExpiry`).
+        /// At rehydration time interfaces are not yet connected, so the mode is unknown; we apply
+        /// the conservative 7-day default. The next `maintenanceTick` refines the expiry once an
+        /// interface connects. Reference (`Transport.py:307-357`, stock 1.4.2) does NOT sweep on
+        /// load — culling happens in the periodic jobs loop — but this action follows the
+        /// `.rehydrateLearnedPeers` precedent and sweeps in the same pass to keep the table
+        /// bounded before anything routes through it.
+        ///
+        /// **A restored entry NEVER replaces a fresher live one.** The app pattern merges
+        /// `.endpoint(.start)` with an async database read, so an announce can populate `learned`
+        /// before this action lands. An unconditional write would move `learnedAt` backward and
+        /// restore superseded routing data. Check `learnedAt` and skip if the live entry is at
+        /// least as fresh.
+        ///
+        /// **A row whose `learnedAt` is non-finite or in the future is dropped, not restored.**
+        /// `Date + TimeInterval` is Double arithmetic and saturates rather than trapping, so there
+        /// is no crash to catch — the test is the only guard. A future date would look unexpired
+        /// forever; a NaN fails open (`now <= nan` is true). Drop both.
+        case rehydrateLearnedDestinations([Data: LearnedDestination])
         case delegate(Delegate)
 
         @CasePathable
@@ -305,6 +328,24 @@ public struct Transport {
 
             case let .setRecursivePathRequests(enabled):
                 state.recursivePathRequests = enabled
+                return .none
+
+            case let .rehydrateLearnedDestinations(destinations):
+                // Restore and sweep in one pass. See the action's declaration for the full
+                // rationale. Short form: drop expired, drop future-dated, never overwrite fresher.
+                let now = date.now
+                for (hash, candidate) in destinations {
+                    // Drop non-finite or future-dated timestamps — they would be unexpired forever
+                    // (future) or fail open (NaN: `now <= nan` evaluates to true). See the action
+                    // declaration for why clamping to now does not work.
+                    guard candidate.learnedAt.timeIntervalSinceReferenceDate.isFinite,
+                          candidate.learnedAt <= now,
+                          now <= candidate.learnedAt + Transport.pathExpiry
+                    else { continue }
+                    // Never overwrite a fresher live entry.
+                    if let live = state.learned[hash], live.learnedAt >= candidate.learnedAt { continue }
+                    state.learned[hash] = candidate
+                }
                 return .none
 
             case let .received(interfaceID, data):
