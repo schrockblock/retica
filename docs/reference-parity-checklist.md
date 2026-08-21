@@ -27,7 +27,7 @@ Reticulum/LXMF, ordered by *what a real peer notices*. Tick items as they land.
 | **Wire format** | Essentially complete, byte-verified against genuine reference output. No algorithmic gap in the crypto primitives. |
 | **Protocol mechanics** | Good for the paths ReTiCA uses — links, resources, requests, announces, path requests, relaying, LXMF opportunistic/direct/propagated. |
 | **Adversarial robustness** | ~18 remotely-reachable aborts closed, plus two fail-opens, one unkillable-work DoS and one wire-sized allocation. Tier 2 is **clear**; the wire-input trap sweep is complete. Still absent: admission control, and any bound on `LinkPlane.state.links` / `LinkSession.state.transfers`. |
-| **Durability** | Absent. Nothing in the transport core persists. |
+| **Durability** | Split. The **LXMF layer** survives a cold start — dedup sets and learned stamp costs persist and replay, so a restart no longer re-delivers every message or sends unstamped to every peer. The **transport core** still persists nothing: no path table, announce cache, packet-hash list, or known-destination store, so a restart begins with no known paths until announces arrive. |
 | **Breadth** | 2 of 15 interfaces; no `Channel`/`Buffer`, tickets, tunnels, or non-link proofs. |
 
 The useful frame: ReTiCA speaks the wire correctly, then **loses messages for reasons the peer
@@ -465,27 +465,71 @@ exactly the class Tier 1 just closed.*
 - [ ] **Nothing in the transport core persists.** No path table, announce cache, packet-hash list,
       or known-destination store. Reference persists all of them (`Transport.py:3291-3504`,
       `Identity.py:176-239`).
-- [ ] **Cold start causes duplicate message delivery.** `LXMFRouter.seen` and
+- [x] **Cold start causes duplicate message delivery.** `LXMFRouter.seen` and
       `downloadedTransientIds` both reset, so the next PN sync re-downloads everything the node
       still holds and re-delivers it as new. Reference avoids this with `local_deliveries` /
       `locally_processed`. **On iOS the process is killed constantly, so this is the normal path.**
-- [ ] **`LXMFNode.State.learnedPeers` is never collected — the deferred risk is GROWTH, not staleness.**
+      **Fixed** — plan `2026-08-17-lxmf-durability.md`. Library: `5459c49` adds
+      `LXMFRouter.rehydrateDedup(seenHashes:downloadedTransientIds:)`. App: ReTiCaMsgr `bcbbef4`
+      persists both sets (`SeenHashRow`, `DownloadedTransientIdRow`) and replays them from
+      `AppFeature.onLaunch`; `eb5312d` pins the transient-id half, which `bcbbef4` persisted but
+      no test observed — stubbing the launch read left all 49 tests green.
+      **`seenHashes` must be supplied oldest-first**, and that contract is the fragile part: the
+      reducer inserts one at a time into a `RingSet(capacity: 10_000)` which evicts at capacity, so
+      reversing the order persists the newest 10 000 and restores the oldest — defeating the feature
+      while every test passes. The app's `order(by: \.storedAt)` is what satisfies it.
+- [x] **`LXMFNode.State.learnedPeers` is never collected — the deferred risk is GROWTH, not staleness.**
       Reference expires `outbound_stamp_costs` entries older than
       `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60` seconds in `clean_outbound_stamp_costs`
       (`LXMRouter.py:1272-1281`, LXMF 1.1.0). We store each entry's `learnedAt` so the same expiry
       can be added without a schema change, but no cleanup runs.
-      **Staleness is the benign half** — a fresh announce overwrites the entry, and nothing spends
-      the value today. **Unbounded growth is the real gap:** one entry per distinct `lxmf.delivery`
+      ~~**Staleness is the benign half** — a fresh announce overwrites the entry, and nothing spends
+      the value today.~~ **That was true on 2026-08-15 and false on 2026-08-16**: the delivery-stamp
+      slice made `LXMFNode.deliverySend` spend `learnedPeers[…].stampCost`. Staleness now means
+      stamping at an outdated price, and **under**-paying gets us dropped by exactly the peers
+      stamps exist for. Struck rather than deleted — it is a one-day-old instance of this file's own
+      maintenance rule, and the seventh summary-wider-than-its-evidence in three weeks.
+      **Unbounded growth is the real gap:** one entry per distinct `lxmf.delivery`
       destination ever heard, retained after the transport has expired the path that produced it.
-      `Transport.maintenanceTick` sweeps `Transport.State.learned` and deliberately piggybacks
-      `announceBlobs` and `announceCache` on it (`Transport.swift`, the `.maintenanceTick` case);
-      `learnedPeers` joins none of them, because it lives in `LXMFNode.State` and no path-expiry
-      delegate crosses the `TransportEndpoint` boundary. Closing this wants either a new
-      `.delegate(.pathExpired)` emitted from both transports, or a sweep driven from `LXMFNode`.
+      **Fixed** — library `5cfe1db` sweeps entries past `stampCostExpiry` during
+      `.rehydrateLearnedPeers`, mirroring reference's startup sequence (load, then
+      `clean_outbound_stamp_costs`, `LXMRouter.py:276`); `54fb7a2` stops a restored entry
+      clobbering a *fresher* live one and drops malformed/future-dated rows; app `eb5312d` deletes
+      expired rows from disk at launch, because the library can skip a row but cannot tell the app
+      to forget it.
+      **Two limits this does NOT reach, both inherited from reference:** the sweep runs only at
+      rehydration, so a long-running **macOS** session never sweeps (reference has the same
+      limitation — `clean_outbound_stamp_costs` has exactly one caller — but reference is a daemon
+      and never faced a 45-day GUI session); and within a session growth is still uncollected,
+      since no path-expiry delegate crosses the `TransportEndpoint` boundary. Closing the second
+      still wants `.delegate(.pathExpired)` from both transports, or a sweep driven from `LXMFNode`.
       *An earlier revision of this entry called the gap low-impact on the grounds that no stale
       entry causes a wrong outcome. That was true of correctness and silently dropped the growth
       mode — which the delivery-hash gate bounds to LXMF peers but does not close.*
-      *Filed 2026-08-15.*
+      *Filed 2026-08-15; closed 2026-08-21.*
+
+*What this slice does NOT close — each checked against a run, not assumed:*
+
+- **Transport-core persistence remains absent** (the item above this one). After a restart there
+  are no known paths until announces arrive, so the first sends of a session may have nowhere to
+  go. Ruled out of scope on 2026-08-17: losing paths costs *delay*, not correctness.
+- **`downloadedTransientIdRows` is deliberately unbounded.** Disk is the only limit. Ruled
+  2026-08-17 so that real usage can inform a cap rather than a guess — any cap trades storage
+  against re-downloading old messages from a propagation node. **Accepted risk, not an oversight.**
+  Revisit trigger: a report of the table growing uncomfortably, or operational data giving a
+  representative steady-state size.
+- **Writes happen per delivered message, not batched.** Chosen for durability because on iOS the
+  process kill is routine, so a batch window is a routine loss window; reference likewise saves at
+  each update rather than on a timer. Expected pull-back if write traffic bites: batch with a flush
+  on `applicationDidEnterBackground` / `applicationWillTerminate`.
+- **One library write-site the app cannot observe.** `LXMFRouter` inserts a hash into `seen`
+  before `LXMFNode` drops a message whose delivery stamp is invalid under `enforceDeliveryStamps`,
+  and that path emits no `.messageReceived` — so the hash is in `seen` but never in `seenHashRows`,
+  and the ~60 ms validation is re-paid after a restart. **Latent only**: nothing sets a delivery
+  stamp cost today, so the drop branch is unreachable. It becomes live the moment enforcement is.
+- **The seen-hash write shares a transaction with the inbound message insert**, so a failing
+  persist rolls back the chat message too. TCA reports the issue and drops the effect rather than
+  crashing, but there is no retry and no user-visible signal.
 
 ## Tier 5 — capability and throughput
 
