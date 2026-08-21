@@ -334,8 +334,33 @@ public struct LXMFNode {
                 // action) is the routine path, so a launch-time sweep fires routinely. The keep
                 // condition `now <= learnedAt + expiry` is reference's strict inequality inverted:
                 // an entry exactly one expiry old survives.
+                //
+                // A restored entry NEVER replaces a fresher live one. Rehydration is not guaranteed
+                // to land before the network does: the app pattern this action is built for merges
+                // `.endpoint(.start)` with an async database read (`AppFeature.onLaunch`), so an
+                // announce can reach `learnedPeers` first. An unconditional write would then move
+                // `learnedAt` BACKWARDS and restore a superseded stamp cost — which is precisely the
+                // failure this slice exists to prevent, since under-paying gets us dropped by an
+                // enforcing peer. Reference is not exposed to this: it loads `outbound_stamp_costs`
+                // synchronously in `__init__`, before any network exists.
+                //
+                // A row whose `learnedAt` is non-finite or in the FUTURE is dropped, not restored.
+                // `Date + TimeInterval` is Double arithmetic, so it saturates rather than traps —
+                // there is no crash here, which is why this needs a test rather than a guard. Two
+                // ways an unclamped sweep keeps such a row forever: NaN fails OPEN, because
+                // `now <= nan` is `!(nan < now)` = true; and a future date is trivially unexpired.
+                //
+                // Clamping to `now` instead of dropping does NOT work, and a test caught that here:
+                // clamping makes a future row look maximally FRESH, so it is kept — and re-clamped
+                // against each later `now`, so it is immortal, which is the defect being fixed.
+                // Dropping is cheap: the next announce from that peer repopulates the entry.
                 let now = date.now
-                for (hash, peer) in peers where now <= peer.learnedAt + LXMFNode.stampCostExpiry {
+                for (hash, peer) in peers {
+                    guard peer.learnedAt.timeIntervalSinceReferenceDate.isFinite,
+                          peer.learnedAt <= now,
+                          now <= peer.learnedAt + LXMFNode.stampCostExpiry
+                    else { continue }
+                    if let live = state.learnedPeers[hash], live.learnedAt >= peer.learnedAt { continue }
                     state.learnedPeers[hash] = peer
                 }
                 return .none

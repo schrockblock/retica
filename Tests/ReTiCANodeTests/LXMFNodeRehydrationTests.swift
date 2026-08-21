@@ -23,9 +23,10 @@ private let peerDestHash = Data(repeating: 0xA1, count: 16)
 private let day: TimeInterval = 24 * 60 * 60
 
 /// A fixed, deliberately PAST clock. Load-bearing for `nodeRehydrationKeepsPeersYoungerThanExpiry`:
-/// an entry 40 days before this instant is ~700 days old against wall-clock time, so an
-/// implementation that swept with `Date()` instead of the `\.date` dependency would drop it and
-/// fail that test.
+/// an entry 40 days before this instant is **well over a year** old against wall-clock time — and
+/// the gap only widens — so an implementation that swept with `Date()` instead of the `\.date`
+/// dependency would drop it and fail that test. (An earlier version of this comment said
+/// "~700 days", which was true when written and is not now; a fixed date's age is not a constant.)
 private let injectedNow = Date(timeIntervalSince1970: 1_700_000_000)
 
 @MainActor
@@ -130,4 +131,65 @@ private func peer(stampCost: Int?, learnedAt: Date) -> LXMFNode.LearnedPeer {
     #expect(store.state.learnedPeers[youngOneDay] != nil)
     #expect(store.state.learnedPeers[youngFortyDays] != nil, "40 days < 45-day expiry; also the injected-clock pin")
     #expect(store.state.learnedPeers[exactlyExpiryOld] != nil, "boundary is kept: reference's sweep is strict")
+}
+
+/// A restored entry must not overwrite a **fresher live** one.
+///
+/// Rehydration is not guaranteed to land before the network does. `AppFeature.onLaunch` merges
+/// `.endpoint(.start)` with an async database read, so an announce can populate `learnedPeers`
+/// first — and an unconditional restore would then move `learnedAt` backwards and reinstate a
+/// superseded stamp cost. That is the exact failure this slice exists to prevent: stamping at an
+/// outdated price, where UNDER-paying gets us dropped by an enforcing peer. Reference never faces
+/// this because it loads `outbound_stamp_costs` synchronously in `__init__`, before any network.
+///
+/// Anti-vacuity: the persisted entry is deliberately **unexpired** (30 days < 45), so the sweep
+/// would keep it. Only the freshness comparison can reject it. Asserting the cost — not merely
+/// that some entry exists — is what distinguishes "kept the live one" from "restored either one".
+@MainActor @Test func nodeRehydrationDoesNotClobberAFresherLiveEntry() async {
+    let store = makeRehydrationStore()
+
+    // Live entry: heard just now, cost 3.
+    let live = peer(stampCost: 3, learnedAt: injectedNow)
+    await store.send(.rehydrateLearnedPeers([peerDestHash: live]))
+    #expect(store.state.learnedPeers[peerDestHash]?.stampCost == 3)
+
+    // Persisted entry: older than the live one but well inside the expiry window, cost 9.
+    let stale = peer(stampCost: 9, learnedAt: injectedNow.addingTimeInterval(-30 * day))
+    await store.send(.rehydrateLearnedPeers([peerDestHash: stale]))
+
+    #expect(store.state.learnedPeers[peerDestHash]?.stampCost == 3, "the fresher live cost survives")
+    #expect(store.state.learnedPeers[peerDestHash]?.learnedAt == injectedNow, "learnedAt must not move backwards")
+}
+
+/// A malformed `learnedAt` is swept, not made immortal.
+///
+/// Rows come from our own database, but a corrupted or hand-edited store must degrade rather than
+/// persist forever. `Date + TimeInterval` is `Double` arithmetic, so it saturates instead of
+/// trapping — there is no crash to catch here, which is exactly why this needs a test rather than
+/// a guard. The sharp case is **NaN, which fails OPEN**: `now <= nan` desugars to `!(nan < now)`
+/// = `true`, so an unclamped sweep keeps it forever. A future-dated row is the realistic one — a
+/// device with a skewed clock writes `learnedAt: date.now` into 2040, and after the clock corrects
+/// that entry can never expire.
+@MainActor @Test func nodeRehydrationSweepsMalformedTimestamps() async {
+    let store = makeRehydrationStore()
+
+    let futureDated = Data(repeating: 0x66, count: 16)
+    let notANumber = Data(repeating: 0x77, count: 16)
+    let infinite = Data(repeating: 0x88, count: 16)
+    let sane = Data(repeating: 0x99, count: 16)
+
+    await store.send(.rehydrateLearnedPeers([
+        futureDated: peer(stampCost: 8, learnedAt: injectedNow.addingTimeInterval(100 * 365 * day)),
+        notANumber: peer(stampCost: 8, learnedAt: Date(timeIntervalSinceReferenceDate: .nan)),
+        infinite: peer(stampCost: 8, learnedAt: Date(timeIntervalSinceReferenceDate: .infinity)),
+        sane: peer(stampCost: 8, learnedAt: injectedNow.addingTimeInterval(-1 * day)),
+    ]))
+
+    // Dropped, NOT clamped. A first attempt at this clamped `learnedAt` to `now`, which makes a
+    // future row look maximally FRESH — kept, and re-clamped against every later `now`, so
+    // immortal. This assertion is what caught that.
+    #expect(store.state.learnedPeers[futureDated] == nil, "a future-dated row is dropped, not made immortal")
+    #expect(store.state.learnedPeers[notANumber] == nil, "NaN must fail CLOSED, not open")
+    #expect(store.state.learnedPeers[infinite] == nil, "non-finite is treated as always-expired")
+    #expect(store.state.learnedPeers[sane] != nil, "the well-formed row is unaffected — the sweep is not just dropping everything")
 }
