@@ -27,6 +27,16 @@ public struct TransportEndpoint {
             }
         }
 
+        /// Connected interfaces of the active transport. Paired with `learned`: an entry in
+        /// `learned` names an `interfaceID`, and only an id present HERE is still reachable —
+        /// which is the test `Transport.reachableLearned` performs and `openLink` gates on.
+        public var interfaces: [InterfaceID: InterfaceProfile] {
+            switch self {
+            case let .tcp(s): return s.transport.interfaces
+            case let .ble(s): return s.transport.interfaces
+            }
+        }
+
         /// Live links of the active transport.
         public var links: IdentifiedArrayOf<LinkSession.State> {
             switch self {

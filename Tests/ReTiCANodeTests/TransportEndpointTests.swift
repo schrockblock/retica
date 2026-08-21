@@ -137,3 +137,26 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
     #expect(bleWrapped.links.isEmpty)
     #expect(bleWrapped.registrations.isEmpty)
 }
+
+// The unified surface exposes `learned`, `links` and `registrations`; `interfaces` was the
+// one table missing, which forced consumers to switch on .tcp/.ble to answer "is this
+// interface still up?" — the question `reachableLearned` is built on.
+@Test @MainActor func interfacesAreExposedOnTheUnifiedSurfaceForBothTransports() {
+    var tcp = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+    tcp.transport.interfaces[InterfaceID("tcp")] = .tcp
+    #expect(TransportEndpoint.State.tcp(tcp).interfaces == [InterfaceID("tcp"): .tcp])
+
+    var ble = BLEEndpoint.State()
+    ble.transport.interfaces[InterfaceID("ble-1")] = .ble
+    #expect(TransportEndpoint.State.ble(ble).interfaces == [InterfaceID("ble-1"): .ble])
+}
+
+// `PendingDelivery` is a public struct with no explicit init, so its memberwise init is
+// INTERNAL and no other module can build one. Constructing it here from the test target is
+// the assertion.
+@Test func pendingDeliveryIsConstructibleFromAnotherModule() {
+    let pending = LXMFRouter.PendingDelivery(
+        resend: .opportunistic(destinationHash: Data(repeating: 0x01, count: 16), payload: Data()),
+        attempts: 3)
+    #expect(pending.attempts == 3)
+}

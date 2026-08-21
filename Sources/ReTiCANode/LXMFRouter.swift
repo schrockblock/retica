@@ -105,7 +105,16 @@ public struct LXMFRouter {
         case direct(destinationHash: Data, data: Data, asResource: Bool)
         case propagated(destinationHash: Data, data: Data)
     }
-    public struct PendingDelivery: Equatable { public var resend: ResendInfo; public var attempts: Int }
+    public struct PendingDelivery: Equatable {
+        public var resend: ResendInfo
+        public var attempts: Int
+        /// Explicit because the synthesised memberwise init on a `public struct` is INTERNAL,
+        /// which made this type public in name only — no other module could construct one.
+        public init(resend: ResendInfo, attempts: Int) {
+            self.resend = resend
+            self.attempts = attempts
+        }
+    }
     public struct PropagationItem: Equatable { public var messageHash: Data; public var propagationPacked: Data }
 
     public enum Action: Equatable {
