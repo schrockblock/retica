@@ -150,6 +150,9 @@ private func makePeeringNode(pendingCostForPeer: Int? = nil) -> TestStore<PNNode
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
         identity: Identity(), appData: nil, ratchet: nil, interfaceID: initial.endpoint.interfaceID,
         hops: 1, nextHop: nil, announceEmitted: 0)
+    // See the note in PNNodeTests: `openLink` gates on `reachableLearned`, which reads the
+    // interface table as well as the path table, so both have to be seeded together.
+    initial.endpoint.transport.interfaces[initial.endpoint.interfaceID] = .tcp
     if let pendingCostForPeer { initial.pendingSyncPeers[peerDest] = pendingCostForPeer }
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })

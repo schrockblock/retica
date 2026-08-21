@@ -194,6 +194,43 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.receive(\.interface.disconnect)
 }
 
+// F8. `learned` is deliberately NON-destructive: losing the interface does not purge the path,
+// so an entry can outlive the interface it names. `Transport.send` already gates on this
+// (`reachableLearned`) and `BLEEndpoint.openLink` does too — `TCPEndpoint.openLink` did not, so it
+// minted a LinkSession that transmitted into a dead interface and exited only via the 15s
+// establishment deadline.
+//
+// That is not just a slow failure, it is a MISLEADING one: `.establishmentTimedOut` is classified
+// PATH-shaped and routes to `pathLostAndClosed`, so a dead SOCKET was being reported as a dead
+// ROUTE. On device this looked like "tapping a peer always fails after 15 seconds" whenever the
+// connection had dropped.
+@Test @MainActor func openLinkOverALostInterfaceFailsFastAsPathStale() async {
+    let (store, events) = makeStore()
+    let id = Identity()
+    let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
+                                                     hops: 1, emitted: 1000)
+    await store.send(.connect)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+    events.yield(.data(HDLC.frame(announceRaw)))
+    await store.receive(\.transport.received)
+    await store.receive(\.delegate.pathLearned)
+
+    // The socket drops. The learned entry survives by design — that is the trap.
+    events.yield(.disconnected(reason: "socket closed"))
+    await store.receive(\.interface.connectionEvent)
+    await store.receive(\.transport.interfaceDisconnected)
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.transport.learned[destHash] != nil, "learned must survive; the gate is the fix")
+
+    await store.send(.openLink(destinationHash: destHash))
+    await store.receive(.delegate(.linkFailed(destinationHash: destHash, reason: .pathStale)))
+    #expect(store.state.links.isEmpty, "no LinkSession may be minted against a dead interface")
+
+    await store.send(.disconnect)
+    await store.skipReceivedActions(strict: false)
+}
+
 @Test @MainActor func openLinkToUnlearnedDestinationFails() async {
     let (store, events) = makeStore()
     await store.send(.connect)

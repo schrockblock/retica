@@ -160,6 +160,18 @@ public struct TCPEndpoint {
                 guard let learned = state.transport.learned[destinationHash] else {
                     return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .noPath)))
                 }
+                // `learned` is deliberately NON-destructive, so an entry outlives the interface it
+                // names: the socket drops, `Transport` drops the interface, and the path stays.
+                // Without this gate `openLink` minted a LinkSession that transmitted into a dead
+                // interface and exited only via the 15s establishment deadline — and worse, reported
+                // it as `.establishmentTimedOut`, which is classified PATH-shaped, so a dead SOCKET
+                // was laundered into a dead ROUTE and solicited a pointless path request.
+                //
+                // `Transport.send` already gates on this, and `BLEEndpoint.openLink` does too; this
+                // was the odd one out (handoff F8).
+                guard state.transport.reachableLearned(destinationHash) != nil else {
+                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .pathStale)))
+                }
                 // Via a relay (learned nextHop != the destination) → HEADER_2 LINKREQUEST to the relay.
                 let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
                 return .send(.linkPlane(.openLink(initiatorTo: learned.identity,
