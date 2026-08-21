@@ -151,12 +151,20 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
     #expect(TransportEndpoint.State.ble(ble).interfaces == [InterfaceID("ble-1"): .ble])
 }
 
-// `PendingDelivery` is a public struct with no explicit init, so its memberwise init is
-// INTERNAL and no other module can build one. Constructing it here from the test target is
-// the assertion.
-@Test func pendingDeliveryIsConstructibleFromAnotherModule() {
-    let pending = LXMFRouter.PendingDelivery(
-        resend: .opportunistic(destinationHash: Data(repeating: 0x01, count: 16), payload: Data()),
-        attempts: 3)
+// `PendingDelivery` gained an explicit `public init` because the synthesised memberwise init
+// on a `public struct` is INTERNAL — the type was public in name only. This test asserts the
+// init ASSIGNS ITS PARAMETERS; it deliberately does NOT claim to prove accessibility.
+//
+// This file carries `@testable import ReTiCANode`, which makes internal members visible, so
+// the module boundary is erased here: the body below would compile and pass even if the
+// `public init` were deleted and the internal memberwise init used instead. A test named for
+// cross-module construction would therefore be a false coverage claim. The genuine boundary
+// proof is a construction from a target that imports ReTiCANode WITHOUT `@testable` — no such
+// target exists in this package, so it lands in the app's test target instead.
+@Test func pendingDeliveryInitAssignsItsParameters() {
+    let resend = LXMFRouter.ResendInfo.opportunistic(
+        destinationHash: Data(repeating: 0x01, count: 16), payload: Data())
+    let pending = LXMFRouter.PendingDelivery(resend: resend, attempts: 3)
     #expect(pending.attempts == 3)
+    #expect(pending.resend == resend)
 }
