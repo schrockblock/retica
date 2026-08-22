@@ -1179,6 +1179,67 @@ private func relayHostingLinkTableEntry(rcvdIf: String, nhIf: String)
     #expect(captured.value?.1 == lp)
 }
 
+// MARK: - Task F13 tests (relay link shadow protection)
+
+@Test @MainActor func reflectedLinkRequestForOurOwnLinkIsNotTabled() async {
+    // A relay that has opened its OWN link (registered its linkID) must NOT create a relay
+    // linkTable entry for a reflected HEADER_2 copy of that request — doing so shadows the link.
+    let (store, relay, destHash, _) = await relayStoreKnowingDestDirectly()
+    store.exhaustivity = .off
+    let payload = Data(repeating: 0x11, count: 64) + Data([0x00, 0x00, 0x00])
+    let lr = makeHeader2LinkRequestPacket(transportId: relay.hash, destHash: destHash, hops: 0, payload: payload)
+    let linkID = Link.linkID(requestPacket: Packet(raw: lr)!)
+    // We are an endpoint of this link.
+    await store.send(.registerLocalLink(linkID))
+    // The attacker reflects our own request back to us as a relay request.
+    await store.send(.received(InterfaceID("in"), lr))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.linkTable[linkID] == nil,
+            "a reflection of our own LINKREQUEST must not be tabled as relay traffic")
+    await store.finish()
+}
+
+@Test @MainActor func linkPacketForOurOwnLinkDeliversLocallyNotForwarded() async {
+    // Even if a relay entry exists for a linkID we own, an inbound link packet for it must be
+    // delivered locally (.linkPacket), never forwarded (.transmit).
+    let (store, linkID) = await relayHostingLinkTableEntry(rcvdIf: "ar", nhIf: "rb")
+    store.exhaustivity = .off
+    await store.send(.registerLocalLink(linkID))
+    let lp = makeLinkPacket(linkID: linkID, hops: 0, payload: Data([1, 2, 3]))
+    let sawLocal = LockIsolated<Bool>(false)
+    let sawForward = LockIsolated<Bool>(false)
+    await store.send(.received(InterfaceID("ar"), lp))
+    await store.receive { action in
+        if case .delegate(.linkPacket) = action { sawLocal.setValue(true); return true }
+        if case .delegate(.transmit) = action { sawForward.setValue(true); return true }
+        return false
+    }
+    #expect(sawLocal.value == true, "our own link's packet must be delivered locally")
+    #expect(sawForward.value == false, "our own link's packet must not be forwarded")
+    await store.finish()
+}
+
+@Test @MainActor func genuineRelayStillTablesWhenLinkIsNotOurs() async {
+    // A non-local linkID is still tabled and forwarded — the fix must not break real relaying.
+    let (store, relay, destHash, outIf) = await relayStoreKnowingDestDirectly()
+    store.exhaustivity = .off
+    // Register some UNRELATED local link, to prove the guard keys on the specific linkID.
+    await store.send(.registerLocalLink(Data(repeating: 0xAB, count: 16)))
+    let payload = Data(repeating: 0x11, count: 64) + Data([0x00, 0x00, 0x00])
+    let lr = makeHeader2LinkRequestPacket(transportId: relay.hash, destHash: destHash, hops: 0, payload: payload)
+    let linkID = Link.linkID(requestPacket: Packet(raw: lr)!)
+    let forwarded = LockIsolated<Bool>(false)
+    await store.send(.received(InterfaceID("in"), lr))
+    await store.receive { action in
+        if case .delegate(.transmit) = action { forwarded.setValue(true); return true }
+        return false
+    }
+    #expect(store.state.linkTable[linkID]?.rcvdIf == InterfaceID("in"))
+    #expect(store.state.linkTable[linkID]?.nhIf == outIf)
+    #expect(forwarded.value == true)
+    await store.finish()
+}
+
 // MARK: - Task 4 (link_id parity cross-validation)
 
 @Test @MainActor func linkIDParityAcrossHeader2ToHeader1Rewrite() async {

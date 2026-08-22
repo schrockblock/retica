@@ -40,6 +40,11 @@ public struct Transport {
         public var transportIdentity: Identity? = nil
         var seenPacketHashes = RingSet(capacity: Transport.seenPacketRingSize)
         public var linkTable: [Data: LinkTableEntry] = [:]
+        /// LinkIDs of links we are an endpoint of (initiator or responder). A link we own is never
+        /// relay traffic: Transport must not table a reflected LINKREQUEST that collides with our
+        /// own linkID, nor forward our own link's packets. Kept in sync by LinkPlane via
+        /// register/unregister (see TransportEndpoint wiring). Session-only.
+        public var localLinkIDs: Set<Data> = []
         /// Per-destination ring of recently-seen announce random-blobs (the 10-byte announce
         /// random_hash). Replaces packetHash dedup for announces: a repeated blob is a replay
         /// (RNS Transport.py:1824 `not random_blob in random_blobs`). Bounded to
@@ -200,6 +205,8 @@ public struct Transport {
         case registerLocalDestination(Destination)
         case setTransportIdentity(Identity?)
         case setRecursivePathRequests(Bool)
+        case registerLocalLink(Data)
+        case unregisterLocalLink(Data)
         case received(InterfaceID, Data)
         case announce(destinationHash: Data, appData: Data?)
         case requestPath(destinationHash: Data)
@@ -330,6 +337,14 @@ public struct Transport {
                 state.recursivePathRequests = enabled
                 return .none
 
+            case let .registerLocalLink(linkID):
+                state.localLinkIDs.insert(linkID)
+                return .none
+
+            case let .unregisterLocalLink(linkID):
+                state.localLinkIDs.remove(linkID)
+                return .none
+
             case let .rehydrateLearnedDestinations(destinations):
                 // Restore and sweep in one pass. See the action's declaration for the full
                 // rationale. Short form: drop expired, drop future-dated, never overwrite fresher.
@@ -387,7 +402,10 @@ public struct Transport {
                 if packet.destinationType == .link {
                     // Relay: a transited link's packets (LRPROOF + established traffic) are forwarded
                     // direction-aware by link_id; a local link surfaces to the endpoint as today.
-                    if let entry = state.linkTable[packet.destinationHash],
+                    // A link we are an endpoint of is never relay traffic — fall through to local delivery.
+                    // Without this, a reflected LINKREQUEST that tabled our own linkID would shadow us.
+                    if !state.localLinkIDs.contains(packet.destinationHash),
+                       let entry = state.linkTable[packet.destinationHash],
                        Int(packet.hops) + 1 < Int(Packet.maxHops) {
                         let outIf: InterfaceID
                         if interfaceID == entry.rcvdIf { outIf = entry.nhIf }        // toward dest
@@ -672,6 +690,9 @@ public struct Transport {
                         guard let entry = state.learned[packet.destinationHash],
                               Int(packet.hops) + 1 < Int(Packet.maxHops) else { return .none }
                         let linkID = Link.linkID(requestPacket: packet)
+                        // A reflection of our OWN LINKREQUEST carries our own linkID (hashablePart excludes
+                        // header/transport fields), so it would otherwise table a shadow of our live link. Drop it.
+                        guard !state.localLinkIDs.contains(linkID) else { return .none }
                         state.linkTable[linkID] = State.LinkTableEntry(
                             rcvdIf: interfaceID, nhIf: entry.interfaceID, refreshedAt: date.now)
                         guard let raw = forwardTowardDest(packet, entry) else { return .none }
