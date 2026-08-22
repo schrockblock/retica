@@ -27,7 +27,7 @@ Reticulum/LXMF, ordered by *what a real peer notices*. Tick items as they land.
 | **Wire format** | Essentially complete, byte-verified against genuine reference output. No algorithmic gap in the crypto primitives. |
 | **Protocol mechanics** | Good for the paths ReTiCA uses — links, resources, requests, announces, path requests, relaying, LXMF opportunistic/direct/propagated. |
 | **Adversarial robustness** | ~18 remotely-reachable aborts closed, plus two fail-opens, one unkillable-work DoS and one wire-sized allocation. Tier 2 is **clear**; the wire-input trap sweep is complete. Still absent: admission control, and any bound on `LinkPlane.state.links` / `LinkSession.state.transfers`. |
-| **Durability** | Split. The **LXMF layer** survives a cold start — dedup sets and learned stamp costs persist and replay, so a restart no longer re-delivers every message or sends unstamped to every peer. The **transport core** still persists nothing: no path table, announce cache, packet-hash list, or known-destination store, so a restart begins with no known paths until announces arrive. |
+| **Durability** | Present for what a restart notices. The **LXMF layer** persists dedup sets and learned stamp costs, so a restart no longer re-delivers every message or sends unstamped to every peer; the **transport path table** persists too, so a restart can route immediately instead of waiting for re-announces. Still transient by decision, not omission: the 8.4 MB packet-hash ring, the announce cache, and tunnels — see Tier 4 for what each costs. |
 | **Breadth** | 2 of 15 interfaces; no `Channel`/`Buffer`, tickets, tunnels, or non-link proofs. |
 
 The useful frame: ReTiCA speaks the wire correctly, then **loses messages for reasons the peer
@@ -462,9 +462,48 @@ exactly the class Tier 1 just closed.*
 
 ## Tier 4 — durability
 
-- [ ] **Nothing in the transport core persists.** No path table, announce cache, packet-hash list,
+- [x] **Nothing in the transport core persists.** No path table, announce cache, packet-hash list,
       or known-destination store. Reference persists all of them (`Transport.py:3291-3504`,
       `Identity.py:176-239`).
+      **The path table now persists** — plan `2026-08-21-transport-path-persistence.md`. Library
+      `9667afe` adds `Transport.rehydrateLearnedDestinations([Data: LearnedDestination])`, which on
+      restore refuses to overwrite a **fresher live** entry and **drops** malformed or future-dated
+      timestamps rather than clamping them (clamping makes a future row look maximally fresh, hence
+      immortal — a mistake made and caught by test in the preceding slice). App ReTiCaMsgr `5d2b33a`
+      persists and replays it; `aa19115`/`cbe1845` export `Transport.pathExpiry` so the app prunes
+      on the library's terms instead of mirroring the constant.
+      **Write policy is debounced — dirty, at most every ~30 s, plus a flush on background** — which
+      deliberately differs from the per-message policy used for LXMF durability. The reason is write
+      *rate*, not principle: a delivered message is discrete and rare; `learned` updates on every
+      announce that improves a path.
+
+      **The rest of the transport core is still not persisted, and three of the four are deliberate:**
+
+      - **Packet-hash ring — deliberate divergence.** `seenPacketHashes` is `seenPacketRingSize =
+        262_144` ≈ **8.4 MB**; writing that on a 30 s debounce is untenable. Reference persists its
+        *larger* equivalent (`hashlist_maxsize = 1_000_000`, `Transport.py:177`) but only on a
+        **12-hour** timer, precisely because each write is expensive. The cost of losing ours is
+        lower than reference's, too: `LXMFRouter.seen` persists at the LXMF layer, so a replayed
+        *message* is still deduplicated. Losing the transport ring costs re-processing work and
+        briefly reopens announce-loop damping — not data.
+      - **Announce cache and announce blobs — a real divergence, not parity.** *An earlier draft of
+        this entry was going to say reference does not persist its equivalents. It does*: cached
+        announce packets are written per-hash under `cachepath/announces/`
+        (`Transport.get_cached_packet`, `:2663-2675`), and reference's path-table **load depends on
+        them** — an entry is skipped when `get_cached_packet` returns nil. We diverge harmlessly
+        because our `LearnedDestination` rows are self-contained where reference's path entries are
+        not. The cost is narrower: after a restart we cannot answer a path request from cache for a
+        destination until we hear it announce again.
+      - **Tunnels** remain absent entirely (Tier 6), so `save_tunnel_table` (`:3425`) has no analogue.
+      - **The debounce loss window** is up to ~30 s of path learning, re-learned from the next
+        announce.
+
+      **Reference's own triggers, for whoever revisits the cadence:** a 12-hour timer in the jobs
+      loop (`Reticulum.py:386-387`, `PERSIST_INTERVAL`), an opportunistic 5-minute-gated save when a
+      shared-instance client disconnects (`_should_persist_data`, `:1187-1191`), and `exit_handler`
+      (`Transport.py:3527`). **None transfers**: iOS rarely runs exit handlers, 12 hours is never
+      before a kill, and we have no shared-instance disconnect.
+      *Closed 2026-08-21.*
 - [x] **Cold start causes duplicate message delivery.** `LXMFRouter.seen` and
       `downloadedTransientIds` both reset, so the next PN sync re-downloads everything the node
       still holds and re-delivers it as new. Reference avoids this with `local_deliveries` /
