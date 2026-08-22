@@ -58,8 +58,9 @@ That last point is the crux: **the router is duplicated per transport today.** T
 - `Sources/ReTiCANode/TransportEndpoint.swift` — becomes the shared container.
 - `Sources/ReTiCANode/TCPEndpoint.swift`, `BLEEndpoint.swift` — reduced to drivers.
 - `Sources/ReTiCANode/PNNode.swift` — **migrate off direct `TCPEndpoint` onto `TransportEndpoint`** (Task 1b; see the correction in Background). Add a convenience `init(…endpoint: TCPEndpoint.State…)` mirroring `LXMFNode`'s, so PNNode test construction churns minimally.
-- `Sources/ReTiCAInterfaces/TCPListener.swift` — **new**; the `NWListener` dependency.
-- `Sources/ReTiCAInterfaces/TCPServerInterface.swift` — **new**; the server driver.
+- `Sources/ReTiCAInterfaces/TCPListener.swift` — **new**; the `NWListener` dependency (multi-connection).
+- `Sources/ReTiCAInterfaces/TCPServerInterface.swift` — **new**; the byte-level server interface (per-connection HDLC deframer), mirroring `TCPClientInterface`.
+- `Sources/ReTiCANode/TransportEndpoint.swift` — **modify (this file list under-counted, like it did for PNNode)**: add a `tcpServer` KIND-slot and its wiring, mirroring the BLE 1:N peer wiring (`TransportEndpoint.swift:182-206`) and the `transmit(_:to:masked:unmasked:)` router (`:287-300`). Task 2's Step-4 "listening + dialling endpoints peer E2E" test cannot pass without this — the server must feed the shared `Transport`. A `Sources/ReTiCANode/TCPServerEndpoint.swift` driver (mirroring `TCPEndpoint`/`BLEEndpoint`, owning connectionID→`InterfaceID` like `BLEEndpoint.peerInterfaces`) is the natural home for the per-connection map; the implementer may instead scope `TCPServerInterface` directly if cleaner.
 - `ReTiCaMsgr/…/AppFeature.swift` and `DiagnosticsSnapshot.swift` — 5 call sites as of 2026-08-21 evening; re-derive at Task 3.
 
 ---
@@ -105,7 +106,7 @@ Pin the behaviours that must survive, **addressed through the unified `Transport
 
 ### Task 2: The TCP server driver
 
-**Files:** `Sources/ReTiCAInterfaces/TCPListener.swift`, `TCPServerInterface.swift`
+**Files:** `Sources/ReTiCAInterfaces/TCPListener.swift`, `TCPServerInterface.swift`, **plus `Sources/ReTiCANode/TransportEndpoint.swift` (add the `tcpServer` kind-slot + wiring) and likely a new `Sources/ReTiCANode/TCPServerEndpoint.swift` driver** — see the corrected File Structure above. The Step-4 E2E test requires the server to be wired into the shared router, not just the raw interface layer.
 
 - [ ] **Step 1: Read `TCPConnection.swift` and `TCPClientInterface.swift` first.** The server speaks the identical protocol — HDLC framing (`HDLC.frame` out, `HDLCDeframer.ingest` in, `TCPClientInterface.swift:91`/`:108-109`). Reuse both; do not write a second framing path.
 - [ ] **Step 2: The dependency shape must differ from `TCPConnection`, and this is the main design point.** `TCPConnection` is single-connection by construction — `send: (Data) -> Void` with no peer. A listener accepts **N** simultaneous connections, each needing its own deframer and its own send. Design a `TCPListener` dependency accordingly (accept/data/closed events carrying a connection identifier, and a per-connection send), following `TCPConnection`'s live-value/mock split.
