@@ -28,7 +28,7 @@ Reticulum/LXMF, ordered by *what a real peer notices*. Tick items as they land.
 | **Protocol mechanics** | Good for the paths ReTiCA uses — links, resources, requests, announces, path requests, relaying, LXMF opportunistic/direct/propagated. |
 | **Adversarial robustness** | ~18 remotely-reachable aborts closed, plus two fail-opens, one unkillable-work DoS and one wire-sized allocation. Tier 2 is **clear**; the wire-input trap sweep is complete. Still absent: admission control, and any bound on `LinkPlane.state.links` / `LinkSession.state.transfers`. |
 | **Durability** | Present for what a restart notices. The **LXMF layer** persists dedup sets and learned stamp costs, so a restart no longer re-delivers every message or sends unstamped to every peer; the **transport path table** persists too, so a restart can route immediately instead of waiting for re-announces. Still transient by decision, not omission: the 8.4 MB packet-hash ring, the announce cache, and tunnels — see Tier 4 for what each costs. |
-| **Breadth** | 2 of 15 interfaces; no `Channel`/`Buffer`, tickets, tunnels, or non-link proofs. |
+| **Breadth** | 3 of 15 interfaces (TCP client, BLE, TCP server — server added by lib `f363dff` + app `5e77ebb`, though a listener is not auto-discoverable without AutoInterface and accepts unbounded connections); no `Channel`/`Buffer`, tickets, tunnels, or non-link proofs. |
 
 The useful frame: ReTiCA speaks the wire correctly, then **loses messages for reasons the peer
 cannot see**. That is what tier 1 is about.
@@ -572,9 +572,16 @@ exactly the class Tier 1 just closed.*
 
 ## Tier 5 — capability and throughput
 
-- [ ] **One transport at a time** — `TransportEndpoint.State` is an enum. No "internet when
-      available, BLE when not". The `Transport` core is already multi-interface-capable
-      (`State.interfaces` is a dictionary); the **composition layer** is not. Largest capability gap.
+- [x] **One transport at a time** — CLOSED (lib `1d91913` Task 1b hoisted the shared
+      `transport`/`linkPlane` into one `TransportEndpoint` container; `f363dff` added the TCP-server
+      driver slot; earlier interface-conformance work `258dd94`/`d19f9e2`; app wired to the new
+      surface in ReTiCaMsgr `5e77ebb`). `TransportEndpoint.State` is now a STRUCT product: one
+      shared router + link plane, plus optional per-KIND driver slots (`tcpClient`, `tcpServer`,
+      `ble`). Several drivers can be present at once, routing through the single shared `Transport`.
+      The app now composes client + opt-in listener. NOT yet automatic ("internet when available,
+      BLE when not"): slot presence is chosen by the app/config, there is no capability-based
+      auto-selection between transports — the router picks the OUTBOUND interface per learned path,
+      but nothing promotes/demotes whole transports by availability.
 - [ ] **Resource window capped at the slow ceiling** — `ResourceWindow.swift`: `maxWindowSlow = 10`
       vs reference's `WINDOW_MAX_FAST = 75`. A **7.5× throughput ceiling** on any link fast enough
       to qualify — every TCP link and most BLE.
@@ -599,9 +606,20 @@ exactly the class Tier 1 just closed.*
       message we received fine. Also breaks proof relay *through* a ReTiCA node.
 - [ ] **Tunnels** — no path restoration when a transport peer reappears; every TCP reconnect
       (backgrounding, cell↔Wi-Fi handoff) loses the peer's routes to us.
-- [ ] **Interfaces: 2 of 15.** Material for iOS: **TCP server** (we can only dial out — two phones
-      on one Wi-Fi cannot peer over IP), **AutoInterface** (zero-config LAN discovery), and
-      **RNodeInterface over BLE** (LoRa hardware; the CoreBluetooth plumbing already exists).
+- [~] **Interfaces: 3 of 15** (was 2 of 15) — **TCP server DONE** (lib `f363dff` `TCPServerEndpoint`
+      driver + container slot; app opt-in listener in ReTiCaMsgr `5e77ebb`). Two phones on one Wi-Fi
+      can now peer over IP — *if the dialler knows the listener's address:port*. STILL OPEN and the
+      reason this is only a PARTIAL tick:
+      - **12 of 15 interfaces remain** (TCP client + BLE + TCP server = 3 done).
+      - **A listening node is NOT auto-discoverable.** Without **AutoInterface** (zero-config LAN
+        discovery, still absent) the dialler must be handed the listener's `address:port` out of
+        band — the listener does not announce its presence on the LAN.
+      - **Accepted connections are UNBOUNDED.** The listener has no per-connection cap and no
+        admission control — the opt-in default-off toggle is the only mitigation. Admission control
+        is tracked under Tier 7 (`No accepts_links policy`, and the link/transfer caps above it).
+      - **RNodeInterface over BLE** (LoRa hardware; CoreBluetooth plumbing exists) remains absent.
+      - Known Task-2 follow-up (Minor M-2-1): the live `NWListener` path has no real-socket
+        loopback test yet — verified only via the reducer with a mocked `TCPListener`.
 - [ ] **Paper messaging** (`lxm://` URI, QR) — the encryption step it needs already exists.
 
 ## Tier 7 — security posture (no known live exploit, but real)
