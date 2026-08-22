@@ -134,7 +134,7 @@ private func framedHello(_ token: Data) -> Data {
 // only via the 15s establishment deadline (which would misreport a dead SOCKET as a dead ROUTE).
 // ═════════════════════════════════════════════════════════════════════════════
 
-@Test @MainActor func openLinkOverALostInterfaceFailsFastAsPathStaleUnified() async {
+@Test @MainActor func openLinkOverALostInterfaceFailsFastAsPathStaleUnified() async throws {
     let (store, events, _, _, _) = makeTCP()
     let id = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
@@ -144,15 +144,14 @@ private func framedHello(_ token: Data) -> Data {
     // Learn the path.
     events.yield(.data(HDLC.frame(announceRaw)))
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
-    let learnedIF = store.state.learned[destHash]?.interfaceID
-    #expect(learnedIF != nil)
-    #expect(store.state.interfaces[learnedIF!] != nil, "interface must be up while connected")
+    let learnedIF = try #require(store.state.learned[destHash]?.interfaceID)
+    #expect(store.state.interfaces[learnedIF] != nil, "interface must be up while connected")
 
     // The socket drops. The learned entry survives by design — that is the trap.
     events.yield(.disconnected(reason: "socket closed"))
     await store.skipReceivedActions(strict: false)
     #expect(store.state.learned[destHash] != nil, "learned must survive the disconnect (non-destructive)")
-    #expect(store.state.interfaces[learnedIF!] == nil, "the interface that named the path must be gone")
+    #expect(store.state.interfaces[learnedIF] == nil, "the interface that named the path must be gone")
 
     // openLink must fail fast as .pathStale and mint no link.
     await store.send(.openLink(destinationHash: destHash))
@@ -165,7 +164,7 @@ private func framedHello(_ token: Data) -> Data {
 
 // A learned & reachable destination (interface still up) opens a link — the positive control that
 // proves `.pathStale` above is the GATE firing, not openLink being universally broken.
-@Test @MainActor func openLinkToReachableDestinationMintsALinkUnified() async {
+@Test @MainActor func openLinkToReachableDestinationMintsALinkUnified() async throws {
     let (store, events, _, _, _) = makeTCP()
     let id = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
@@ -174,7 +173,8 @@ private func framedHello(_ token: Data) -> Data {
     events.yield(.connected)
     events.yield(.data(HDLC.frame(announceRaw)))
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
-    #expect(store.state.interfaces[store.state.learned[destHash]!.interfaceID] != nil)
+    let learnedIF = try #require(store.state.learned[destHash]?.interfaceID)
+    #expect(store.state.interfaces[learnedIF] != nil)
 
     await store.send(.openLink(destinationHash: destHash))
     await store.skipReceivedActions(strict: false)
