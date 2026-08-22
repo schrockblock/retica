@@ -89,8 +89,9 @@ public struct TCPServerInterface {
             case let .listenerEvent(.data(conn, bytes)):
                 // Deframe against THIS connection's deframer. If the connection is unknown
                 // (accepted event not yet seen — should not happen given ordering) drop.
-                guard state.deframers[conn] != nil else { return .none }
-                let frames = state.deframers[conn]!.ingest(bytes)
+                guard var deframer = state.deframers[conn] else { return .none }
+                let frames = deframer.ingest(bytes)
+                state.deframers[conn] = deframer
                 return .merge(frames.map { .send(.delegate(.packetReceived(conn, $0))) })
 
             case let .listenerEvent(.closed(conn, _)):

@@ -182,27 +182,23 @@ public struct TransportEndpoint {
                 return .send(.transport(.received(id, data)))
             case .tcpClient(.interface(.connectionEvent(.connected))):
                 guard let driver = state.tcpClient else { return .none }
-                return .merge(.send(.transport(.interfaceConnected(driver.interfaceID, driver.profile))),
-                              .send(.transport(.startMaintenance)))
+                return .merge([.send(.transport(.interfaceConnected(driver.interfaceID, driver.profile)))]
+                              + maintenanceStartEffect(state))
             case .tcpClient(.interface(.connectionEvent(.disconnected))):
                 guard let id = state.tcpClient?.interfaceID else { return .none }
-                return .merge(.send(.transport(.interfaceDisconnected(id))),
-                              .send(.linkPlane(.interfaceDisconnected(id))),
-                              .send(.transport(.stopMaintenance)))
+                return .merge([.send(.transport(.interfaceDisconnected(id))),
+                               .send(.linkPlane(.interfaceDisconnected(id)))]
+                              + maintenanceStopEffect(state, departing: id))
 
             // --- TCP-server connection lifecycle → shared router interface set (+ maintenance) ---
             // Mirrors the BLE 1:N peer wiring: one Transport InterfaceID per accepted connection,
             // tracked in the driver's connInterfaces map so transmit can route back to it.
             case let .tcpServer(.interface(.delegate(.connectionAccepted(conn)))):
                 let id = tcpServerInterfaceID(conn)
-                let wasEmpty = state.tcpServer?.connInterfaces.isEmpty ?? true
                 guard let profile = state.tcpServer?.profile else { return .none }
+                let startEffects = maintenanceStartEffect(state)
                 state.tcpServer?.connInterfaces[id] = conn
-                var effects: [Effect<Action>] = [
-                    .send(.transport(.interfaceConnected(id, profile))),
-                ]
-                if wasEmpty { effects.append(.send(.transport(.startMaintenance))) }
-                return .merge(effects)
+                return .merge([.send(.transport(.interfaceConnected(id, profile)))] + startEffects)
 
             case let .tcpServer(.interface(.delegate(.packetReceived(conn, data)))):
                 return .send(.transport(.received(tcpServerInterfaceID(conn), data)))
@@ -210,36 +206,26 @@ public struct TransportEndpoint {
             case let .tcpServer(.interface(.delegate(.connectionClosed(conn)))):
                 let id = tcpServerInterfaceID(conn)
                 state.tcpServer?.connInterfaces[id] = nil
-                var effects: [Effect<Action>] = [
-                    .send(.transport(.interfaceDisconnected(id))),
-                    .send(.linkPlane(.interfaceDisconnected(id))),
-                ]
-                if state.tcpServer?.connInterfaces.isEmpty ?? true { effects.append(.send(.transport(.stopMaintenance))) }
-                return .merge(effects)
+                return .merge([.send(.transport(.interfaceDisconnected(id))),
+                               .send(.linkPlane(.interfaceDisconnected(id)))]
+                              + maintenanceStopEffect(state, departing: id))
 
             // --- BLE peer lifecycle → shared router interface set (+ maintenance) ---
             case let .ble(.ble(.delegate(.peerOnline(token)))):
                 let id = bleInterfaceID(token)
-                let wasEmpty = state.ble?.peerInterfaces.isEmpty ?? true
                 guard let profile = state.ble?.profile else { return .none }
+                let startEffects = maintenanceStartEffect(state)
                 state.ble?.peerInterfaces[id] = token
-                var effects: [Effect<Action>] = [
-                    .send(.transport(.interfaceConnected(id, profile))),
-                    .send(.ble(.delegate(.peerOnline(token)))),
-                ]
-                if wasEmpty { effects.append(.send(.transport(.startMaintenance))) }
-                return .merge(effects)
+                return .merge([.send(.transport(.interfaceConnected(id, profile))),
+                               .send(.ble(.delegate(.peerOnline(token))))] + startEffects)
 
             case let .ble(.ble(.delegate(.peerOffline(token)))):
                 let id = bleInterfaceID(token)
                 state.ble?.peerInterfaces[id] = nil
-                var effects: [Effect<Action>] = [
-                    .send(.transport(.interfaceDisconnected(id))),
-                    .send(.linkPlane(.interfaceDisconnected(id))),
-                    .send(.ble(.delegate(.peerOffline(token)))),
-                ]
-                if state.ble?.peerInterfaces.isEmpty ?? true { effects.append(.send(.transport(.stopMaintenance))) }
-                return .merge(effects)
+                return .merge([.send(.transport(.interfaceDisconnected(id))),
+                               .send(.linkPlane(.interfaceDisconnected(id))),
+                               .send(.ble(.delegate(.peerOffline(token))))]
+                              + maintenanceStopEffect(state, departing: id))
 
             case let .ble(.ble(.delegate(.packetReceived(token, packet)))):
                 return .send(.transport(.received(bleInterfaceID(token), packet)))
@@ -317,6 +303,35 @@ public struct TransportEndpoint {
         .ifLet(\.tcpClient, action: \.tcpClient) { TCPEndpoint() }
         .ifLet(\.tcpServer, action: \.tcpServer) { TCPServerEndpoint() }
         .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
+    }
+
+    /// The ONE maintenance loop (path-expiry / link-table / discovery-request GC) is shared by the
+    /// whole router, so its start/stop MUST be driven off the SHARED interface count — not any one
+    /// driver's own map. Otherwise a multi-driver node (tcpClient + tcpServer, the slice's opt-in
+    /// client+listener case) would halt GC for still-live interfaces the moment ANY one driver lost
+    /// its last interface.
+    ///
+    /// Evaluation order (verified): the connect/disconnect arms register the interface with the
+    /// router by RETURNING `.transport(.interfaceConnected/interfaceDisconnected(...))` as effects,
+    /// which the Transport scope applies LATER. So at the moment these helpers run,
+    /// `state.transport.interfaces` does NOT yet contain a CONNECTING id and STILL contains a
+    /// DISCONNECTING id. Hence: "first interface" ⇔ `interfaces.isEmpty` (before the pending
+    /// connect); "last interface" ⇔ only the departing id remains (`interfaces` == {departing}).
+    /// The regression tests assert the resulting maintenance behaviour, not this reasoning.
+
+    /// Arm the shared maintenance loop iff this is the node's 0→1 interface transition (across ALL
+    /// drivers). Call BEFORE mutating any driver's own map — reads the pre-connect router state.
+    private func maintenanceStartEffect(_ state: State) -> [Effect<Action>] {
+        state.transport.interfaces.isEmpty ? [.send(.transport(.startMaintenance))] : []
+    }
+
+    /// Stop the shared maintenance loop iff `departing` is the node's LAST interface across ALL
+    /// drivers — i.e. the router's interface set is exactly {departing} at call time (the
+    /// disconnect effect that removes it is still pending). Any other live interface keeps GC up.
+    private func maintenanceStopEffect(_ state: State, departing: InterfaceID) -> [Effect<Action>] {
+        let live = state.transport.interfaces
+        let isLast = live[departing] != nil ? live.count <= 1 : live.isEmpty
+        return isLast ? [.send(.transport(.stopMaintenance))] : []
     }
 
     /// Routes an outbound (already IFAC-masked) buffer to whichever driver owns `txID`. The
