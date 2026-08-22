@@ -12,8 +12,9 @@ issue** (`holdArmsDeferredReleaseTimerNotImmediateFireDuringFlood`, pre-existing
 ## ⚠️ How to read this
 
 Per this repo's own history with handoffs (see §6 of
-`2026-08-10-handoff-link-lifecycle-and-delivery-termination.md`), the failure mode here is a
-sentence wider than its evidence. So this document marks every substantive claim as one of:
+`2026-08-10-handoff-link-lifecycle-and-delivery-termination.md`, which catalogs this failure mode —
+the exact phrasing "a sentence wider than its evidence" is from that doc's §3), the failure mode
+here is a sentence wider than its evidence. So this document marks every substantive claim as one of:
 
 - **VERIFIED** — I ran it or read the code and can name what I read.
 - **HYPOTHESIS** — plausible, not demonstrated. Do not build on it.
@@ -141,8 +142,12 @@ an inbound LINKREQUEST. That asymmetry fits, but nothing has tested it.
 
 So the content genuinely arrived empty in a well-formed, signed message.
 **HYPOTHESIS:** Sideband control messages — LXMF defines `FIELD_TELEMETRY` (0x02),
-`FIELD_ICON_APPEARANCE` (0x04), `FIELD_COMMANDS` (0x09), all of which carry empty `content` by
-design — and the app renders every delivered message as a bubble while discarding `fields`.
+`FIELD_ICON_APPEARANCE` (0x04), `FIELD_COMMANDS` (0x09) (constants VERIFIED in LXMF 1.1.0
+`LXMF.py:9,11,16`), which Sideband is expected to send with empty `content` — and the app renders
+every delivered message as a bubble while discarding `fields`. The empty-`content` convention is
+**UNVERIFIED**: nothing in the LXMF package states or enforces it (the only support is that
+`LXMessage.__init__` defaults `content=""`); the convention would live in Sideband's source, which
+was not checked.
 
 **A diagnostic is live in `AppFeature`'s `.messageReceived` handler**, logging content size, title
 size, field keys, wire size and validation to subsystem `com.reticamsgr`, category `inbound`. It
@@ -191,11 +196,15 @@ seams no single task owned. Both VERIFIED independently before fixing:
   `LinkSession.acceptRequest`, and the initiator's `.establish` never assigns status at all. No
   test existed for that rule, so mutation testing had nothing to kill. Now `.pending`, with
   `requestedAt` rendered as the age that separates in-flight from stalled.
-- **The Delivery rule read the wrong table.** The app sends only opportunistic, which arms
-  `pendingDeliveries` but needs no link → yellow during every normal send; while the real fault, a
-  `.direct` send with no link, goes to `outboundQueue` and never reaches `pendingDeliveries` →
-  green throughout a genuinely failing delivery. The rule is now method-aware and
-  destination-correlated, and warns on destinations parked at `.awaitingPath`/`.establishing`.
+- **The Delivery rule read the wrong table.** The app issues no `.direct` delivery send at all —
+  1:1 sends are all opportunistic (with an additional `.propagated` copy only when a propagation
+  node is configured). Opportunistic arms `pendingDeliveries` but needs no link → yellow during
+  every normal send; while the real fault, a `.direct` send with no link, would go to
+  `outboundQueue` and never reach `pendingDeliveries` → green throughout a genuinely failing
+  delivery. The rule is now method-aware and destination-correlated, and warns on destinations
+  parked at `.awaitingPath`/`.establishing`. (Note: the diagnostics rule cannot read `outboundQueue`
+  — it is `internal` to the library; the fault is caught via the destination parking in
+  `directLinks`, not by inspecting the queue.)
 
 **Known and accepted limit:** opportunistic sends are structurally unobservable — there is no
 receipt — so a small message to an offline peer still yields an all-green board. No rule over that
@@ -215,12 +224,15 @@ Interleaved with the above, the user landed **path persistence**: ReTiCA `9667af
 
 **One design question is genuinely open, not settled:** the fix restores identity **and** path
 together, where the analysis argued the parity target for a leaf client is *persist identities,
-re-learn paths* (reference loads its path table only on transport-enabled nodes —
-`Transport.py:306`; the identity cache is loaded unconditionally — `Reticulum.py:344`). A
+re-learn paths* (reference loads its path table only on transport-enabled, non-shared-instance
+nodes — `Transport.py:306` gate, `+310` adds the not-shared-instance condition, stock 1.4.2; the
+identity cache is loaded unconditionally — `Reticulum.py:344` in stock 1.4.2, `:345` in the local
+1.4.1 fork, whose `BLEInterface` import at line 37 shifts everything after it by +1). A
 rehydrated entry therefore carries an `interfaceID` minted by a previous process, which F8's gate
 refuses until an interface with that id registers. Works while the id is stable
-(`InterfaceID("tcp")` is a constant) — but it is a choice, not an accident, and should be recorded
-as one.
+(`TCPEndpoint`'s `interfaceID` defaults to `InterfaceID("tcp")` — a stable default parameter value,
+not a named constant, so it holds only as long as callers use the default) — but it is a choice,
+not an accident, and should be recorded as one.
 
 ---
 
@@ -249,9 +261,14 @@ device. If it establishes then, it is Android power management and there is noth
 ## 8. Backlog
 
 `docs/superpowers/2026-08-10-handoff-link-lifecycle-and-delivery-termination.md` §3 is the standing
-task list. Ranked: **F13** (a reflected LINKREQUEST makes us forward our own link's traffic — the
-only item that redirects a peer's traffic rather than merely denying service), then **F11**,
-**F19**, **F7**. F8 and F20 are now closed; read their headers before trusting their bodies.
+task list. Ranked: **F13** (a reflected LINKREQUEST makes us forward our own link's traffic to the
+attacker — one remote packet, gated on relay mode), then **F11**, **F19**, **F7**. The backlog
+frames F13 as "the only item that redirects a peer's traffic rather than merely denying service";
+treat the *uniqueness* half with caution — **F10** is a plausible counterexample (its re-home grant
+is claimable by any foreign interface after a local disconnect, re-homing a link — potentially our
+own — to the claimant). The distinction is real (F13 is one remote packet with no attacker-side
+precondition — relay mode is our config, not the attacker's to arrange; F10 needs a local
+disconnect plus an already-connected foreign interface) but "the only item" is not established. F8 and F20 are now closed; read their headers before trusting their bodies.
 
 ---
 

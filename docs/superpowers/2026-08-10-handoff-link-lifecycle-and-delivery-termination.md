@@ -200,8 +200,12 @@ believing any sentence in its body.
 Current priority:
 
 1. **F13** — a reflected LINKREQUEST makes us forward our OWN link's traffic to
-   the attacker. One packet. The only item here that redirects a legitimate
-   peer's traffic rather than merely denying service. Gated on relay mode.
+   the attacker. One remote packet, no attacker-side precondition (we must be in
+   relay mode, but that is our config, not something the attacker arranges). It
+   redirects a legitimate peer's traffic rather than merely denying service —
+   the strongest such item here, though not the *only* one: F10 also re-homes a
+   link's traffic to a bystander, but requires a local disconnect plus an
+   already-connected foreign interface, where F13 needs neither.
 2. **F11** — advertise-and-stall pins a link against eviction and then locks out
    every other peer. Does not self-clear.
 3. **F19** — a replayed `RESOURCE_REQ` re-arms the sender watchdog, so for as long
