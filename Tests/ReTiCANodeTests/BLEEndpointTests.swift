@@ -6,17 +6,28 @@ import ReTiCA
 import ReTiCAInterfaces
 import ReTiCATransport
 
+// Task-1b: these tests previously drove `BLEEndpoint` STANDALONE (it owned its own Transport +
+// LinkPlane). After the hoist the BLE driver is a thin slot inside `TransportEndpoint`, which owns
+// the SHARED router / link plane and performs all the wiring. Behaviour is unchanged; addressing
+// moves one level:
+//   * BLEInterface driver events are now `.ble(.ble(.delegate(...)))` / `.ble(.ble(.send(...)))`.
+//   * The endpoint's BLE-ONLY peer delegates stay off the UNIFIED surface (decision 2) and are
+//     observed under the driver slot: `.ble(.delegate(.peerOnline/.peerOffline))`.
+//   * `.transport(...)` / `.linkPlane(...)` and the UNIFIED `.delegate(...)` (pathLearned,
+//     messageReceived, sendFailed) address the shared machinery on the container directly.
+//   * `store.state.peerInterfaces` moved onto the driver slot: `store.state.ble!.peerInterfaces`.
+
 private let tokenA = Data(repeating: 0xA1, count: 16)
 private let tokenB = Data(repeating: 0xB2, count: 16)
 
 @MainActor
-private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
-    let store = TestStore(initialState: BLEEndpoint.State()) {
-        BLEEndpoint()
+private func makeStore() -> TestStore<TransportEndpoint.State, TransportEndpoint.Action> {
+    let store = TestStore(initialState: bleDriverEndpoint()) {
+        TransportEndpoint()
     } withDependencies: {
         $0.continuousClock = TestClock()
         // Benign driver so `.start`/`.stop` forwarding runs without hitting the
-        // unimplemented testValue; the wiring tests inject `.ble(.delegate(...))`
+        // unimplemented testValue; the wiring tests inject `.ble(.ble(.delegate(...)))`
         // directly and never rely on the driver.
         $0.bleDriver = BLEDriver(
             start: { _ in AsyncStream { $0.finish() } },
@@ -28,56 +39,53 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     return store
 }
 
-// Compile-driven adjustment: store.send is async in this TCA version; all store.send(...)
-// calls use `await` (not in the brief's code sample which omitted them).
-
 @Test @MainActor func peerOnlineRegistersInterfaceAndStartsMaintenanceOnFirstPeer() async {
     let store = makeStore()
     let idA = bleInterfaceID(tokenA)
 
-    await store.send(.ble(.delegate(.peerOnline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOnline(tokenA)))))
     await store.receive(.transport(.interfaceConnected(idA, .ble))) {
         $0.transport.interfaces[idA] = .ble
     }
-    await store.receive(.delegate(.peerOnline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOnline(tokenA))))
     await store.receive(.transport(.startMaintenance))
-    #expect(store.state.peerInterfaces[idA] == tokenA)
+    #expect(store.state.ble!.peerInterfaces[idA] == tokenA)
 
     // A second peer connects: interfaceConnected fires, but NOT a second startMaintenance.
     let idB = bleInterfaceID(tokenB)
-    await store.send(.ble(.delegate(.peerOnline(tokenB))))
+    await store.send(.ble(.ble(.delegate(.peerOnline(tokenB)))))
     await store.receive(.transport(.interfaceConnected(idB, .ble))) {
         $0.transport.interfaces[idB] = .ble
     }
-    await store.receive(.delegate(.peerOnline(tokenB)))
+    await store.receive(.ble(.delegate(.peerOnline(tokenB))))
     // (no .startMaintenance here — .off exhaustivity tolerates its absence)
 
     // Drive both peers offline to cancel the maintenance effect cleanly.
-    await store.send(.ble(.delegate(.peerOffline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOffline(tokenA)))))
     await store.receive(.transport(.interfaceDisconnected(idA))) {
         $0.transport.interfaces[idA] = nil
     }
-    await store.receive(.delegate(.peerOffline(tokenA)))
-    await store.send(.ble(.delegate(.peerOffline(tokenB))))
+    await store.receive(.ble(.delegate(.peerOffline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOffline(tokenB)))))
     await store.receive(.transport(.interfaceDisconnected(idB))) {
         $0.transport.interfaces[idB] = nil
     }
-    await store.receive(.delegate(.peerOffline(tokenB)))
+    await store.receive(.ble(.delegate(.peerOffline(tokenB))))
     await store.receive(.transport(.stopMaintenance))
-    #expect(store.state.peerInterfaces.isEmpty)
+    #expect(store.state.ble!.peerInterfaces.isEmpty)
 }
 
 @Test @MainActor func lastPeerOfflineStopsMaintenance() async {
     let store = makeStore()
     let idA = bleInterfaceID(tokenA)
-    await store.send(.ble(.delegate(.peerOnline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOnline(tokenA)))))
     await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
-    await store.receive(.delegate(.peerOnline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOnline(tokenA))))
     await store.receive(.transport(.startMaintenance))
 
-    await store.send(.ble(.delegate(.peerOffline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOffline(tokenA)))))
     await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
-    await store.receive(.delegate(.peerOffline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOffline(tokenA))))
     await store.receive(.transport(.stopMaintenance))
 }
 
@@ -85,41 +93,41 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     let store = makeStore()
     let idA = bleInterfaceID(tokenA)
     // Bring the peer online first (so maintenance can be cancelled at the end).
-    await store.send(.ble(.delegate(.peerOnline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOnline(tokenA)))))
     await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
-    await store.receive(.delegate(.peerOnline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOnline(tokenA))))
     await store.receive(.transport(.startMaintenance))
 
     let packet = Data([0x01, 0x02, 0x03])
-    await store.send(.ble(.delegate(.packetReceived(peer: tokenA, packet: packet))))
+    await store.send(.ble(.ble(.delegate(.packetReceived(peer: tokenA, packet: packet)))))
     await store.receive(.transport(.received(idA, packet)))
 
-    await store.send(.ble(.delegate(.peerOffline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOffline(tokenA)))))
     await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
-    await store.receive(.delegate(.peerOffline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOffline(tokenA))))
     await store.receive(.transport(.stopMaintenance))
 }
 
 @Test @MainActor func transmitForLivePeerRoutesToBLESendWithRightToken() async {
     let store = makeStore()
     let idA = bleInterfaceID(tokenA)
-    await store.send(.ble(.delegate(.peerOnline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOnline(tokenA)))))
     await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
-    await store.receive(.delegate(.peerOnline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOnline(tokenA))))
     await store.receive(.transport(.startMaintenance))
 
     let raw = Data([0xAB, 0xCD])
     await store.send(.transport(.delegate(.transmit(idA, raw))))
-    await store.receive(.ble(.send(peer: tokenA, packet: raw)))
+    await store.receive(.ble(.ble(.send(peer: tokenA, packet: raw))))
 
-    await store.send(.ble(.delegate(.peerOffline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOffline(tokenA)))))
     await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
-    await store.receive(.delegate(.peerOffline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOffline(tokenA))))
     await store.receive(.transport(.stopMaintenance))
 }
 
 /// Pins the deliberate residue of the undeliverable-transmit path: a packet that cannot be
-/// parsed drops SILENTLY, emitting neither `.ble(.send)` nor `.delegate(.sendFailed)`.
+/// parsed drops SILENTLY, emitting neither `.ble(.ble(.send))` nor `.delegate(.sendFailed)`.
 /// `sendFailed` carries a destinationHash, and an unparseable packet has no destination to
 /// report — so there is nothing meaningful to surface and the drop stands. This is the ONLY
 /// case that still vanishes; the unknown-interface case it superficially resembles is now
@@ -127,7 +135,7 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
 /// `linkPlaneTransmitToUnknownInterfaceReportsSendFailed`.
 @Test @MainActor func transmitForUnparseablePacketIsDropped() async {
     let store = makeStore()
-    // .on exhaustivity so ANY emitted action — a stray .ble(.send) or an unwanted
+    // .on exhaustivity so ANY emitted action — a stray .ble(.ble(.send)) or an unwanted
     // .delegate(.sendFailed) — fails the test when finish() drains.
     store.exhaustivity = .on
     // A 1-byte payload is below the 2-byte minimum `Packet(raw:)` needs for flags+hops, so
@@ -143,7 +151,7 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
 /// derived from the peer's session token, so a reconnected peer is a different interface
 /// and any link still bound to the old one transmits into the void.
 ///
-/// The bad transmit is the LAST store.send so teardown catches any stray .ble(.send) that
+/// The bad transmit is the LAST store.send so teardown catches any stray .ble(.ble(.send)) that
 /// might be emitted alongside the sendFailed. (With .off exhaustivity a subsequent send
 /// would wipe the queue, hiding a stray action.)
 @Test @MainActor func transportTransmitToUnknownInterfaceReportsSendFailed() async {
@@ -151,15 +159,15 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     let idA = bleInterfaceID(tokenA)
 
     // Bring peer A online so there is at least one live interface.
-    await store.send(.ble(.delegate(.peerOnline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOnline(tokenA)))))
     await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
-    await store.receive(.delegate(.peerOnline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOnline(tokenA))))
     await store.receive(.transport(.startMaintenance))
 
     // Teardown the live peer FIRST — before the bad transmit — so nothing wipes the queue.
-    await store.send(.ble(.delegate(.peerOffline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOffline(tokenA)))))
     await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
-    await store.receive(.delegate(.peerOffline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOffline(tokenA))))
     await store.receive(.transport(.stopMaintenance))
 
     // Build a minimal parseable packet whose destinationHash is a known value.
@@ -171,7 +179,7 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     rawPacket.append(0xBB)             // payload byte
 
     // Transmit to a DIFFERENT (never-connected) interface — stale binding scenario.
-    // This is the last send; teardown will catch any stray .ble(.send) emitted here.
+    // This is the last send; teardown will catch any stray .ble(.ble(.send)) emitted here.
     let unknownID = InterfaceID("ble:unknown1234567890ab")
     store.exhaustivity = .on
     await store.send(.transport(.delegate(.transmit(unknownID, rawPacket))))
@@ -185,21 +193,21 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
 ///
 /// flags=0x03 sets header1/broadcast/single/linkPacket (the link-packet type byte), matching
 /// the comment's reasoning about a link packet. The bad transmit is last so teardown catches
-/// any stray .ble(.send) that might accompany the sendFailed.
+/// any stray .ble(.ble(.send)) that might accompany the sendFailed.
 @Test @MainActor func linkPlaneTransmitToUnknownInterfaceReportsSendFailed() async {
     let store = makeStore()
     let idA = bleInterfaceID(tokenA)
 
     // Bring peer A online so there is at least one live interface.
-    await store.send(.ble(.delegate(.peerOnline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOnline(tokenA)))))
     await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
-    await store.receive(.delegate(.peerOnline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOnline(tokenA))))
     await store.receive(.transport(.startMaintenance))
 
     // Teardown the live peer FIRST — before the bad transmit — so nothing wipes the queue.
-    await store.send(.ble(.delegate(.peerOffline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOffline(tokenA)))))
     await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
-    await store.receive(.delegate(.peerOffline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOffline(tokenA))))
     await store.receive(.transport(.stopMaintenance))
 
     // Build a minimal parseable link-plane packet — destination hash doubles as the link ID.
@@ -211,7 +219,7 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     rawPacket.append(0xDD)             // payload byte
 
     // Transmit via a link-plane delegate to an interface that is not connected.
-    // This is the last send; teardown will catch any stray .ble(.send) emitted here.
+    // This is the last send; teardown will catch any stray .ble(.ble(.send)) emitted here.
     let unknownID = InterfaceID("ble:unknown9876543210ef")
     store.exhaustivity = .on
     await store.send(.linkPlane(.delegate(.transmit(unknownID, rawPacket))))
@@ -222,15 +230,15 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
 /// Regression: a transmit to a LIVE interface still goes out, unchanged, and emits no failure.
 ///
 /// Exhaustivity is .on for the transmit and receive ONLY, so teardown catches a stray
-/// sendFailed that might be emitted alongside the .ble(.send). The surrounding setup/teardown
-/// uses .off (the makeStore default) to stay concise.
+/// sendFailed that might be emitted alongside the .ble(.ble(.send)). The surrounding
+/// setup/teardown uses .off (the makeStore default) to stay concise.
 @Test @MainActor func transmitToLiveInterfaceStillSendsAndReportsNoFailure() async {
     let store = makeStore()  // .off by default
     let idA = bleInterfaceID(tokenA)
 
-    await store.send(.ble(.delegate(.peerOnline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOnline(tokenA)))))
     await store.receive(.transport(.interfaceConnected(idA, .ble))) { $0.transport.interfaces[idA] = .ble }
-    await store.receive(.delegate(.peerOnline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOnline(tokenA))))
     await store.receive(.transport(.startMaintenance))
 
     // Build a parseable packet to send to the live peer's interface.
@@ -240,17 +248,17 @@ private func makeStore() -> TestStore<BLEEndpoint.State, BLEEndpoint.Action> {
     rawPacket.append(0x00)
     rawPacket.append(0xEE)
 
-    // Flip to .on for the transmit pair: a stray sendFailed emitted alongside .ble(.send)
+    // Flip to .on for the transmit pair: a stray sendFailed emitted alongside .ble(.ble(.send))
     // would be detected because no other store.send follows to wipe the queue.
     store.exhaustivity = .on
     await store.send(.transport(.delegate(.transmit(idA, rawPacket))))
-    await store.receive(.ble(.send(peer: tokenA, packet: rawPacket)))
+    await store.receive(.ble(.ble(.send(peer: tokenA, packet: rawPacket))))
     // Back to .off for teardown (peerOffline cascades through several actions).
     store.exhaustivity = .off
 
-    await store.send(.ble(.delegate(.peerOffline(tokenA))))
+    await store.send(.ble(.ble(.delegate(.peerOffline(tokenA)))))
     await store.receive(.transport(.interfaceDisconnected(idA))) { $0.transport.interfaces[idA] = nil }
-    await store.receive(.delegate(.peerOffline(tokenA)))
+    await store.receive(.ble(.delegate(.peerOffline(tokenA))))
     await store.receive(.transport(.stopMaintenance))
 }
 

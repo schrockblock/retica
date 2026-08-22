@@ -45,8 +45,8 @@ import ComposableArchitecture
     }
 
     // Send-frame predicates.
-    func aSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
-    func bSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
+    func aSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
+    func bSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
 
     let sentA = LockIsolated<[Data]>([])
     let sentB = LockIsolated<[Data]>([])
@@ -54,8 +54,8 @@ import ComposableArchitecture
     let (b, eventsB) = makePN("b", bIdentity, sentB)
 
     // Connect both.
-    await a.send(.endpoint(.connect)); eventsA.yield(.connected)
-    await b.send(.endpoint(.connect)); eventsB.yield(.connected)
+    await a.send(.endpoint(.start)); eventsA.yield(.connected)
+    await b.send(.endpoint(.start)); eventsB.yield(.connected)
 
     // --- Pre-populate A's store: inject a dummy resourceReceived so A holds `tid`. ---
     let dummyLinkID = Data(repeating: 0xAA, count: 16)
@@ -146,6 +146,6 @@ import ComposableArchitecture
     // --- Final assertions: B now holds A's message. ---
     #expect(b.state.node.store.contains(transientId: tid))
 
-    await a.send(.endpoint(.disconnect))
-    await b.send(.endpoint(.disconnect))
+    await a.send(.endpoint(.stop))
+    await b.send(.endpoint(.stop))
 }

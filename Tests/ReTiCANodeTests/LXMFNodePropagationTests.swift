@@ -26,7 +26,7 @@ import ComposableArchitecture
         -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: LXMFNode.State(
-            identity: identity, endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false))
+            identity: identity, endpoint: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false))
         ) { LXMFNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -39,10 +39,10 @@ import ComposableArchitecture
     }
 
     func makeEndpoint(_ host: String, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -54,8 +54,8 @@ import ComposableArchitecture
         return (store, events.continuation)
     }
 
-    func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcp(.interface(.send))) = act { return true }; return false }
-    func epSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+    func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
+    func epSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClient(.interface(.send)) = act { return true }; return false }
 
     let sentA = LockIsolated<[Data]>([]); let sentR = LockIsolated<[Data]>([]); let sentPN = LockIsolated<[Data]>([])
     let (a, eventsA) = makeNode("a", aIdentity, sentA)
@@ -63,8 +63,8 @@ import ComposableArchitecture
     let (pn, eventsPN) = makeEndpoint("pn", sentPN)
 
     await a.send(.endpoint(.start)); eventsA.yield(.connected)
-    await r.send(.connect); eventsR.yield(.connected)
-    await pn.send(.connect); eventsPN.yield(.connected)
+    await r.send(.start); eventsR.yield(.connected)
+    await pn.send(.start); eventsPN.yield(.connected)
 
     // R announces its delivery destination → A learns R's identity (to encrypt the container tail).
     await r.send(.registerLocalDestination(rDelivery))
@@ -157,5 +157,5 @@ import ComposableArchitecture
     }
     #expect(gotAccepted.value == sentHash)
 
-    await a.send(.endpoint(.stop)); await r.send(.disconnect); await pn.send(.disconnect)
+    await a.send(.endpoint(.stop)); await r.send(.stop); await pn.send(.stop)
 }

@@ -15,10 +15,10 @@ import ComposableArchitecture
     let bIdentity = Identity()
     let bDelivery = Destination(kind: .single, direction: .in, appName: "lxmf", aspects: ["delivery"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -36,9 +36,9 @@ import ComposableArchitecture
     let (b, eventsB) = make("b", sentB)
 
     // --- Establish the link (mirrors twoEndpointsEstablishLinkExchangeDataAndClose steps 1–4) ---
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(bDelivery))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
 
     // 1. B announces its lxmf.delivery destination; A learns it.
     await b.send(.announce(destinationHash: bDelivery.hash, appData: nil))
@@ -49,16 +49,16 @@ import ComposableArchitecture
     // 2. A opens the link → LINKREQUEST out to B.
     await a.send(.openLink(destinationHash: bDelivery.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }  // LRPROOF out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // LRPROOF out
 
     // 3. B's LRPROOF → A → A active, emits LRRTT.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }  // LRRTT out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // LRRTT out
     await a.receive(\.delegate.linkEstablished)
     #expect(a.state.links[0].status == .active)
 
@@ -75,7 +75,7 @@ import ComposableArchitecture
                                timestamp: 1700000000.5, title: Data("hi".utf8), content: Data("small direct".utf8))
     #expect(msg.directRepresentation == .packet)    // packed ≤ 431 bytes
     await a.send(.sendOverLink(linkID: linkID, data: msg.packed))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
 
     let got = LockIsolated<Data?>(nil)
     eventsB.yield(.data(sentA.value.last!))
@@ -92,7 +92,7 @@ import ComposableArchitecture
     #expect(recovered?.hash == msg.hash)
     #expect(recovered?.validateSignature(source: aIdentity) == true)
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }
 
 /// Large LXMF message (packed > Link.mdu = 431) delivered as a Resource over the link.
@@ -102,10 +102,10 @@ import ComposableArchitecture
     let bIdentity = Identity()
     let bDelivery = Destination(kind: .single, direction: .in, appName: "lxmf", aspects: ["delivery"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -123,9 +123,9 @@ import ComposableArchitecture
     let (b, eventsB) = make("b", sentB)
 
     // --- Establish the link (mirrors twoEndpointsTransferAResourceOverALink steps 1–4) ---
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(bDelivery))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
 
     // 1. B announces its lxmf.delivery destination; A learns it.
     await b.send(.announce(destinationHash: bDelivery.hash, appData: nil))
@@ -136,16 +136,16 @@ import ComposableArchitecture
     // 2. A opens the link → LINKREQUEST out to B.
     await a.send(.openLink(destinationHash: bDelivery.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }  // LRPROOF out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // LRPROOF out
 
     // 3. B's LRPROOF → A → A active, emits LRRTT.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }  // LRRTT out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // LRRTT out
     await a.receive(\.delegate.linkEstablished)
     #expect(a.state.links[0].status == .active)
 
@@ -164,19 +164,19 @@ import ComposableArchitecture
     #expect(msg.directRepresentation == .resource)  // packed > 431 bytes
 
     await a.send(.sendResourceOverLink(linkID: linkID, data: msg.packed))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }  // RESOURCE_ADV out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // RESOURCE_ADV out
 
     // ADV → B: spawns a receiver, emits RESOURCE_REQ.
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }  // RESOURCE_REQ out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // RESOURCE_REQ out
 
     // REQ → A: A serves its parts.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
     let partCount = a.state.links[0].transfers[0].parts.count
     for _ in 0..<partCount {
-        await a.receive { if case .interface(.send) = $0 { return true }; return false }
+        await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     }
 
     // Deliver every part frame A emitted (the last `partCount` frames in sentA) to B.
@@ -186,7 +186,7 @@ import ComposableArchitecture
         eventsB.yield(.data(frame))
         await b.receive(\.transport.received)
         if i == partCount - 1 {
-            await b.receive { if case .interface(.send) = $0 { return true }; return false }  // RESOURCE_PRF out
+            await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // RESOURCE_PRF out
             await b.receive { action in
                 if case let .delegate(.resourceReceived(lid, d)) = action, lid == linkID { got.setValue(d); return true }
                 return false
@@ -209,5 +209,5 @@ import ComposableArchitecture
     #expect(recovered?.hash == msg.hash)
     #expect(recovered?.validateSignature(source: aIdentity) == true)
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }

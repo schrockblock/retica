@@ -25,13 +25,13 @@ private let handle2    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-
 private let tokenForChannel: [BLEChannelID: Data] = [channel: peerToken, channel2: peerTokenB]
 
 @MainActor
-private func makeNode() -> (TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
+private func makeNode() -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>,
                             AsyncStream<BLEDriverEvent>.Continuation,
                             LockIsolated<[(Data, Data)]>) {
     let events = AsyncStream<BLEDriverEvent>.makeStream()
     let sent = LockIsolated<[(Data, Data)]>([])   // (peerToken the send actually went to, packet)
-    let store = TestStore(initialState: BLEEndpoint.State()) {
-        BLEEndpoint()
+    let store = TestStore(initialState: bleDriverEndpoint()) {
+        TransportEndpoint()
     } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 0))
@@ -54,7 +54,7 @@ private func makeNode() -> (TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
 /// Parameters default to the file-level constants so existing call sites need no changes.
 /// Pass `startFirst: false` when the node is already running (e.g. second peer in a peer-cycle).
 @MainActor
-private func bringPeerOnline(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
+private func bringPeerOnline(_ store: TestStore<TransportEndpoint.State, TransportEndpoint.Action>,
                              _ events: AsyncStream<BLEDriverEvent>.Continuation,
                              token: Data = peerToken,
                              channelID: BLEChannelID = channel,
@@ -70,7 +70,7 @@ private func bringPeerOnline(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.A
 }
 
 @MainActor
-private func teardown(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.Action>) async {
+private func teardown(_ store: TestStore<TransportEndpoint.State, TransportEndpoint.Action>) async {
     await store.send(.stop)
     await store.receive { if case .transport(.stopMaintenance) = $0 { return true }; return false }
 }
@@ -107,7 +107,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     events.yield(.channelData(channel, try! BLEFraming.frame(try! request.packed())))
 
     // A responder link is created on the arrival peer's interface, and the LRPROOF goes back to that peer.
-    await store.receive { if case .ble(.send) = $0 { return true }; return false }
+    await store.receive { if case .ble(.ble(.send)) = $0 { return true }; return false }
     #expect(store.state.links.count == 1)
     #expect(store.state.links[0].interfaceID == bleInterfaceID(peerToken))
     let last = sent.value.last
@@ -134,7 +134,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     await store.send(.openLink(destinationHash: destHash))
     // A LINKREQUEST is emitted as the link begins establishing; wait for the transmit so we
     // know LinkPlane has processed .openLink and state is settled.
-    await store.receive { if case .ble(.send) = $0 { return true }; return false }
+    await store.receive { if case .ble(.ble(.send)) = $0 { return true }; return false }
 
     // (a) link shim: state.links forwards to linkPlane.links
     #expect(store.state.links.count == 1)
@@ -191,7 +191,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     // transport.interfaces, so reachableLearned(destHash) will return nil even though
     // learned[destHash] still exists.
     events.yield(.channelClosed(channel, reason: nil))
-    await store.receive { if case .delegate(.peerOffline) = $0 { return true }; return false }
+    await store.receive { if case .ble(.delegate(.peerOffline)) = $0 { return true }; return false }
     // That was the last peer, so maintenance also stops. Drain it here, while exhaustivity is
     // still .off, so the .on window below sees only what `.openLink` itself produces.
     await store.receive { if case .transport(.stopMaintenance) = $0 { return true }; return false }
@@ -282,7 +282,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     events.yield(.channelData(channel, try! BLEFraming.frame(try! request.packed())))
 
     // Responder creates a link and sends LRPROOF back to tokenA.
-    await store.receive { if case .ble(.send) = $0 { return true }; return false }
+    await store.receive { if case .ble(.ble(.send)) = $0 { return true }; return false }
     #expect(store.state.links.count == 1)
     let linkID = store.state.links[0].linkID
 
@@ -312,7 +312,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     // The link's stored interfaceID is now stale: tokenA is gone from peerInterfaces, so any
     // outbound link transmit would hit a dead lookup and fire sendFailed.
     events.yield(.channelClosed(channel, reason: nil))
-    await store.receive { if case .delegate(.peerOffline) = $0 { return true }; return false }
+    await store.receive { if case .ble(.delegate(.peerOffline)) = $0 { return true }; return false }
 
     // ── Phase 3: peer reconnects under tokenB (a DIFFERENT InterfaceID) ─────────────────────
     await bringPeerOnline(store, events, token: peerTokenB, channelID: channel2,
@@ -337,7 +337,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     // → sendFailed fires instead of ble(.send) → the receive below never matches → test FAILS.
     await store.send(.sendOverLink(linkID: linkID, data: Data("pong".utf8)))
     await store.receive { action in
-        if case .ble(.send(peer: let peer, packet: _)) = action { return peer == peerTokenB }
+        if case .ble(.ble(.send(peer: let peer, packet: _))) = action { return peer == peerTokenB }
         return false
     }
     // And the packet reached the DRIVER on tokenB's channel, not tokenA's — the action assertion
@@ -376,7 +376,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
                          payload: initEph.publicKey + Link.signallingBytes)
     events.yield(.channelData(channel, try! BLEFraming.frame(try! request.packed())))
     // Drain the LRPROOF so the link element is fully created before we read state.
-    await store.receive { if case .ble(.send) = $0 { return true }; return false }
+    await store.receive { if case .ble(.ble(.send)) = $0 { return true }; return false }
 
     guard let element = store.state.linkPlane.links.first(where: { $0.interfaceID == bleInterfaceID(peerToken) }) else {
         Issue.record("Expected a responder link bound to peerToken's interface")
@@ -389,7 +389,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
 
     // Peer goes offline. This must fan out .interfaceDisconnected to LinkPlane.
     events.yield(.channelClosed(channel, reason: nil))
-    await store.receive { if case .delegate(.peerOffline) = $0 { return true }; return false }
+    await store.receive { if case .ble(.delegate(.peerOffline)) = $0 { return true }; return false }
 
     // After disconnect: rehomePermitted must be true for the link bound to that interface.
     // If the fan-out is missing, rehomePermitted stays false and this assertion fails.

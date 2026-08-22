@@ -16,10 +16,10 @@ import ComposableArchitecture
     let aDelivery = Destination(kind: .single, direction: .in, appName: "lxmf", aspects: ["delivery"], identity: aIdentity)!
     let bDelivery = Destination(kind: .single, direction: .in, appName: "lxmf", aspects: ["delivery"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -36,20 +36,20 @@ import ComposableArchitecture
     let (a, eventsA) = make("a", sentA)
     let (b, eventsB) = make("b", sentB)
 
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
     await a.send(.registerLocalDestination(aDelivery))
     await b.send(.registerLocalDestination(bDelivery))
 
     // B announces its lxmf.delivery destination; A learns it (so A can address + encrypt to B).
     await b.send(.announce(destinationHash: bDelivery.hash, appData: nil))
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
 
     // A announces its lxmf.delivery destination; B learns it (so B can resolve the sender identity).
     await a.send(.announce(destinationHash: aDelivery.hash, appData: nil))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received); await b.receive(\.delegate.pathLearned)
 
@@ -58,7 +58,7 @@ import ComposableArchitecture
                                timestamp: 1700000000.5, title: Data("hi".utf8), content: Data("hello lxmf".utf8))
     #expect(bDelivery.hash == LXMessage.deliveryHash(identityHash: bIdentity.hash))   // addressing sanity
     await a.send(.send(destinationHash: bDelivery.hash, plaintext: msg.opportunisticPayload))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
 
     // Bridge the DATA packet to B; B decrypts and surfaces the plaintext.
     let got = LockIsolated<(Data, Data)?>(nil)
@@ -81,5 +81,5 @@ import ComposableArchitecture
     #expect(recovered?.validateSignature(source: senderIdentity!) == true)
     #expect(recovered?.hash == msg.hash)
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }

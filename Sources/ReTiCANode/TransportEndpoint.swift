@@ -4,59 +4,77 @@ import ReTiCA
 import ReTiCAInterfaces
 import ReTiCATransport
 
-/// A Reticulum endpoint over one concrete transport. Presents ONE unified action/delegate
-/// surface so compositions above it (`LXMFNode`) stay transport-agnostic: the same
-/// `.send`/`.openLink`/`.sendRequestOverLink`… reach whichever endpoint is active, and both
-/// endpoints' delegates surface under the same names.
+/// A Reticulum endpoint that may run SEVERAL interface drivers at once over ONE shared router
+/// and ONE shared link plane. Presents a single unified action/delegate surface so compositions
+/// above it (`LXMFNode`, `PNNode`) stay transport-agnostic: `.send`/`.openLink`/… reach the
+/// shared router regardless of which driver carries the bytes, and every driver's delegates
+/// surface under the same unified names.
 ///
-/// Transport-specific driving stays available through the `.tcp` / `.ble` escape hatches —
-/// which is also where BLE-only delegates (`peerOnline`/`peerOffline`) remain observable; they
-/// are deliberately absent from the unified surface because LXMF has no use for them.
+/// Task-1b hoist: the router (`transport`) and the link/resource/request machinery (`linkPlane`)
+/// live HERE, one of each, shared across all drivers. Each driver is a thin, KIND-indexed slot
+/// (`tcpClient`, `ble`) owning only its interface(s); the container performs ALL the wiring —
+/// inbound driver bytes are tagged with the arriving `InterfaceID` into the shared router, and
+/// the router's outbound `.transmit(InterfaceID, data)` is routed back to whichever driver owns
+/// that id. A packet arriving over one driver can therefore leave over another.
+///
+/// Transport-specific driving stays available through the KIND-addressed `.tcpClient(...)` /
+/// `.ble(...)` escape hatches — which is also where BLE-only delegates (`peerOnline`/
+/// `peerOffline`) remain observable; they are deliberately absent from the unified surface
+/// because LXMF has no use for them.
 @Reducer
 public struct TransportEndpoint {
     @ObservableState
-    public enum State: Equatable {
-        case tcp(TCPEndpoint.State)
-        case ble(BLEEndpoint.State)
+    public struct State: Equatable {
+        /// The ONE shared router.
+        public var transport: Transport.State
+        /// The ONE shared link/resource/request plane.
+        public var linkPlane: LinkPlane.State
+        /// The TCP-client driver slot (at most one this slice).
+        public var tcpClient: TCPEndpoint.State?
+        /// The BLE driver slot.
+        public var ble: BLEEndpoint.State?
 
-        /// Learned-destination table of the active transport (identity / appData / path).
-        public var learned: [Data: LearnedDestination] {
-            switch self {
-            case let .tcp(s): return s.transport.learned
-            case let .ble(s): return s.transport.learned
-            }
-        }
+        /// Learned-destination table of the shared router (identity / appData / path).
+        public var learned: [Data: LearnedDestination] { transport.learned }
 
-        /// Connected interfaces of the active transport. Paired with `learned`: an entry in
+        /// Connected interfaces of the shared router. Paired with `learned`: an entry in
         /// `learned` names an `interfaceID`, and only an id present HERE is still reachable —
         /// which is the test `Transport.reachableLearned` performs and `openLink` gates on.
-        public var interfaces: [InterfaceID: InterfaceProfile] {
-            switch self {
-            case let .tcp(s): return s.transport.interfaces
-            case let .ble(s): return s.transport.interfaces
-            }
+        public var interfaces: [InterfaceID: InterfaceProfile] { transport.interfaces }
+
+        /// Live links of the shared link plane.
+        public var links: IdentifiedArrayOf<LinkSession.State> { linkPlane.links }
+
+        /// Request-handler registrations of the shared link plane.
+        public var registrations: [Data: RequestRegistration] { linkPlane.registrations }
+
+        public init(transport: Transport.State = Transport.State(),
+                    linkPlane: LinkPlane.State = LinkPlane.State(),
+                    tcpClient: TCPEndpoint.State? = nil,
+                    ble: BLEEndpoint.State? = nil) {
+            self.transport = transport
+            self.linkPlane = linkPlane
+            self.tcpClient = tcpClient
+            self.ble = ble
         }
 
-        /// Live links of the active transport.
-        public var links: IdentifiedArrayOf<LinkSession.State> {
-            switch self {
-            case let .tcp(s): return s.links
-            case let .ble(s): return s.links
-            }
+        /// Convenience factory: an endpoint running over a single TCP-client driver.
+        public static func tcp(_ driver: TCPEndpoint.State) -> State {
+            State(tcpClient: driver)
         }
 
-        /// Request-handler registrations of the active transport.
-        public var registrations: [Data: RequestRegistration] {
-            switch self {
-            case let .tcp(s): return s.registrations
-            case let .ble(s): return s.registrations
-            }
+        /// Convenience factory: an endpoint running over a BLE driver.
+        public static func ble(_ driver: BLEEndpoint.State) -> State {
+            State(ble: driver)
         }
     }
 
     public enum Action: Equatable {
-        case tcp(TCPEndpoint.Action)
+        case tcpClient(TCPEndpoint.Action)
         case ble(BLEEndpoint.Action)
+        case transport(Transport.Action)
+        case linkPlane(LinkPlane.Action)
+        case link(IdentifiedActionOf<LinkSession>)
 
         case start
         case stop
@@ -102,126 +120,256 @@ public struct TransportEndpoint {
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Scope(state: \.tcp, action: \.tcp) { TCPEndpoint() }
-        Scope(state: \.ble, action: \.ble) { BLEEndpoint() }
+        Scope(state: \.transport, action: \.transport) { Transport() }
+        Scope(state: \.linkPlane, action: \.linkPlaneRoute) { LinkPlane() }
         Reduce { state, action in
             switch action {
-            // --- unified → the active transport ---
+            // --- unified verbs → shared router / link plane ---
             case .start:
-                return route(state, tcp: .connect, ble: .start)
+                return .merge(state.tcpClient != nil ? .send(.tcpClient(.connect)) : .none,
+                              state.ble != nil ? .send(.ble(.start)) : .none)
             case .stop:
-                return route(state, tcp: .disconnect, ble: .stop)
-            case let .registerLocalDestination(d):
-                return route(state, tcp: .registerLocalDestination(d), ble: .registerLocalDestination(d))
-            case let .announce(h, a):
-                return route(state, tcp: .announce(destinationHash: h, appData: a),
-                                    ble: .announce(destinationHash: h, appData: a))
-            case let .send(h, p):
-                return route(state, tcp: .send(destinationHash: h, plaintext: p),
-                                    ble: .send(destinationHash: h, plaintext: p))
-            case let .enableRelay(i):
-                return route(state, tcp: .enableRelay(i), ble: .enableRelay(i))
-            case let .requestPath(h):
-                return route(state, tcp: .requestPath(destinationHash: h),
-                                    ble: .requestPath(destinationHash: h))
-            case let .openLink(h):
-                return route(state, tcp: .openLink(destinationHash: h),
-                                    ble: .openLink(destinationHash: h))
-            case let .sendOverLink(l, d):
-                return route(state, tcp: .sendOverLink(linkID: l, data: d),
-                                    ble: .sendOverLink(linkID: l, data: d))
-            case let .sendResourceOverLink(l, d):
-                return route(state, tcp: .sendResourceOverLink(linkID: l, data: d),
-                                    ble: .sendResourceOverLink(linkID: l, data: d))
-            case let .identifyOverLink(l, i):
-                return route(state, tcp: .identifyOverLink(linkID: l, identity: i),
-                                    ble: .identifyOverLink(linkID: l, identity: i))
-            case let .sendRequestOverLink(l, p, d):
-                return route(state, tcp: .sendRequestOverLink(linkID: l, path: p, data: d),
-                                    ble: .sendRequestOverLink(linkID: l, path: p, data: d))
-            case let .sendResponseOverLink(l, r, d):
-                return route(state, tcp: .sendResponseOverLink(linkID: l, requestID: r, data: d),
-                                    ble: .sendResponseOverLink(linkID: l, requestID: r, data: d))
-            case let .sendWithReceiptOverLink(l, d, t):
-                return route(state, tcp: .sendWithReceiptOverLink(linkID: l, data: d, token: t),
-                                    ble: .sendWithReceiptOverLink(linkID: l, data: d, token: t))
-            case let .provePacketOverLink(l, h):
-                return route(state, tcp: .provePacketOverLink(linkID: l, packetHash: h),
-                                    ble: .provePacketOverLink(linkID: l, packetHash: h))
-            case let .closeLink(l):
-                return route(state, tcp: .closeLink(linkID: l), ble: .closeLink(linkID: l))
-            case let .registerRequestHandler(p, pol):
-                return route(state, tcp: .registerRequestHandler(path: p, policy: pol),
-                                    ble: .registerRequestHandler(path: p, policy: pol))
-            case let .deregisterRequestHandler(p):
-                return route(state, tcp: .deregisterRequestHandler(path: p),
-                                    ble: .deregisterRequestHandler(path: p))
+                return .merge(state.tcpClient != nil ? .send(.tcpClient(.disconnect)) : .none,
+                              state.ble != nil ? .send(.ble(.stop)) : .none)
+            case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
+            case let .announce(h, a):               return .send(.transport(.announce(destinationHash: h, appData: a)))
+            case let .send(h, p):                   return .send(.transport(.send(destinationHash: h, plaintext: p)))
+            case let .enableRelay(identity):        return .send(.transport(.setTransportIdentity(identity)))
+            case let .requestPath(h):               return .send(.transport(.requestPath(destinationHash: h)))
 
-            // --- child delegates → the unified delegate ---
-            case let .tcp(.delegate(d)):
-                return .send(.delegate(unify(d)))
-            case let .ble(.delegate(d)):
-                guard let unified = unify(d) else { return .none }   // BLE-only → not surfaced
-                return .send(.delegate(unified))
+            case let .openLink(destinationHash):
+                // F8 stale-path gate, on the SHARED router. `learned` is deliberately
+                // non-destructive, so an entry outlives the interface it names: the socket drops,
+                // Transport drops the interface, the path stays. Minting a LinkSession on a dead
+                // interface transmits into nothing and exits only via the 15s establishment
+                // deadline — misreported as a dead ROUTE (soliciting a pointless path request)
+                // rather than a dead interface. `Transport.send` gates the same way.
+                guard let learned = state.transport.learned[destinationHash] else {
+                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .noPath)))
+                }
+                guard state.transport.reachableLearned(destinationHash) != nil else {
+                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .pathStale)))
+                }
+                // Via a relay (learned nextHop != the destination) → HEADER_2 LINKREQUEST to the
+                // relay. The learned entry records which interface the destination was heard on.
+                let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
+                return .send(.linkPlane(.openLink(initiatorTo: learned.identity,
+                                                  destinationHash: destinationHash,
+                                                  interfaceID: learned.interfaceID,
+                                                  relayNextHop: relayNextHop)))
 
-            case .tcp, .ble, .delegate:
+            // The link verbs (`.sendOverLink`, `.closeLink`, `.registerRequestHandler`, …) are
+            // NOT forwarded here: they are aliased straight into the shared `LinkPlane` by
+            // `linkPlaneRoute` and have already been consumed by the `Scope` above. Forwarding
+            // them again would double-deliver (e.g. two `.close`s to one element — a "forEach
+            // received an action for a missing element" crash).
+
+            // --- TCP driver interface events → shared router ---
+            case let .tcpClient(.interface(.delegate(.packetReceived(data)))):
+                guard let id = state.tcpClient?.interfaceID else { return .none }
+                return .send(.transport(.received(id, data)))
+            case .tcpClient(.interface(.connectionEvent(.connected))):
+                guard let driver = state.tcpClient else { return .none }
+                return .merge(.send(.transport(.interfaceConnected(driver.interfaceID, driver.profile))),
+                              .send(.transport(.startMaintenance)))
+            case .tcpClient(.interface(.connectionEvent(.disconnected))):
+                guard let id = state.tcpClient?.interfaceID else { return .none }
+                return .merge(.send(.transport(.interfaceDisconnected(id))),
+                              .send(.linkPlane(.interfaceDisconnected(id))),
+                              .send(.transport(.stopMaintenance)))
+
+            // --- BLE peer lifecycle → shared router interface set (+ maintenance) ---
+            case let .ble(.ble(.delegate(.peerOnline(token)))):
+                let id = bleInterfaceID(token)
+                let wasEmpty = state.ble?.peerInterfaces.isEmpty ?? true
+                guard let profile = state.ble?.profile else { return .none }
+                state.ble?.peerInterfaces[id] = token
+                var effects: [Effect<Action>] = [
+                    .send(.transport(.interfaceConnected(id, profile))),
+                    .send(.ble(.delegate(.peerOnline(token)))),
+                ]
+                if wasEmpty { effects.append(.send(.transport(.startMaintenance))) }
+                return .merge(effects)
+
+            case let .ble(.ble(.delegate(.peerOffline(token)))):
+                let id = bleInterfaceID(token)
+                state.ble?.peerInterfaces[id] = nil
+                var effects: [Effect<Action>] = [
+                    .send(.transport(.interfaceDisconnected(id))),
+                    .send(.linkPlane(.interfaceDisconnected(id))),
+                    .send(.ble(.delegate(.peerOffline(token)))),
+                ]
+                if state.ble?.peerInterfaces.isEmpty ?? true { effects.append(.send(.transport(.stopMaintenance))) }
+                return .merge(effects)
+
+            case let .ble(.ble(.delegate(.packetReceived(token, packet)))):
+                return .send(.transport(.received(bleInterfaceID(token), packet)))
+
+            // --- shared router delegates → interface / unified delegate ---
+            case let .transport(.delegate(.transmit(txID, raw))):
+                // C5 IFAC outbound masking, on the interface's OWN profile. `transport.interfaces`
+                // is registered per driver at `.interfaceConnected`, so the ifac key there is the
+                // driver's profile — equivalent to the pre-hoist per-endpoint `state.profile.ifac`.
+                // Masking centrally (not in Transport) keeps it off every emission point and off
+                // the inbound C4 replay path.
+                let masked = state.transport.interfaces[txID]?.ifac?.protect(raw) ?? raw
+                return transmit(state, to: txID, masked: masked, unmasked: raw)
+            case let .transport(.delegate(.received(h, p))):
+                return .send(.delegate(.messageReceived(destinationHash: h, plaintext: p)))
+            case let .transport(.delegate(.pathLearned(h, hops))):
+                return .send(.delegate(.pathLearned(destinationHash: h, hops: hops)))
+            case let .transport(.delegate(.sendFailed(h, r))):
+                return .send(.delegate(.sendFailed(destinationHash: h, reason: r)))
+
+            // --- shared router → shared link plane ---
+            case let .transport(.delegate(.linkPacket(linkID, arrivalInterface, data))):
+                return .send(.linkPlane(.routeLinkPacket(linkID: linkID, arrivalInterface: arrivalInterface, data: data)))
+
+            case let .transport(.delegate(.linkRequest(destHash, arrivalInterface, data))):
+                guard let owner = state.transport.localDestinations[destHash]?.identity,
+                      owner.privateKey != nil
+                else { return .none }
+                // Reply on the interface the request arrived from.
+                return .send(.linkPlane(.acceptLinkRequest(owner: owner, destinationHash: destHash,
+                                                           interfaceID: arrivalInterface, data: data)))
+
+            // --- shared link plane delegates → interface / unified delegate ---
+            case let .linkPlane(.delegate(.transmit(txID, raw))):
+                // C5 IFAC outbound masking (same rationale as transport transmit above).
+                let masked = state.transport.interfaces[txID]?.ifac?.protect(raw) ?? raw
+                return transmit(state, to: txID, masked: masked, unmasked: raw)
+
+            case let .linkPlane(.delegate(.linkEstablished(linkID, destHash))):
+                return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))
+            case let .linkPlane(.delegate(.linkDataReceived(linkID, data, packetHash))):
+                return .send(.delegate(.linkDataReceived(linkID: linkID, data: data, packetHash: packetHash)))
+            case let .linkPlane(.delegate(.linkClosed(linkID, reason))):
+                return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
+            case let .linkPlane(.delegate(.linkFailed(destHash, reason))):
+                return .send(.delegate(.linkFailed(destinationHash: destHash, reason: reason)))
+            case let .linkPlane(.delegate(.resourceReceived(linkID, data))):
+                return .send(.delegate(.resourceReceived(linkID: linkID, data: data)))
+            case let .linkPlane(.delegate(.resourceConcluded(linkID, hash))):
+                return .send(.delegate(.resourceConcluded(linkID: linkID, resourceHash: hash)))
+            case let .linkPlane(.delegate(.resourceFailed(linkID, hash))):
+                return .send(.delegate(.resourceFailed(linkID: linkID, resourceHash: hash)))
+            case let .linkPlane(.delegate(.linkIdentified(linkID, identity))):
+                return .send(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: identity)))
+            case let .linkPlane(.delegate(.requestReceived(linkID, rid, ph, data))):
+                return .send(.delegate(.requestReceived(linkID: linkID, requestID: rid, pathHash: ph, data: data)))
+            case let .linkPlane(.delegate(.responseReceived(linkID, rid, data))):
+                return .send(.delegate(.responseReceived(linkID: linkID, requestID: rid, data: data)))
+            case let .linkPlane(.delegate(.requestFailed(linkID, rid))):
+                return .send(.delegate(.requestFailed(linkID: linkID, requestID: rid)))
+            case let .linkPlane(.delegate(.packetDelivered(token))):
+                return .send(.delegate(.packetDelivered(token: token)))
+            case let .linkPlane(.delegate(.packetDeliveryFailed(token))):
+                return .send(.delegate(.packetDeliveryFailed(token: token)))
+
+            // Everything else (child scopes already ran; the link verbs were consumed by the
+            // `linkPlaneRoute` alias Scope).
+            case .tcpClient, .ble, .transport, .linkPlane, .link, .delegate,
+                 .sendOverLink, .sendResourceOverLink, .identifyOverLink, .sendRequestOverLink,
+                 .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
+                 .closeLink, .registerRequestHandler, .deregisterRequestHandler:
                 return .none
             }
         }
+        .ifLet(\.tcpClient, action: \.tcpClient) { TCPEndpoint() }
+        .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
     }
 
-    /// Sends the transport-appropriate action to whichever case is active.
-    private func route(_ state: State,
-                       tcp: TCPEndpoint.Action,
-                       ble: BLEEndpoint.Action) -> Effect<Action> {
-        switch state {
-        case .tcp: return .send(.tcp(tcp))
-        case .ble: return .send(.ble(ble))
+    /// Routes an outbound (already IFAC-masked) buffer to whichever driver owns `txID`. TCP owns
+    /// its single `interfaceID`; BLE owns each token in its `peerInterfaces` map. If the id maps
+    /// to no live driver interface, the send is not deliverable: for BLE, surface `.sendFailed`
+    /// (a stale binding otherwise dies silently on the ~60s inactivity watchdog); for TCP the id
+    /// mismatch cannot occur for a live socket, so drop.
+    private func transmit(_ state: State, to txID: InterfaceID,
+                          masked: Data, unmasked: Data) -> Effect<Action> {
+        if let driver = state.tcpClient, driver.interfaceID == txID {
+            return .send(.tcpClient(.interface(.send(masked))))
         }
+        if let peerToken = state.ble?.peerInterfaces[txID] {
+            return .send(.ble(.ble(.send(peer: peerToken, packet: masked))))
+        }
+        // Not deliverable. `Packet(raw:)` recovers the destination hash; for established link
+        // traffic that value IS the link ID, so the failure correlates. An unparseable packet
+        // drops silently (no destination to report).
+        guard state.ble != nil, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
+        return .send(.delegate(.sendFailed(destinationHash: destHash, reason: .interfaceUnavailable)))
     }
+}
 
-    /// TCP delegates map 1:1 onto the unified surface.
-    private func unify(_ d: TCPEndpoint.Action.Delegate) -> Action.Delegate {
-        switch d {
-        case let .messageReceived(h, p):        return .messageReceived(destinationHash: h, plaintext: p)
-        case let .pathLearned(h, hops):         return .pathLearned(destinationHash: h, hops: hops)
-        case let .sendFailed(h, r):             return .sendFailed(destinationHash: h, reason: r)
-        case let .linkEstablished(l, h):        return .linkEstablished(linkID: l, destinationHash: h)
-        case let .linkDataReceived(l, d, h):    return .linkDataReceived(linkID: l, data: d, packetHash: h)
-        case let .linkClosed(l, r):             return .linkClosed(linkID: l, reason: r)
-        case let .linkFailed(h, r):             return .linkFailed(destinationHash: h, reason: r)
-        case let .resourceReceived(l, d):       return .resourceReceived(linkID: l, data: d)
-        case let .resourceConcluded(l, h):      return .resourceConcluded(linkID: l, resourceHash: h)
-        case let .resourceFailed(l, h):         return .resourceFailed(linkID: l, resourceHash: h)
-        case let .linkIdentified(l, i):         return .linkIdentified(linkID: l, remoteIdentity: i)
-        case let .requestReceived(l, r, p, d):  return .requestReceived(linkID: l, requestID: r, pathHash: p, data: d)
-        case let .responseReceived(l, r, d):    return .responseReceived(linkID: l, requestID: r, data: d)
-        case let .requestFailed(l, r):          return .requestFailed(linkID: l, requestID: r)
-        case let .packetDelivered(t):           return .packetDelivered(token: t)
-        case let .packetDeliveryFailed(t):      return .packetDeliveryFailed(token: t)
-        }
-    }
-
-    /// BLE delegates map 1:1 EXCEPT the BLE-only peer lifecycle, which returns nil.
-    private func unify(_ d: BLEEndpoint.Action.Delegate) -> Action.Delegate? {
-        switch d {
-        case .peerOnline, .peerOffline:         return nil     // BLE-only: observe via `.ble`
-        case let .messageReceived(h, p):        return .messageReceived(destinationHash: h, plaintext: p)
-        case let .pathLearned(h, hops):         return .pathLearned(destinationHash: h, hops: hops)
-        case let .sendFailed(h, r):             return .sendFailed(destinationHash: h, reason: r)
-        case let .linkEstablished(l, h):        return .linkEstablished(linkID: l, destinationHash: h)
-        case let .linkDataReceived(l, d, h):    return .linkDataReceived(linkID: l, data: d, packetHash: h)
-        case let .linkClosed(l, r):             return .linkClosed(linkID: l, reason: r)
-        case let .linkFailed(h, r):             return .linkFailed(destinationHash: h, reason: r)
-        case let .resourceReceived(l, d):       return .resourceReceived(linkID: l, data: d)
-        case let .resourceConcluded(l, h):      return .resourceConcluded(linkID: l, resourceHash: h)
-        case let .resourceFailed(l, h):         return .resourceFailed(linkID: l, resourceHash: h)
-        case let .linkIdentified(l, i):         return .linkIdentified(linkID: l, remoteIdentity: i)
-        case let .requestReceived(l, r, p, d):  return .requestReceived(linkID: l, requestID: r, pathHash: p, data: d)
-        case let .responseReceived(l, r, d):    return .responseReceived(linkID: l, requestID: r, data: d)
-        case let .requestFailed(l, r):          return .requestFailed(linkID: l, requestID: r)
-        case let .packetDelivered(t):           return .packetDelivered(token: t)
-        case let .packetDeliveryFailed(t):      return .packetDeliveryFailed(token: t)
-        }
+extension TransportEndpoint.Action.AllCasePaths {
+    /// The case path the shared `LinkPlane` is scoped through. Aliases every `LinkPlane.Action`
+    /// that has an identically-shaped `TransportEndpoint.Action` case (`.link`, `.sendOverLink`,
+    /// `.closeLink`, `.registerRequestHandler`, …) onto that case, and rides the plane-only
+    /// actions (`.openLink(initiatorTo:…)`, `.acceptLinkRequest`, `.routeLinkPacket`,
+    /// `.interfaceDisconnected`, `.delegate`) on `.linkPlane(...)`.
+    ///
+    /// It is a bijection, not a forward-plus-mirror: each `LinkPlane.Action` reaches the plane
+    /// exactly once, with no re-entry. This preserves the pre-hoist spelling so callers keep
+    /// sending AND matching `.link(.element(id:action:))`, `.sendResponseOverLink(...)` etc.
+    public var linkPlaneRoute: AnyCasePath<TransportEndpoint.Action, LinkPlane.Action> {
+        AnyCasePath(
+            embed: { plane in
+                switch plane {
+                case let .link(action):
+                    return .link(action)
+                case let .sendOverLink(linkID, data):
+                    return .sendOverLink(linkID: linkID, data: data)
+                case let .sendResourceOverLink(linkID, data):
+                    return .sendResourceOverLink(linkID: linkID, data: data)
+                case let .identifyOverLink(linkID, identity):
+                    return .identifyOverLink(linkID: linkID, identity: identity)
+                case let .sendRequestOverLink(linkID, path, data):
+                    return .sendRequestOverLink(linkID: linkID, path: path, data: data)
+                case let .sendResponseOverLink(linkID, requestID, data):
+                    return .sendResponseOverLink(linkID: linkID, requestID: requestID, data: data)
+                case let .sendWithReceiptOverLink(linkID, data, token):
+                    return .sendWithReceiptOverLink(linkID: linkID, data: data, token: token)
+                case let .provePacketOverLink(linkID, packetHash):
+                    return .provePacketOverLink(linkID: linkID, packetHash: packetHash)
+                case let .closeLink(linkID):
+                    return .closeLink(linkID: linkID)
+                case let .registerRequestHandler(path, policy):
+                    return .registerRequestHandler(path: path, policy: policy)
+                case let .deregisterRequestHandler(path):
+                    return .deregisterRequestHandler(path: path)
+                case .openLink, .acceptLinkRequest, .routeLinkPacket, .interfaceDisconnected, .delegate:
+                    return .linkPlane(plane)
+                }
+            },
+            extract: { action in
+                switch action {
+                case let .link(elementAction):
+                    return .link(elementAction)
+                case let .sendOverLink(linkID, data):
+                    return .sendOverLink(linkID: linkID, data: data)
+                case let .sendResourceOverLink(linkID, data):
+                    return .sendResourceOverLink(linkID: linkID, data: data)
+                case let .identifyOverLink(linkID, identity):
+                    return .identifyOverLink(linkID: linkID, identity: identity)
+                case let .sendRequestOverLink(linkID, path, data):
+                    return .sendRequestOverLink(linkID: linkID, path: path, data: data)
+                case let .sendResponseOverLink(linkID, requestID, data):
+                    return .sendResponseOverLink(linkID: linkID, requestID: requestID, data: data)
+                case let .sendWithReceiptOverLink(linkID, data, token):
+                    return .sendWithReceiptOverLink(linkID: linkID, data: data, token: token)
+                case let .provePacketOverLink(linkID, packetHash):
+                    return .provePacketOverLink(linkID: linkID, packetHash: packetHash)
+                case let .closeLink(linkID):
+                    return .closeLink(linkID: linkID)
+                case let .registerRequestHandler(path, policy):
+                    return .registerRequestHandler(path: path, policy: policy)
+                case let .deregisterRequestHandler(path):
+                    return .deregisterRequestHandler(path: path)
+                case let .linkPlane(plane):
+                    return plane
+                default:
+                    return nil
+                }
+            }
+        )
     }
 }

@@ -32,11 +32,11 @@ private let handle    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0
 
 /// A single BLEEndpoint store with a controllable mock driver.
 @MainActor
-private func makeNode() -> (TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
+private func makeNode() -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>,
                             AsyncStream<BLEDriverEvent>.Continuation) {
     let events = AsyncStream<BLEDriverEvent>.makeStream()
-    let store = TestStore(initialState: BLEEndpoint.State()) {
-        BLEEndpoint()
+    let store = TestStore(initialState: bleDriverEndpoint()) {
+        TransportEndpoint()
     } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 0))
@@ -60,7 +60,7 @@ private func makeNode() -> (TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
 /// which requires `.ready` to be received first (`.start` puts it in `.starting`, not `.online`).
 /// The brief's code omitted this step; we yield `.ready` before `.channelOpened`.
 @MainActor
-private func bringPeerOnline(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.Action>,
+private func bringPeerOnline(_ store: TestStore<TransportEndpoint.State, TransportEndpoint.Action>,
                             _ events: AsyncStream<BLEDriverEvent>.Continuation) async {
     await store.send(.start)
     events.yield(.ready)
@@ -73,7 +73,7 @@ private func bringPeerOnline(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.A
 /// Cancel the driver stream + maintenance: `.stop` emits `peerOffline`, whose cascade
 /// reaches `stopMaintenance`; fast-forward to it.
 @MainActor
-private func teardown(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.Action>) async {
+private func teardown(_ store: TestStore<TransportEndpoint.State, TransportEndpoint.Action>) async {
     await store.send(.stop)
     await store.receive { if case .transport(.stopMaintenance) = $0 { return true }; return false }
 }
@@ -120,7 +120,7 @@ private func teardown(_ store: TestStore<BLEEndpoint.State, BLEEndpoint.Action>)
     let captured = LockIsolated<(Data, Data)?>(nil)   // (peerToken, raw packet)
     await store.send(.send(destinationHash: destHash, plaintext: Data("ping".utf8)))
     await store.receive { action in
-        if case let .ble(.send(peer, packet)) = action { captured.setValue((peer, packet)); return true }
+        if case let .ble(.ble(.send(peer, packet))) = action { captured.setValue((peer, packet)); return true }
         return false
     }
     #expect(captured.value?.0 == peerToken)

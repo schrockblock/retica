@@ -312,7 +312,7 @@ private func makeLearnPeerStore(
     peerIdentity: Identity,
     peerAppData: Data?
 ) -> TestStore<LXMFNode.State, LXMFNode.Action> {
-    var tcp = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+    var tcp = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     tcp.transport.learned[announcedHash] = LearnedDestination(
         identity: peerIdentity, appData: peerAppData, ratchet: nil,
         interfaceID: InterfaceID("tcp"), hops: 1, nextHop: nil, announceEmitted: 0)

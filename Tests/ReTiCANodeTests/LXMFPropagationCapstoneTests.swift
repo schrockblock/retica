@@ -58,9 +58,9 @@ import ComposableArchitecture
     }
 
     // Send-frame predicates.
-    func sSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcp(.interface(.send))) = act { return true }; return false }
-    func rSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcp(.interface(.send))) = act { return true }; return false }
-    func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
+    func sSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
+    func rSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
+    func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
 
     let sentS  = LockIsolated<[Data]>([])
     let sentR  = LockIsolated<[Data]>([])
@@ -73,7 +73,7 @@ import ComposableArchitecture
     // Connect all three.
     await s.send(.endpoint(.start));  eventsS.yield(.connected)
     await r.send(.endpoint(.start));  eventsR.yield(.connected)
-    await pn.send(.endpoint(.connect)); eventsPN.yield(.connected)
+    await pn.send(.endpoint(.start)); eventsPN.yield(.connected)
 
     // ─────────────────────────────────────────────────────────────────────────────
     // ANNOUNCE PHASE
@@ -249,5 +249,5 @@ import ComposableArchitecture
     // Disconnect all.
     await s.send(.endpoint(.stop))
     await r.send(.endpoint(.stop))
-    await pn.send(.endpoint(.disconnect))
+    await pn.send(.endpoint(.stop))
 }

@@ -22,7 +22,7 @@ import ComposableArchitecture
     let otherLink = Data(repeating: 0xC2, count: 16)
 
     var initial = LXMFNode.State(identity: identity,
-                                 endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+                                 endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false))
     initial.propagationDestinationHash = servedPropHash
 
     let store = TestStore(initialState: initial) { LXMFNode() } withDependencies: {
@@ -74,7 +74,7 @@ import ComposableArchitecture
     -> TestStore<LXMFServiceNode.State, LXMFServiceNode.Action> {
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 0)                       // 0 → accept synthetic unstamped test entries
     initial.nodeModeEnabled = nodeMode
     return makeServiceNodeStore(initial)
@@ -89,7 +89,7 @@ import ComposableArchitecture
     let identity = Identity()
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 12)
     initial.nodeModeEnabled = true
     let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
@@ -136,7 +136,7 @@ import ComposableArchitecture
     let identity = Identity()
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 12)
     initial.nodeModeEnabled = true
     let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
@@ -177,7 +177,7 @@ import ComposableArchitecture
 @Test @MainActor func serviceNodeAnnouncesStoreEnforcedCostAfterMutation() async {
     let identity = Identity()
     var initial = LXMFServiceNode.State(identity: identity,
-                                        endpoint: TCPEndpoint.State(host: "h", port: 1),
+                                        endpoint: tcpDriverEndpoint(host: "h", port: 1),
                                         minStampCost: 16)
     initial.nodeModeEnabled = true
     initial.pn.store.minStampCost = 21                    // mutate ONLY the store
@@ -248,7 +248,7 @@ import ComposableArchitecture
     // Fully armed EXCEPT the master switch.
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 0)
     initial.nodeModeEnabled = false
     initial.client.propagationDestinationHash = propDest.hash   // isPropagationLink would pass…
@@ -458,7 +458,7 @@ import ComposableArchitecture
         let events = AsyncStream<TCPEvent>.makeStream()
         var initial = LXMFServiceNode.State(
             identity: nodeIdentity,
-            endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false),
+            endpoint: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false),
             minStampCost: 4)
         initial.nodeModeEnabled = true
         let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
@@ -473,10 +473,10 @@ import ComposableArchitecture
     }
 
     func makeClient(_ host: String, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -489,17 +489,17 @@ import ComposableArchitecture
     }
 
     func nodeSend(_ act: LXMFServiceNode.Action) -> Bool {
-        if case .client(.endpoint(.tcp(.interface(.send)))) = act { return true }; return false
+        if case .client(.endpoint(.tcpClient(.interface(.send)))) = act { return true }; return false
     }
-    func cSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClient(.interface(.send)) = act { return true }; return false }
 
     let sentNode = LockIsolated<[Data]>([])
     let sentC = LockIsolated<[Data]>([])
     let (node, eventsNode) = makeNode("node", sentNode)
     let (c, eventsC) = makeClient("c", sentC)
 
-    await node.send(.client(.endpoint(.tcp(.connect)))); eventsNode.yield(.connected)
-    await c.send(.connect); eventsC.yield(.connected)
+    await node.send(.client(.endpoint(.tcpClient(.connect)))); eventsNode.yield(.connected)
+    await c.send(.start); eventsC.yield(.connected)
 
     // Node registers + announces lxmf.propagation; bridge the announce so C learns its path + identity.
     await node.send(.registerPropagation)
@@ -595,7 +595,7 @@ import ComposableArchitecture
     #expect(recovered?.content == Data("hi C".utf8))
     #expect(recovered?.validateSignature(source: sIdentity) == true)
 
-    await node.send(.client(.endpoint(.tcp(.disconnect)))); await c.send(.disconnect)
+    await node.send(.client(.endpoint(.tcpClient(.disconnect)))); await c.send(.stop)
 }
 
 // MARK: - Inbound packet proving (reference LXMRouter.py:2255 `packet.prove()`)
@@ -679,7 +679,7 @@ import ComposableArchitecture
 
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 0)
     initial.nodeModeEnabled = false
     initial.client.propagationDestinationHash = propDest.hash   // isPropagationLink would pass…
@@ -896,7 +896,7 @@ import ComposableArchitecture
     // test cannot distinguish which guard is effective.
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 0)
     initial.nodeModeEnabled = true
     initial.clientIdentities[deliveryLink] = client    // bypass the IDENTIFY guard — only isPropagationLink matters
@@ -960,7 +960,7 @@ import ComposableArchitecture
     // Pre-seed the initial state with req1 already in the queue and both links set up.
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 0)
     initial.nodeModeEnabled = true
     initial.client.propagationDestinationHash = propDest.hash
@@ -1000,7 +1000,7 @@ import ComposableArchitecture
 @MainActor @Test func lxmfNodeClearsSyncPhaseOnLinkClose() async {
     let identity = Identity()
     var initial = LXMFNode.State(identity: identity,
-                                  endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+                                  endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false))
     let linkID = Data(repeating: 0xC1, count: 16)
     // Simulate a mid-phase sync that is interrupted: plant syncPhase state directly.
     initial.syncPhase[linkID] = .awaitingMessages
@@ -1347,7 +1347,7 @@ import ComposableArchitecture
     let identity = Identity()
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 4)   // enforce: any un-/under-stamped entry is invalid
     initial.nodeModeEnabled = true
     let store = makeServiceNodeStore(initial)
@@ -1367,10 +1367,10 @@ import ComposableArchitecture
 
     // Must send ERROR_INVALID_STAMP (0xF5) as a plain data packet on the link (sendOverLink),
     // NOT provePacketOverLink. The action bubbles through TransportEndpoint → TCPEndpoint, so
-    // it appears as .client(.endpoint(.tcp(.sendOverLink(...)))).
+    // it appears as .client(.endpoint(.sendOverLink(...)))).
     // Order: the error is emitted before the close (both in the same merge).
     await store.receive { action in
-        if case let .client(.endpoint(.tcp(.sendOverLink(lid, data)))) = action {
+        if case let .client(.endpoint(.sendOverLink(lid, data))) = action {
             #expect(lid == linkID)
             #expect(MsgPack.decodeValue(data) == .array([.uint(LXMFPropagation.errorInvalidStamp)]),
                     "must send msgpack([0xF5]) per LXMPeer.ERROR_INVALID_STAMP / LXMRouter.py:2258")
@@ -1379,7 +1379,7 @@ import ComposableArchitecture
         return false
     }
     await store.receive { action in
-        if case let .client(.endpoint(.tcp(.closeLink(lid)))) = action {
+        if case let .client(.endpoint(.closeLink(lid))) = action {
             #expect(lid == linkID)
             return true
         }
@@ -1398,7 +1398,7 @@ import ComposableArchitecture
     let identity = Identity()
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 0)
     initial.nodeModeEnabled = true
     let store = makeServiceNodeStore(initial)
@@ -1477,7 +1477,7 @@ import ComposableArchitecture
     let identity = Identity()
     var initial = LXMFServiceNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false),
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
         minStampCost: 4)   // > 0, so the stamp pre-scan runs
     initial.nodeModeEnabled = true
     let store = makeServiceNodeStore(initial)
@@ -1528,7 +1528,7 @@ import ComposableArchitecture
     let identity = Identity()
     var initial = LXMFNode.State(
         identity: identity,
-        endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false))
     let linkID = Data(repeating: 0xC1, count: 16)
     initial.syncPhase[linkID] = .awaitingList   // simulate: we sent a phase-1 /get, waiting for list
     initial.linkDestinations[linkID] = Data(repeating: 0xAB, count: 16)
@@ -1548,9 +1548,9 @@ import ComposableArchitecture
 
     // The link must be closed. Receive this BEFORE skipReceivedActions — in a .off store receive
     // skips non-matching actions, so asserting state first and then receiving would drain the close.
-    // closeLink is routed through TransportEndpoint → TCPEndpoint, so appears as .endpoint(.tcp(.closeLink(...))).
+    // closeLink is routed through TransportEndpoint → TCPEndpoint, so appears as .endpoint(.closeLink(...))).
     await store.receive { action in
-        if case let .endpoint(.tcp(.closeLink(lid))) = action {
+        if case let .endpoint(.closeLink(lid)) = action {
             #expect(lid == linkID)
             return true
         }
@@ -1586,7 +1586,7 @@ import ComposableArchitecture
         let events = AsyncStream<TCPEvent>.makeStream()
         var initial = LXMFServiceNode.State(
             identity: nodeIdentity,
-            endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false),
+            endpoint: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false),
             minStampCost: 0)   // accept unstamped entries
         initial.nodeModeEnabled = true
         let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
@@ -1601,10 +1601,10 @@ import ComposableArchitecture
     }
 
     func makeClient(_ host: String, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -1617,17 +1617,17 @@ import ComposableArchitecture
     }
 
     func nodeSend(_ act: LXMFServiceNode.Action) -> Bool {
-        if case .client(.endpoint(.tcp(.interface(.send)))) = act { return true }; return false
+        if case .client(.endpoint(.tcpClient(.interface(.send)))) = act { return true }; return false
     }
-    func cSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClient(.interface(.send)) = act { return true }; return false }
 
     let sentNode = LockIsolated<[Data]>([])
     let sentC    = LockIsolated<[Data]>([])
     let (node, eventsNode) = makeNode("node", sentNode)
     let (c, eventsC) = makeClient("c", sentC)
 
-    await node.send(.client(.endpoint(.tcp(.connect)))); eventsNode.yield(.connected)
-    await c.send(.connect); eventsC.yield(.connected)
+    await node.send(.client(.endpoint(.tcpClient(.connect)))); eventsNode.yield(.connected)
+    await c.send(.start); eventsC.yield(.connected)
 
     // Node registers + announces lxmf.propagation; bridge the announce so C learns the path.
     await node.send(.registerPropagation)
@@ -1674,5 +1674,5 @@ import ComposableArchitecture
         return false
     }
 
-    await node.send(.client(.endpoint(.tcp(.disconnect)))); await c.send(.disconnect)
+    await node.send(.client(.endpoint(.tcpClient(.disconnect)))); await c.send(.stop)
 }

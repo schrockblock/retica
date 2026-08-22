@@ -43,7 +43,7 @@ import ComposableArchitecture
 
     // Predicate helpers for the .off store (everything is wrapped under .endpoint(...)).
     func isInterfaceSend(_ a: LXMFNode.Action) -> Bool {
-        if case .endpoint(.tcp(.interface(.send))) = a { return true }; return false
+        if case .endpoint(.tcpClient(.interface(.send))) = a { return true }; return false
     }
 
     let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])
@@ -189,7 +189,7 @@ import ComposableArchitecture
     }
 
     func isInterfaceSend(_ a: LXMFNode.Action) -> Bool {
-        if case .endpoint(.tcp(.interface(.send))) = a { return true }; return false
+        if case .endpoint(.tcpClient(.interface(.send))) = a { return true }; return false
     }
 
     let sentA = LockIsolated<[Data]>([]); let sentB = LockIsolated<[Data]>([])

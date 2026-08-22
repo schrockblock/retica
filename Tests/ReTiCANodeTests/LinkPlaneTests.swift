@@ -59,14 +59,14 @@ private let ifA = InterfaceID("iface-a")
     await store.send(.closeLink(linkID: store.state.links[0].linkID))
 }
 
-/// Verify that every `LinkPlane.Action` case round-trips through `TCPEndpoint`'s `linkPlaneRoute`
-/// alias: `linkPlaneRoute.extract(from: linkPlaneRoute.embed(a)) == a`.
+/// Verify that every `LinkPlane.Action` case round-trips through `TransportEndpoint`'s
+/// `linkPlaneRoute` alias: `linkPlaneRoute.extract(from: linkPlaneRoute.embed(a)) == a`.
 ///
 /// This is a structural test: if the bijection ever mis-maps a case (e.g. routes `.openLink`
 /// through the wrong embed branch, or forgets a case in `extract`), at least one assertion
 /// below will fail.  Fourteen cases are checked — one representative value per case.
 @Test func linkPlaneRouteCasePathRoundTripsEveryPlaneAction() {
-    let route = TCPEndpoint.Action.allCasePaths.linkPlaneRoute
+    let route = TransportEndpoint.Action.allCasePaths.linkPlaneRoute
 
     func roundTrips(_ plane: LinkPlane.Action) -> Bool {
         route.extract(from: route.embed(plane)) == plane

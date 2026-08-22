@@ -71,7 +71,7 @@ private func bringPeerOnlineWith(_ store: TestStore<LXMFNode.State, LXMFNode.Act
     events.yield(.channelOpened(channelID, peerHandle, direction: .inbound))
     events.yield(.channelData(channelID, framedHello(token)))
     await store.receive { action in
-        if case .endpoint(.ble(.transport(.interfaceConnected))) = action { return true }
+        if case .endpoint(.transport(.interfaceConnected)) = action { return true }
         return false
     }
 }
@@ -95,7 +95,7 @@ private func makeLXMFAnnouncePacket(identity: Identity, emitted: UInt64) -> (Dat
 private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async {
     await store.send(.endpoint(.stop))
     await store.receive { action in
-        if case .endpoint(.ble(.transport(.stopMaintenance))) = action { return true }
+        if case .endpoint(.transport(.stopMaintenance)) = action { return true }
         return false
     }
 }
@@ -251,7 +251,7 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     events.continuation.yield(.channelClosed(channel, reason: nil))
     await store.receive { if case .endpoint(.ble(.delegate(.peerOffline))) = $0 { return true }; return false }
     // Drain stopMaintenance (emitted when the last peer disconnects).
-    await store.receive { if case .endpoint(.ble(.transport(.stopMaintenance))) = $0 { return true }; return false }
+    await store.receive { if case .endpoint(.transport(.stopMaintenance)) = $0 { return true }; return false }
 
     // Sanity: learned entry survives; bleInterfaceID(peerToken) is gone.
     #expect(store.state.endpoint.learned[bDeliveryHash] != nil)
@@ -334,5 +334,5 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
 
     // Teardown: the node is still running (one active peer: tokenB).
     await store.send(.endpoint(.stop))
-    await store.receive { if case .endpoint(.ble(.transport(.stopMaintenance))) = $0 { return true }; return false }
+    await store.receive { if case .endpoint(.transport(.stopMaintenance)) = $0 { return true }; return false }
 }

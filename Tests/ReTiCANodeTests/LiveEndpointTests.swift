@@ -14,15 +14,15 @@ func liveEndpointLearnsAnnouncesFromRealNode() async throws {
     let host = ProcessInfo.processInfo.environment["RETICA_LIVE_HOST"]!
     let port = UInt16(ProcessInfo.processInfo.environment["RETICA_LIVE_PORT"] ?? "4242") ?? 4242
 
-    let store = Store(initialState: TCPEndpoint.State(host: host, port: port, reconnectOnDrop: true)) {
-        TCPEndpoint()
+    let store = Store(initialState: .tcp(TCPEndpoint.State(host: host, port: port, reconnectOnDrop: true))) {
+        TransportEndpoint()
     }
-    store.send(.connect)
+    store.send(.start)
 
     // Real Reticulum nodes announce periodically; wait a bounded window for the path table to fill.
     try await Task.sleep(for: .seconds(10))
 
     #expect(!store.state.transport.learned.isEmpty,
             "Expected to learn at least one announce from \(host):\(port) within 10s")
-    store.send(.disconnect)
+    store.send(.stop)
 }

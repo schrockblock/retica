@@ -24,12 +24,12 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
 // TestStore (which is main-actor-isolated); tests end deterministically via .disconnect.
 @MainActor
 private func makeStore(host: String = "node", port: UInt16 = 4242)
-    -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
     let events = AsyncStream<TCPEvent>.makeStream()
     let store = TestStore(
-        initialState: TCPEndpoint.State(host: host, port: port, reconnectOnDrop: false)
+        initialState: tcpDriverEndpoint(host: host, port: port, reconnectOnDrop: false)
     ) {
-        TCPEndpoint()
+        TransportEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in events.stream }, send: { _ in }, close: { })
         $0.continuousClock = TestClock()
@@ -42,13 +42,13 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
 @Test @MainActor func connectWiresInterfaceOnlineToTransportInterfaceConnected() async {
     let (store, events) = makeStore()
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
-    #expect(store.state.transport.interfaces[store.state.interfaceID] == .tcp)
-    #expect(store.state.interface.status == .online)
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    #expect(store.state.transport.interfaces[store.state.tcpClient!.interfaceID] == .tcp)
+    #expect(store.state.tcpClient!.interface.status == .online)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 @Test @MainActor func inboundAnnounceIsLearnedAndBubblesPathLearned() async {
@@ -56,7 +56,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let id = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
                                                      hops: 3, emitted: 1000, appData: Data("meta".utf8))
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
@@ -64,9 +64,9 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.receive(\.delegate.pathLearned)
     #expect(store.state.transport.learned[destHash]?.identity.hash == id.hash)
     #expect(store.state.transport.learned[destHash]?.hops == 3)
-    #expect(store.state.transport.learned[destHash]?.interfaceID == store.state.interfaceID)
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    #expect(store.state.transport.learned[destHash]?.interfaceID == store.state.tcpClient!.interfaceID)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 @Test @MainActor func inboundDataToLocalDestinationBubblesMessageReceived() async {
@@ -79,7 +79,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
                         destinationHash: dest.hash, transportId: nil, payload: dest.encrypt(plaintext))
 
     await store.send(.registerLocalDestination(dest))
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
@@ -90,8 +90,8 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         return false
     }
     #expect(captured.value == plaintext)
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 @Test @MainActor func outboundAnnounceReachesInterfaceSendAsValidPacket() async {
@@ -99,7 +99,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
                            identity: Identity())!
     await store.send(.registerLocalDestination(dest))
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
@@ -107,7 +107,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let captured = LockIsolated<Data?>(nil)
     await store.send(.announce(destinationHash: dest.hash, appData: nil))
     await store.receive { action in
-        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        if case let .tcpClient(.interface(.send(raw))) = action { captured.setValue(raw); return true }
         return false
     }
     let packet = Packet(raw: captured.value!)!
@@ -116,21 +116,21 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let parsed = Announce.parse(payload: packet.payload, destinationHash: dest.hash,
                                 contextFlagSet: packet.contextFlag)
     #expect(parsed?.identity.hash == dest.identity!.hash)
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 @Test @MainActor func sendToUnlearnedDestinationBubblesSendFailed() async {
     let (store, events) = makeStore()
     let destHash = Data(repeating: 0x33, count: 16)
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
     await store.send(.send(destinationHash: destHash, plaintext: Data("x".utf8)))
     await store.receive(.delegate(.sendFailed(destinationHash: destHash, reason: .notLearned)))
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 @Test @MainActor func inboundLinkRequestCreatesResponderAndEmitsProof() async {
@@ -138,7 +138,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let owner = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: owner)!
     await store.send(.registerLocalDestination(dest))
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
@@ -157,14 +157,14 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         return false
     }
     await store.receive { action in
-        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        if case let .tcpClient(.interface(.send(raw))) = action { captured.setValue(raw); return true }
         return false
     }
     #expect(store.state.links.count == 1)
     #expect(Packet(raw: captured.value!)!.packetType == .proof)
 
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 @Test @MainActor func openLinkToLearnedDestinationEmitsLinkRequest() async {
@@ -172,7 +172,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let id = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
                                                      hops: 1, emitted: 1000)
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
     events.yield(.data(HDLC.frame(announceRaw)))
@@ -184,14 +184,14 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
     await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
     await store.receive { action in
-        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        if case let .tcpClient(.interface(.send(raw))) = action { captured.setValue(raw); return true }
         return false
     }
     #expect(store.state.links.count == 1)
     #expect(Packet(raw: captured.value!)!.packetType == .linkRequest)
 
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 // F8. `learned` is deliberately NON-destructive: losing the interface does not purge the path,
@@ -209,7 +209,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let id = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
                                                      hops: 1, emitted: 1000)
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
     events.yield(.data(HDLC.frame(announceRaw)))
@@ -218,7 +218,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
     // The socket drops. The learned entry survives by design — that is the trap.
     events.yield(.disconnected(reason: "socket closed"))
-    await store.receive(\.interface.connectionEvent)
+    await store.receive(\.tcpClient.interface.connectionEvent)
     await store.receive(\.transport.interfaceDisconnected)
     await store.skipReceivedActions(strict: false)
     #expect(store.state.transport.learned[destHash] != nil, "learned must survive; the gate is the fix")
@@ -227,20 +227,20 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.receive(.delegate(.linkFailed(destinationHash: destHash, reason: .pathStale)))
     #expect(store.state.links.isEmpty, "no LinkSession may be minted against a dead interface")
 
-    await store.send(.disconnect)
+    await store.send(.stop)
     await store.skipReceivedActions(strict: false)
 }
 
 @Test @MainActor func openLinkToUnlearnedDestinationFails() async {
     let (store, events) = makeStore()
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
     await store.send(.openLink(destinationHash: Data(repeating: 0x44, count: 16)))
     await store.receive(.delegate(.linkFailed(destinationHash: Data(repeating: 0x44, count: 16), reason: .noPath)))
     #expect(store.state.links.isEmpty)
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 @Test @MainActor func inboundLinkPacketRoutesToHeldLink() async {
@@ -250,7 +250,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let owner = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: owner)!
     await store.send(.registerLocalDestination(dest))
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
@@ -263,7 +263,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.receive(\.transport.received)
     await store.receive(\.transport.delegate.linkRequest)
     await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
-    await store.receive { if case .interface(.send) = $0 { return true }; return false }
+    await store.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let linkID = store.state.links[0].linkID
     #expect(store.state.links[0].status == .handshake)
 
@@ -282,8 +282,8 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     }
     #expect(routed.value == true)
 
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 @Test @MainActor func twoEndpointsEstablishLinkExchangeDataAndClose() async {
@@ -292,10 +292,10 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -312,9 +312,9 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let (a, eventsA) = make("a", sentA)
     let (b, eventsB) = make("b", sentB)
 
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(dest))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
 
     // 1. B announces; A learns it.
     await b.send(.announce(destinationHash: dest.hash, appData: nil))
@@ -326,16 +326,16 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     // 2. A opens the link → LINKREQUEST out to B.
     await a.send(.openLink(destinationHash: dest.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))                 // LINKREQUEST → B
     await b.receive(\.transport.received)
     await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }  // LRPROOF out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // LRPROOF out
 
     // 3. B's LRPROOF → A → A active, emits LRRTT.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }  // LRRTT out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // LRRTT out
     await a.receive(\.delegate.linkEstablished)
     #expect(a.state.links[0].status == .active)
 
@@ -349,7 +349,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     // 5. A sends data over the link → B receives it.
     let payload = Data("hello over link".utf8)
     await a.send(.sendOverLink(linkID: a.state.links[0].linkID, data: payload))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let gotData = LockIsolated<Data?>(nil)
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
@@ -361,7 +361,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
     // 6. A closes the link → B observes the close.
     await a.send(.closeLink(linkID: a.state.links[0].linkID))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await a.receive(\.delegate.linkClosed)
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
@@ -369,13 +369,13 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     #expect(a.state.links.isEmpty)      // closed link is removed from the collection
     #expect(b.state.links.isEmpty)      // closed link is removed from the collection
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }
 
 @Test @MainActor func sendResourceOverLinkDispatchesToTheMatchingLink() async {
     let clock = TestClock()
     let store = TestStore(initialState: {
-        var s = TCPEndpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var s = tcpDriverEndpoint(host: "n", port: 4242, reconnectOnDrop: false)
         var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
                                      destinationHash: Data(repeating: 0x02, count: 16),
                                      interfaceID: InterfaceID("tcp"))
@@ -383,9 +383,9 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         link.sessionKey = Data(repeating: 0x01, count: 64)
         link.linkID = Data(repeating: 0xAB, count: 16)
         link.rtt = 1.0
-        s.links.append(link)
+        s.linkPlane.links.append(link)
         return s
-    }()) { TCPEndpoint() } withDependencies: {
+    }()) { TransportEndpoint() } withDependencies: {
         $0.continuousClock = clock
         $0.date = .constant(Date(timeIntervalSince1970: 0))
         $0.uuid = .incrementing
@@ -404,14 +404,14 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let clock = TestClock()
     let linkID = Data(repeating: 0xAB, count: 16)
     let store = TestStore(initialState: {
-        var s = TCPEndpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var s = tcpDriverEndpoint(host: "n", port: 4242, reconnectOnDrop: false)
         var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
                                      destinationHash: Data(repeating: 0x02, count: 16),
                                      interfaceID: InterfaceID("tcp"))
         link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
-        s.links.append(link)
+        s.linkPlane.links.append(link)
         return s
-    }()) { TCPEndpoint() } withDependencies: {
+    }()) { TransportEndpoint() } withDependencies: {
         $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
     }
     store.exhaustivity = .off
@@ -432,10 +432,10 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -453,21 +453,21 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let (b, eventsB) = make("b", sentB)
 
     // --- Establish the link (mirrors twoEndpointsEstablishLinkExchangeDataAndClose steps 1–4) ---
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(dest))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
     await b.send(.announce(destinationHash: dest.hash, appData: nil))
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
     await a.send(.openLink(destinationHash: dest.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await a.receive(\.delegate.linkEstablished)
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
@@ -477,17 +477,17 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     // --- A sends a 2-part resource to B; B assembles it; A concludes. ---
     let payload = Data((0..<600).map { UInt8($0 & 0xff) })     // > 1 part at SDU 464, ≤ 4 parts → one window
     await a.send(.sendResourceOverLink(linkID: linkID, data: payload))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_ADV out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_ADV out
     // ADV → B: spawns a receiver, emits RESOURCE_REQ.
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_REQ out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_REQ out
     // REQ → A: A serves its parts.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
     let partCount = a.state.links[0].transfers[0].parts.count
     for _ in 0..<partCount {
-        await a.receive { if case .interface(.send) = $0 { return true }; return false }
+        await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     }
     // Deliver every part frame A emitted (the last `partCount` frames in sentA) to B.
     let parts = Array(sentA.value.suffix(partCount))
@@ -496,7 +496,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         eventsB.yield(.data(frame))
         await b.receive(\.transport.received)
         if i == partCount - 1 {
-            await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_PRF out
+            await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_PRF out
             await b.receive { action in
                 if case let .delegate(.resourceReceived(lid, d)) = action, lid == linkID { got.setValue(d); return true }
                 return false
@@ -516,24 +516,24 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
     // Close the link to cancel the link timers, then disconnect.
     await a.send(.closeLink(linkID: linkID))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await a.receive(\.delegate.linkClosed)
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received); await b.receive(\.delegate.linkClosed)
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }
 
 @Test @MainActor func identifyOverLinkDispatchesToTheMatchingLink() async {
     let clock = TestClock()
     let linkID = Data(repeating: 0xAB, count: 16)
     let store = TestStore(initialState: {
-        var s = TCPEndpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var s = tcpDriverEndpoint(host: "n", port: 4242, reconnectOnDrop: false)
         var link = LinkSession.State(id: UUID(0), initiatorTo: Identity(),
                                      destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
         link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
-        s.links.append(link)
+        s.linkPlane.links.append(link)
         return s
-    }()) { TCPEndpoint() } withDependencies: {
+    }()) { TransportEndpoint() } withDependencies: {
         $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
     }
@@ -546,13 +546,13 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let clock = TestClock()
     let linkID = Data(repeating: 0xAB, count: 16)
     let store = TestStore(initialState: {
-        var s = TCPEndpoint.State(host: "n", port: 4242, reconnectOnDrop: false)
+        var s = tcpDriverEndpoint(host: "n", port: 4242, reconnectOnDrop: false)
         var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
                                      destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
         link.status = .active; link.sessionKey = Data(repeating: 0x01, count: 64); link.linkID = linkID; link.rtt = 1.0
-        s.links.append(link)
+        s.linkPlane.links.append(link)
         return s
-    }()) { TCPEndpoint() } withDependencies: {
+    }()) { TransportEndpoint() } withDependencies: {
         $0.continuousClock = clock; $0.date = .constant(Date(timeIntervalSince1970: 0)); $0.uuid = .incrementing
     }
     store.exhaustivity = .off
@@ -572,10 +572,10 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -592,21 +592,21 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let (b, eventsB) = make("b", sentB)
 
     // --- Establish the link (same steps as twoEndpointsTransferAResourceOverALink) ---
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(dest))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
     await b.send(.announce(destinationHash: dest.hash, appData: nil))
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
     await a.send(.openLink(destinationHash: dest.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await a.receive(\.delegate.linkEstablished)
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
     let linkID = a.state.links[0].linkID
@@ -620,19 +620,19 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let respData = MsgPack.encode(.bin(Data((0..<450).map { UInt8($0 & 0xff) })))
 
     await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: reqData))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }   // REQ_RESOURCE_ADV out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // REQ_RESOURCE_ADV out
 
     // ADV → B: spawns a receiver, emits RESOURCE_REQ.
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_REQ out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_REQ out
 
     // REQ → A: A serves its parts.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
     let reqPartCount = a.state.links[0].transfers[0].parts.count
     for _ in 0..<reqPartCount {
-        await a.receive { if case .interface(.send) = $0 { return true }; return false }
+        await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     }
 
     // Deliver every part frame A emitted (the last `reqPartCount` frames in sentA) to B.
@@ -644,7 +644,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         await b.receive(\.transport.received)
         if i == reqPartCount - 1 {
             // Last part: B sends PRF, then surfaces requestReceived.
-            await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_PRF out
+            await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_PRF out
             await b.receive { action in
                 if case let .delegate(.requestReceived(_, rid, _, d)) = action {
                     gotReqID.setValue(rid); gotReqData.setValue(d); return true
@@ -661,19 +661,19 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
 
     // --- B replies with a large response; it rides a Resource. ---
     await b.send(.sendResponseOverLink(linkID: linkID, requestID: gotReqID.value!, data: respData))
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESP_RESOURCE_ADV out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESP_RESOURCE_ADV out
 
     // ADV → A: A's pendingRequests has the requestID, so it accepts the response resource.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_REQ out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_REQ out
 
     // REQ → B: B serves its parts.
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     let respPartCount = b.state.links[0].transfers.first(where: { $0.role == .sender && $0.advertisement?.isResponse == true })!.parts.count
     for _ in 0..<respPartCount {
-        await b.receive { if case .interface(.send) = $0 { return true }; return false }
+        await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     }
 
     // Deliver every part frame B emitted (the last `respPartCount` frames in sentB) to A.
@@ -684,7 +684,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         await a.receive(\.transport.received)
         if i == respPartCount - 1 {
             // Last part: A sends PRF, then surfaces responseReceived.
-            await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_PRF out
+            await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_PRF out
             await a.receive { action in
                 if case let .delegate(.responseReceived(_, rid, d)) = action, rid == gotReqID.value! {
                     gotRespData.setValue(d); return true
@@ -699,7 +699,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }
 
 @Test @MainActor func twoEndpointsIdentifyAndRoundTripARequest() async {
@@ -708,10 +708,10 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -728,25 +728,25 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let (b, eventsB) = make("b", sentB)
 
     // Establish (identical to twoEndpointsEstablishLinkExchangeDataAndClose steps 1–4).
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(dest))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
     await b.send(.announce(destinationHash: dest.hash, appData: nil))
     eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
     await a.send(.openLink(destinationHash: dest.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await a.receive(\.delegate.linkEstablished)
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
     let linkID = a.state.links[0].linkID
 
     // A identifies → B surfaces linkIdentified with A's identity.
     await a.send(.identifyOverLink(linkID: linkID, identity: aIdentity))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let idHash = LockIsolated<Data?>(nil)
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received)
     await b.receive { action in
@@ -760,7 +760,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     let pingData = MsgPack.encode(.string("ping"))
     let pongData = MsgPack.encode(.string("pong"))
     await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: pingData))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let reqID = LockIsolated<Data?>(nil)
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received)
     await b.receive { action in
@@ -768,7 +768,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
         return false
     }
     await b.send(.sendResponseOverLink(linkID: linkID, requestID: reqID.value!, data: pongData))
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let respData = LockIsolated<Data?>(nil)
     eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
     await a.receive { action in
@@ -777,7 +777,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     }
     #expect(respData.value == pongData)
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }
 
 // MARK: – Request handler registry + allow-gated auto-response tests
@@ -791,8 +791,8 @@ private func endpointWithActiveLink(
     registrations: [Data: RequestRegistration],
     responder: RequestResponder,
     _ clock: TestClock<Duration>
-) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, UUID) {
-    var s = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, UUID) {
+    var s = tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false)
     let elementID = UUID(0)
     var link = LinkSession.State(id: elementID, responderFor: Identity(),
                                  destinationHash: Data(repeating: 0x02, count: 16), interfaceID: InterfaceID("tcp"))
@@ -800,9 +800,9 @@ private func endpointWithActiveLink(
     link.sessionKey = Data(repeating: 0x09, count: 64)
     link.linkID = linkID
     link.remoteIdentity = remoteIdentity
-    s.links.append(link)
-    s.registrations = registrations
-    let store = TestStore(initialState: s) { TCPEndpoint() } withDependencies: {
+    s.linkPlane.links.append(link)
+    s.linkPlane.registrations = registrations
+    let store = TestStore(initialState: s) { TransportEndpoint() } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
         $0.continuousClock = clock
         $0.date = .constant(Date(timeIntervalSince1970: 0))
@@ -816,14 +816,14 @@ private func endpointWithActiveLink(
 /// A store holding one INITIATOR link still in `.pending` — the shape that establishment
 /// failures actually arise from, and the one whose `destinationHash` names a REMOTE peer.
 private func endpointWithInitiatorLink(_ clock: TestClock<Duration>)
-    -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, UUID) {
-    var s = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+    -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, UUID) {
+    var s = tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false)
     let elementID = UUID(0)
     let link = LinkSession.State(id: elementID, initiatorTo: Identity(),
                                  destinationHash: Data(repeating: 0x03, count: 16),
                                  interfaceID: InterfaceID("tcp"), relayNextHop: nil)
-    s.links.append(link)
-    let store = TestStore(initialState: s) { TCPEndpoint() } withDependencies: {
+    s.linkPlane.links.append(link)
+    let store = TestStore(initialState: s) { TransportEndpoint() } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
         $0.continuousClock = clock
         $0.date = .constant(Date(timeIntervalSince1970: 0))
@@ -837,7 +837,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
 @Test @MainActor func registerThenDeregisterMutatesRegistrations() async {
     let clock = TestClock()
-    let store = TestStore(initialState: TCPEndpoint.State(host: "h", port: 1)) { TCPEndpoint() } withDependencies: {
+    let store = TestStore(initialState: tcpDriverEndpoint(host: "h", port: 1)) { TransportEndpoint() } withDependencies: {
         $0.continuousClock = clock; $0.uuid = .incrementing
     }
     store.exhaustivity = .off
@@ -926,8 +926,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // Build A (initiator): standard make.
     let eventsA_stream = AsyncStream<TCPEvent>.makeStream()
-    let a = TestStore(initialState: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
-        TCPEndpoint()
+    let a = TestStore(initialState: tcpDriverEndpoint(host: "a", port: 4242, reconnectOnDrop: false)) {
+        TransportEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in eventsA_stream.stream },
                                          send: { d in sentA.withValue { $0.append(d) } }, close: { })
@@ -940,8 +940,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // Build B (responder): same, plus the echo requestResponder.
     let eventsB_stream = AsyncStream<TCPEvent>.makeStream()
-    let b = TestStore(initialState: TCPEndpoint.State(host: "b", port: 4242, reconnectOnDrop: false)) {
-        TCPEndpoint()
+    let b = TestStore(initialState: tcpDriverEndpoint(host: "b", port: 4242, reconnectOnDrop: false)) {
+        TransportEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in eventsB_stream.stream },
                                          send: { d in sentB.withValue { $0.append(d) } }, close: { })
@@ -954,18 +954,18 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     let eventsB = eventsB_stream.continuation
 
     // Establish link (same as twoEndpointsIdentifyAndRoundTripARequest steps 1–4).
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(dest))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
     await b.send(.announce(destinationHash: dest.hash, appData: nil))
     eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
     await a.send(.openLink(destinationHash: dest.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await a.receive(\.delegate.linkEstablished)
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
     let linkID = a.state.links[0].linkID
@@ -979,7 +979,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     // A sends a small inline request. Must be valid msgpack to survive the wire round-trip.
     let reqPayload = MsgPack.encode(.string("ping"))
     await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: reqPayload))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
 
     // Request frame → B: B auto-answers, never surfaces requestReceived.
     // bSurfaced is checked in EVERY B-side predicate so a delegate.requestReceived emitted in any
@@ -996,7 +996,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     // is caught. Require no requestReceived.
     await b.receive { action in
         if case .delegate(.requestReceived) = action { bSurfaced.setValue(true) }
-        if case .interface(.send) = action { return true }
+        if case .tcpClient(.interface(.send)) = action { return true }
         return false
     }
     #expect(bSurfaced.value == false, "B must NOT surface delegate.requestReceived for a registered+allowed path")
@@ -1011,7 +1011,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     }
     #expect(gotRespData.value == reqPayload, "A must receive the exact echoed bytes")
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }
 
 @Test @MainActor func handlerAutoAnswersWithLargeResourceResponse() async {
@@ -1029,8 +1029,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // Build A (initiator).
     let eventsA_stream = AsyncStream<TCPEvent>.makeStream()
-    let a = TestStore(initialState: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
-        TCPEndpoint()
+    let a = TestStore(initialState: tcpDriverEndpoint(host: "a", port: 4242, reconnectOnDrop: false)) {
+        TransportEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in eventsA_stream.stream },
                                          send: { d in sentA.withValue { $0.append(d) } }, close: { })
@@ -1043,8 +1043,8 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // Build B (responder) with large-response responder.
     let eventsB_stream = AsyncStream<TCPEvent>.makeStream()
-    let b = TestStore(initialState: TCPEndpoint.State(host: "b", port: 4242, reconnectOnDrop: false)) {
-        TCPEndpoint()
+    let b = TestStore(initialState: tcpDriverEndpoint(host: "b", port: 4242, reconnectOnDrop: false)) {
+        TransportEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in eventsB_stream.stream },
                                          send: { d in sentB.withValue { $0.append(d) } }, close: { })
@@ -1057,18 +1057,18 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     let eventsB = eventsB_stream.continuation
 
     // Establish link (same steps as above).
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(dest))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
     await b.send(.announce(destinationHash: dest.hash, appData: nil))
     eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
     await a.send(.openLink(destinationHash: dest.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!)); await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await a.receive(\.delegate.linkEstablished)
     eventsB.yield(.data(sentA.value.last!)); await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
     let linkID = a.state.links[0].linkID
@@ -1078,18 +1078,18 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
 
     // A sends a small inline request (only the RESPONSE is large). Must be valid msgpack.
     await a.send(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: MsgPack.encode(.string("ping"))))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
 
     // Request frame → B: B auto-answers with the large response, which rides a Resource.
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     // B emits RESOURCE_ADV for the large response (not an interface(.send) from inline).
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // RESP_RESOURCE_ADV out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESP_RESOURCE_ADV out
 
     // ADV → A: A's pendingRequests has the requestID, so it accepts the response resource and emits RESOURCE_REQ.
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_REQ out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_REQ out
 
     // REQ → B: B serves its parts.
     eventsB.yield(.data(sentA.value.last!))
@@ -1097,7 +1097,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     let respPartCount = b.state.links[0].transfers.first(where: { $0.role == .sender && $0.advertisement?.isResponse == true })!.parts.count
     #expect(respPartCount > 1, "Large auto-response must ride a genuinely multi-part Resource")
     for _ in 0..<respPartCount {
-        await b.receive { if case .interface(.send) = $0 { return true }; return false }
+        await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     }
 
     // Deliver every part frame B emitted (last `respPartCount` frames in sentB) to A.
@@ -1108,7 +1108,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
         await a.receive(\.transport.received)
         if i == respPartCount - 1 {
             // Last part: A sends PRF then surfaces responseReceived.
-            await a.receive { if case .interface(.send) = $0 { return true }; return false }   // RESOURCE_PRF out
+            await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // RESOURCE_PRF out
             await a.receive { action in
                 if case let .delegate(.responseReceived(_, _, d)) = action { gotRespData.setValue(d); return true }
                 return false
@@ -1122,7 +1122,7 @@ private func pathHash(_ p: String) -> Data { Crypto.truncatedHash(Data(p.utf8)) 
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }
 
 // MARK: – Multi-segment (>maxEfficientSize) end-to-end round-trip
@@ -1165,10 +1165,10 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     let bIdentity = Identity()
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: bIdentity)!
 
-    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+    func make(_ host: String, _ sent: LockIsolated<[Data]>) -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
@@ -1186,21 +1186,21 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     let (b, eventsB) = make("b", sentB)
 
     // --- Establish the link (mirrors twoEndpointsTransferAResourceOverALink steps 1–4) ---
-    await a.send(.connect); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
+    await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
     await b.send(.registerLocalDestination(dest))
-    await b.send(.connect); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
+    await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
     await b.send(.announce(destinationHash: dest.hash, appData: nil))
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
     await a.send(.openLink(destinationHash: dest.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received); await b.receive(\.transport.delegate.linkRequest)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await a.receive(\.delegate.linkEstablished)
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received); await b.receive(\.delegate.linkEstablished)
@@ -1217,7 +1217,7 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
 
     await a.send(.sendResourceOverLink(linkID: linkID, data: payload))
     // A emits ADV for segment 1 immediately.
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     // Task.yield() lets the async .run { tcpConnection.send(framed) } task write sentA.value.last.
     await Task.yield()
     #expect(a.state.links[0].transfers.count == 1)
@@ -1232,7 +1232,7 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     // B spawns a receiver and emits RESOURCE_REQ for the first window.
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await Task.yield()   // flush tcpConnection.send for the REQ
 
     // Windowed pump loop: each iteration delivers one window of parts to B.
@@ -1249,7 +1249,7 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
         eventsA.yield(.data(reqFrame))
         await a.receive(\.transport.received)
         for _ in 0..<n {
-            await a.receive { if case .interface(.send) = $0 { return true }; return false }
+            await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
         }
         // After n interface.send awaits, each .run { tcpConnection.send } has had time to run.
         let frames = Array(sentA.value.suffix(n))
@@ -1262,12 +1262,12 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
         let bSeg1 = b.state.links.first?.transfers.first(where: { $0.role == .receiver })
         if bSeg1?.status == .complete {
             // B has already emitted PRF as part of completion. Capture it.
-            await b.receive { if case .interface(.send) = $0 { return true }; return false }
+            await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
             await Task.yield()   // flush tcpConnection.send for the PRF
             break
         }
         // B emits the next REQ; flush the async write before reading sentB.value.last.
-        await b.receive { if case .interface(.send) = $0 { return true }; return false }
+        await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
         await Task.yield()
     }
 
@@ -1279,13 +1279,13 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     eventsA.yield(.data(prf1Frame))
     await a.receive(\.transport.received)
     // A concludes segment 1 → segmentedSend advances → emits ADV for segment 2.
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     await Task.yield()
 
     // --- Pump segment 2 (K = 400 bytes → 1 part at SDU 464, fits in 1 window, no HMU) ---
     eventsB.yield(.data(sentA.value.last!))  // seg2 ADV → B
     await b.receive(\.transport.received)
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }   // REQ out
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // REQ out
     await Task.yield()
 
     let got = LockIsolated<Data?>(nil)
@@ -1303,7 +1303,7 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
         eventsA.yield(.data(seg2ReqFrame))
         await a.receive(\.transport.received)
         for _ in 0..<seg2n {
-            await a.receive { if case .interface(.send) = $0 { return true }; return false }
+            await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
         }
         let seg2Parts = Array(sentA.value.suffix(seg2n))
         for frame in seg2Parts {
@@ -1315,12 +1315,12 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
         if bSeg2 == nil || bSeg2?.status == .complete {
             // Seg2 complete: PRF already in queue or about to be emitted.
             // Await the PRF interface.send so sentB.value.last! becomes the PRF frame.
-            await b.receive { if case .interface(.send) = $0 { return true }; return false }   // PRF
+            await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }   // PRF
             await Task.yield()   // flush tcpConnection.send for PRF
             break
         }
         // Not done yet; B emits next REQ.
-        await b.receive { if case .interface(.send) = $0 { return true }; return false }
+        await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
         await Task.yield()
     }
     // resourceReceived fires as B's next delegate action after PRF (split assembly completes).
@@ -1344,7 +1344,7 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     }
     #expect(a.state.links[0].segmentedSend == nil)
 
-    await a.send(.disconnect); await b.send(.disconnect)
+    await a.send(.stop); await b.send(.stop)
 }
 
 // MARK: – GC: closed/failed links are removed from the collection
@@ -1383,7 +1383,7 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
     #expect(store.state.links[id: elementID]?.role == .responder)   // the helper seeds a responder
     store.exhaustivity = .on
     await store.send(.link(.element(id: elementID, action: .delegate(.establishmentFailed(.timedOut))))) {
-        $0.links.remove(id: elementID)
+        $0.linkPlane.links.remove(id: elementID)
     }
     #expect(store.state.links[id: elementID] == nil)           // removed regardless of role
     await store.send(.closeLink(linkID: Data(repeating: 0xEE, count: 16)))   // probe: no-op
@@ -1443,7 +1443,7 @@ private func makeRelayAnnouncePacket(identity: Identity, appName: String, aspect
                                                           appName: "app", aspects: ["relay-svc"],
                                                           hops: 2, emitted: 2000,
                                                           transportId: relayHash)
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
@@ -1459,7 +1459,7 @@ private func makeRelayAnnouncePacket(identity: Identity, appName: String, aspect
     await store.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
     await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
     await store.receive { action in
-        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        if case let .tcpClient(.interface(.send(raw))) = action { captured.setValue(raw); return true }
         return false
     }
     #expect(store.state.links.count == 1)
@@ -1470,8 +1470,8 @@ private func makeRelayAnnouncePacket(identity: Identity, appName: String, aspect
     // Link id parity: the id stored in state == Link.linkID of the packet.
     #expect(store.state.links[0].linkID == Link.linkID(requestPacket: p))
 
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 // MARK: - 3-node A—R—B link end-to-end (Task 4b-2b)
@@ -1508,12 +1508,12 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
 
     // Helper: build an TCPEndpoint store with a given interfaceID (not the default "tcp").
     func makeEndpoint(_ host: String, _ ifID: InterfaceID, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let evStream = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(
-            initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false,
+            initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false,
                                          interfaceID: ifID)
-        ) { TCPEndpoint() } withDependencies: {
+        ) { TransportEndpoint() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in evStream.stream },
                                              send: { d in sent.withValue { $0.append(d) } },
                                              close: { })
@@ -1542,16 +1542,16 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
 
     // Connect A and B.
     await b.send(.registerLocalDestination(destB))
-    await a.send(.connect)
+    await a.send(.start)
     eventsA.yield(.connected)
     await a.receive(\.transport.interfaceConnected)
-    await b.send(.connect)
+    await b.send(.start)
     eventsB.yield(.connected)
     await b.receive(\.transport.interfaceConnected)
 
     // ── Step 1: B announces D → R rebroadcasts → A learns D via R ────────────────────────────
     await b.send(.announce(destinationHash: destB.hash, appData: nil))
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let bAnnounceRaw = deframeOne(sentB.value.last!)
 
     // R receives B's HEADER_1 announce on "rb", rebroadcasts as HEADER_2 on "ar".
@@ -1580,7 +1580,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     await a.send(.openLink(destinationHash: destB.hash))
     await a.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
     await a.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let aLinkRequestRaw = deframeOne(sentA.value.last!)
     let lrPacket = Packet(raw: aLinkRequestRaw)!
     #expect(lrPacket.headerType == .header2)
@@ -1608,7 +1608,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     await b.receive(\.transport.received)
     await b.receive(\.transport.delegate.linkRequest)
     await b.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let bProofRaw = deframeOne(sentB.value.last!)
     let proofPkt = Packet(raw: bProofRaw)!
     #expect(proofPkt.destinationType == .link)
@@ -1627,7 +1627,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
 
     eventsA.yield(.data(HDLC.frame(rToA_Proof.value!)))
     await a.receive(\.transport.received)
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }  // LRRTT out
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }  // LRRTT out
     await a.receive(\.delegate.linkEstablished)
     #expect(a.state.links[0].status == .active)
     let aLinkID = a.state.links[0].linkID
@@ -1656,7 +1656,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     // ── Step 5: A sends data over link → relay → B ───────────────────────────────────────────
     let atobPayload = Data("hello from A via relay".utf8)
     await a.send(.sendOverLink(linkID: aLinkID, data: atobPayload))
-    await a.receive { if case .interface(.send) = $0 { return true }; return false }
+    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let aDataRaw = deframeOne(sentA.value.last!)
 
     let rToB_Data = LockIsolated<Data?>(nil)
@@ -1685,7 +1685,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     // ── Step 6: B sends data over link → relay → A ───────────────────────────────────────────
     let btoaPayload = Data("hello from B via relay".utf8)
     await b.send(.sendOverLink(linkID: bLinkID, data: btoaPayload))
-    await b.receive { if case .interface(.send) = $0 { return true }; return false }
+    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     let bDataRaw = deframeOne(sentB.value.last!)
 
     let rToA_Data = LockIsolated<Data?>(nil)
@@ -1711,8 +1711,8 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     // REQUIRED: B→A data arrives at A with the EXACT plaintext.
     #expect(gotBtoAData.value == btoaPayload)
 
-    await a.send(.disconnect)
-    await b.send(.disconnect)
+    await a.send(.stop)
+    await b.send(.stop)
 }
 
 // MARK: - 4b-3c-2 maintenance lifecycle
@@ -1723,8 +1723,8 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     let clock = TestClock()
     let now = LockIsolated(Date(timeIntervalSince1970: 0))
     let events = AsyncStream<TCPEvent>.makeStream()
-    let store = TestStore(initialState: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)) {
-        TCPEndpoint()
+    let store = TestStore(initialState: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false)) {
+        TransportEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in events.stream }, send: { _ in }, close: { })
         $0.continuousClock = clock
@@ -1736,7 +1736,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     let id = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: ["svc"],
                                                      hops: 3, emitted: 1000)
-    await store.send(.connect)
+    await store.send(.start)
     events.continuation.yield(.connected)               // → interfaceConnected + startMaintenance
     await store.receive(\.transport.interfaceConnected)
     events.continuation.yield(.data(HDLC.frame(announceRaw)))
@@ -1752,7 +1752,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
 /// Disconnecting an TCPEndpoint stops the maintenance tick (the TCPEndpoint forwards .stopMaintenance).
 @Test @MainActor func endpointStopsMaintenanceOnDisconnect() async {
     let (store, events) = makeStore()
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
     events.yield(.disconnected(reason: nil))              // → interfaceDisconnected + stopMaintenance
@@ -1763,8 +1763,8 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     let clock = TestClock()
     let events = AsyncStream<TCPEvent>.makeStream()
     let sent = LockIsolated<[Data]>([])
-    let store = TestStore(initialState: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false)) {
-        TCPEndpoint()
+    let store = TestStore(initialState: tcpDriverEndpoint(host: "a", port: 4242, reconnectOnDrop: false)) {
+        TransportEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                          send: { d in sent.withValue { $0.append(d) } },
@@ -1775,16 +1775,16 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     }
     store.exhaustivity = .off
 
-    await store.send(.connect); events.continuation.yield(.connected)
+    await store.send(.start); events.continuation.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
     let dest = Data((0..<16).map { UInt8($0) })
     await store.send(.requestPath(destinationHash: dest))
     await store.receive(\.transport.requestPath)                 // forwarder reaches Transport
-    await store.receive { if case .interface(.send) = $0 { return true }; return false }
+    await store.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
     #expect(!sent.value.isEmpty)                                 // a path-request packet went out
 
-    await store.send(.disconnect)
+    await store.send(.stop)
 }
 
 // MARK: - #C5 IFAC outbound masking
@@ -1800,9 +1800,9 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     let events = AsyncStream<TCPEvent>.makeStream()
     let captured = LockIsolated<Data?>(nil)
     let store = TestStore(
-        initialState: TCPEndpoint.State(host: "node", port: 4242, reconnectOnDrop: false, profile: profile)
+        initialState: tcpDriverEndpoint(host: "node", port: 4242, reconnectOnDrop: false, profile: profile)
     ) {
-        TCPEndpoint()
+        TransportEndpoint()
     } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                          send: { _ in }, close: { })
@@ -1815,13 +1815,13 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
                            identity: Identity())!
     await store.send(.registerLocalDestination(dest))
-    await store.send(.connect)
+    await store.send(.start)
     events.continuation.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
     await store.send(.announce(destinationHash: dest.hash, appData: nil))
     await store.receive { action in
-        if case let .interface(.send(raw)) = action { captured.setValue(raw); return true }
+        if case let .tcpClient(.interface(.send(raw))) = action { captured.setValue(raw); return true }
         return false
     }
 
@@ -1836,8 +1836,8 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     #expect(packet?.packetType == .announce)
     #expect(packet?.destinationHash == dest.hash)
 
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }
 
 /// TCP disconnected must fan out `.interfaceDisconnected` to `LinkPlane`, granting links on that
@@ -1854,7 +1854,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
                            identity: owner)!
     let (store, events) = makeStore()
     await store.send(.registerLocalDestination(dest))
-    await store.send(.connect)
+    await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
 
@@ -1871,7 +1871,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     // Drain the LRPROOF transmit so the responder element is fully created.
     await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
 
-    guard let element = store.state.linkPlane.links.first(where: { $0.interfaceID == store.state.interfaceID }) else {
+    guard let element = store.state.linkPlane.links.first(where: { $0.interfaceID == store.state.tcpClient!.interfaceID }) else {
         Issue.record("Expected a responder link bound to the TCP interfaceID")
         return
     }
@@ -1891,6 +1891,6 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     #expect(store.state.linkPlane.links[id: elementID]?.rehomePermitted == true,
             "TCP disconnected must fan-out interfaceDisconnected to LinkPlane so rehomePermitted is set")
 
-    await store.send(.disconnect)
-    await store.receive(\.interface.disconnect)
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
 }

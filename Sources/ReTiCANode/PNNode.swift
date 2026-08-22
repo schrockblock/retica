@@ -11,7 +11,7 @@ import ReTiCATransport
 public struct PNNode {
     @ObservableState
     public struct State: Equatable {
-        public var endpoint: TCPEndpoint.State
+        public var endpoint: TransportEndpoint.State
         public var node: PropagationNode.State
         public var identity: Identity
         public var peeringCost: Int = 0                        // required cost for inbound /offer peering keys
@@ -20,12 +20,21 @@ public struct PNNode {
         public var pendingOffer: [Data: PendingOffer] = [:]   // peerHash → (linkID, requestID, offeredIds)
         public var pendingSyncPeers: [Data: Int] = [:]     // peer dest → the peer's peering cost, awaiting linkEstablished
         public var offerLinks: [Data: [Data]] = [:]        // outbound offer linkID → offeredIds we sent
-        public init(identity: Identity, endpoint: TCPEndpoint.State, storageLimitBytes: Int? = nil,
+        public init(identity: Identity, endpoint: TransportEndpoint.State, storageLimitBytes: Int? = nil,
                     minStampCost: Int = LXMFPropagation.defaultPropagationStampCost, peeringCost: Int = 0) {
             self.identity = identity
             self.endpoint = endpoint
             self.peeringCost = peeringCost
             self.node = PropagationNode.State(storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
+        }
+
+        /// Convenience: run this propagation node over a single TCP-client driver. Mirrors
+        /// `LXMFNode.init(endpoint: TCPEndpoint.State)` — callers keep constructing a bare TCP
+        /// driver while the endpoint now owns the shared router / link plane.
+        public init(identity: Identity, endpoint: TCPEndpoint.State, storageLimitBytes: Int? = nil,
+                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost, peeringCost: Int = 0) {
+            self.init(identity: identity, endpoint: .tcp(endpoint), storageLimitBytes: storageLimitBytes,
+                      minStampCost: minStampCost, peeringCost: peeringCost)
         }
     }
 
@@ -41,7 +50,7 @@ public struct PNNode {
     }
 
     public enum Action: Equatable {
-        case endpoint(TCPEndpoint.Action)
+        case endpoint(TransportEndpoint.Action)
         case node(PropagationNode.Action)
         case registerPropagation
         case syncToPeer(destinationHash: Data, peeringCost: Int)
@@ -66,7 +75,7 @@ public struct PNNode {
     }
 
     public var body: some ReducerOf<Self> {
-        Scope(state: \.endpoint, action: \.endpoint) { TCPEndpoint() }
+        Scope(state: \.endpoint, action: \.endpoint) { TransportEndpoint() }
         Scope(state: \.node, action: \.node) { PropagationNode() }
         Reduce { [date] state, action in
             func clearLink(_ state: inout State, _ linkID: Data) {
@@ -179,7 +188,7 @@ public struct PNNode {
                 // Second gate, at the point the unbounded search would actually start. `pendingSyncPeers`
                 // is public state, so `syncToPeer`'s refusal is not the only way a cost can get here.
                 guard cost <= LXMFPropagation.maxPeeringCost else { return .none }   // decline to peer
-                guard let peerIdentity = state.endpoint.transport.learned[dest]?.identity else { return .none }
+                guard let peerIdentity = state.endpoint.learned[dest]?.identity else { return .none }
                 state.offerLinks[linkID] = state.node.store.transientIds
                 let peeringId = peerIdentity.hash + state.identity.hash              // responder-first (matches P4a)
                 let selfIdentity = state.identity

@@ -31,15 +31,17 @@ private let peerHashPath = "/tmp/ReTiCA/linkprobe/peer_hash.txt"
 @Reducer
 private struct ProbeHarness {
     @ObservableState
-    struct State: Equatable { var endpoint = TCPEndpoint.State(host: "127.0.0.1", port: 4250) }
-    enum Action { case endpoint(TCPEndpoint.Action) }
+    struct State: Equatable {
+        var endpoint = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "127.0.0.1", port: 4250))
+    }
+    enum Action { case endpoint(TransportEndpoint.Action) }
 
-    /// `TCPEndpoint.Action.Delegate` is not Sendable, so the probe records a rendered
+    /// `TransportEndpoint.Action.Delegate` is not Sendable, so the probe records a rendered
     /// summary rather than the value itself.
     let sink: @Sendable (String) -> Void
 
     var body: some ReducerOf<Self> {
-        Scope(state: \.endpoint, action: \.endpoint) { TCPEndpoint() }
+        Scope(state: \.endpoint, action: \.endpoint) { TransportEndpoint() }
         Reduce { _, action in
             guard case let .endpoint(.delegate(d)) = action else { return .none }
             switch d {
@@ -94,11 +96,11 @@ struct LiveLinkProbeTests {
             $0.context = .live
         }
 
-        store.send(.endpoint(.connect))
+        store.send(.endpoint(.start))
 
         // 1. The socket must come up.
         let connected = await waitFor("connect") {
-            store.state.endpoint.interface.status == .online
+            store.state.endpoint.tcpClient?.interface.status == .online
         }
         #expect(connected, "never connected to the hub — is rnsd running on 4250?")
 
@@ -128,6 +130,6 @@ struct LiveLinkProbeTests {
         let established = events.value.contains { $0.hasPrefix("ESTABLISHED") }
         #expect(established, "ReTiCA could not establish an outbound link to a stock RNS peer")
 
-        store.send(.endpoint(.disconnect))
+        store.send(.endpoint(.stop))
     }
 }

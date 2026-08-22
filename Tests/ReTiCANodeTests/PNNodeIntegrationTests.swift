@@ -43,10 +43,10 @@ import ComposableArchitecture
 
     // makeClient: builds a bare TCPEndpoint TestStore for client C.
     func makeClient(_ host: String, _ sent: LockIsolated<[Data]>)
-        -> (TestStore<TCPEndpoint.State, TCPEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
+        -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false)) {
-            TCPEndpoint()
+        let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
+            TransportEndpoint()
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
@@ -59,8 +59,8 @@ import ComposableArchitecture
     }
 
     // Predicate helpers.
-    func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.interface(.send)) = act { return true }; return false }
-    func cSend(_ act: TCPEndpoint.Action) -> Bool { if case .interface(.send) = act { return true }; return false }
+    func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
+    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClient(.interface(.send)) = act { return true }; return false }
 
     let sentPN = LockIsolated<[Data]>([])
     let sentC  = LockIsolated<[Data]>([])
@@ -68,8 +68,8 @@ import ComposableArchitecture
     let (c, eventsC)   = makeClient("c", sentC)
 
     // Connect both.
-    await pn.send(.endpoint(.connect)); eventsPN.yield(.connected)
-    await c.send(.connect); eventsC.yield(.connected)
+    await pn.send(.endpoint(.start)); eventsPN.yield(.connected)
+    await c.send(.start); eventsC.yield(.connected)
 
     // PN.registerPropagation → registers lxmf.propagation dest + announces.
     await pn.send(.registerPropagation)
@@ -194,5 +194,5 @@ import ComposableArchitecture
     #expect(recovered?.content == Data("hi C".utf8))
     #expect(recovered?.validateSignature(source: sIdentity) == true)
 
-    await pn.send(.endpoint(.disconnect)); await c.send(.disconnect)
+    await pn.send(.endpoint(.stop)); await c.send(.stop)
 }

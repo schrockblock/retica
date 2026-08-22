@@ -6,11 +6,16 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
+// Task-1b: `TransportEndpoint.State` is now a struct product with a SHARED `transport`/`linkPlane`
+// and kind-indexed driver slots (`tcpClient`, `ble`). These tests pin the container-level routing:
+// unified verbs reach the shared router / link plane; driver lifecycle verbs reach the driver slot;
+// shared-machinery delegates surface unified; BLE-only peer delegates stay OFF the unified surface;
+// and the unified accessors read straight off the shared machinery.
+
 @MainActor
 private func makeTCP() -> TestStore<TransportEndpoint.State, TransportEndpoint.Action> {
     let store = TestStore(
-        initialState: TransportEndpoint.State.tcp(
-            TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        initialState: .tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     ) {
         TransportEndpoint()
     } withDependencies: {
@@ -25,7 +30,7 @@ private func makeTCP() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
 
 @MainActor
 private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.Action> {
-    let store = TestStore(initialState: TransportEndpoint.State.ble(BLEEndpoint.State())) {
+    let store = TestStore(initialState: .ble(BLEEndpoint.State())) {
         TransportEndpoint()
     } withDependencies: {
         $0.continuousClock = TestClock()
@@ -41,12 +46,12 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
     return store
 }
 
-@Test @MainActor func startAndStopMapToEachTransportsLifecycle() async {
+@Test @MainActor func startAndStopMapToEachDriversLifecycle() async {
     let tcp = makeTCP()
     await tcp.send(.start)
-    await tcp.receive(.tcp(.connect))
+    await tcp.receive(.tcpClient(.connect))
     await tcp.send(.stop)
-    await tcp.receive(.tcp(.disconnect))
+    await tcp.receive(.tcpClient(.disconnect))
 
     let ble = makeBLE()
     await ble.send(.start)
@@ -55,64 +60,99 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
     await ble.receive(.ble(.stop))
 }
 
-@Test @MainActor func sharedVerbsReachTheActiveChildOnBothTransports() async {
+@Test @MainActor func sharedVerbsReachTheSharedRouterAndLinkPlaneOnBothConfigs() async {
     let dest = Data(repeating: 0x11, count: 16)
     let plaintext = Data("hi".utf8)
 
+    // The router verbs are forwarded explicitly by the container's Reduce; the link verbs are
+    // aliased straight into the shared LinkPlane by `linkPlaneRoute` (consumed by the Scope, so
+    // they do NOT re-surface under `.linkPlane(...)`). To observe the link verb reaching the
+    // plane, seed a live link and watch for the plane forwarding it to the element.
+    let linkID = dest
+    func withLink(_ base: TransportEndpoint.State) -> TransportEndpoint.State {
+        var s = base
+        var link = LinkSession.State(id: UUID(0), responderFor: Identity(),
+                                     destinationHash: Data(repeating: 0x02, count: 16),
+                                     interfaceID: InterfaceID("tcp"))
+        link.status = .active
+        link.sessionKey = Data(repeating: 0x01, count: 64)
+        link.linkID = linkID
+        link.rtt = 1.0
+        s.linkPlane.links.append(link)
+        return s
+    }
+
     let tcp = makeTCP()
     await tcp.send(.send(destinationHash: dest, plaintext: plaintext))
-    await tcp.receive(.tcp(.send(destinationHash: dest, plaintext: plaintext)))
+    await tcp.receive(.transport(.send(destinationHash: dest, plaintext: plaintext)))
     await tcp.send(.requestPath(destinationHash: dest))
-    await tcp.receive(.tcp(.requestPath(destinationHash: dest)))
-    await tcp.send(.sendOverLink(linkID: dest, data: plaintext))
-    await tcp.receive(.tcp(.sendOverLink(linkID: dest, data: plaintext)))
+    await tcp.receive(.transport(.requestPath(destinationHash: dest)))
 
     let ble = makeBLE()
     await ble.send(.send(destinationHash: dest, plaintext: plaintext))
-    await ble.receive(.ble(.send(destinationHash: dest, plaintext: plaintext)))
+    await ble.receive(.transport(.send(destinationHash: dest, plaintext: plaintext)))
     await ble.send(.requestPath(destinationHash: dest))
-    await ble.receive(.ble(.requestPath(destinationHash: dest)))
-    await ble.send(.sendOverLink(linkID: dest, data: plaintext))
-    await ble.receive(.ble(.sendOverLink(linkID: dest, data: plaintext)))
+    await ble.receive(.transport(.requestPath(destinationHash: dest)))
+
+    // Link verb via the alias: reaches the plane, which forwards to the element by linkID.
+    let linked = TestStore(initialState: withLink(.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)))) {
+        TransportEndpoint()
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+    }
+    linked.exhaustivity = .off
+    await linked.send(.sendOverLink(linkID: linkID, data: plaintext))
+    await linked.receive { if case .link(.element(_, .send)) = $0 { return true }; return false }
 }
 
-@Test @MainActor func childDelegatesSurfaceAsUnifiedDelegates() async {
+@Test @MainActor func sharedMachineryDelegatesSurfaceAsUnifiedDelegates() async {
     let h = Data(repeating: 0x22, count: 16)
 
     let tcp = makeTCP()
-    await tcp.send(.tcp(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x01])))))
+    await tcp.send(.transport(.delegate(.received(destinationHash: h, plaintext: Data([0x01])))))
     await tcp.receive(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x01]))))
-    await tcp.send(.tcp(.delegate(.pathLearned(destinationHash: h, hops: 2))))
+    await tcp.send(.transport(.delegate(.pathLearned(destinationHash: h, hops: 2))))
     await tcp.receive(.delegate(.pathLearned(destinationHash: h, hops: 2)))
-    await tcp.send(.tcp(.delegate(.linkEstablished(linkID: h, destinationHash: h))))
+    await tcp.send(.linkPlane(.delegate(.linkEstablished(linkID: h, destinationHash: h))))
     await tcp.receive(.delegate(.linkEstablished(linkID: h, destinationHash: h)))
 
     let ble = makeBLE()
-    await ble.send(.ble(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x02])))))
+    await ble.send(.transport(.delegate(.received(destinationHash: h, plaintext: Data([0x02])))))
     await ble.receive(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x02]))))
-    await ble.send(.ble(.delegate(.resourceConcluded(linkID: h, resourceHash: h))))
+    await ble.send(.linkPlane(.delegate(.resourceConcluded(linkID: h, resourceHash: h))))
     await ble.receive(.delegate(.resourceConcluded(linkID: h, resourceHash: h)))
 }
 
 @Test @MainActor func bleOnlyDelegatesDoNotSurfaceOnTheUnifiedSurface() async {
-    let ble = makeBLE()
-    // Must be EXHAUSTIVE: under `.off` the store swallows unasserted actions, so a spuriously
-    // surfaced `.delegate(...)` would go unnoticed and this test could never fail. With `.on`,
-    // `finish()` asserts no action went unreceived.
-    ble.exhaustivity = .on
+    let ble = makeBLE()  // .off
     let token = Data(repeating: 0xC7, count: 16)
-    // peerOnline/peerOffline are BLE-specific; they must NOT map to a unified delegate.
-    await ble.send(.ble(.delegate(.peerOnline(token))))
-    await ble.send(.ble(.delegate(.peerOffline(token))))
-    await ble.finish()
+    // Record every UNIFIED top-level `.delegate(...)` the store surfaces across a full BLE peer
+    // online→offline cycle. peerOnline/peerOffline are BLE-specific and must map to NO unified
+    // delegate — they surface only under `.ble(.delegate)`. The scan records any unified
+    // `.delegate` it is OFFERED (the predicate runs per action even when it returns false) and its
+    // sentinel is the BLE-only `.peerOffline` re-emission, which comes LAST — so any unified
+    // delegate emitted by the peer transitions before it would be recorded too. (The 1a
+    // characterization test pins the same property with a positive `pathLearned` sentinel.)
+    let unifiedDelegates = LockIsolated<[String]>([])
+    await ble.send(.ble(.ble(.delegate(.peerOnline(token)))))
+    await ble.send(.ble(.ble(.delegate(.peerOffline(token)))))
+    await ble.receive { action in
+        if case .delegate = action { unifiedDelegates.withValue { $0.append("delegate") } }
+        if case .ble(.delegate(.peerOffline)) = action { return true }
+        return false
+    }
+    await ble.skipReceivedActions(strict: false)
+    #expect(unifiedDelegates.value.isEmpty,
+            "BLE peer lifecycle must add NO unified delegate; saw \(unifiedDelegates.value)")
 }
 
-@Test @MainActor func stateReadsPassThroughToTheActiveCase() async {
-    // learned: seed each child's transport table and read it transport-agnostically.
+@Test @MainActor func stateReadsPassThroughToTheSharedMachinery() async {
+    // learned: seed the shared router table and read it transport-agnostically.
     let dest = Data(repeating: 0x33, count: 16)
     let identity = Identity()
-    // Real LearnedDestination init requires appData, ratchet, interfaceID, hops, nextHop,
-    // announceEmitted, learnedAt — adjusted from the brief's abbreviated call.
     let learned = LearnedDestination(identity: identity,
                                      appData: Data("meta".utf8),
                                      ratchet: nil,
@@ -122,33 +162,30 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
                                      announceEmitted: 0,
                                      learnedAt: Date(timeIntervalSince1970: 0))
 
-    var tcpState = TCPEndpoint.State(host: "h", port: 1, reconnectOnDrop: false)
+    var tcpState = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 1, reconnectOnDrop: false))
     tcpState.transport.learned[dest] = learned
-    let tcpWrapped = TransportEndpoint.State.tcp(tcpState)
-    #expect(tcpWrapped.learned[dest]?.identity.hash == identity.hash)
-    #expect(tcpWrapped.learned[dest]?.appData == Data("meta".utf8))
-    #expect(tcpWrapped.links.isEmpty)
-    #expect(tcpWrapped.registrations.isEmpty)
+    #expect(tcpState.learned[dest]?.identity.hash == identity.hash)
+    #expect(tcpState.learned[dest]?.appData == Data("meta".utf8))
+    #expect(tcpState.links.isEmpty)
+    #expect(tcpState.registrations.isEmpty)
 
-    var bleState = BLEEndpoint.State()
+    var bleState = TransportEndpoint.State.ble(BLEEndpoint.State())
     bleState.transport.learned[dest] = learned
-    let bleWrapped = TransportEndpoint.State.ble(bleState)
-    #expect(bleWrapped.learned[dest]?.identity.hash == identity.hash)
-    #expect(bleWrapped.links.isEmpty)
-    #expect(bleWrapped.registrations.isEmpty)
+    #expect(bleState.learned[dest]?.identity.hash == identity.hash)
+    #expect(bleState.links.isEmpty)
+    #expect(bleState.registrations.isEmpty)
 }
 
-// The unified surface exposes `learned`, `links` and `registrations`; `interfaces` was the
-// one table missing, which forced consumers to switch on .tcp/.ble to answer "is this
-// interface still up?" — the question `reachableLearned` is built on.
-@Test @MainActor func interfacesAreExposedOnTheUnifiedSurfaceForBothTransports() {
-    var tcp = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
+// The unified surface exposes `learned`, `links`, `registrations` AND `interfaces`, read directly
+// off the shared router / link plane — no switch on transport kind.
+@Test @MainActor func interfacesAreExposedOnTheUnifiedSurfaceForBothConfigs() {
+    var tcp = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     tcp.transport.interfaces[InterfaceID("tcp")] = .tcp
-    #expect(TransportEndpoint.State.tcp(tcp).interfaces == [InterfaceID("tcp"): .tcp])
+    #expect(tcp.interfaces == [InterfaceID("tcp"): .tcp])
 
-    var ble = BLEEndpoint.State()
+    var ble = TransportEndpoint.State.ble(BLEEndpoint.State())
     ble.transport.interfaces[InterfaceID("ble-1")] = .ble
-    #expect(TransportEndpoint.State.ble(ble).interfaces == [InterfaceID("ble-1"): .ble])
+    #expect(ble.interfaces == [InterfaceID("ble-1"): .ble])
 }
 
 // `PendingDelivery` gained an explicit `public init` because the synthesised memberwise init
