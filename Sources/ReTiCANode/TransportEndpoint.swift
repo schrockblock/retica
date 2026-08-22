@@ -31,6 +31,8 @@ public struct TransportEndpoint {
         public var linkPlane: LinkPlane.State
         /// The TCP-client driver slot (at most one this slice).
         public var tcpClient: TCPEndpoint.State?
+        /// The TCP-server driver slot (at most one; owns N accepted connections internally).
+        public var tcpServer: TCPServerEndpoint.State?
         /// The BLE driver slot.
         public var ble: BLEEndpoint.State?
 
@@ -51,16 +53,23 @@ public struct TransportEndpoint {
         public init(transport: Transport.State = Transport.State(),
                     linkPlane: LinkPlane.State = LinkPlane.State(),
                     tcpClient: TCPEndpoint.State? = nil,
+                    tcpServer: TCPServerEndpoint.State? = nil,
                     ble: BLEEndpoint.State? = nil) {
             self.transport = transport
             self.linkPlane = linkPlane
             self.tcpClient = tcpClient
+            self.tcpServer = tcpServer
             self.ble = ble
         }
 
         /// Convenience factory: an endpoint running over a single TCP-client driver.
         public static func tcp(_ driver: TCPEndpoint.State) -> State {
             State(tcpClient: driver)
+        }
+
+        /// Convenience factory: an endpoint running over a TCP-server (listener) driver.
+        public static func tcpServer(_ driver: TCPServerEndpoint.State) -> State {
+            State(tcpServer: driver)
         }
 
         /// Convenience factory: an endpoint running over a BLE driver.
@@ -71,6 +80,7 @@ public struct TransportEndpoint {
 
     public enum Action: Equatable {
         case tcpClient(TCPEndpoint.Action)
+        case tcpServer(TCPServerEndpoint.Action)
         case ble(BLEEndpoint.Action)
         case transport(Transport.Action)
         case linkPlane(LinkPlane.Action)
@@ -127,9 +137,11 @@ public struct TransportEndpoint {
             // --- unified verbs → shared router / link plane ---
             case .start:
                 return .merge(state.tcpClient != nil ? .send(.tcpClient(.connect)) : .none,
+                              state.tcpServer != nil ? .send(.tcpServer(.start)) : .none,
                               state.ble != nil ? .send(.ble(.start)) : .none)
             case .stop:
                 return .merge(state.tcpClient != nil ? .send(.tcpClient(.disconnect)) : .none,
+                              state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
                               state.ble != nil ? .send(.ble(.stop)) : .none)
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
             case let .announce(h, a):               return .send(.transport(.announce(destinationHash: h, appData: a)))
@@ -177,6 +189,33 @@ public struct TransportEndpoint {
                 return .merge(.send(.transport(.interfaceDisconnected(id))),
                               .send(.linkPlane(.interfaceDisconnected(id))),
                               .send(.transport(.stopMaintenance)))
+
+            // --- TCP-server connection lifecycle → shared router interface set (+ maintenance) ---
+            // Mirrors the BLE 1:N peer wiring: one Transport InterfaceID per accepted connection,
+            // tracked in the driver's connInterfaces map so transmit can route back to it.
+            case let .tcpServer(.interface(.delegate(.connectionAccepted(conn)))):
+                let id = tcpServerInterfaceID(conn)
+                let wasEmpty = state.tcpServer?.connInterfaces.isEmpty ?? true
+                guard let profile = state.tcpServer?.profile else { return .none }
+                state.tcpServer?.connInterfaces[id] = conn
+                var effects: [Effect<Action>] = [
+                    .send(.transport(.interfaceConnected(id, profile))),
+                ]
+                if wasEmpty { effects.append(.send(.transport(.startMaintenance))) }
+                return .merge(effects)
+
+            case let .tcpServer(.interface(.delegate(.packetReceived(conn, data)))):
+                return .send(.transport(.received(tcpServerInterfaceID(conn), data)))
+
+            case let .tcpServer(.interface(.delegate(.connectionClosed(conn)))):
+                let id = tcpServerInterfaceID(conn)
+                state.tcpServer?.connInterfaces[id] = nil
+                var effects: [Effect<Action>] = [
+                    .send(.transport(.interfaceDisconnected(id))),
+                    .send(.linkPlane(.interfaceDisconnected(id))),
+                ]
+                if state.tcpServer?.connInterfaces.isEmpty ?? true { effects.append(.send(.transport(.stopMaintenance))) }
+                return .merge(effects)
 
             // --- BLE peer lifecycle → shared router interface set (+ maintenance) ---
             case let .ble(.ble(.delegate(.peerOnline(token)))):
@@ -268,7 +307,7 @@ public struct TransportEndpoint {
 
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).
-            case .tcpClient, .ble, .transport, .linkPlane, .link, .delegate,
+            case .tcpClient, .tcpServer, .ble, .transport, .linkPlane, .link, .delegate,
                  .sendOverLink, .sendResourceOverLink, .identifyOverLink, .sendRequestOverLink,
                  .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
                  .closeLink, .registerRequestHandler, .deregisterRequestHandler:
@@ -276,18 +315,23 @@ public struct TransportEndpoint {
             }
         }
         .ifLet(\.tcpClient, action: \.tcpClient) { TCPEndpoint() }
+        .ifLet(\.tcpServer, action: \.tcpServer) { TCPServerEndpoint() }
         .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
     }
 
-    /// Routes an outbound (already IFAC-masked) buffer to whichever driver owns `txID`. TCP owns
-    /// its single `interfaceID`; BLE owns each token in its `peerInterfaces` map. If the id maps
-    /// to no live driver interface, the send is not deliverable: for BLE, surface `.sendFailed`
-    /// (a stale binding otherwise dies silently on the ~60s inactivity watchdog); for TCP the id
-    /// mismatch cannot occur for a live socket, so drop.
+    /// Routes an outbound (already IFAC-masked) buffer to whichever driver owns `txID`. The
+    /// TCP-client owns its single `interfaceID`; the TCP-server owns each accepted connection in
+    /// its `connInterfaces` map (1:N, like BLE); BLE owns each token in its `peerInterfaces` map.
+    /// If the id maps to no live driver interface, the send is not deliverable: for BLE, surface
+    /// `.sendFailed` (a stale binding otherwise dies silently on the ~60s inactivity watchdog);
+    /// for TCP the id mismatch cannot occur for a live socket, so drop.
     private func transmit(_ state: State, to txID: InterfaceID,
                           masked: Data, unmasked: Data) -> Effect<Action> {
         if let driver = state.tcpClient, driver.interfaceID == txID {
             return .send(.tcpClient(.interface(.send(masked))))
+        }
+        if let conn = state.tcpServer?.connInterfaces[txID] {
+            return .send(.tcpServer(.interface(.send(conn: conn, masked))))
         }
         if let peerToken = state.ble?.peerInterfaces[txID] {
             return .send(.ble(.ble(.send(peer: peerToken, packet: masked))))
