@@ -188,11 +188,14 @@ ownership rather than on authentication because authentication is not available
 to it. **F8 is CLOSED** by `c4d00b2` (2026-08-21) — read its entry before trusting
 the severity this list gave it, which was too low for the wrong reason.
 
-**F20 was added 2026-08-21** from device testing: nothing persists the peer identity
-cache, so a cold launch can render a peer list it cannot message. Not ranked
-against the adversarial items below — it is a durability/reference-parity gap, not
-a security one — but it is what a user actually hits, so do not let its absence
-from the ranking read as "low".
+**F20 was added AND largely closed on 2026-08-21** — filed from device testing
+(a cold launch rendering a peer list it could not message), then fixed hours later
+by `aa19115` + `5d2b33a` + `cbe1845`, which persist and replay
+`Transport.State.learned`. Its entry is kept because the reference-parity analysis
+in it is what the fix was built from, and because one question it raised is still
+open: the fix restores identity and path TOGETHER, where the analysis argued for
+restoring identities and re-learning paths. Read the entry's header before
+believing any sentence in its body.
 
 Current priority:
 
@@ -600,10 +603,37 @@ and `.linkEstablished`. Harmless today — the stale timer is swallowed by
 `.pathRequestDeadline`'s `.awaitingPath` guard — but it is the one park exit that
 does not cancel, and the asymmetry is a trap for a future edit to that guard.
 
-### F20 — nothing persists the peer IDENTITY cache, so a restart can see a peer it cannot message
+### F20 — nothing persists the peer IDENTITY cache, so a restart can see a peer it cannot message — ✅ LARGELY CLOSED
 
-**Added 2026-08-21 from device testing. NOT yet fixed** — recorded here so it is
-tested deliberately rather than rediscovered as "the send button is greyed out".
+**Added 2026-08-21 from device testing. CLOSED the same day**, by work that landed
+while this entry was still being written: ReTiCA gained
+`Transport.Action.rehydrateLearnedDestinations` and `Transport.pathExpiry` became
+public (`aa19115`), and ReTiCaMsgr added a `LearnedDestinationRow` GRDB table that
+mirrors `Transport.State.learned`, writes on a debounced 30 s timer plus an
+immediate flush on background/terminate, prunes at launch, and dispatches the
+rehydrate action (`5d2b33a`, `cbe1845`).
+
+**So the headline claim below — "ReTiCA persists neither" — is now FALSE, and the
+diagnosis in the middle of this entry is what the fix was built from.** Read the
+rest as the analysis that produced the fix, not as current state.
+
+**What the fix does NOT cover, stated so this is not read as fully closed.** The
+restored table carries `LearnedDestination`, which holds BOTH the identity and the
+path — including an `interfaceID` minted by a previous process. F8's gate requires
+that id to be present in `transport.interfaces`, so a rehydrated entry is
+`reachable=NO` until an interface with that id registers. The parity target argued
+below was *restore identities, re-learn paths*; what shipped restores both
+together. Whether that is right is a live question, not a settled one: it is
+cheaper and it works when the interface id is stable (`InterfaceID("tcp")` is a
+constant for the TCP endpoint), but it puts entries in the table that `openLink`
+will refuse until the socket is up.
+
+The diagnostics screen added the same day renders exactly this — its Paths layer
+cross-checks `learned` against `interfaces` — so the condition is now visible
+rather than inferred from a greyed-out Send button, which is what this entry asked
+for. See `docs/superpowers/specs/2026-08-21-diagnostics-page-design.md`.
+
+**Original entry follows, unchanged apart from this header.**
 
 **What reference actually does. Every citation below was opened and read, because
 two earlier drafts of this paragraph got it wrong in opposite directions.**
