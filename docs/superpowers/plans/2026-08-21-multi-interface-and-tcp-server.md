@@ -6,7 +6,7 @@
 
 **Architecture:** The sum type does not disappear; **it moves down a layer.** Today `TransportEndpoint.State` is `.tcp | .ble` — one transport *or* another — and each case privately owns a `Transport` (the router) and a `LinkPlane` (links + registrations). That means running both would give two independent routers with separate path tables, not one node with two interfaces. The fix is to hoist the router and link plane into a shared container and reduce the endpoints to **drivers**. The enum survives at the driver leaf, where "this driver is a TCP client" is a true statement about one thing.
 
-> **Corrected 2026-08-21, before any code was written.** An earlier draft said drivers are "each identified by an `InterfaceID`". **That is wrong, and the existing code already contradicts it:** `BLEEndpoint.State.peerInterfaces` is `[InterfaceID: Data]` (`BLEEndpoint.swift:29`) — **one driver already owns N InterfaceIDs**, one per peer. Reference does the same for the server case, spawning a per-socket `TCPClientInterface` into `spawned_interfaces` (stock 1.4.2 `TCPInterface.py:449-531`). The relation is **1:N**, so the container needs *driver identity* plus a separate `InterfaceID → driver` map. Designing around a 1:1 assumption would have had to be undone in Task 2.
+> **Corrected 2026-08-21, before any code was written.** An earlier draft said drivers are "each identified by an `InterfaceID`". **That is wrong, and the existing code already contradicts it:** `BLEEndpoint.State.peerInterfaces` is `[InterfaceID: Data]` (`BLEEndpoint.swift:29`) — **one driver already owns N InterfaceIDs**, one per peer. Reference does the same for the server case, spawning a per-socket `TCPClientInterface` into `spawned_interfaces` (stock 1.4.2 `TCPInterface.py`: spawn at `:591`, tracked at `:644-646`; an earlier citation said `:449-531`, which is the detach/count/init code). The relation is **1:N**, so the container needs *driver identity* plus a separate `InterfaceID → driver` map. Designing around a 1:1 assumption would have had to be undone in Task 2.
 
 **Tech Stack:** Swift 6, swift-testing, The Composable Architecture 1.26, Network.framework (`NWListener`).
 
@@ -47,7 +47,7 @@ So the routing decision — *which interface does this packet leave by* — is *
 
 That last point is the crux: **the router is duplicated per transport today.** Two active endpoints would mean two path tables, two seen-packet rings, two link planes — a packet arriving over BLE could not be routed out over TCP. Fixing the enum without hoisting the router would produce something that compiles and is still wrong.
 
-**Consumers:** 13 switch sites inside `TransportEndpoint.swift`; **zero** in `LXMFNode`/`LXMFServiceNode` (they are already transport-agnostic — the unified surface works); **4** in the app's `AppFeature.swift`.
+**Consumers** *(re-verified 2026-08-21 evening — two figures were wrong)*: 8 `switch` statements carrying 13 `case .tcp`/`case .ble` arms inside `TransportEndpoint.swift` (the "13 switch sites" counted arms, not switches); **zero** in `LXMFNode`/`LXMFServiceNode` (they are already transport-agnostic — the unified surface works). The app count went stale the day it was written: there are now **5 code sites in two files** — `AppFeature.swift:285`/`:317`/`:678` (`endpoint(.tcp(` spellings), `:712` (`guard case .tcp`, landed 15:08 that day), and `DiagnosticsSnapshot.swift:79` (`if case let .tcp`, landed that evening) — plus a doc-comment at `AppFeature.swift:103`. **Task 3 must re-derive this list, not inherit it.**
 
 ---
 
@@ -57,15 +57,15 @@ That last point is the crux: **the router is duplicated per transport today.** T
 - `Sources/ReTiCANode/TCPEndpoint.swift`, `BLEEndpoint.swift` — reduced to drivers.
 - `Sources/ReTiCAInterfaces/TCPListener.swift` — **new**; the `NWListener` dependency.
 - `Sources/ReTiCAInterfaces/TCPServerInterface.swift` — **new**; the server driver.
-- `ReTiCaMsgr/…/AppFeature.swift` — 4 call sites.
+- `ReTiCaMsgr/…/AppFeature.swift` and `DiagnosticsSnapshot.swift` — 5 call sites as of 2026-08-21 evening; re-derive at Task 3.
 
 ---
 
 ### Task 1 — RESHAPED 2026-08-21, before any code was written
 
-**The original Task 1 was unachievable, and its own acceptance criterion is what proved it.** It said: hoist the router and link plane, change no behaviour, and *"any test that changes is a finding."* But **56 tests drive `TCPEndpoint`/`BLEEndpoint` as `TestStore`s and assert exactly the responsibilities being hoisted out** — `TCPEndpointTests` alone makes 126 `.transport` references, e.g. `store.state.transport.interfaces[store.state.interfaceID]` (`:48`), the F8 stale-path gate via `state.transport.learned` (`:224-228`), and `receive(\.transport.interfaceConnected)` (`:1548`). After the hoist, `TCPEndpoint` has no `transport` to read. Add 6 of 7 in `TransportEndpointTests` and 13 nested-path matchers across 6 LXMF files.
+**The original Task 1 was unachievable, and its own acceptance criterion is what proved it.** It said: hoist the router and link plane, change no behaviour, and *"any test that changes is a finding."* But **56 tests drive `TCPEndpoint`/`BLEEndpoint` as `TestStore`s and assert exactly the responsibilities being hoisted out** — `TCPEndpointTests` alone makes 139 `.transport` references on 132 lines *(an earlier count said 126)*, e.g. `store.state.transport.interfaces[store.state.interfaceID]` (`:48`), the F8 stale-path gate via `state.transport.learned` (`:224-228`), and `receive(\.transport.interfaceConnected)` (`:1547`). After the hoist, `TCPEndpoint` has no `transport` to read. Add 6 of 7 in `TransportEndpointTests` and 27 nested `endpoint(.tcp(` / `endpoint(.ble(` code lines across **7** LXMF test files *(an earlier count said "13 matchers across 6 files"; the re-run grep found 29 lines, 2 of them comments, and includes send-sites like `LXMFServiceNodeTests:501` as well as matchers)*.
 
-So "hoist" and "no test changes" cannot both hold. **And the deeper problem is that rewriting ~75 assertions destroys the proof**: the task's deliverable *is* the argument "suite unchanged and green ⇒ behaviour unchanged". Rewrite the suite and only the refactor remains — the thing this plan says must not be trusted alone.
+So "hoist" and "no test changes" cannot both hold. **And the deeper problem is that rewriting ~90 test sites destroys the proof** *(earlier ~75; re-counted with the corrected figures above)*: the task's deliverable *is* the argument "suite unchanged and green ⇒ behaviour unchanged". Rewrite the suite and only the refactor remains — the thing this plan says must not be trusted alone.
 
 The fix is to write the proof at a level that **survives** the change, then change.
 
@@ -91,7 +91,7 @@ Pin the behaviours that must survive, **addressed through the unified `Transport
 #### Three decisions this task must make explicitly — they were reserved and cannot be
 
 1. **How drivers are indexed, and what TCA forces.** `Scope`'s `action:` needs a *static* case path. Indexing by runtime `InterfaceID` forces `IdentifiedAction`, which is what breaks all 69 `.interface(…)` sites in `TCPEndpointTests`; indexing by *kind* keeps them but caps you at one TCP client — and `TCPEndpointTests.swift:1514` already uses a non-default `interfaceID`. **The entire test cost of this slice turns on this choice.** Decide it deliberately and record the trade.
-2. **Whether BLE-only `peerOnline`/`peerOffline` join the unified surface.** `BLEEndpointTests` pins them on `.delegate` in 30+ places; `TransportEndpoint.swift:12-14` deliberately excludes them because LXMF has no use for them. **One enum cannot honour both.** Pick, and say what the loser costs.
+2. **Whether BLE-only `peerOnline`/`peerOffline` join the unified surface.** `BLEEndpointTests` pins them on `.delegate` in 30+ places (32 pins); `TransportEndpoint.swift:12-14` deliberately excludes them because LXMF has no use for them. **One enum cannot honour both.** Pick, and say what the loser costs. **Timing correction (2026-08-21): this one decision must be made BEFORE Task 1a, not in 1b** — it is behavioural, and 1a's characterization tests will pin whichever answer holds when they are written (`bleOnlyDelegatesDoNotSurfaceOnTheUnifiedSurface` already pins the exclusion). Reversing it in 1b would force edits to 1a's tests, which 1b Step 3 forbids — the proof would be destroyed by the very decision it was built to survive. Decisions 1 and 3 are structural (action addressing only) and can stay in 1b.
 3. **What the `.tcp` / `.ble` escape hatches mean when several drivers exist.** "The TCP one" stops being well-defined the moment there can be two.
 
 ### Task 2: The TCP server driver
@@ -106,7 +106,7 @@ Pin the behaviours that must survive, **addressed through the unified `Transport
 
 ### Task 3: App wiring and the checklist
 
-- [ ] **Step 1:** Update the app's 4 `endpoint(.tcp(` sites. Decide the app's default topology — client only, or client *and* listener — and say why.
+- [ ] **Step 1:** Update the app's sum-type call sites — **re-derive the list first** (grep `endpoint(.tcp(`, `case .tcp`, `case let .tcp`, `guard case .tcp` across the app); as of 2026-08-21 evening it was 5 sites across `AppFeature.swift` and `DiagnosticsSnapshot.swift`, and it grew twice in that one day. Decide the app's default topology — client only, or client *and* listener — and say why.
 - [ ] **Step 2:** Tick **both** the Tier 5 "one transport at a time" item and the Tier 6 interfaces item (partially — TCP server only; `AutoInterface` and `RNodeInterface` remain). SHAs inline across both repos.
 - [ ] **Step 3: State what is NOT closed**, checked rather than assumed: the remaining 12 of 15 interfaces; whether a listening node is discoverable without `AutoInterface` (it is not — you still need an address); and any per-connection resource bound the server does or does not have. *Seven documentation overclaims here in three weeks have been the same shape — a summary wider than its evidence.*
 
