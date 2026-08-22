@@ -971,8 +971,20 @@ public struct Transport {
         }
     }
 
-    /// RNS DESTINATION_TIMEOUT (Transport.py:91): learned paths expire after one week unused, seconds.
-    static let pathExpiry: TimeInterval = 60 * 60 * 24 * 7      // 604800
+    /// RNS `DESTINATION_TIMEOUT` (stock 1.4.2 `Transport.py:92`): learned paths expire after one
+    /// week unused, in seconds.
+    ///
+    /// **`public` so a persisting host can prune its stored copy on the same terms.** An app that
+    /// persists `learned` must expire its rows to match, or the table outgrows the state it
+    /// mirrors. The only alternative to exporting this is a duplicated constant in the app behind
+    /// a "keep in sync" comment — which is exactly the mirrored-copy drift that produced a real
+    /// stamp-cost bug in this project, and which `LXMFServiceNode` carries a standing warning
+    /// about. One source of truth is cheaper than the comment.
+    ///
+    /// Note this is the **default**; `pathExpiry(forMode:)` below is shorter for AP (1 day) and
+    /// roaming (6 hours) interfaces. A host pruning at launch cannot use the mode-dependent form —
+    /// interfaces are not connected yet — so this conservative value is the correct one there.
+    public static let pathExpiry: TimeInterval = 60 * 60 * 24 * 7      // 604800
     /// Mode-dependent path lifetimes (RNS Transport.py:787-792).
     static let apPathExpiry: TimeInterval = 60 * 60 * 24       // AP_PATH_TIME, 1 day
     static let roamingPathExpiry: TimeInterval = 60 * 60 * 6   // ROAMING_PATH_TIME, 6 hours
