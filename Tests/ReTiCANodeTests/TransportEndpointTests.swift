@@ -205,3 +205,64 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
     #expect(pending.attempts == 3)
     #expect(pending.resend == resend)
 }
+
+@Test @MainActor func openingAnInitiatorLinkRegistersItsLinkIDWithTransport() async {
+    let store = makeTCP()
+    await store.send(.linkPlane(.openLink(initiatorTo: Identity(),
+                                          destinationHash: Data(repeating: 0x02, count: 16),
+                                          interfaceID: InterfaceID("tcp"), relayNextHop: nil)))
+    await store.skipReceivedActions(strict: false)
+    let linkID = store.state.linkPlane.links[0].linkID
+    #expect(!linkID.isEmpty)
+    #expect(store.state.transport.localLinkIDs.contains(linkID),
+            "opening an initiator link must register its linkID with Transport")
+    await store.finish()
+}
+
+@Test @MainActor func acceptingAResponderLinkRegistersItsLinkIDWithTransport() async {
+    let store = makeTCP()
+    let owner = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: owner)!
+    let initEph = Identity()
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                         destinationHash: dest.hash, transportId: nil,
+                         payload: initEph.publicKey + Link.signallingBytes)
+    await store.send(.linkPlane(.acceptLinkRequest(owner: owner, destinationHash: dest.hash,
+                                                   interfaceID: InterfaceID("tcp"), data: try! request.packed())))
+    await store.skipReceivedActions(strict: false)
+    let linkID = store.state.linkPlane.links[0].linkID
+    #expect(!linkID.isEmpty)
+    #expect(store.state.transport.localLinkIDs.contains(linkID),
+            "accepting a responder link must register its linkID with Transport")
+    await store.finish()
+}
+
+@Test @MainActor func aFailedInitiatorLinkUnregistersItsLinkID() async {
+    // Drive an initiator link to establishment timeout; LinkPlane removes the element and must
+    // unregister its linkID from Transport.
+    let clock = TestClock()
+    let store = TestStore(
+        initialState: TransportEndpoint.State.tcp(
+            TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    ) { TransportEndpoint() } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.linkPlane(.openLink(initiatorTo: Identity(),
+                                          destinationHash: Data(repeating: 0x02, count: 16),
+                                          interfaceID: InterfaceID("tcp"), relayNextHop: nil)))
+    await store.skipReceivedActions(strict: false)
+    let linkID = store.state.linkPlane.links[0].linkID
+    #expect(store.state.transport.localLinkIDs.contains(linkID))
+    // Establishment timeout is 15s; advance past it.
+    await clock.advance(by: .seconds(16))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.linkPlane.links.isEmpty, "the link element is removed on timeout")
+    #expect(!store.state.transport.localLinkIDs.contains(linkID),
+            "a removed link must be unregistered from Transport")
+    await store.finish()
+}

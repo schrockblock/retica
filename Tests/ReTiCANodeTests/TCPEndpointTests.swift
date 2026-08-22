@@ -1386,6 +1386,10 @@ private func countExpectedSenderFrames(reqFrame: Data, sessionKey: Data) -> Int 
         $0.linkPlane.links.remove(id: elementID)
     }
     #expect(store.state.links[id: elementID] == nil)           // removed regardless of role
+    // F13 Task 2: establishmentFailed now emits localLinkClosed + unregisterLocalLink.
+    // Receive them here so the probe send below still fails only if linkFailed leaks.
+    await store.receive { if case .linkPlane(.delegate(.localLinkClosed)) = $0 { return true }; return false }
+    await store.receive { if case .transport(.unregisterLocalLink) = $0 { return true }; return false }
     await store.send(.closeLink(linkID: Data(repeating: 0xEE, count: 16)))   // probe: no-op
     store.exhaustivity = .off
 }

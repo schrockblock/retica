@@ -290,6 +290,10 @@ public struct TransportEndpoint {
                 return .send(.delegate(.packetDelivered(token: token)))
             case let .linkPlane(.delegate(.packetDeliveryFailed(token))):
                 return .send(.delegate(.packetDeliveryFailed(token: token)))
+            case let .linkPlane(.delegate(.localLinkOpened(linkID))):
+                return .send(.transport(.registerLocalLink(linkID)))
+            case let .linkPlane(.delegate(.localLinkClosed(linkID))):
+                return .send(.transport(.unregisterLocalLink(linkID)))
 
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).

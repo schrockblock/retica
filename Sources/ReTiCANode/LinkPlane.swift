@@ -124,6 +124,10 @@ public struct LinkPlane {
             case requestFailed(linkID: Data, requestID: Data)
             case packetDelivered(token: Data)
             case packetDeliveryFailed(token: Data)
+            /// A local link's linkID was assigned / released — Transport tracks these to avoid
+            /// relaying or shadowing links we are an endpoint of.
+            case localLinkOpened(linkID: Data)
+            case localLinkClosed(linkID: Data)
         }
     }
 
@@ -340,17 +344,20 @@ public struct LinkPlane {
             case let .link(.element(elementID, .delegate(.closed(reason)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
                 state.links.remove(id: elementID)
-                return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
+                return .merge(.send(.delegate(.linkClosed(linkID: linkID, reason: reason))),
+                              .send(.delegate(.localLinkClosed(linkID: linkID))))
 
             case let .link(.element(elementID, .delegate(.establishmentFailed(kind)))):
                 guard let session = state.links[id: elementID] else { return .none }
+                let releasedLinkID = session.linkID
                 state.links.remove(id: elementID)
+                let unregister = Effect<Action>.send(.delegate(.localLinkClosed(linkID: releasedLinkID)))
                 // Only an INITIATOR failure names a remote peer. A responder's destinationHash is the
                 // destination WE serve (set by `acceptLinkRequest` above), so reporting linkFailed for
                 // it would tell the delivery layer that a peer it never contacted is unreachable.
                 // Still remove the element either way — that is the leak-prevention half, and it must
                 // not become conditional on role.
-                guard session.role == .initiator else { return .none }
+                guard session.role == .initiator else { return unregister }
                 // Exhaustive switch, deliberately not a ternary: a new EstablishmentFailure case must
                 // be a COMPILE error here, not a silent default into `.handshakeRejected` — that is
                 // the one PEER-shaped reason, and the only one the delivery layer does NOT answer
@@ -360,7 +367,7 @@ public struct LinkPlane {
                 case .timedOut:          reason = .establishmentTimedOut
                 case .handshakeRejected: reason = .handshakeRejected
                 }
-                return .send(.delegate(.linkFailed(destinationHash: session.destinationHash, reason: reason)))
+                return .merge(unregister, .send(.delegate(.linkFailed(destinationHash: session.destinationHash, reason: reason))))
 
             case let .link(.element(elementID, .delegate(.resourceReceived(data)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
@@ -439,6 +446,9 @@ public struct LinkPlane {
                     state.links[id: elementID]?.transfers[id: tid]?.interfaceID = interfaceID
                 }
                 return .none
+
+            case let .link(.element(_, .delegate(.linkIDAssigned(linkID)))):
+                return .send(.delegate(.localLinkOpened(linkID: linkID)))
 
             case .link, .delegate:
                 return .none

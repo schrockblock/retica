@@ -454,6 +454,9 @@ private func authenticatedPacket(linkID: Data, sessionKey: Data, body: Data) -> 
         await store.receive(
             { if case .link(.element(_, .delegate(.establishmentFailed(.handshakeRejected)))) = $0 { return true }; return false }
         )
+        await store.receive(
+            { if case .delegate(.localLinkClosed) = $0 { return true }; return false }
+        )
         #expect(store.state.links.isEmpty, "Shape 2 (wrong packetType): element must be reaped")
         store.exhaustivity = .on
     }
@@ -474,6 +477,9 @@ private func authenticatedPacket(linkID: Data, sessionKey: Data, body: Data) -> 
                                             interfaceID: ifA, data: try! wrongSize.packed()))
         await store.receive(
             { if case .link(.element(_, .delegate(.establishmentFailed(.handshakeRejected)))) = $0 { return true }; return false }
+        )
+        await store.receive(
+            { if case .delegate(.localLinkClosed) = $0 { return true }; return false }
         )
         #expect(store.state.links.isEmpty, "Shape 3 (wrong payload size): element must be reaped")
         store.exhaustivity = .on

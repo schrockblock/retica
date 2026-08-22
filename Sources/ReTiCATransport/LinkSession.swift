@@ -193,6 +193,10 @@ public struct LinkSession {
             case packetDeliveryFailed(token: Data)
             /// The session rebound to a new interface. `LinkPlane` re-homes in-flight transfers.
             case rehomed(InterfaceID)
+            /// This link's linkID is now assigned — register it so Transport treats it as local
+            /// (never relays or shadows it). Emitted for both initiator (.establish) and responder
+            /// (.acceptRequest).
+            case linkIDAssigned(Data)
         }
     }
 
@@ -308,7 +312,9 @@ public struct LinkSession {
                 guard let raw = try? packet.packed()
                 else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 let id = state.interfaceID
-                return .merge(.send(.delegate(.transmit(id, raw))), establishmentTimer(state.establishmentTimeout))
+                return .merge(.send(.delegate(.linkIDAssigned(state.linkID))),
+                              .send(.delegate(.transmit(id, raw))),
+                              establishmentTimer(state.establishmentTimeout))
 
             case let .acceptRequest(data):
                 // Split into two guards with distinct semantics.
@@ -370,7 +376,9 @@ public struct LinkSession {
                 guard let raw = try? packetOut.packed()
                 else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 let id = state.interfaceID
-                return .merge(.send(.delegate(.transmit(id, raw))), establishmentTimer(state.establishmentTimeout))
+                return .merge(.send(.delegate(.linkIDAssigned(linkID))),
+                              .send(.delegate(.transmit(id, raw))),
+                              establishmentTimer(state.establishmentTimeout))
 
             case let .received(data, arrivalInterface):
                 guard let packet = Packet(raw: data), packet.destinationHash == state.linkID
