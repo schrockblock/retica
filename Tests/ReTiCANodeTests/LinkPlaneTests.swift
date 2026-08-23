@@ -1470,12 +1470,29 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
             "genuine application data must advance the eviction clock")
 }
 
-/// **F11 Fix #2 — self-reap characterization: a no-parts transfer is removed after its watchdog exhausts.**
+/// **F11 Fix #2 — self-reap: a no-parts transfer is reaped by ITS OWN watchdog while the link lives.**
 ///
-/// This pins existing behavior (Section 2 of the spec): once an advertisement is received and no
-/// segment ever arrives, the receiver watchdog's 16-retry budget eventually exhausts and the
-/// transfer removes itself. The slot does NOT hold a stale entry forever.
-/// Expected: PASS before the Fix #2 production change (characterization test, not a failing test).
+/// This is the property F11 relies on under a CONTINUOUS re-advertising / traffic attack: the link
+/// stays alive (its inactivity timer keeps getting reset by inbound traffic), so the ONLY thing that
+/// can remove a stalled transfer is the transfer's own receiver watchdog — NOT link teardown.
+///
+/// The distinction matters. The link's inactivity timer (`staleTime = keepaliveInterval*2 = 60s`)
+/// fires BEFORE the receiver watchdog's full 16-retry budget (~72.25s at rtt≈0: the initial arm
+/// plus arms for retriesLeft 15…0 sum to Σ_{k=0}^{16}(0.25 + 0.5k) = 17·0.25 + 0.5·136 = 72.25s).
+/// So a single large clock advance tears the whole link down and would let a broken transfer-removal
+/// path pass silently. To prove the WATCHDOG reaps the transfer, this test keeps the link alive by
+/// injecting a genuine `.data/.none` packet before each sub-`staleTime` clock step — that resets the
+/// link's inactivity timer but does NOT touch the transfer's separate `CancelID.watchdog`, so the
+/// watchdog budget still elapses. The assertion then witnesses the transfer removed WHILE the link
+/// is still present.
+///
+/// Expected: PASS before the Fix #2 production change (characterization test — no production change
+/// to the watchdog or the stale timer).
+///
+/// Discrimination (mutation reasoning, not applied to production): the assertion requires
+/// `links[id:] != nil` AND `transfers.isEmpty`. Because the link is deliberately kept alive, a
+/// broken `.receiverDeadline → .failed → transfers.remove` path would leave `transfers.count == 1`
+/// and the second `#expect` would fail — so this cannot pass via link teardown.
 @Test @MainActor func aStalledTransferSelfReapsAfterItsWatchdogExhausts() async {
     let owner = Identity()
     let destHash = Data(repeating: 0x72, count: 16)
@@ -1498,14 +1515,25 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
     await store.receive { if case .link(.element(_, .received)) = $0 { return true }; return false }
     #expect(store.state.links[id: session.id]?.transfers.count == 1)
 
-    // No segment ever arrives. Advance well past the receiver watchdog's full retry budget
-    // (16 retries × (rtt*4 + 0.25 grace + 0.5*k delay) with rtt≈0 from the test handshake ≈ 64s).
-    // The link's inactivity timer (staleTime ≈ 60s) fires before the 16th retry exhausts, so the
-    // link element may be nil after the advance. Either outcome — link nil OR transfers empty —
-    // proves the transfer is not held forever.
-    await clock.advance(by: .seconds(600))
-    await store.skipReceivedActions(strict: false)
-    let remaining = store.state.links[id: session.id]?.transfers
-    #expect(remaining == nil || remaining?.isEmpty == true,
-            "a no-parts transfer must be removed after its watchdog exhausts — not held forever")
+    // No SEGMENT ever arrives, so the transfer's receiver watchdog keeps retrying and eventually
+    // exhausts at ~72.25s. Keep the LINK alive across that budget by injecting a genuine data packet
+    // before each sub-staleTime (60s) step: genuine link data resets the link's inactivity timer but
+    // does not reset the transfer's own watchdog. Two 50s steps (100s total ≫ 72.25s budget) exhaust
+    // the watchdog while every gap stays under 60s, so the link never times out.
+    let genuine = authenticatedPacket(linkID: session.linkID, sessionKey: session.sessionKey,
+                                      body: Data([0x01, 0x02]))
+    for _ in 0 ..< 2 {
+        await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: iface, data: genuine))
+        await store.receive { if case .delegate(.linkDataReceived) = $0 { return true }; return false }
+        await clock.advance(by: .seconds(50))
+        await store.skipReceivedActions(strict: false)
+    }
+
+    // The LINK is still present (its inactivity timer was reset by the genuine traffic), yet the
+    // stalled transfer has been removed — proving the transfer's OWN watchdog reaped it, not link
+    // teardown.
+    #expect(store.state.links[id: session.id] != nil,
+            "the link must still be alive — its inactivity timer was reset by genuine traffic")
+    #expect(store.state.links[id: session.id]?.transfers.isEmpty == true,
+            "a no-parts transfer must be reaped by its own receiver watchdog while the link lives")
 }
