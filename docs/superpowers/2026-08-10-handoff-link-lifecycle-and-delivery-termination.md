@@ -199,24 +199,23 @@ believing any sentence in its body.
 
 Current priority:
 
-1. **F19** — a replayed `RESOURCE_REQ` re-arms the sender watchdog, so for as long
-   as the replays keep arriving the transfer does not self-terminate and its
-   responder link is not evictable: F11's lockout without the session key. **Now
-   the top open item** (F11 closed 2026-08-23). It was ranked below F11 because the
-   attacker cannot create the transfer — we must already be serving a resource to
-   that peer — and above F7 because it denies service to every other peer rather
-   than leaking a map entry. Full entry, what bounds the pin, and the rest of the
-   ranking argument in §3c.
-2. **F7** — a real unbounded leak, in the router rather than the link plane.
-3. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
+1. **F7** — a real unbounded leak, in the router rather than the link plane. **Now
+   the top open item** (F19 closed 2026-08-23). Cheapest fix (per §3c): bind
+   `linkID` in `LXMFRouter.idleDeadline`'s existing `.active` guard and clear
+   `linkResourceInFlight[linkID]` before nil'ing `directLinks[dest]`.
+2. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
    deliberate, pinned by tests, listed so a future fix confronts them rather than
-   deleting them).
-4. ~~**F8**~~ (CLOSED, `c4d00b2`), ~~**F13**~~ (CLOSED, `3023592..ac7a2f3`; latent
+   deleting them). Note F16 is now the last link-plane pin rider: F19's fix makes
+   the sender transfer self-terminate despite replays, but the *link's* inactivity
+   timer is still refreshed by replayed traffic (reclamation relies on F11 cap
+   pressure once the transfer is gone).
+3. ~~**F8**~~ (CLOSED, `c4d00b2`), ~~**F13**~~ (CLOSED, `3023592..ac7a2f3`; latent
    until relay mode is enabled — see its entry), ~~**F11**~~ (CLOSED,
    `07d12bd..6d05524`; eviction now keys on genuine transfer progress and
-   advertisements no longer refresh the eviction clock — see its entry), then
-   F3/F4/F5.
-5. **F17**, then **F18** — both low, both from the destructive-transition sweep.
+   advertisements no longer refresh the eviction clock — see its entry),
+   ~~**F19**~~ (CLOSED, `3a7a1d9`; replayed RESOURCE_REQ deduped on the encrypted
+   packet hash — see §3c), then F3/F4/F5.
+4. **F17**, then **F18** — both low, both from the destructive-transition sweep.
    F17 is an actual behaviour defect (two of our own transfers destroy each
    other) with no reference-aligned fix — RNS routes resource segments the same
    way, carrying a standing TODO — so taking it means choosing a deliberate
@@ -1446,7 +1445,21 @@ mis-reading is what produced the retracted ranking flip in §3:
 
 ## 3c. Added 2026-08-14 — the final whole-branch review of the destructive-transition slice
 
-### F19 — a replayed `RESOURCE_REQ` postpones the sender watchdog without bound, pinning the transfer and its link
+### F19 — a replayed `RESOURCE_REQ` postpones the sender watchdog without bound, pinning the transfer and its link — ✅ CLOSED (`3a7a1d9`, 2026-08-23)
+
+**Closed by** adopting reference's per-resource `req_hashlist`: the sender transfer now carries a
+`servedRequestHashes: Set<Data>`, and the `(.sender, .data, .resourceRequest)` branch dedups an
+incoming request on `packet.packetHash` — the hash over the ENCRYPTED packet — before any re-send,
+status/retry reset, or `armSenderWatchdog`. A byte-identical replay is a complete no-op, so it can no
+longer re-arm the watchdog; the transfer's watchdog fires on schedule, `proofRetriesLeft` decrements,
+it reaches `.failed`, and the link becomes evictable (via the F11 fix). Genuine re-requests are
+served because `Link.encrypt` uses a fresh random IV per call (`Token.swift:31-32`), so a legitimate
+re-request — even for the same still-missing parts — re-encrypts to a different packet and a different
+`packetHash`. No cap (transfer-scoped, matching reference). Whole-branch reviewed, both mutation
+directions confirmed live. **F16 rider still open:** the *link's* inactivity timer is still refreshed
+by replayed traffic; the link is reclaimed under F11 cap pressure once the transfer self-terminates.
+Spec/plan: `docs/superpowers/specs/2026-08-23-f19-replayed-resource-req-watchdog-design.md`,
+`docs/superpowers/plans/2026-08-23-f19-replayed-resource-req-watchdog.md`. The original analysis follows.
 
 **Where:** `ResourceTransfer.received`'s `(.sender, .data, .resourceRequest)`
 branch and `armSenderWatchdog`; `LinkPlane`'s `evictable` filter, which since
