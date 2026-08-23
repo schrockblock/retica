@@ -199,13 +199,19 @@ believing any sentence in its body.
 
 Current priority:
 
-1. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
-   deliberate, pinned by tests, listed so a future fix confronts them rather than
-   deleting them). **Now the top open item** (F7 closed 2026-08-23). Note F16 is
-   the last link-plane pin rider: F19's fix makes the sender transfer
-   self-terminate despite replays, but the *link's* inactivity timer is still
-   refreshed by replayed traffic (reclamation relies on F11 cap pressure once the
-   transfer is gone).
+1. **F3/F4/F5** — the top item with an open fix decision (F7 closed 2026-08-23;
+   **F16 accepted won't-fix** 2026-08-23; F9/F10 remain accepted residuals). The
+   whole family below F7 is now either accepted-residual (F16/F9/F10) or low
+   (F17/F18), so F3/F4/F5 is the next place a genuine fix would land — scope it
+   before assuming it's actionable.
+   - ⏸️ **F16** — ACCEPTED (won't fix): the inactivity re-arm fires for any
+     link-addressed packet, but the plaintext keepalive makes that vector
+     irreducible and F11's `lastData`-based eviction already reclaims the slot; a
+     fix would be cosmetic and reintroduce per-branch re-arm fragility. See its
+     entry for the full analysis.
+   - **F9**/**F10** — the two accepted residuals of the re-home fix (deliberate,
+     pinned by tests, listed so a future fix confronts them rather than deleting
+     them).
 2. ~~**F8**~~ (CLOSED, `c4d00b2`), ~~**F13**~~ (CLOSED, `3023592..ac7a2f3`; latent
    until relay mode is enabled — see its entry), ~~**F11**~~ (CLOSED,
    `07d12bd..6d05524`; eviction now keys on genuine transfer progress and
@@ -1157,7 +1163,31 @@ branch never checks that the proof belongs to this transfer — even though
 `Resource.proofData` puts the resource hash in the proof's first 32 bytes and
 `validateProof` ignores them.
 
-### F16 — the inactivity re-arm fires for ANY link-addressed packet
+### F16 — the inactivity re-arm fires for ANY link-addressed packet — ⏸️ ACCEPTED (won't fix, 2026-08-23)
+
+**Decision (2026-08-23), after a full brainstorm with the reference and the post-F11 state mapped:**
+fixing F16 is not worth it, for three compounding reasons.
+- **RNS-faithful.** Stock RNS stamps `last_inbound` BEFORE decrypt (`Link.py:935`, verified in 1.4.2 and
+  the local fork), so reference ALSO extends a link's life on undecryptable junk. Any fix is a
+  deliberate divergence, not a correctness restoration.
+- **The plaintext keepalive is an irreducible re-arm vector.** An off-path party who knows the
+  cleartext `linkID` can hold an `.active` link open indefinitely with valid `0xFF` keepalives, which
+  RNS interop REQUIRES the responder to honor (re-arm + `0xFE` reply, pinned by
+  `plaintextKeepaliveStillRefreshesInactivity` / `responderRepliesToKeepaliveWith0xFE`). Gating the
+  re-arm on "legitimacy" only forces the attacker from arbitrary junk to valid keepalives — the
+  capability (holding the link `.active`) is unchanged.
+- **The slot-pinning harm is already handled by F11.** Eviction now keys on `lastData` + transfer
+  progress, and keepalives/junk do NOT advance `lastData`, so a keepalive-held attacker link has an old
+  `lastData` and no progressing transfer → it is the LRU eviction victim under cap pressure. The slot
+  is reclaimable regardless of the inactivity timer; without cap pressure a keepalive-held link is just
+  a live link consuming its own state and denies no one.
+
+So the best a fix could do is stop *junk* (not keepalives) from re-arming the inactivity clock — a
+cosmetic/consistency gain with near-zero residual-harm reduction — while reintroducing exactly the
+per-branch re-arm fragility the hoisting exists to prevent ("adding a new context must not require
+remembering this"). Net-negative; accepted as an RNS-faithful residual. Revisit only if a future change
+makes the inactivity timer (not F11's eviction) load-bearing for slot reclamation. The original
+analysis follows.
 
 **Where:** `LinkSession.received`, the hoisted block below `dispatch`.
 
