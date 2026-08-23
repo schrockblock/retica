@@ -290,7 +290,7 @@ In `LinkSession.swift`, add to the `Delegate` enum (`:175-196`, after `case esta
         /// (.acceptRequest).
         case linkIDAssigned(Data)
 ```
-In `.establish`, immediately after `state.linkID = Link.linkID(requestPacket: packet)` (`:278`), emit the delegate. The handler currently returns effects including the transmit; add `.send(.delegate(.linkIDAssigned(state.linkID)))` to that returned `.merge(...)` (register must be applied at/before the LINKREQUEST transmit so no reflection can race ahead of it — put the linkIDAssigned send FIRST in the merge). 
+In `.establish`, immediately after `state.linkID = Link.linkID(requestPacket: packet)` (`:278`), emit the delegate. The handler currently returns effects including the transmit; add `.send(.delegate(.linkIDAssigned(state.linkID)))` to that returned `.merge(...)` (emit it alongside the transmit in the same turn; placing it first in the `.merge` is harmless but is NOT the guarantee — TCA does not order the actions sibling effects emit. The real guarantee is that a reflection is a post-transmit network event, so registration is always dispatched a full round-trip earlier). 
 In `.acceptRequest`, immediately after `state.linkID = linkID` (`:~344`, before status/proof), add `.send(.delegate(.linkIDAssigned(linkID)))` to that handler's returned effects (first in the merge).
 
 - [ ] **Step 4: Forward + unregister in LinkPlane**

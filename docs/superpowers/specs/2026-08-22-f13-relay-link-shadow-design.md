@@ -73,8 +73,11 @@ App/library-side, in `ReTiCATransport` with wiring through `ReTiCANode`. No wire
    - **Register** when an initiator link's `linkID` is computed (`LinkSession.swift:278`) and when a
      responder link is accepted (`LinkPlane.acceptLinkRequest`).
    - **Unregister** on link close/teardown.
-   - Registration for an initiator link MUST be applied at or before the LINKREQUEST is transmitted,
-     so a reflection (only possible after the attacker observes our request) cannot race ahead of it.
+   - Registration and the LINKREQUEST transmit are dispatched in the same reducer turn. The guarantee
+     against a reflection racing ahead is NOT the order within that turn (TCA does not order the
+     actions sibling effects emit) but that a reflection is an inbound network event — only possible
+     after the attacker observes our transmitted request — so `localLinkIDs` already holds the linkID
+     a full network round-trip before any reflection can be processed.
 4. **Two guards in `Transport.received`:**
    - **LINKREQUEST relay branch** (`Transport.swift:669-678`): `guard !state.localLinkIDs.contains(linkID)`
      before creating a relay entry. A reflection of our own request is dropped (`return .none`),
@@ -135,7 +138,8 @@ maintenanceTick GC:
 
 ## Edge cases
 
-- **Registration race:** closed by registering before transmit (see A.3).
+- **Registration race:** closed by the network round-trip — a reflection can't be processed until
+  after the transmit is observed and echoed, by which time registration has been dispatched (see A.3).
 - **linkID reuse after close:** unregister makes a no-longer-owned linkID relayable again — correct.
 - **Responder links:** registered on accept, so an inbound link we terminate can't be shadowed.
 - **Genuine transit unaffected:** non-local linkIDs are never in `localLinkIDs`.

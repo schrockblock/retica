@@ -312,6 +312,13 @@ public struct LinkSession {
                 guard let raw = try? packet.packed()
                 else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 let id = state.interfaceID
+                // Register our linkID with Transport (so it never relays or shadows this link) in
+                // the same reducer turn as the transmit. This defeats the reflected-LINKREQUEST
+                // attack (F13) NOT because of ordering within this `.merge` — TCA does not guarantee
+                // the order in which sibling effects' emitted actions are processed — but because a
+                // reflection is an inbound NETWORK event: it cannot arrive until the transmit has
+                // left the device and an attacker has observed and echoed it, a full round-trip
+                // after this register action was already dispatched.
                 return .merge(.send(.delegate(.linkIDAssigned(state.linkID))),
                               .send(.delegate(.transmit(id, raw))),
                               establishmentTimer(state.establishmentTimeout))
@@ -376,6 +383,9 @@ public struct LinkSession {
                 guard let raw = try? packetOut.packed()
                 else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 let id = state.interfaceID
+                // Register our responder linkID before the proof transmit — same F13 timing
+                // guarantee as the initiator path in `.establish`: a reflection is a post-transmit
+                // network event, not a within-turn `.merge` ordering concern.
                 return .merge(.send(.delegate(.linkIDAssigned(linkID))),
                               .send(.delegate(.transmit(id, raw))),
                               establishmentTimer(state.establishmentTimeout))
