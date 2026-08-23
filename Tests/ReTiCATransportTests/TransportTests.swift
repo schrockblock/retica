@@ -2380,6 +2380,15 @@ private func peerRebroadcast(of originalRaw: Data, hops: UInt8) -> Data {
     await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
     #expect(store.state.linkTable[linkID] != nil)
 
+    // Validate the entry by forwarding an LRPROOF at t = 5 (before the entry's proofDeadline).
+    now.setValue(Date(timeIntervalSince1970: 5))
+    let proof = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                       destinationType: .link, context: .linkRequestProof, contextFlag: false, hops: 0,
+                       destinationHash: linkID, transportId: nil, payload: Data(repeating: 0x1, count: 96))
+    await store.send(.received(InterfaceID("in"), try! proof.packed()))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }
+    #expect(store.state.linkTable[linkID]?.validated == true)
+
     // Refresh the entry by forwarding a link packet arriving on rcvdIf ("in") at t = 10.
     now.setValue(Date(timeIntervalSince1970: 10))
     let linkPacket = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
@@ -4414,6 +4423,89 @@ private func distinctPayload(_ i: Int) -> Data {
 
     #expect(store.state.learned[destHash] == nil)
     store.exhaustivity = .on
+}
+
+// MARK: - Task F13 tests (relay link table hardening)
+
+// A relayed entry is created UNVALIDATED, and junk data traffic must not validate it. (The hard
+// proofDeadline reaping is verified by the next test, which controls the clock; this harness pins
+// date to epoch, so it asserts only creation state and the no-validate-on-junk property.)
+@Test @MainActor func relayedLinkRequestCreatesUnvalidatedEntryAndJunkDoesNotValidateIt() async {
+    let (store, relay, destHash, _) = await relayStoreKnowingDestDirectly()
+    store.exhaustivity = .off
+    let payload = Data(repeating: 0x11, count: 64) + Data([0x00, 0x00, 0x00])
+    let lr = makeHeader2LinkRequestPacket(transportId: relay.hash, destHash: destHash, hops: 0, payload: payload)
+    let linkID = Link.linkID(requestPacket: Packet(raw: lr)!)
+    await store.send(.received(InterfaceID("in"), lr))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.linkTable[linkID] != nil)
+    #expect(store.state.linkTable[linkID]?.validated == false, "a relayed entry starts unvalidated")
+    // A junk data packet for the link must not flip validated (only an LRPROOF may).
+    let junk = makeLinkPacket(linkID: linkID, hops: 0, payload: Data([9, 9, 9]))
+    await store.send(.received(InterfaceID("in"), junk))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.linkTable[linkID]?.validated == false, "junk data must not validate an entry")
+    await store.finish()
+}
+
+@Test @MainActor func maintenanceReapsUnvalidatedByDeadlineAndKeepsValidatedByRefresh() async {
+    // Two entries in a controllable-clock store: one unvalidated past its deadline (reaped),
+    // one validated and freshly refreshed (kept).
+    let now = Date(timeIntervalSince1970: 100_000)
+    var initial = Transport.State()
+    initial.interfaces = [InterfaceID("a"): .default, InterfaceID("b"): .default]
+    let staleUnvalidated = Data(repeating: 0x01, count: 16)
+    let freshValidated = Data(repeating: 0x02, count: 16)
+    initial.linkTable[staleUnvalidated] = Transport.State.LinkTableEntry(
+        rcvdIf: InterfaceID("a"), nhIf: InterfaceID("b"),
+        refreshedAt: now, validated: false,
+        proofDeadline: Date(timeIntervalSince1970: 99_000))          // already past
+    initial.linkTable[freshValidated] = Transport.State.LinkTableEntry(
+        rcvdIf: InterfaceID("a"), nhIf: InterfaceID("b"),
+        refreshedAt: now, validated: true,
+        proofDeadline: Date(timeIntervalSince1970: 0))               // ignored for validated
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.transportDate = .constant(now)
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.maintenanceTick)
+    #expect(store.state.linkTable[staleUnvalidated] == nil, "unvalidated past deadline is reaped")
+    #expect(store.state.linkTable[freshValidated] != nil, "validated + fresh survives")
+    await store.finish()
+}
+
+@Test @MainActor func lrproofValidatesEntryWithoutRefreshingAndDataRefreshes() async {
+    // Forwarding an LRPROOF marks the entry validated but does NOT bump refreshedAt; a data
+    // packet DOES bump refreshedAt.
+    let seededAt = Date(timeIntervalSince1970: 0)
+    var initial = Transport.State()
+    initial.interfaces = [InterfaceID("ar"): .default, InterfaceID("rb"): .default]
+    let linkID = Data(repeating: 0xEE, count: 16)
+    initial.linkTable[linkID] = Transport.State.LinkTableEntry(
+        rcvdIf: InterfaceID("ar"), nhIf: InterfaceID("rb"),
+        refreshedAt: seededAt, validated: false,
+        proofDeadline: Date(timeIntervalSince1970: 1_000_000))
+    let now = Date(timeIntervalSince1970: 500)
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.transportDate = .constant(now)
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+    // Forward an LRPROOF (packetType .proof, context .linkRequestProof) for the link.
+    let proof = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                       destinationType: .link, context: .linkRequestProof, contextFlag: false, hops: 0,
+                       destinationHash: linkID, transportId: nil, payload: Data(repeating: 0x1, count: 96))
+    await store.send(.received(InterfaceID("ar"), try! proof.packed()))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.linkTable[linkID]?.validated == true, "LRPROOF validates the entry")
+    #expect(store.state.linkTable[linkID]?.refreshedAt == seededAt, "LRPROOF must not refresh")
+    // Now a data packet refreshes.
+    let data = makeLinkPacket(linkID: linkID, hops: 0, payload: Data([1, 2, 3]))
+    await store.send(.received(InterfaceID("ar"), data))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.linkTable[linkID]?.refreshedAt == now, "a data packet refreshes")
+    await store.finish()
 }
 
 ///

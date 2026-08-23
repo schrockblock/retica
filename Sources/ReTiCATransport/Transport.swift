@@ -171,11 +171,21 @@ public struct Transport {
             public var rcvdIf: InterfaceID
             public var nhIf: InterfaceID
             public var refreshedAt: Date
+            /// True once a link proof (LRPROOF) has flowed through this relay for the link — RNS
+            /// `IDX_LT_VALIDATED`. Validated entries roll on data traffic; unvalidated entries die at
+            /// `proofDeadline` and cannot be kept alive by junk.
+            public var validated: Bool
+            /// Hard deadline for an unvalidated entry (RNS `IDX_LT_PROOF_TMO`). Ignored once validated.
+            public var proofDeadline: Date
             public init(rcvdIf: InterfaceID, nhIf: InterfaceID,
-                        refreshedAt: Date = Date(timeIntervalSince1970: 0)) {
+                        refreshedAt: Date = Date(timeIntervalSince1970: 0),
+                        validated: Bool = false,
+                        proofDeadline: Date = Date(timeIntervalSince1970: 0)) {
                 self.rcvdIf = rcvdIf
                 self.nhIf = nhIf
                 self.refreshedAt = refreshedAt
+                self.validated = validated
+                self.proofDeadline = proofDeadline
             }
         }
     }
@@ -411,7 +421,14 @@ public struct Transport {
                         if interfaceID == entry.rcvdIf { outIf = entry.nhIf }        // toward dest
                         else if interfaceID == entry.nhIf { outIf = entry.rcvdIf }   // toward initiator
                         else { return .none }
-                        state.linkTable[packet.destinationHash]?.refreshedAt = date.now   // keep active links alive
+                        // Reference refresh semantics: a link proof VALIDATES the entry (but does not refresh its
+                        // timestamp); only forwarded DATA refreshes. Never refresh on proof/other, so junk cannot
+                        // keep an unvalidated entry alive.
+                        if packet.packetType == .proof, packet.context == .linkRequestProof {
+                            state.linkTable[packet.destinationHash]?.validated = true
+                        } else if packet.packetType == .data {
+                            state.linkTable[packet.destinationHash]?.refreshedAt = date.now
+                        }
                         var fwd = packet
                         fwd.hops = packet.hops + 1
                         guard let raw = try? fwd.packed() else { return .none }
@@ -694,7 +711,10 @@ public struct Transport {
                         // header/transport fields), so it would otherwise table a shadow of our live link. Drop it.
                         guard !state.localLinkIDs.contains(linkID) else { return .none }
                         state.linkTable[linkID] = State.LinkTableEntry(
-                            rcvdIf: interfaceID, nhIf: entry.interfaceID, refreshedAt: date.now)
+                            rcvdIf: interfaceID, nhIf: entry.interfaceID, refreshedAt: date.now,
+                            validated: false,
+                            proofDeadline: date.now.addingTimeInterval(
+                                Self.establishmentTimeoutPerHop * Double(max(1, entry.hops))))
                         guard let raw = forwardTowardDest(packet, entry) else { return .none }
                         return .send(.delegate(.transmit(entry.interfaceID, raw)))
                     }
@@ -723,9 +743,11 @@ public struct Transport {
                     state.announceBlobs[dest] = nil          // blob GC piggybacks on path expiry
                     state.announceCache[dest] = nil          // cached announce GC piggybacks too
                 }
-                for (link, entry) in state.linkTable
-                where now.timeIntervalSince(entry.refreshedAt) > Transport.linkTableExpiry {
-                    state.linkTable[link] = nil
+                for (link, entry) in Array(state.linkTable) {
+                    let expired = entry.validated
+                        ? now.timeIntervalSince(entry.refreshedAt) > Transport.linkTableExpiry
+                        : now > entry.proofDeadline
+                    if expired { state.linkTable[link] = nil }
                 }
                 for (dest, startedAt) in state.discoveryPathRequests
                 where now.timeIntervalSince(startedAt) > Transport.pathRequestTimeout {
@@ -1134,6 +1156,10 @@ public struct Transport {
 
     /// RNS LINK_TIMEOUT (Transport.py:89 = Link.STALE_TIME * 1.25 = (STALE_FACTOR*KEEPALIVE)*1.25).
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
+    /// RNS ESTABLISHMENT_TIMEOUT_PER_HOP (Link.py). An unvalidated relay entry gets a hard deadline
+    /// of now + this * max(1, hops-to-dest); if no proof flows through by then it is reaped, so junk
+    /// LINKREQUESTs cannot accumulate.
+    static let establishmentTimeoutPerHop: TimeInterval = 6
     /// RNS PATH_REQUEST_TIMEOUT (Transport.py:79): in-flight recursive path searches expire, seconds.
     /// Governs discoveryPathRequests (relay-only). Do NOT use this for pathRequests.
     static let pathRequestTimeout: TimeInterval = 15
