@@ -199,23 +199,22 @@ believing any sentence in its body.
 
 Current priority:
 
-1. **F7** — a real unbounded leak, in the router rather than the link plane. **Now
-   the top open item** (F19 closed 2026-08-23). Cheapest fix (per §3c): bind
-   `linkID` in `LXMFRouter.idleDeadline`'s existing `.active` guard and clear
-   `linkResourceInFlight[linkID]` before nil'ing `directLinks[dest]`.
-2. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
+1. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
    deliberate, pinned by tests, listed so a future fix confronts them rather than
-   deleting them). Note F16 is now the last link-plane pin rider: F19's fix makes
-   the sender transfer self-terminate despite replays, but the *link's* inactivity
-   timer is still refreshed by replayed traffic (reclamation relies on F11 cap
-   pressure once the transfer is gone).
-3. ~~**F8**~~ (CLOSED, `c4d00b2`), ~~**F13**~~ (CLOSED, `3023592..ac7a2f3`; latent
+   deleting them). **Now the top open item** (F7 closed 2026-08-23). Note F16 is
+   the last link-plane pin rider: F19's fix makes the sender transfer
+   self-terminate despite replays, but the *link's* inactivity timer is still
+   refreshed by replayed traffic (reclamation relies on F11 cap pressure once the
+   transfer is gone).
+2. ~~**F8**~~ (CLOSED, `c4d00b2`), ~~**F13**~~ (CLOSED, `3023592..ac7a2f3`; latent
    until relay mode is enabled — see its entry), ~~**F11**~~ (CLOSED,
    `07d12bd..6d05524`; eviction now keys on genuine transfer progress and
    advertisements no longer refresh the eviction clock — see its entry),
    ~~**F19**~~ (CLOSED, `3a7a1d9`; replayed RESOURCE_REQ deduped on the encrypted
-   packet hash — see §3c), then F3/F4/F5.
-4. **F17**, then **F18** — both low, both from the destructive-transition sweep.
+   packet hash — see §3c), ~~**F7**~~ (CLOSED, `ce14cfa`; linkResourceInFlight now
+   reaped on directLink teardown via a shared clearDirectLink helper), then
+   F3/F4/F5.
+3. **F17**, then **F18** — both low, both from the destructive-transition sweep.
    F17 is an actual behaviour defect (two of our own transfers destroy each
    other) with no reference-aligned fix — RNS routes resource segments the same
    way, carrying a standing TODO — so taking it means choosing a deliberate
@@ -535,7 +534,16 @@ their fix surface and belongs in the same slice. The §1b rule ("an element is
 reapable whenever a timer is armed") is about STRANDING and does not cover this
 inverse hazard.
 
-### F7 — `linkResourceInFlight` leaks on idle teardown
+### F7 — `linkResourceInFlight` leaks on idle teardown — ✅ CLOSED (`ce14cfa`, 2026-08-23)
+
+**Closed by** a shared `clearDirectLink(&state, dest)` helper that reaps `linkResourceInFlight[linkID]`
+(when the entry is `.active`) BEFORE clearing `directLinks[dest]`. All three teardown paths — `closed()`,
+`.idleDeadline`, and `giveUp` — now route through it, so the leak is fixed and the reap-on-teardown
+invariant is enforced in one place a future teardown path cannot bypass. `.idleDeadline` was the only
+leaking site (exhaustive lifecycle grep); `giveUp` is unreachable with an `.active` link. Whole-branch
+reviewed, mutation-verified in a worktree. No wire/reference concern (internal router state). Spec/plan:
+`docs/superpowers/specs/2026-08-23-f7-linkresourceinflight-leak-design.md`,
+`docs/superpowers/plans/2026-08-23-f7-linkresourceinflight-leak.md`. The original analysis follows.
 
 **Added on the revision pass. A genuinely unbounded leak — in `LXMFRouter` rather
 than `LinkPlane`, which is why the link-element slice did not touch it.**
