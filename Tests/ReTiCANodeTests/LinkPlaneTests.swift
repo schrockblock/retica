@@ -1313,9 +1313,9 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
 /// `transfers` conferred full eviction immunity — so a peer that advertises and never sends a
 /// segment became permanently immune.
 ///
-/// The fix (Fix #1 of F11): `transfers.allSatisfy { !$0.receivedFirstPart }`. A link is immune
-/// only when at least one of its transfers has received a part, distinguishing a transfer that is
-/// actually progressing from a bare advertisement.
+/// The fix (Fix #1 of F11): `transfers.allSatisfy { $0.role == .receiver && !$0.receivedFirstPart }`.
+/// A link is immune when any transfer is either sender-role (always progressing) or a receiver that
+/// has received at least one part, distinguishing genuine progress from a bare advertisement.
 @Test @MainActor func stalledAdvertiserIsEvictedNotThePinnedNewcomer() async {
     let owner = Identity()
     let destHash = Data(repeating: 0x63, count: 16)
@@ -1350,8 +1350,7 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
         if case let .link(.element(id, .close)) = action { return id == session.id }
         return false
     }
-    #expect(store.state.links[id: session.id]?.status != .active
-            || store.state.links[id: session.id] == nil,
+    #expect(store.state.links[id: session.id]?.status != .active,
             "a stalled advertiser must be evicted, not immune")
     #expect(store.state.links[id: newcomer]?.status == .active,
             "the newcomer that paid for a handshake keeps the slot")
