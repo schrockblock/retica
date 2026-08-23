@@ -1063,6 +1063,57 @@ private func driveTransferToTerminalStatus(sender senderState: ResourceTransfer.
     #expect(s.advertisement!.isSplit == true)             // l > 1
 }
 
+// MARK: - F19: req_hashlist dedup tests
+
+// F19: a genuine re-request (same plaintext, but re-encrypted with a fresh random IV → a different
+// packetHash) must still be served. This proves the dedup keys on the ciphertext, not the plaintext,
+// so legitimate retransmission is not broken.
+@Test @MainActor func aFreshlyEncryptedReRequestIsStillServed() async {
+    let data = Data("f19: a genuine re-request must still be served".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)                 // drain the advertisement
+    let s = store.state
+    await store.send(.received(resourceRequestPacket(s)))        // first genuine request
+    _ = await captureTransmits(store, count: s.parts.count)      // all parts served
+    // Second call re-encrypts with a fresh IV → different packet → must be served again.
+    await store.send(.received(resourceRequestPacket(s)))
+    let reServed = await captureTransmits(store, count: s.parts.count)
+    #expect(reServed.count == s.parts.count,
+            "a freshly-encrypted re-request must be served — dedup keys on ciphertext, not plaintext")
+}
+
+// F19: a byte-identical replayed RESOURCE_REQ must NOT re-arm the sender watchdog. Advancing the
+// clock in sub-window steps while replaying the captured request must still let the watchdog fire
+// (proofRetriesLeft decrements). Without the dedup, each replay re-arms (cancelInFlight) the
+// watchdog and it never fires.
+@Test @MainActor func replayedRequestsDoNotPostponeTheSenderWatchdog() async {
+    let data = Data("f19: replays must not re-arm the sender watchdog".utf8)
+    let clock = TestClock<Duration>()
+    let store = senderStore(data, clock)
+    await store.send(.advertise)
+    _ = await captureTransmits(store, count: 1)
+    let s = store.state
+    let req = resourceRequestPacket(s)                           // capture ONE request; replay these bytes
+    await store.send(.received(req))
+    _ = await captureTransmits(store, count: s.parts.count)
+    #expect(store.state.status == .awaitingProof)
+    #expect(store.state.servedRequestHashes.count == 1)
+    // awaitingProof window = rtt(1s)*proofTimeoutFactor(3) + senderGrace(10s) = 13s. Step 5s < 13s,
+    // 4 steps = 20s > 13s, replaying each step. With the dedup the replays are no-ops so the window
+    // elapses and the watchdog fires; without it every replay resets the 13s timer.
+    let before = store.state.proofRetriesLeft
+    for _ in 0..<4 {
+        await store.send(.received(req))                        // byte-identical replay → deduped no-op
+        await clock.advance(by: .seconds(5))
+        await store.skipReceivedActions(strict: false)
+    }
+    #expect(store.state.proofRetriesLeft < before,
+            "the watchdog must fire despite replays — a replay must not re-arm it")
+    #expect(store.state.servedRequestHashes.count == 1, "a replay is not recorded a second time")
+}
+
 /// `LinkSession.sendResponse` does NOT split: it hands the whole payload to ONE `ResourceTransfer`
 /// (only `sendResource` splits at maxEfficientSize). Reference splits EVERY resource in
 /// `Resource.__init__` (RNS/Resource.py:274-310), which is what lets it bound an advertisement's

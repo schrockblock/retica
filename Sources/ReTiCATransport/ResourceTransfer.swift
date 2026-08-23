@@ -42,6 +42,11 @@ public struct ResourceTransfer {
         public var sentIndices: Set<Int>
         public var advRetriesLeft: Int
         public var proofRetriesLeft: Int
+        /// F19 `req_hashlist`: hashes of RESOURCE_REQ packets already served on this SENDER transfer.
+        /// Keyed on the ENCRYPTED packet (`packet.packetHash`) so a byte-identical replay is deduped
+        /// while a genuine re-request (fresh random IV → new packet) is served. Transfer-scoped;
+        /// no cap, matching reference's per-resource list.
+        public var servedRequestHashes: Set<Data> = []
         // hashmap-update (receiver)
         public var knownHashmap: Data
         public var hashmapHeight: Int
@@ -284,6 +289,13 @@ public struct ResourceTransfer {
                     guard p.count >= pad + 32,
                           Data(p[(p.startIndex + pad)..<(p.startIndex + pad + 32)]) == state.resourceHash
                     else { return .none }
+                    // F19: dedup on the ENCRYPTED request packet. A byte-identical replay has the
+                    // same packetHash; a genuine re-request re-encrypts with a fresh random IV, so
+                    // its packetHash differs and it is served. A replay must be a complete no-op —
+                    // no re-send, no status/retry reset, and above all no watchdog re-arm, or it
+                    // postpones the sender watchdog (the transfer's only self-terminator) without bound.
+                    guard !state.servedRequestHashes.contains(packet.packetHash) else { return .none }
+                    state.servedRequestHashes.insert(packet.packetHash)
                     state.status = .transferring
                     state.retriesLeft = Const.maxRetries
                     let reqHashes = Data(p.dropFirst(pad + 32))
