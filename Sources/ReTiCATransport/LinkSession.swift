@@ -411,10 +411,23 @@ public struct LinkSession {
                 // advance `lastData`. (The same reasoning as hoisting the inactivity re-arm
                 // below: per-branch bookkeeping is how the mid-transfer teardown bug got in.)
                 var sawAuthenticatedData = false
+                // `sawGenuineData` gates ONLY the `lastData` eviction clock (below). It is a strict
+                // subset of `sawAuthenticatedData`, which still gates re-home authentication and must
+                // stay set for advertisements. Advertisements authenticate but are not genuine use of
+                // the slot, so they set `sawAuthenticatedData` but NOT `sawGenuineData` — otherwise a
+                // peer advertising resources it never sends would look "recently active" and outrank
+                // quiet legitimate peers in the eviction LRU (F11).
+                var sawGenuineData = false
                 func authDecrypt(_ payload: Data, _ key: Data) -> Data? {
                     guard let plain = Link.decrypt(payload, sessionKey: key) else { return nil }
                     sawAuthenticatedData = true
+                    sawGenuineData = true
                     return plain
+                }
+                func authDecryptAdvertisement(_ payload: Data, _ key: Data) -> Data? {
+                    guard let plain = Link.decrypt(payload, sessionKey: key) else { return nil }
+                    sawAuthenticatedData = true    // still counts for re-home
+                    return plain                   // NOT sawGenuineData → does not advance lastData
                 }
                 func dispatch(_ state: inout State) -> Effect<Action> {
                 switch (state.role, state.status, packet.packetType, packet.context) {
@@ -511,7 +524,7 @@ public struct LinkSession {
                     return inactivityTimer(state.staleTime)                                          // 0xFE reply resets inactivity
 
                 case (_, .active, .data, .resourceAdvertisement):
-                    guard let plain = authDecrypt(packet.payload, state.sessionKey),
+                    guard let plain = authDecryptAdvertisement(packet.payload, state.sessionKey),
                           let adv = ResourceAdvertisement.unpack(plain) else { return .none }
                     if state.transfers.contains(where: { $0.resourceHash == adv.hash }) { return .none }
                     // A response-Resource is only ours if its request_id is currently pending.
@@ -635,7 +648,7 @@ public struct LinkSession {
                 // sets .closed and must not have an inactivity timer re-armed behind it.
                 guard state.status == .active else { return effect }
                 state.lastInbound = now
-                if sawAuthenticatedData { state.lastData = now }
+                if sawGenuineData { state.lastData = now }
                 var extra: [Effect<Action>] = []
                 // RE-HOME, gated on authentication OR a local-disconnect permission.
                 //

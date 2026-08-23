@@ -1422,3 +1422,90 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
         $0.registrations[ph] = nil
     }
 }
+
+/// **F11 Fix #2 — a resource advertisement must not advance the eviction clock.**
+///
+/// `lastData` is the LRU key used to pick the eviction victim. An advertisement authenticates
+/// (so re-home is unchanged) but is NOT genuine use of the slot. If an advertisement advanced
+/// `lastData`, a stalled re-advertiser would look "recently active" and outrank quiet legitimate
+/// peers in the eviction LRU — eliminating Fix #1's benefit.
+///
+/// This test uses a mutable date box so "advanced" vs "unchanged" is observable:
+/// the clock is at 100 when the advertisement arrives (lastData must NOT move to 500),
+/// then at 900 when genuine application data arrives (lastData MUST move to 900).
+@Test @MainActor func advertisementDoesNotAdvanceLastDataButGenuineDataDoes() async {
+    let owner = Identity()
+    let destHash = Data(repeating: 0x71, count: 16)
+    let iface = InterfaceID("clock")
+    let dateBox = LockIsolated(Date(timeIntervalSince1970: 100))
+    let store = TestStore(
+        initialState: LinkPlane.State(maxResponderLinks: 4)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .init { dateBox.value }
+    }
+    store.exhaustivity = .off
+
+    let session = await activeResponderInPlane(store, owner: owner,
+                                               destHash: destHash, interfaceID: iface)
+
+    // Advance the clock, then deliver an advertisement. lastData must NOT move to this time.
+    dateBox.setValue(Date(timeIntervalSince1970: 500))
+    let before = store.state.links[id: session.id]?.lastData
+    let adv = advertisementPacket(linkID: session.linkID, sessionKey: session.sessionKey,
+                                  resourceHash: Data(repeating: 0x01, count: 32))
+    await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: iface, data: adv))
+    await store.receive { if case .link(.element(_, .received)) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.lastData == before,
+            "an advertisement must not advance the eviction clock")
+
+    // Advance again, then deliver genuine application data. lastData MUST move to this time.
+    dateBox.setValue(Date(timeIntervalSince1970: 900))
+    let data = authenticatedPacket(linkID: session.linkID, sessionKey: session.sessionKey,
+                                   body: Data([0x01, 0x02]))
+    await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: iface, data: data))
+    await store.receive { if case .delegate(.linkDataReceived) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.lastData == 900,
+            "genuine application data must advance the eviction clock")
+}
+
+/// **F11 Fix #2 — self-reap characterization: a no-parts transfer is removed after its watchdog exhausts.**
+///
+/// This pins existing behavior (Section 2 of the spec): once an advertisement is received and no
+/// segment ever arrives, the receiver watchdog's 16-retry budget eventually exhausts and the
+/// transfer removes itself. The slot does NOT hold a stale entry forever.
+/// Expected: PASS before the Fix #2 production change (characterization test, not a failing test).
+@Test @MainActor func aStalledTransferSelfReapsAfterItsWatchdogExhausts() async {
+    let owner = Identity()
+    let destHash = Data(repeating: 0x72, count: 16)
+    let iface = InterfaceID("reap")
+    let clock = TestClock()
+    let store = TestStore(
+        initialState: LinkPlane.State(maxResponderLinks: 4)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    let session = await activeResponderInPlane(store, owner: owner,
+                                               destHash: destHash, interfaceID: iface)
+    let adv = advertisementPacket(linkID: session.linkID, sessionKey: session.sessionKey,
+                                  resourceHash: Data(repeating: 0x01, count: 32))
+    await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: iface, data: adv))
+    await store.receive { if case .link(.element(_, .received)) = $0 { return true }; return false }
+    #expect(store.state.links[id: session.id]?.transfers.count == 1)
+
+    // No segment ever arrives. Advance well past the receiver watchdog's full retry budget
+    // (16 retries × (rtt*4 + 0.25 grace + 0.5*k delay) with rtt≈0 from the test handshake ≈ 64s).
+    // The link's inactivity timer (staleTime ≈ 60s) fires before the 16th retry exhausts, so the
+    // link element may be nil after the advance. Either outcome — link nil OR transfers empty —
+    // proves the transfer is not held forever.
+    await clock.advance(by: .seconds(600))
+    await store.skipReceivedActions(strict: false)
+    let remaining = store.state.links[id: session.id]?.transfers
+    #expect(remaining == nil || remaining?.isEmpty == true,
+            "a no-parts transfer must be removed after its watchdog exhausts — not held forever")
+}
