@@ -199,27 +199,22 @@ believing any sentence in its body.
 
 Current priority:
 
-1. **F13** — a reflected LINKREQUEST makes us forward our OWN link's traffic to
-   the attacker. One remote packet, no attacker-side precondition (we must be in
-   relay mode, but that is our config, not something the attacker arranges). It
-   redirects a legitimate peer's traffic rather than merely denying service —
-   the strongest such item here, though not the *only* one: F10 also re-homes a
-   link's traffic to a bystander, but requires a local disconnect plus an
-   already-connected foreign interface, where F13 needs neither.
-2. **F11** — advertise-and-stall pins a link against eviction and then locks out
-   every other peer. Does not self-clear.
-3. **F19** — a replayed `RESOURCE_REQ` re-arms the sender watchdog, so for as long
+1. **F11** — advertise-and-stall pins a link against eviction and then locks out
+   every other peer. Does not self-clear. **Now the top open item** (F13 closed
+   2026-08-22).
+2. **F19** — a replayed `RESOURCE_REQ` re-arms the sender watchdog, so for as long
    as the replays keep arriving the transfer does not self-terminate and its
    responder link is not evictable: F11's lockout without the session key. Below
    F11 because the attacker cannot create the transfer — we must already be
    serving a resource to that peer — and above F7 because it denies service to
    every other peer rather than leaking a map entry. Full entry, what bounds the
    pin, and the rest of the ranking argument in §3c.
-4. **F7** — a real unbounded leak, in the router rather than the link plane.
-5. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
+3. **F7** — a real unbounded leak, in the router rather than the link plane.
+4. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
    deliberate, pinned by tests, listed so a future fix confronts them rather than
    deleting them).
-6. ~~**F8**~~ (CLOSED, `c4d00b2`), then F3/F4/F5.
+5. ~~**F8**~~ (CLOSED, `c4d00b2`), ~~**F13**~~ (CLOSED, `3023592..ac7a2f3`; latent
+   until relay mode is enabled — see its entry), then F3/F4/F5.
 7. **F17**, then **F18** — both low, both from the destructive-transition sweep.
    F17 is an actual behaviour defect (two of our own transfers destroy each
    other) with no reference-aligned fix — RNS routes resource segments the same
@@ -923,7 +918,17 @@ The fix is Task 1's, applied to this branch: ignore an unvalidatable proof and l
 `establishmentDeadline` decide. The element is reapable throughout — the
 establishment timer is already armed.
 
-### F13 — a reflected LINKREQUEST makes us forward our own link's traffic to the attacker ⚠️ top priority
+### F13 — a reflected LINKREQUEST makes us forward our own link's traffic to the attacker — ✅ CLOSED (`3023592..ac7a2f3`, 2026-08-22)
+
+**Closed by** a `Transport.localLinkIDs` registry (synced from the link lifecycle via
+`LinkSession`→`LinkPlane`→`TransportEndpoint`): Transport now drops a reflected LINKREQUEST whose
+linkID it owns and delivers a local link's packets locally instead of relaying them. The same slice
+added the reference-aligned validated/unvalidated `linkTable` split (hard unvalidated proof-deadline,
+refresh-only-on-data) that closes the GC-evasion the probes below also found. Whole-branch reviewed;
+no count cap (matches stock RNS — the validated-junk accumulation vector is accepted). **Latent
+until relay mode is enabled** (`transportIdentity != nil`, no in-repo caller). Spec/plan:
+`docs/superpowers/specs/2026-08-22-f13-relay-link-shadow-design.md`,
+`docs/superpowers/plans/2026-08-22-f13-relay-link-shadow.md`. The original analysis follows.
 
 **Where:** `Transport.received`, the `case .linkRequest:` relay branch (CREATE)
 and the `destinationType == .link` + `linkTable` hit branch (shadow + EXTEND).
