@@ -1155,6 +1155,50 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.directLinks[msg.destinationHash] == nil)
 }
 
+/// Idle teardown of a link with an in-flight Resource must reap the linkResourceInFlight entry (F7).
+@Test @MainActor func idleTeardownReapsLinkResourceInFlight() async {
+    // A Resource-sized message (directRepresentation == .resource) sets linkResourceInFlight on send.
+    // When the idle timer tears the link down, that entry must be reaped — not leaked (F7).
+    let bigMsg = makeMessage(source: Identity(), content: String(repeating: "y", count: 2000))
+    #expect(bigMsg.directRepresentation == .resource)
+    let linkID = Data(repeating: 0x37, count: 16)
+    let clock = TestClock()
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(bigMsg.destinationHash)     // path known → establishes directly
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+
+    await store.send(.send(message: bigMsg, desiredMethod: .direct))
+    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
+    await store.send(.linkEstablished(destinationHash: bigMsg.destinationHash, linkID: linkID))
+    await store.receive { action in                        // drain arms the idle timer; sets in-flight
+        if case let .delegate(.sendDirect(lid, _, asResource)) = action {
+            #expect(lid == linkID); #expect(asResource == true); return true
+        }
+        return false
+    }
+    #expect(store.state.linkResourceInFlight[linkID] == bigMsg.hash)
+
+    // Resolve the delivery so its retry timer is cancelled; the idle timer and the in-flight entry
+    // both remain (the Resource is still notionally in flight for eviction purposes).
+    await store.send(.delivered(messageHash: bigMsg.hash))
+    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
+    #expect(store.state.linkResourceInFlight[linkID] == bigMsg.hash, "still in-flight before idle")
+    #expect(store.state.directLinks[bigMsg.destinationHash] == .active(linkID: linkID))
+
+    // Idle window elapses → the link is torn down. The in-flight entry MUST be reaped.
+    await clock.advance(by: .seconds(LXMFDelivery.linkMaxInactivitySeconds))
+    await store.receive { action in
+        if case let .delegate(.closeLink(dest)) = action { #expect(dest == bigMsg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.linkResourceInFlight[linkID] == nil,
+            "idle teardown must reap the in-flight Resource entry — F7 leak")
+    #expect(store.state.directLinks[bigMsg.destinationHash] == nil)
+}
+
 // MARK: - LXMF-4d-2b PROPAGATED outbound
 
 @Test @MainActor func routerPropagationFailsWithNoNode() async {

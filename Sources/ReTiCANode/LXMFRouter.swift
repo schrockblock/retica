@@ -218,6 +218,15 @@ public struct LXMFRouter {
             func arm(_ state: inout State, _ hash: Data, _ resend: ResendInfo) {
                 state.pendingDeliveries[hash] = PendingDelivery(resend: resend, attempts: 1)
             }
+            // Tear down a direct link, reaping its in-flight Resource entry. `linkResourceInFlight`
+            // is keyed on the linkID carried by `.active`, so it can only be reaped BEFORE
+            // `directLinks[dest]` is cleared — do both here so no teardown path can strand an entry (F7).
+            func clearDirectLink(_ state: inout State, _ dest: Data) {
+                if case let .active(linkID) = state.directLinks[dest] {
+                    state.linkResourceInFlight[linkID] = nil
+                }
+                state.directLinks[dest] = nil
+            }
             /// Give up on `dest`: cancel the path-request park timer, fail everything queued for it,
             /// forget the path, and clear all establishment state. Both call sites (the `establish`
             /// ceiling and `.pathRequestDeadline`) must terminate identically — extract here rather
@@ -225,7 +234,7 @@ public struct LXMFRouter {
             func giveUp(_ state: inout State, _ dest: Data) -> Effect<Action> {
                 state.establishAttempts[dest] = nil
                 state.knownPaths.remove(dest)
-                state.directLinks[dest] = nil
+                clearDirectLink(&state, dest)
                 let queued = state.outboundQueue[dest] ?? []
                 let propQueued = state.propagationQueue[dest] ?? []
                 state.outboundQueue[dest] = nil
@@ -274,10 +283,7 @@ public struct LXMFRouter {
             /// `knownPaths` was cleared before this runs, which decides which branch `establish`
             /// takes.
             func closed(_ state: inout State, _ dest: Data) -> Effect<Action> {
-                if case let .active(linkID) = state.directLinks[dest] {
-                    state.linkResourceInFlight[linkID] = nil
-                }
-                state.directLinks[dest] = nil
+                clearDirectLink(&state, dest)
                 let hasPending = state.pendingDeliveries.values.contains {
                     switch $0.resend {
                     case let .direct(d, _, _): return d == dest
@@ -589,7 +595,7 @@ public struct LXMFRouter {
 
             case let .idleDeadline(dest):
                 guard case .active = state.directLinks[dest] else { return .none }
-                state.directLinks[dest] = nil
+                clearDirectLink(&state, dest)
                 return .send(.delegate(.closeLink(destinationHash: dest)))
 
             case let .pathRequestDeadline(dest):
