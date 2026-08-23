@@ -199,23 +199,24 @@ believing any sentence in its body.
 
 Current priority:
 
-1. **F11** — advertise-and-stall pins a link against eviction and then locks out
-   every other peer. Does not self-clear. **Now the top open item** (F13 closed
-   2026-08-22).
-2. **F19** — a replayed `RESOURCE_REQ` re-arms the sender watchdog, so for as long
+1. **F19** — a replayed `RESOURCE_REQ` re-arms the sender watchdog, so for as long
    as the replays keep arriving the transfer does not self-terminate and its
-   responder link is not evictable: F11's lockout without the session key. Below
-   F11 because the attacker cannot create the transfer — we must already be
-   serving a resource to that peer — and above F7 because it denies service to
-   every other peer rather than leaking a map entry. Full entry, what bounds the
-   pin, and the rest of the ranking argument in §3c.
-3. **F7** — a real unbounded leak, in the router rather than the link plane.
-4. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
+   responder link is not evictable: F11's lockout without the session key. **Now
+   the top open item** (F11 closed 2026-08-23). It was ranked below F11 because the
+   attacker cannot create the transfer — we must already be serving a resource to
+   that peer — and above F7 because it denies service to every other peer rather
+   than leaking a map entry. Full entry, what bounds the pin, and the rest of the
+   ranking argument in §3c.
+2. **F7** — a real unbounded leak, in the router rather than the link plane.
+3. **F16**, then **F9**/**F10** (the two accepted residuals of the re-home fix —
    deliberate, pinned by tests, listed so a future fix confronts them rather than
    deleting them).
-5. ~~**F8**~~ (CLOSED, `c4d00b2`), ~~**F13**~~ (CLOSED, `3023592..ac7a2f3`; latent
-   until relay mode is enabled — see its entry), then F3/F4/F5.
-7. **F17**, then **F18** — both low, both from the destructive-transition sweep.
+4. ~~**F8**~~ (CLOSED, `c4d00b2`), ~~**F13**~~ (CLOSED, `3023592..ac7a2f3`; latent
+   until relay mode is enabled — see its entry), ~~**F11**~~ (CLOSED,
+   `07d12bd..6d05524`; eviction now keys on genuine transfer progress and
+   advertisements no longer refresh the eviction clock — see its entry), then
+   F3/F4/F5.
+5. **F17**, then **F18** — both low, both from the destructive-transition sweep.
    F17 is an actual behaviour defect (two of our own transfers destroy each
    other) with no reference-aligned fix — RNS routes resource segments the same
    way, carrying a standing TODO — so taking it means choosing a deliberate
@@ -839,7 +840,21 @@ party refreshes the watchdog with junk. Bounded to one re-home per disconnect;
 not otherwise bounded. Nothing clears `rehomePermitted` except the re-home that
 spends it, so the grant does not expire either.
 
-### F11 — advertise-and-stall pins a link against eviction
+### F11 — advertise-and-stall pins a link against eviction — ✅ CLOSED (`07d12bd..6d05524`, 2026-08-23)
+
+**Closed by** fixing the eviction POLICY (not by the per-link `transfers` cap this entry originally
+proposed — a cap would not have helped, since one stalled transfer conferred immunity regardless of
+count). Two changes: (1) `LinkPlane`'s `evictable` filter now grants immunity only to a link with a
+genuinely-progressing transfer — a sender-role transfer, or a receiver that has received a part
+(`transfers.allSatisfy { $0.role == .receiver && !$0.receivedFirstPart }`) — so an advertised-but-
+stalled transfer no longer pins the slot; (2) resource advertisements no longer advance the
+`lastData` eviction clock (a new `sawGenuineData` flag gates `lastData`; advertisements still set
+`sawAuthenticatedData`, so re-home is unchanged), so a re-advertising attacker sorts as the LRU
+victim instead of looking freshly active. No per-link cap (reference has none; stalled transfers
+self-reap via the receiver watchdog / link inactivity). Whole-branch reviewed. Accepted residual: an
+attacker who continuously sends REAL parts holds a slot like any long transfer — only the zero-cost
+pin is eliminated. Spec/plan: `docs/superpowers/specs/2026-08-23-f11-stalled-advertiser-link-pin-design.md`,
+`docs/superpowers/plans/2026-08-23-f11-stalled-advertiser-link-pin.md`. The original analysis follows.
 
 **Where:** `LinkSession.received`'s `(_, .active, .data, .resourceAdvertisement)`
 branch, and `LinkPlane`'s `evictable` filter — which since F14's fix lives in the
