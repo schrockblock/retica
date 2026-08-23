@@ -122,6 +122,11 @@ Eviction at promotion (responder cap exceeded):
   limitations.
 - **Genuine data still protects a link:** a peer sending real application-data messages advances
   `lastData` and is not evicted ahead of a bare advertiser.
+- **Quiet legitimate link older than the attacker:** with multiple evictable incumbents, the LRU
+  picks the lowest `lastData`. A quiet legitimate link whose last genuine data predates the
+  attacker's (younger) establishment still sorts ahead of the attacker and would be the victim.
+  This is inherent LRU behavior, not a new attack, and it is strictly better than pre-fix, where
+  re-advertising made the attacker look freshest and it *always* survived. Accepted.
 
 ## Testing
 
