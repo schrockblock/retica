@@ -296,19 +296,16 @@ public struct LinkPlane {
                 // so an LRU over it would preserve an attacker's keepalive-fed link and evict a
                 // quiet legitimate one. `lastData` only advances on traffic that decrypted.
                 //
-                // Also skip links with in-flight transfers. Resource SEGMENT contexts forward raw
-                // bytes to `ResourceTransfer` children that decrypt internally, so they never
-                // advance `lastData` — only `.resourceAdvertisement` does, at transfer start.
-                // Without this filter a link receiving a large resource would look idle and be
-                // evicted mid-transfer.
-                //
-                // That filter is a TRADE-OFF, not pure protection. `LinkSession`'s
-                // `.resourceAdvertisement` branch appends to `transfers` on a valid advertisement
-                // alone, so a peer holding an active link (which it may have, by protocol design)
-                // can advertise a resource, never send a segment, and become eviction-immune —
-                // re-advertising outruns `ResourceTransfer`'s receiver watchdog. We accept it: it
-                // is cheaper than throwing away demonstrably busy legitimate transfers, and
-                // bounding transfers per link is the real fix.
+                // Skip links with a PROGRESSING transfer: a sender-role transfer (we are sending),
+                // or a receiver-role transfer that has received at least one part (`receivedFirstPart`).
+                // Resource SEGMENT contexts forward raw bytes to `ResourceTransfer` children that
+                // decrypt internally, so a link genuinely receiving a large resource never advances
+                // `lastData` and would otherwise look idle — the part-receiving transfer is what marks
+                // it as busy and protects it mid-transfer. Sender-role transfers are always in-progress
+                // by construction (they begin sending immediately on advertisement).
+                // A receiver transfer that was only ADVERTISED (no part yet) confers no immunity:
+                // otherwise a peer could advertise a resource it never sends and pin this slot
+                // forever (F11).
                 //
                 // The element being promoted is excluded by id, not left to the comparator. It has
                 // just stamped `lastData`, so a real clock would never choose it — but under a
@@ -319,7 +316,7 @@ public struct LinkPlane {
                 // path that removes it and reaps its transfers. A bare `state.links.remove` here
                 // would strand `LXMFRouter.linkResourceInFlight`.
                 let evictable = active
-                    .filter { $0.id != elementID && $0.transfers.isEmpty }
+                    .filter { $0.id != elementID && $0.transfers.allSatisfy { $0.role == .receiver && !$0.receivedFirstPart } }
                     .sorted { ($0.lastData ?? $0.activatedAt ?? 0) < ($1.lastData ?? $1.activatedAt ?? 0) }
                     .prefix(active.count - cap)
                 // Nothing evictable: REFUSE the promotion by closing the link that just arrived,

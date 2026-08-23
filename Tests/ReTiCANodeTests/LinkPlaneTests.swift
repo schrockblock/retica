@@ -1305,30 +1305,18 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
     return try! packet.packed()
 }
 
-/// **F11 — advertise-and-stall pins a link against eviction, and locks everyone else out.**
+/// **F11 — a stalled advertiser is now an eviction candidate; genuine in-progress transfers stay immune.**
 ///
 /// `LinkSession`'s `(_, .active, .data, .resourceAdvertisement)` branch appends to
 /// `state.transfers` after decrypt, unpack and a SAME-hash dedup only, so DISTINCT-hash
-/// advertisements append without bound. `LinkPlane`'s eviction filter skips any link whose
-/// `transfers` is non-empty — deliberately, because resource SEGMENT contexts forward raw bytes to
-/// `ResourceTransfer` children that decrypt internally and so never advance `lastData`, which would
-/// otherwise make a link receiving a large resource look maximally idle.
+/// advertisements append without bound. Under the old filter (`transfers.isEmpty`), any non-empty
+/// `transfers` conferred full eviction immunity — so a peer that advertises and never sends a
+/// segment became permanently immune.
 ///
-/// The combination is the residual: a peer holding an active link — which it may have, since
-/// opening one is unauthenticated by protocol design — advertises and never sends a segment. It
-/// becomes eviction-immune, and once it holds the active cap nothing can displace it: a newcomer
-/// that completes a whole handshake is the one closed, because it is the only candidate the filter
-/// leaves. Unlike the half-open variant of the same shape, this does NOT self-clear: incomplete
-/// elements leave on their own establishment deadline, whereas re-advertising outruns
-/// `ResourceTransfer`'s receiver watchdog with the advertiser's cooperation alone.
-///
-/// The durable fix is a per-link bound on `transfers`, which is its own slice — it has to choose
-/// what to do with the transfer it displaces.
-///
-/// Both halves are asserted because they fail independently: a per-link transfer bound would break
-/// the first, and dropping the `transfers.isEmpty` filter from `evictable` would break the second
-/// (the advertiser would become the victim, and the newcomer would live).
-@Test @MainActor func distinctAdvertisementsGrowTransfersAndPinTheLinkAgainstEviction() async {
+/// The fix (Fix #1 of F11): `transfers.allSatisfy { !$0.receivedFirstPart }`. A link is immune
+/// only when at least one of its transfers has received a part, distinguishing a transfer that is
+/// actually progressing from a bare advertisement.
+@Test @MainActor func stalledAdvertiserIsEvictedNotThePinnedNewcomer() async {
     let owner = Identity()
     let destHash = Data(repeating: 0x63, count: 16)
     let iface = InterfaceID("advertiser")
@@ -1344,30 +1332,81 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
     let session = await activeResponderInPlane(store, owner: owner,
                                                destHash: destHash, interfaceID: iface)
 
-    // Three advertisements with DISTINCT hashes. The same-hash dedup does not apply, and nothing
-    // bounds the append, so each one adds an element.
+    // Three DISTINCT-hash advertisements, no segment ever sent → three no-parts transfers.
     for i: UInt8 in 1 ... 3 {
         let adv = advertisementPacket(linkID: session.linkID, sessionKey: session.sessionKey,
                                       resourceHash: Data(repeating: i, count: 32))
         await store.send(.routeLinkPacket(linkID: session.linkID, arrivalInterface: iface, data: adv))
         await store.receive { if case .link(.element(_, .received)) = $0 { return true }; return false }
     }
-    #expect(store.state.links[id: session.id]?.transfers.count == 3,
-            "distinct-hash advertisements append without bound; only same-hash repeats are deduped")
+    #expect(store.state.links[id: session.id]?.transfers.count == 3)
 
-    // No segment is ever sent. The link is now at the active cap and eviction-immune, so a third
-    // party that completes an entire handshake is the one closed on promotion — the advertiser is
-    // not a candidate, so the newcomer is the only one left to refuse.
+    // A newcomer completes a full handshake at the cap. Because none of the advertiser's transfers
+    // has received a part, the advertiser is now the eviction candidate — it is closed, not the
+    // newcomer.
     let newcomer = await acceptAndActivateResponder(store, owner: owner, destHash: destHash,
                                                     iface: InterfaceID("newcomer"))
     await store.receive { action in
-        if case let .link(.element(id, .close)) = action { return id == newcomer }
+        if case let .link(.element(id, .close)) = action { return id == session.id }
         return false
     }
-    #expect(store.state.links[id: session.id]?.status == .active,
-            "a stalled advertiser is never chosen as an eviction victim")
-    #expect(store.state.links.filter { $0.status == .active }.count == 1,
-            "the advertiser keeps the only slot")
+    #expect(store.state.links[id: session.id]?.status != .active
+            || store.state.links[id: session.id] == nil,
+            "a stalled advertiser must be evicted, not immune")
+    #expect(store.state.links[id: newcomer]?.status == .active,
+            "the newcomer that paid for a handshake keeps the slot")
+}
+
+/// Guard test: a transfer that has received a part confers genuine immunity.
+///
+/// Seeds link A (active responder, one transfer with `receivedFirstPart == true`) and link B
+/// (active responder, no transfers). A newcomer promotes at cap 2, forcing an eviction. Because
+/// link A's transfer has received a part, it is immune; link B — the bare link — is the victim.
+///
+/// This test is expected to PASS before and after Fix #1. Its role is to confirm the fix does not
+/// over-evict: a link genuinely mid-transfer must never be displaced.
+@Test @MainActor func aTransferThatReceivedAPartIsNotEvicted() async {
+    let iface = InterfaceID("seed")
+    // Link A: active responder, holds a transfer that has received a part → immune.
+    var linkA = LinkSession.State(id: UUID(1), responderFor: Identity(),
+                                  destinationHash: Data(repeating: 0x0A, count: 16), interfaceID: iface)
+    linkA.status = .active
+    linkA.sessionKey = Data(repeating: 0x01, count: 64)
+    linkA.linkID = Data(repeating: 0xAA, count: 16)
+    linkA.activatedAt = 10          // older than link B, so a naive LRU would pick A
+    var partTransfer = ResourceTransfer.State(receivingOn: linkA.linkID, sessionKey: linkA.sessionKey,
+                                              interfaceID: iface, rtt: .seconds(1), id: UUID(101))
+    partTransfer.receivedFirstPart = true
+    linkA.transfers.append(partTransfer)
+
+    // Link B: active responder, bare (no transfers) → evictable.
+    var linkB = LinkSession.State(id: UUID(2), responderFor: Identity(),
+                                  destinationHash: Data(repeating: 0x0B, count: 16), interfaceID: iface)
+    linkB.status = .active
+    linkB.sessionKey = Data(repeating: 0x02, count: 64)
+    linkB.linkID = Data(repeating: 0xBB, count: 16)
+    linkB.activatedAt = 20
+
+    let owner = Identity()
+    let destHash = Data(repeating: 0x63, count: 16)
+    let store = TestStore(
+        initialState: LinkPlane.State(links: [linkA, linkB], maxResponderLinks: 2)
+    ) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+
+    let newcomer = await acceptAndActivateResponder(store, owner: owner, destHash: destHash,
+                                                    iface: InterfaceID("newcomer"))
+    await store.receive { action in
+        if case let .link(.element(id, .close)) = action { return id == linkB.id }
+        return false
+    }
+    #expect(store.state.links[id: linkA.id]?.status == .active,
+            "a link with a part-receiving transfer must stay immune, even as the oldest link")
+    #expect(store.state.links[id: newcomer]?.status == .active)
 }
 
 @Test @MainActor func registerThenDeregisterMutatesPlaneRegistrations() async {
