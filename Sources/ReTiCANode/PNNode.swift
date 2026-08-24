@@ -59,6 +59,11 @@ public struct PNNode {
 
         public enum Delegate: Equatable {
             case messagesStored(transientIds: [Data])
+            /// An outbound sync to `destinationHash` failed before a link was established. `PNNode`
+            /// carries no retry machinery (that lives in `LXMFRouter`) and has no production consumer
+            /// today, so this exists to make the drop OBSERVABLE rather than abandoning the pending
+            /// sync silently (handoff F3). The `LinkFailure` reason is surfaced, not discarded.
+            case syncFailed(destinationHash: Data, reason: LinkFailure)
         }
     }
 
@@ -233,9 +238,15 @@ public struct PNNode {
                 clearLink(&state, linkID)
                 return .cancel(id: CancelID.peeringKey(linkID))
 
-            case let .endpoint(.delegate(.linkFailed(dest, _))):
-                state.pendingSyncPeers[dest] = nil          // outbound openLink failed before a link existed
-                return .none
+            case let .endpoint(.delegate(.linkFailed(dest, reason))):
+                // Outbound openLink failed before a link existed. Surface it: PNNode has no retry
+                // machinery (that is LXMFRouter's job) and no production consumer, so abandoning the
+                // sync silently — as this did — hides the failure from any future consumer entirely
+                // (handoff F3). Only report for a sync WE initiated: a `linkFailed` for a dest with no
+                // pending entry is not ours to fail.
+                guard state.pendingSyncPeers[dest] != nil else { return .none }
+                state.pendingSyncPeers[dest] = nil
+                return .send(.delegate(.syncFailed(destinationHash: dest, reason: reason)))
 
             case .endpoint, .node, .delegate:
                 return .none

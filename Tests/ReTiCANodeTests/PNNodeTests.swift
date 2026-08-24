@@ -416,13 +416,39 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     #expect(store.state.offerLinks[linkID] == nil)
 }
 
-/// linkFailed clears the pending sync peer (outbound openLink failed).
-@Test @MainActor func pnNodeLinkFailedClearsPendingSyncPeer() async {
+/// linkFailed (outbound openLink failed before a link existed) SURFACES an observable
+/// `syncFailed` delegate carrying the reason (handoff F3 — the drop must not be silent) AND clears
+/// the pending sync peer. Both halves are asserted: the `receive` fails hard even under `.off` if
+/// the delegate is absent (a MISSING action is not silenced by non-exhaustivity), and the state
+/// check pins the clearing.
+@Test @MainActor func pnNodeLinkFailedSurfacesSyncFailedAndClearsPendingSyncPeer() async {
     let peerDest = Data(repeating: 0xD0, count: 16)
-    let store = makeStore(Identity())
-    await store.send(.syncToPeer(destinationHash: peerDest, peeringCost: 0))
-    await store.receive { if case .endpoint(.openLink(peerDest)) = $0 { return true }; return false }
-    #expect(store.state.pendingSyncPeers[peerDest] == 0)
+    // Seed the pending sync directly rather than via `syncToPeer`: an `openLink` to an unlearned
+    // dest auto-fails and pre-emits its OWN `linkFailed` (and now `syncFailed`), which would
+    // contaminate the queue. The handler under test only needs the pending entry as a precondition.
+    var initial = PNNode.State(identity: Identity(),
+                               endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false),
+                               minStampCost: 4)
+    initial.pendingSyncPeers[peerDest] = 3
+    let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
     await store.send(.endpoint(.delegate(.linkFailed(destinationHash: peerDest, reason: .noPath))))
+    await store.receive {
+        if case let .delegate(.syncFailed(dest, reason)) = $0 { return dest == peerDest && reason == .noPath }
+        return false
+    }
     #expect(store.state.pendingSyncPeers[peerDest] == nil)
+}
+
+/// A `linkFailed` for a destination we are NOT syncing to (no `pendingSyncPeers` entry) must NOT
+/// emit a spurious `syncFailed`. Trailing `.on` so teardown fails if any stray delegate is emitted.
+@Test @MainActor func pnNodeLinkFailedForAnUntrackedDestEmitsNoSyncFailed() async {
+    let store = makeStore(Identity())
+    let unknown = Data(repeating: 0xAB, count: 16)
+    store.exhaustivity = .on
+    await store.send(.endpoint(.delegate(.linkFailed(destinationHash: unknown, reason: .noPath))))
 }
