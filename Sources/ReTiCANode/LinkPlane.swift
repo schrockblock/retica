@@ -148,6 +148,12 @@ public struct LinkPlane {
                 return .send(.link(.element(id: newID, action: .establish)))
 
             case let .acceptLinkRequest(owner, destinationHash, interfaceID, data):
+                // A responder cannot sign the LRPROOF without a private key: `Link.buildProof` →
+                // `Identity.sign` `preconditionFailure`s (the only one in `Sources`). The endpoints
+                // guard `owner.privateKey != nil` before forwarding here, but this method is public
+                // API, so a direct-composition caller can reach it with a public-only identity.
+                // Refuse rather than crash — a keyless owner can never complete a handshake anyway.
+                guard owner.privateKey != nil else { return .none }
                 // DEDUPE BEFORE CRYPTO. A duplicate LINKREQUEST costs a DH, an HKDF, an Ed25519
                 // signature with our long-term destination key, and — because we do not pass
                 // `ephemeral:` below — a fresh keypair generation from the defaulted
@@ -241,6 +247,10 @@ public struct LinkPlane {
                 return .send(.link(.element(id: element.id, action: .sendResource(data))))
 
             case let .identifyOverLink(linkID, identity):
+                // Same crash surface as `acceptLinkRequest`: `LinkSession.identify` signs with this
+                // identity, so a keyless one would `preconditionFailure` in `Identity.sign`. Public
+                // API, so guard here rather than trusting every caller.
+                guard identity.privateKey != nil else { return .none }
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .identify(identity))))
 

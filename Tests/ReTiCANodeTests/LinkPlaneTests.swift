@@ -1537,3 +1537,46 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
     #expect(store.state.links[id: session.id]?.transfers.isEmpty == true,
             "a no-parts transfer must be reaped by its own receiver watchdog while the link lives")
 }
+
+// MARK: - F4: unguarded public sign paths must not crash on a keyless identity
+
+/// `LinkPlane.acceptLinkRequest` is public API. A direct-composition caller that passes an owner
+/// with no private key (an `Identity(publicKey:)`) must be REFUSED, not crash inside `Identity.sign`
+/// while building the LRPROOF — the only `preconditionFailure` in `Sources`. The endpoints already
+/// guard `owner.privateKey != nil` before forwarding (TransportEndpoint's `.linkRequest` handler);
+/// the plane, being public, must guard too.
+@Test @MainActor func acceptLinkRequestWithAKeylessOwnerIsRefusedNotCrashed() async {
+    let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    let full = Identity()
+    let destHash = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"],
+                               identity: full)!.hash
+    let keylessOwner = Identity(publicKey: full.publicKey)!
+    await store.send(.acceptLinkRequest(owner: keylessOwner, destinationHash: destHash,
+                                        interfaceID: ifA, data: freshLinkRequest(destHash: destHash)))
+    #expect(store.state.links.isEmpty,
+            "a keyless owner cannot sign a proof, so no responder element may be minted")
+}
+
+/// `LinkPlane.identifyOverLink` is public API and reaches `Identity.sign` on an active initiator
+/// link (`LinkSession.identify`). A keyless identity must be refused, not crash. Same shape as the
+/// `acceptLinkRequest` guard above; the handoff (F4) says to fix both together.
+@Test @MainActor func identifyOverLinkWithAKeylessIdentityIsRefusedNotCrashed() async {
+    let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    let destHash = Data(repeating: 0x07, count: 16)
+    let id = await openAndActivateInitiator(store, peer: Identity(), destHash: destHash, iface: ifA)
+    let linkID = store.state.links[id: id]!.linkID
+    let keyless = Identity(publicKey: Identity().publicKey)!
+    await store.send(.identifyOverLink(linkID: linkID, identity: keyless))
+    #expect(store.state.links[id: id]?.status == .active,
+            "the link is untouched; identify is refused before it can sign")
+}
