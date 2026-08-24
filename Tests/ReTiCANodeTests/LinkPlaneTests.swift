@@ -1580,3 +1580,25 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
     #expect(store.state.links[id: id]?.status == .active,
             "the link is untouched; identify is refused before it can sign")
 }
+
+/// Third path to `Identity.sign`, found by whole-branch review of the F4 fix: `provePacketOverLink`
+/// signs with the link's `owningIdentity` (`LinkSession.provePacket`). A responder link whose owner
+/// has no private key — constructible directly, since `LinkSession.State(responderFor:)` and its
+/// `status`/`linkID` are public — must be refused, not crash. `acceptLinkRequest`'s guard cannot
+/// cover this: the owner is read from session state here, not passed to the action.
+@Test @MainActor func provePacketOverLinkWithAKeylessOwnerIsRefusedNotCrashed() async {
+    let keyless = Identity(publicKey: Identity().publicKey)!
+    let linkID = Data(repeating: 0x09, count: 16)
+    var link = LinkSession.State(responderFor: keyless, destinationHash: Data(repeating: 0x01, count: 16),
+                                 interfaceID: ifA)
+    link.linkID = linkID
+    link.status = .active
+    let store = TestStore(initialState: LinkPlane.State(links: [link])) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    await store.send(.provePacketOverLink(linkID: linkID, packetHash: Data(repeating: 0xAB, count: 16)))
+    #expect(store.state.links.count == 1, "proving is refused before it can sign; the link is untouched")
+}

@@ -929,7 +929,13 @@ public struct LinkSession {
                 // Requiring `owningIdentity` therefore also structurally restricts proving to the
                 // responder role, matching RNS: an initiator link signs with an ephemeral key the
                 // peer never learns, so an initiator-side packet proof could never validate.
-                guard state.status == .active, let owner = state.owningIdentity else { return .none }
+                // `owner.privateKey != nil` completes the F4 guard set: `owner.sign` below
+                // `preconditionFailure`s without a private key. The owner is read from session state
+                // (not an action parameter), so `LinkPlane.acceptLinkRequest`'s guard cannot cover a
+                // link whose keyless owner was seeded by a direct-composition caller — guard the
+                // crash site itself, which also defends every other caller of `provePacket`.
+                guard state.status == .active, let owner = state.owningIdentity,
+                      owner.privateKey != nil else { return .none }
                 let proofData = packetHash + owner.sign(packetHash)
                 let proofPacket = Packet(headerType: .header1, packetType: .proof,
                                          transportType: .broadcast, destinationType: .link,
