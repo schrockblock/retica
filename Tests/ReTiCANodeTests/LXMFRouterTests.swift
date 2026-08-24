@@ -1424,9 +1424,14 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // A second establish (e.g. link re-open) must NOT re-request the download — the flag was cleared.
     await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
     #expect(store.state.pendingDownloadFromPN == false)
-    // F5.2: always-arm means every .linkEstablished leaves an idle timer in flight, so a trailing
-    // .on would trip teardown. Keep .off — the absence of requestMessageList is asserted by the
-    // fact that we receive nothing and state remains unchanged (pendingDownloadFromPN == false).
+    // The `#expect` above only catches a resurrection that ALSO sets the flag; a `requestMessageList`
+    // decoupled from the flag would slip past it. Assert its ABSENCE with a flip-then-send AFTER the
+    // second establish: flip .on, send a genuine no-op (empty offer → router returns .none) so TCA
+    // runs the "must handle received actions" check and fails on any stray requestMessageList queued
+    // by that establish, then flip back to .off so teardown tolerates the F5.2 idle timer.
+    store.exhaustivity = .on
+    await store.send(.offeredMessageList(transientIds: []))   // no-op; forces the stray check
+    store.exhaustivity = .off
 }
 
 /// A sync whose PN link dies before it establishes must retry. An outstanding
@@ -1497,17 +1502,18 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.pendingDownloadFromPN == false)      // the sync has a terminus
     #expect(store.state.knownPaths.contains(pn) == false)    // and the path is forgotten
 
-    // A later PN link must NOT resurrect the abandoned sync. Use flip-then-send to assert the
-    // absence of a stray requestMessageList: send a no-op first while in .on (TCA checks received
-    // actions before processing it), then flip back to .off before .linkEstablished — because
-    // F5.2 always-arm means every .linkEstablished leaves an idle timer in flight, and a trailing
-    // .on would trip teardown on that timer.
-    store.exhaustivity = .on
-    await store.send(.offeredMessageList(transientIds: []))   // no-op; forces the stray check
-    store.exhaustivity = .off
+    // A later PN link must NOT resurrect the abandoned sync. Run the resurrection trigger first
+    // (still .off), then assert the absence of a stray requestMessageList with a flip-then-send
+    // AFTER it: the no-op send under .on forces TCA's "must handle received actions" check and fails
+    // on any requestMessageList that establish queued (whether or not it also touched the flag).
+    // The block must come AFTER .linkEstablished — placing it before would leave the trigger
+    // unguarded. Flip back to .off so teardown tolerates the F5.2 idle timer that establish armed.
     await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
     #expect(store.state.directLinks[pn] == .active(linkID: linkID))
     #expect(store.state.pendingDownloadFromPN == false)   // not resurrected
+    store.exhaustivity = .on
+    await store.send(.offeredMessageList(transientIds: []))   // no-op; forces the stray check
+    store.exhaustivity = .off
 }
 
 // MARK: - Resource-direct delivery confirmation

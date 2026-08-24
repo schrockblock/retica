@@ -666,15 +666,17 @@ import ComposableArchitecture
     await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: otherLink, destinationHash: otherHash)))))
     await store.skipReceivedActions(strict: false)       // drain setup effects
 
-    // A `.off` store alone would NOT catch a stray provePacketOverLink at teardown, so flip to .on
-    // for the send under test: the stray action then fails teardown.
+    // Flip to .on for the send under test, then ASSERT the absence with a flip-then-send AFTER the
+    // send/receive: a bare `.on` send only checks the received-actions queue at the NEXT interaction,
+    // so the no-op send below is what actually forces "no stray provePacketOverLink" to be asserted —
+    // it fails on any action still queued after the legitimate `.router(.received)` is consumed.
+    // (F5.2 always-arms a per-dest idle timer at .linkEstablished, so we flip back to .off afterwards
+    // to let teardown tolerate that in-flight timer; the stray guard is the no-op send, not teardown.)
     store.exhaustivity = .on
     await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: Data("msg".utf8),
                                                                    packetHash: Data(repeating: 0xF8, count: 32))))))
     await store.receive { if case .client(.router(.received)) = $0 { return true }; return false }
-    // F5.2: the router now always arms a per-dest idle timer at .linkEstablished, so the setup
-    // establish above leaves an idle timer in flight. The stray-provePacket check is already
-    // enforced by the .on window over the send/receive; flip back to .off so teardown tolerates it.
+    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -1445,13 +1447,16 @@ import ComposableArchitecture
     await store.skipReceivedActions(strict: false)
 
     // An unparseable container must produce NO actions (no prove, no error packet, no ingest).
-    // Flip to .on so the send-under-test fails immediately if it emits any stray action.
+    // Flip to .on for the send-under-test, then ASSERT the absence with a flip-then-send AFTER it: a
+    // bare `.on` send defers its received-actions check to the NEXT interaction, so the no-op send
+    // below is what actually forces "no stray prove/error/ingest" to be asserted — it fails on any
+    // action the garbage packet queued. (F5.2 always-arms a per-dest idle timer at .linkEstablished,
+    // so we flip back to .off afterwards to let teardown tolerate that timer; the stray guard is the
+    // no-op send, not teardown.)
     store.exhaustivity = .on
     await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: garbage,
                                                                    packetHash: packetHash)))))
-    // The stray-action check is complete: an .on send fails on any received action the garbage
-    // packet emits. F5.2 always-arms a router idle timer at .linkEstablished, so flip back to .off
-    // before teardown so it tolerates that in-flight timer (an unrelated effect).
+    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
     store.exhaustivity = .off
     #expect(store.state.pn.store.count == 0)
 }
