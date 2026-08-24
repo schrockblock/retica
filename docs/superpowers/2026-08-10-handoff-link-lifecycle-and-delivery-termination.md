@@ -199,18 +199,17 @@ believing any sentence in its body.
 
 Current priority:
 
-1. **F4, and the rest of F5** — the remaining items with an open fix decision
+1. **The rest of F5** — the remaining items with an open fix decision
    (F7 closed 2026-08-23; **F16 accepted won't-fix**; F9/F10 accepted residuals;
    **F5.2 CLOSED `e22cb4d..654d230` 2026-08-23** — the stale idle-timer teardown).
-   Scoped 2026-08-23: **F3 is dead code** (`PNNode` has no production consumer —
-   skip until wired up). **F4** is a real crash-on-misuse (the only
-   `preconditionFailure` in `Sources`, two unguarded public `LinkPlane` paths) but
-   reachable only by a direct-composition caller, not remotely — a robustness
-   cleanup if wanted. **F5's remaining sub-items:** F5.1 `sendFailed` is
-   unconsumable (a delegate DESIGN change, not small), F5.3 `LXMFNode.sendViaPropagation`
-   silent drop (minor observability), F5.4 `.handshakeRejected` label test-coverage,
-   F5.5 the app-side double-saga (ReTiCaMsgr — real UX bug, app work). None is a
-   clean high-value link/router fix; scope before assuming actionable.
+   **F3, F4 and F5.5 CLOSED 2026-08-23** (`06b2829`, `a047fea`, `1990a88`, and
+   ReTiCaMsgr `4f92cab`) — read their entries; **F4 turned out to be THREE public
+   sign paths, not two** (the whole-branch review found `provePacket`, which this
+   doc had explicitly and wrongly excluded). **F5's remaining sub-items:** F5.1
+   `sendFailed` is unconsumable (a delegate DESIGN change, not small), F5.3
+   `LXMFNode.sendViaPropagation` silent drop (minor observability), F5.4
+   `.handshakeRejected` label test-coverage. None is a clean high-value link/router
+   fix; scope before assuming actionable.
    - ⏸️ **F16** — ACCEPTED (won't fix): the inactivity re-arm fires for any
      link-addressed packet, but the plaintext keepalive makes that vector
      irreducible and F11's `lastData`-based eviction already reclaims the slot; a
@@ -436,7 +435,19 @@ control in `Transport` (confirmed: the burst/hold/arrival machinery is reached
 exclusively from the `.announce` branch; the LINKREQUEST branch has no rate
 limit, no hold queue, no per-interface accounting).
 
-### F3 — `PNNode` discards the `LinkFailure` reason
+### F3 — `PNNode` discards the `LinkFailure` reason — ✅ CLOSED (`a047fea`, 2026-08-23)
+
+**CLOSED** by adding `PNNode.Action.Delegate.syncFailed(destinationHash:reason:)` and emitting it
+from the `linkFailed` handler (guarded on `pendingSyncPeers[dest] != nil`, so no spurious failure
+for a link we did not open). Still no production consumer and no retry machinery — the fix makes the
+drop OBSERVABLE, as the entry below prescribed, not a duplicate of `LXMFRouter`'s ladder.
+
+**Stale sub-claim corrected:** the entry below says `PNNode` "composes `TCPEndpoint` directly, not
+`TransportEndpoint`, so it cannot run over BLE at all." That is now FALSE — `PNNode.State.endpoint`
+is a `TransportEndpoint.State` (a TCP convenience initializer remains). The dead-code CONCLUSION is
+unchanged and re-verified: a repo-wide grep finds no non-test, non-comment reference to `PNNode`. The
+original text follows.
+
 
 `PNNode`'s `linkFailed` handler binds and ignores the reason, terminally
 abandoning `pendingSyncPeers[dest]` and never requesting a path — the behaviour
@@ -459,7 +470,30 @@ list despite being easy to fix.
 Given no production caller, the proportionate fix is a **failure delegate** so
 the drop is observable, NOT duplicating `LXMFRouter`'s retry machinery.
 
-### F4 — `Link.buildProof` can crash the process
+### F4 — `Link.buildProof` can crash the process — ✅ CLOSED (`06b2829` + `1990a88`, 2026-08-23)
+
+**CLOSED**, but as THREE public sign paths, not two. `06b2829` guarded
+`acceptLinkRequest` and `identifyOverLink`; the whole-branch review of that fix
+found a third, which `1990a88` guarded.
+
+> ### ⚠️ The parenthetical below was WRONG, and the way it was wrong is the lesson
+>
+> It said `LinkSession.provePacket` → `owner.sign` "is reachable only through the
+> guarded endpoint path, so it is fine." **`LinkPlane.provePacketOverLink` is
+> itself a public action**, and `provePacket` signs with the link's
+> `owningIdentity` (read from session state, not passed to the action). Both
+> `LinkSession.State(responderFor:)` and its `status`/`linkID` are public — the
+> existing tests seed exactly that shape — so a direct-composition caller builds an
+> active responder link with a keyless owner and crashes the process by proving one
+> packet. "Reachable only through the guarded endpoint path" was a claim about
+> current CALLERS; F4's own scope is "direct composition, not remotely", which the
+> parenthetical contradicted. This is the "fix the branch you found, not the
+> property" trap §6 warns about — the fix guarded the two paths that take an
+> identity as an ARGUMENT and missed the one that reads it from STATE. `1990a88`
+> guards the crash site itself (`provePacket`'s existing guard gains
+> `owner.privateKey != nil`), which defends every caller, not just the plane action.
+
+**The original entry follows.**
 
 `Identity.sign` calls `preconditionFailure` without a private key — the only
 `preconditionFailure`/`fatalError` in all of `Sources`. Both endpoints guard
@@ -471,8 +505,6 @@ direct composition, not remotely.
 **Second unguarded public path, same shape, missed originally:**
 `LinkPlane.identifyOverLink` → `LinkSession.identify` → `identity.sign(...)`,
 also public, also with no `privateKey` guard. Fix both together.
-(`LinkSession.provePacket` → `owner.sign` is reachable only through the guarded
-endpoint path, so it is fine.)
 
 ### F5 — smaller, verified
 
@@ -516,10 +548,14 @@ endpoint path, so it is fine.)
   reachable via an all-zeros X25519 key (the degenerate-point trick the tests
   already use on the initiator side), so what is untested there is the
   element-reaping BEHAVIOUR, not merely the label.
-- **Out of repo (ReTiCaMsgr):** with a PN configured, one `message.hash` gets TWO
-  sagas, and `deliveryFailed` overwrites `propagationAccepted` last-write-wins —
-  a message that propagated fine at ~20s is marked failed when the opportunistic
-  leg times out at ~50s.
+- **F5.5 — out of repo (ReTiCaMsgr) — ✅ CLOSED (`4f92cab`, 2026-08-23):** with a
+  PN configured, one `message.hash` got TWO sagas, and `deliveryFailed` overwrote
+  `propagationAccepted` last-write-wins — a message that propagated fine at ~20s was
+  marked failed when the opportunistic leg timed out at ~50s. Fixed by gating the
+  `deliveryFailed` DB update on `status.neq(MessageStatus.propagated)`, so a
+  propagation success survives the later timeout; the reverse order still works
+  because `propagationAccepted` writes unconditionally. "propagated" is the only
+  reachable success terminal for an outgoing message (whole-branch-review verified).
 
 ### F6 — one injected packet kills a legitimate inbound establishment — ✅ CLOSED
 
