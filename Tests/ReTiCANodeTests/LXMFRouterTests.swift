@@ -1385,7 +1385,11 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     var initial = LXMFRouter.State()
     initial.outboundPropagationNode = pn
     initial.knownPaths.insert(pn)   // path known → establishes directly
-    let store = TestStore(initialState: initial) { LXMFRouter() }
+    // F5.2: always-arm means .linkEstablished now arms an idle timer; TestClock is required so the
+    // clock.sleep in idleTimer doesn't hit the unimplemented system continuousClock.
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
     store.exhaustivity = .off
     await store.send(.syncFromPropagationNode)
     await store.receive { action in
@@ -1407,7 +1411,11 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     var initial = LXMFRouter.State()
     initial.outboundPropagationNode = pn
     initial.knownPaths.insert(pn)
-    let store = TestStore(initialState: initial) { LXMFRouter() }
+    // F5.2: always-arm means .linkEstablished now arms an idle timer; TestClock is required so the
+    // clock.sleep in idleTimer doesn't hit the unimplemented system continuousClock.
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
     store.exhaustivity = .off
     await store.send(.syncFromPropagationNode)
     await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
@@ -1416,7 +1424,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // A second establish (e.g. link re-open) must NOT re-request the download — the flag was cleared.
     await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
     #expect(store.state.pendingDownloadFromPN == false)
-    store.exhaustivity = .on   // a stray requestMessageList would fail teardown
+    // F5.2: always-arm means every .linkEstablished leaves an idle timer in flight, so a trailing
+    // .on would trip teardown. Keep .off — the absence of requestMessageList is asserted by the
+    // fact that we receive nothing and state remains unchanged (pendingDownloadFromPN == false).
 }
 
 /// A sync whose PN link dies before it establishes must retry. An outstanding
@@ -1463,7 +1473,11 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     var initial = LXMFRouter.State()
     initial.outboundPropagationNode = pn
     initial.knownPaths.insert(pn)
-    let store = TestStore(initialState: initial) { LXMFRouter() }
+    // F5.2: always-arm means .linkEstablished now arms an idle timer; TestClock is required so the
+    // clock.sleep in idleTimer doesn't hit the unimplemented system continuousClock.
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
     store.exhaustivity = .off
 
     // Drive to the precondition rather than seeding it: a sync with nothing queued (attempt 1).
@@ -1483,12 +1497,17 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.pendingDownloadFromPN == false)      // the sync has a terminus
     #expect(store.state.knownPaths.contains(pn) == false)    // and the path is forgotten
 
-    // A later PN link must NOT resurrect the abandoned sync. Flipping to .on and then SENDING is
-    // what makes this an absence assertion — under .off a stray requestMessageList is swallowed.
+    // A later PN link must NOT resurrect the abandoned sync. Use flip-then-send to assert the
+    // absence of a stray requestMessageList: send a no-op first while in .on (TCA checks received
+    // actions before processing it), then flip back to .off before .linkEstablished — because
+    // F5.2 always-arm means every .linkEstablished leaves an idle timer in flight, and a trailing
+    // .on would trip teardown on that timer.
     store.exhaustivity = .on
-    await store.send(.linkEstablished(destinationHash: pn, linkID: linkID)) {
-        $0.directLinks[pn] = .active(linkID: linkID)
-    }
+    await store.send(.offeredMessageList(transientIds: []))   // no-op; forces the stray check
+    store.exhaustivity = .off
+    await store.send(.linkEstablished(destinationHash: pn, linkID: linkID))
+    #expect(store.state.directLinks[pn] == .active(linkID: linkID))
+    #expect(store.state.pendingDownloadFromPN == false)   // not resurrected
 }
 
 // MARK: - Resource-direct delivery confirmation
@@ -1690,6 +1709,46 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
+}
+
+// MARK: - F5.2 idle-timer stale-teardown fix
+
+// F5.2 (stamp): a stale idle deadline carrying an OLD linkID must not close the link that has since
+// re-established on the same destination with a NEW linkID.
+@Test @MainActor func staleIdleDeadlineDoesNotCloseANewerLink() async {
+    let dest = Data(repeating: 0x51, count: 16)
+    let oldLinkID = Data(repeating: 0xA1, count: 16)
+    let newLinkID = Data(repeating: 0xB2, count: 16)
+    var initial = LXMFRouter.State()
+    initial.directLinks[dest] = .active(linkID: newLinkID)
+    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+    await store.send(.idleDeadline(destinationHash: dest, linkID: oldLinkID))
+    #expect(store.state.directLinks[dest] == .active(linkID: newLinkID),
+            "a stale idle deadline (old linkID) must not close the current link")
+}
+
+// F5.2 (always-arm): a link established with NOTHING queued (the retry / PN-sync re-establish shape)
+// must still get its own idle timer, so it idle-closes instead of lingering forever.
+@Test @MainActor func linkEstablishedWithEmptyQueueStillArmsAnIdleTimer() async {
+    let dest = Data(repeating: 0x52, count: 16)
+    let linkID = Data(repeating: 0xC3, count: 16)
+    let clock = TestClock()
+    let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = clock
+    }
+    store.exhaustivity = .off
+    await store.send(.linkEstablished(destinationHash: dest, linkID: linkID))
+    #expect(store.state.directLinks[dest] == .active(linkID: linkID))
+    await clock.advance(by: .seconds(LXMFDelivery.linkMaxInactivitySeconds))
+    await store.receive { action in
+        if case let .delegate(.closeLink(d)) = action { #expect(d == dest); return true }
+        return false
+    }
+    #expect(store.state.directLinks[dest] == nil,
+            "an empty-queue re-established link must still idle-close on its own timer")
 }
 
 /// Rehydrating MORE than RingSet's capacity (10 000) keeps the NEWEST hashes and evicts the oldest,

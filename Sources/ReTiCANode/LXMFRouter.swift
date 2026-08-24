@@ -171,7 +171,7 @@ public struct LXMFRouter {
         case delivered(messageHash: Data)
         case resourceDeliveredOnLink(linkID: Data)
         case retryDue(messageHash: Data)
-        case idleDeadline(destinationHash: Data)
+        case idleDeadline(destinationHash: Data, linkID: Data)
         case pathRequestDeadline(destinationHash: Data)
         case delegate(Delegate)
 
@@ -203,10 +203,10 @@ public struct LXMFRouter {
                     await send(.retryDue(messageHash: hash))
                 }.cancellable(id: CancelID.retry(hash), cancelInFlight: true)
             }
-            func idleTimer(_ dest: Data) -> Effect<Action> {
+            func idleTimer(_ dest: Data, _ linkID: Data) -> Effect<Action> {
                 .run { send in
                     try await clock.sleep(for: .seconds(LXMFDelivery.linkMaxInactivitySeconds))
-                    await send(.idleDeadline(destinationHash: dest))
+                    await send(.idleDeadline(destinationHash: dest, linkID: linkID))
                 }.cancellable(id: CancelID.idle(dest), cancelInFlight: true)
             }
             func pathRequestTimer(_ dest: Data) -> Effect<Action> {
@@ -386,7 +386,7 @@ public struct LXMFRouter {
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: message.packed,
                                                                   asResource: asResource))),
                                       retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
-                                      idleTimer(dest))
+                                      idleTimer(dest, linkID))
                     }
                     state.outboundQueue[dest, default: []].append(message)
                     if state.directLinks[dest] == nil {
@@ -412,13 +412,13 @@ public struct LXMFRouter {
                                                                             propagationPacked: propagationPacked,
                                                                             messageHash: message.hash))),
                                       retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
-                                      idleTimer(pn))
+                                      idleTimer(pn, linkID))
                     } else {
                         // Large container: send as Resource; receipt via resourceDeliveredOnLink (unchanged).
                         state.linkResourceInFlight[linkID] = message.hash
                         return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: propagationPacked))),
                                       retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
-                                      idleTimer(pn))
+                                      idleTimer(pn, linkID))
                     }
                 }
                 state.propagationQueue[pn, default: []].append(
@@ -481,7 +481,11 @@ public struct LXMFRouter {
                     }
                     effects.append(retryTimer(item.messageHash, LXMFDelivery.retryWaitSeconds))
                 }
-                if !queued.isEmpty || !propQueued.isEmpty { effects.append(idleTimer(dest)) }
+                // Always arm — not only when a queue was drained. A link re-established for a
+                // still-pending delivery or a PN sync drains no queue, so the old "only if queued"
+                // left it with no timer while the prior link's stale timer lived on (F5.2). The
+                // cancelInFlight on CancelID.idle(dest) also cancels that stale timer here.
+                effects.append(idleTimer(dest, linkID))
                 if dest == state.outboundPropagationNode, state.pendingDownloadFromPN {
                     state.pendingDownloadFromPN = false
                     effects.append(.send(.delegate(.requestMessageList(linkID: linkID))))
@@ -593,8 +597,12 @@ public struct LXMFRouter {
                     return retryTimer(hash, LXMFDelivery.retryWaitSeconds)
                 }
 
-            case let .idleDeadline(dest):
-                guard case .active = state.directLinks[dest] else { return .none }
+            case let .idleDeadline(dest, linkID):
+                // Close ONLY the link this timer was armed for. A stale timer from a prior link on
+                // this dest (or one that fired in the close→re-establish gap) finds a different
+                // linkID — or none — and no-ops (F5.2).
+                guard case let .active(current) = state.directLinks[dest], current == linkID
+                else { return .none }
                 clearDirectLink(&state, dest)
                 return .send(.delegate(.closeLink(destinationHash: dest)))
 
