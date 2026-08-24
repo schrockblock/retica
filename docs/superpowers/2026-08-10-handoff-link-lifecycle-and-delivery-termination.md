@@ -199,11 +199,18 @@ believing any sentence in its body.
 
 Current priority:
 
-1. **F3/F4/F5** — the top item with an open fix decision (F7 closed 2026-08-23;
-   **F16 accepted won't-fix** 2026-08-23; F9/F10 remain accepted residuals). The
-   whole family below F7 is now either accepted-residual (F16/F9/F10) or low
-   (F17/F18), so F3/F4/F5 is the next place a genuine fix would land — scope it
-   before assuming it's actionable.
+1. **F4, and the rest of F5** — the remaining items with an open fix decision
+   (F7 closed 2026-08-23; **F16 accepted won't-fix**; F9/F10 accepted residuals;
+   **F5.2 CLOSED `e22cb4d..654d230` 2026-08-23** — the stale idle-timer teardown).
+   Scoped 2026-08-23: **F3 is dead code** (`PNNode` has no production consumer —
+   skip until wired up). **F4** is a real crash-on-misuse (the only
+   `preconditionFailure` in `Sources`, two unguarded public `LinkPlane` paths) but
+   reachable only by a direct-composition caller, not remotely — a robustness
+   cleanup if wanted. **F5's remaining sub-items:** F5.1 `sendFailed` is
+   unconsumable (a delegate DESIGN change, not small), F5.3 `LXMFNode.sendViaPropagation`
+   silent drop (minor observability), F5.4 `.handshakeRejected` label test-coverage,
+   F5.5 the app-side double-saga (ReTiCaMsgr — real UX bug, app work). None is a
+   clean high-value link/router fix; scope before assuming actionable.
    - ⏸️ **F16** — ACCEPTED (won't fix): the inactivity re-arm fires for any
      link-addressed packet, but the plaintext keepalive makes that vector
      irreducible and F11's `lastData`-based eviction already reclaims the slot; a
@@ -478,7 +485,18 @@ endpoint path, so it is fine.)
   causes, 7 textual emit statements counting endpoint forwarders, 8 if you count
   `BLEInterface`'s differently-typed `sendFailed(peer:reason:)` — which is also
   unconsumed. Count causes, not statements.)*
-- `idleTimer` is never cancelled on close (`CancelID.idle` appears exactly once
+- ✅ **F5.2 CLOSED (`e22cb4d..654d230`, 2026-08-23):** `idleTimer` was never cancelled on close and
+  `.linkEstablished` re-armed it only if a queue drained, so a link re-established for a still-pending
+  delivery (or PN sync) kept the prior link's timer alive; it fired on its original deadline and
+  `.idleDeadline`'s `.active` guard matched the NEW link, closing it (PN-sync branch same shape).
+  Fixed by always arming `idleTimer(dest, linkID)` at `.linkEstablished` (its `cancelInFlight` cancels
+  the stale timer and provisions the new link) and linkID-stamping `.idleDeadline` so it closes only
+  the link it was armed for. Whole-branch reviewed; two fix rounds repaired ripple-broken/weakened
+  tests (the always-arm timer rippled into LXMFServiceNode tests that flip `.on`, and four ripple-fixes
+  had to be injection-verified to keep their stray-action guard). Spec/plan:
+  `docs/superpowers/specs/2026-08-23-f5-2-router-idle-timer-stale-teardown-design.md`,
+  `docs/superpowers/plans/2026-08-23-f5-2-router-idle-timer-stale-teardown.md`. **Original bullet:**
+  `idleTimer` is never cancelled on close (`CancelID.idle` appears exactly once
   in `Sources`, at the arming site; the only suppression is re-arming), and the
   harm is real — the `.idleDeadline` guard does NOT prevent it, because a new
   link is also `.active`. Reachable route: direct send arms the timer → link
