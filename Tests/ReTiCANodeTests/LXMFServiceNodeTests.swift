@@ -55,6 +55,12 @@ import ComposableArchitecture
     await store.send(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: Data("msg".utf8),
                                                            packetHash: Data(repeating: 0xE2, count: 32)))))
     await store.receive { if case .router(.received) = $0 { return true }; return false }
+    // F5.2: the router now always arms a per-dest idle timer at .linkEstablished, so both setup
+    // establishes leave idle timers in flight. The stray-.router(.received) check is preserved: the
+    // send on otherLink above runs under .on, and TCA checks the received-actions queue BEFORE
+    // processing it — so a stray leaked by the propagation-link sends fails there, not at teardown.
+    // Flip back to .off so teardown tolerates the idle timers (an unrelated in-flight effect).
+    store.exhaustivity = .off
 }
 
 /// Builds a non-exhaustive TestStore over an arbitrary LXMFServiceNode.State.
@@ -666,6 +672,10 @@ import ComposableArchitecture
     await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: Data("msg".utf8),
                                                                    packetHash: Data(repeating: 0xF8, count: 32))))))
     await store.receive { if case .client(.router(.received)) = $0 { return true }; return false }
+    // F5.2: the router now always arms a per-dest idle timer at .linkEstablished, so the setup
+    // establish above leaves an idle timer in flight. The stray-provePacket check is already
+    // enforced by the .on window over the send/receive; flip back to .off so teardown tolerates it.
+    store.exhaustivity = .off
 }
 
 /// NEGATIVE 2 — with node-mode OFF, a packet on the (otherwise fully armed) propagation link must not
@@ -773,7 +783,15 @@ import ComposableArchitecture
     await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: propDest.hash)))))
     await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: Data("offer".utf8),
                                                                    packetHash: Data(repeating: 0xE5, count: 32))))))
-    store.exhaustivity = .on   // no stray .router(.received) from the disabled-but-still-open link
+    // The claim "no stray .router(.received) from the disabled-but-still-open link" is an absence
+    // assertion. F5.2 always-arms a router idle timer at .linkEstablished, so a trailing .on would
+    // trip teardown on that in-flight timer for an unrelated reason. Use flip-then-send instead:
+    // flip .on, send a genuine no-op (empty offer → router returns .none) so TCA runs the
+    // "must handle received actions" check and catches any stray, then flip back to .off so
+    // teardown tolerates the idle timer.
+    store.exhaustivity = .on
+    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
+    store.exhaustivity = .off
 }
 
 // MARK: - Task 5: setNodeMode(false) re-announces with nodeState = false
@@ -913,7 +931,13 @@ import ComposableArchitecture
         pathHash: Crypto.truncatedHash(Data("/get".utf8)),
         data: MsgPack.encode(.array([.null, .null])))))))
 
-    store.exhaustivity = .on   // a stray .sendResponseOverLink would fail teardown
+    // The absence claim "a stray .sendResponseOverLink would appear" is caught by flipping to .on
+    // and forcing the received-actions check with a no-op send. F5.2 always-arms a router idle timer
+    // at .linkEstablished, so a trailing .on would trip teardown on that in-flight timer for an
+    // unrelated reason — flip back to .off after the check so teardown tolerates the timer.
+    store.exhaustivity = .on
+    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
+    store.exhaustivity = .off
     #expect(store.state.pendingGet.isEmpty)
 }
 
@@ -1388,8 +1412,14 @@ import ComposableArchitecture
     // Nothing must have been stored.
     #expect(store.state.pn.store.count == 0, "invalid-stamp offer must not be stored")
 
-    // Prove must NOT have been sent (flip to .on so any stray prove fails teardown).
+    // Prove must NOT have been sent. F5.2 always-arms a router idle timer at .linkEstablished (the
+    // link's .closeLink above goes to the transport, not the router, so the router's idle timer for
+    // this dest stays armed), so a trailing .on would trip teardown on that timer for an unrelated
+    // reason. Flip .on, force the received-actions check with a no-op send to catch any stray prove,
+    // then flip back to .off so teardown tolerates the idle timer.
     store.exhaustivity = .on
+    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
+    store.exhaustivity = .off
 }
 
 /// A PACKET-framed offer whose container is unparseable (malformed msgpack) must neither prove nor
@@ -1415,10 +1445,14 @@ import ComposableArchitecture
     await store.skipReceivedActions(strict: false)
 
     // An unparseable container must produce NO actions (no prove, no error packet, no ingest).
-    // Flip to .on so any stray action causes teardown to fail.
+    // Flip to .on so the send-under-test fails immediately if it emits any stray action.
     store.exhaustivity = .on
     await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: garbage,
                                                                    packetHash: packetHash)))))
+    // The stray-action check is complete: an .on send fails on any received action the garbage
+    // packet emits. F5.2 always-arms a router idle timer at .linkEstablished, so flip back to .off
+    // before teardown so it tolerates that in-flight timer (an unrelated effect).
+    store.exhaustivity = .off
     #expect(store.state.pn.store.count == 0)
 }
 
