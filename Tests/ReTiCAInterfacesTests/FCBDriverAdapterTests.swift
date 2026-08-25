@@ -200,7 +200,7 @@ func collect(_ stream: AsyncStream<BLEDriverEvent>, count: Int) async -> [BLEDri
     let events = adapter.start(BLEDriverConfig(version: 2, pairingMode: .open))
     stubs.centralState.yield(.poweredOff)
     let collected = await collect(events, count: 1)
-    #expect(collected == [.unavailable(reason: "central poweredOff")])
+    #expect(collected == [.unavailable(.poweredOff)])
     await adapter.stop()
 }
 

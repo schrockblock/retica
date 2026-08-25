@@ -230,6 +230,12 @@ public struct TransportEndpoint {
             case let .ble(.ble(.delegate(.packetReceived(token, packet)))):
                 return .send(.transport(.received(bleInterfaceID(token), packet)))
 
+            // Terminal adapter unavailability (S6): translate the interface-level delegate to the
+            // BLE-only hatch delegate and surface it. Like peerOnline/peerOffline, it is deliberately
+            // absent from the unified surface — LXMF has no use for it; only the app consumes it (A5).
+            case let .ble(.ble(.delegate(.adapterUnavailable(cause)))):
+                return .send(.ble(.delegate(.adapterUnavailable(cause))))
+
             // --- shared router delegates → interface / unified delegate ---
             case let .transport(.delegate(.transmit(txID, raw))):
                 // C5 IFAC outbound masking, on the interface's OWN profile. `transport.interfaces`

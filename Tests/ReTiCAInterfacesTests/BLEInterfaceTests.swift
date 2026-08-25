@@ -506,8 +506,8 @@ func establishPeer(
 @Test @MainActor func adapterLossTakesPeersOfflineThenRecoversWithBackoff() async {
     let (store, events, calls, clock, _) = await makeOnlineStore(streams: 2)
     await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    events[0].yield(.unavailable(reason: "poweredOff"))
-    await store.receive(.driverEvent(.unavailable(reason: "poweredOff"))) {
+    events[0].yield(.unavailable(.poweredOff))
+    await store.receive(.driverEvent(.unavailable(.poweredOff))) {
         $0.status = .waitingForAdapter
         $0.channels = [:]
         $0.peers = [:]
@@ -529,16 +529,16 @@ func establishPeer(
 
 @Test @MainActor func adapterRetryDelayDoublesUpToCap() async {
     let (store, events, _, clock, _) = await makeOnlineStore(streams: 2)
-    events[0].yield(.unavailable(reason: nil))
-    await store.receive(.driverEvent(.unavailable(reason: nil))) {
+    events[0].yield(.unavailable(.other(nil)))
+    await store.receive(.driverEvent(.unavailable(.other(nil)))) {
         $0.status = .waitingForAdapter
         $0.adapterRetryDelay = .seconds(10)  // doubled after scheduling the 5 s retry
     }
     await clock.advance(by: BLEInterface.adapterRetryMin)
     await store.receive(.adapterRetry) { $0.status = .starting }
     // Second loss: the scheduled retry now uses 10 s, and the stored delay doubles to 20 s.
-    events[1].yield(.unavailable(reason: nil))
-    await store.receive(.driverEvent(.unavailable(reason: nil))) {
+    events[1].yield(.unavailable(.other(nil)))
+    await store.receive(.driverEvent(.unavailable(.other(nil)))) {
         $0.status = .waitingForAdapter
         $0.adapterRetryDelay = .seconds(20)
     }
@@ -551,10 +551,70 @@ func establishPeer(
 
 @Test @MainActor func stopWhileWaitingForAdapterCancelsRetry() async {
     let (store, events, calls, clock, _) = await makeOnlineStore()
-    events[0].yield(.unavailable(reason: nil))
-    await store.receive(.driverEvent(.unavailable(reason: nil))) { $0.status = .waitingForAdapter }
+    events[0].yield(.unavailable(.other(nil)))
+    await store.receive(.driverEvent(.unavailable(.other(nil)))) { $0.status = .waitingForAdapter }
     await store.send(.stop) { $0.status = .stopped }
     let startsBefore = calls.value.filter { $0 == .start }.count
     await clock.advance(by: BLEInterface.adapterRetryMax)
     #expect(calls.value.filter { $0 == .start }.count == startsBefore)  // no retry fired
+}
+
+// MARK: - Terminal adapter unavailability (S6)
+
+/// `unauthorized` (Bluetooth permission denied) is TERMINAL: unlike `poweredOff`, no amount of
+/// retrying can resolve it, so the interface must stop the backoff loop, land in a terminal status,
+/// take live peers offline, and SURFACE the cause via `adapterUnavailable` — the signal the app
+/// turns into a "permission denied — open Settings" prompt (A5). Before S6 every `.unavailable`
+/// folded into `waitingForAdapter` and re-probed forever, invisibly.
+@Test @MainActor func unauthorizedIsTerminalStopsRetryingAndSurfaces() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore(streams: 2)
+    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
+    events[0].yield(.unavailable(.unauthorized))
+    await store.receive(.driverEvent(.unavailable(.unauthorized))) {
+        $0.status = .unavailable(.unauthorized)
+        $0.channels = [:]
+        $0.peers = [:]
+        $0.pendingPeers = []
+    }
+    await store.receive(.delegate(.peerOffline(tokenHigh)))
+    await store.receive(.delegate(.adapterUnavailable(.unauthorized)))
+    // Terminal: NO retry is scheduled. Advancing well past the max backoff must not re-start the
+    // driver (the mutation that keeps the old waitingForAdapter+retry path fires a second .start).
+    let startsBefore = calls.value.filter { $0 == .start }.count
+    await clock.advance(by: BLEInterface.adapterRetryMax)
+    #expect(calls.value.filter { $0 == .start }.count == startsBefore, "terminal state must not retry")
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+/// `unsupported` (no BLE LE radio, e.g. a Mac without the hardware) is likewise terminal and
+/// surfaces its own cause.
+@Test @MainActor func unsupportedIsTerminalAndSurfaces() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore()
+    events[0].yield(.unavailable(.unsupported))
+    await store.receive(.driverEvent(.unavailable(.unsupported))) {
+        $0.status = .unavailable(.unsupported)
+    }
+    await store.receive(.delegate(.adapterUnavailable(.unsupported)))
+    let startsBefore = calls.value.filter { $0 == .start }.count
+    await clock.advance(by: BLEInterface.adapterRetryMax)
+    #expect(calls.value.filter { $0 == .start }.count == startsBefore)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+/// A terminal state is not a dead end: a fresh `.start` (the user granted permission and reconnected
+/// / foregrounded) restarts the driver, rather than leaving the interface wedged. `poweredOff`'s
+/// recovery already runs through the retry loop; terminal states have no loop, so `.start` is the
+/// only way back — and it must be honoured.
+@Test @MainActor func startRestartsFromTerminalUnavailable() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(streams: 2)
+    events[0].yield(.unavailable(.unauthorized))
+    await store.receive(.driverEvent(.unavailable(.unauthorized))) {
+        $0.status = .unavailable(.unauthorized)
+    }
+    await store.receive(.delegate(.adapterUnavailable(.unauthorized)))
+    let startsBefore = calls.value.filter { $0 == .start }.count
+    await store.send(.start) { $0.status = .starting }
+    #expect(calls.value.filter { $0 == .start }.count == startsBefore + 1,
+            "start must restart the driver from a terminal state")
+    await store.send(.stop) { $0.status = .stopped }
 }

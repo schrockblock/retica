@@ -58,6 +58,10 @@ public struct BLEEndpoint {
             case peerOnline(Data)
             /// A BLE peer disconnected. BLE-only — observe via `.ble(.delegate(.peerOffline))`.
             case peerOffline(Data)
+            /// The BLE adapter is terminally unavailable (permission denied / no radio). BLE-only —
+            /// observe via `.ble(.delegate(.adapterUnavailable))`. LXMF has no use for it; the app
+            /// consumes it to show a permission-denied prompt (S6 → A5).
+            case adapterUnavailable(BLEAdapterUnavailable)
         }
     }
 

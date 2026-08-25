@@ -28,9 +28,33 @@ public struct BLEDriverConfig: Equatable, Sendable {
     }
 }
 
+/// Why the BLE adapter is unavailable. `isTerminal` separates causes the user (or the device)
+/// cannot resolve by waiting — `unauthorized` (permission denied) and `unsupported` (no BLE LE
+/// radio) — from transient ones (`poweredOff`, or an `other` setup failure) where the interface
+/// keeps waiting and retrying. The `BLEInterface` reducer branches on `isTerminal`; the FCB adapter
+/// maps `CBManagerState` onto these cases. Replaces the earlier free-text `reason: String?`, whose
+/// distinction died in the reducer and never reached the app (punch-list S6).
+public enum BLEAdapterUnavailable: Equatable, Sendable {
+    case poweredOff
+    case unauthorized
+    case unsupported
+    /// A non-state failure (e.g. GATT/L2CAP setup threw). Transient — worth a retry. Carries an
+    /// optional diagnostic string; never a permission signal.
+    case other(String?)
+
+    /// True when retrying cannot help — the interface should stop the backoff loop and surface the
+    /// cause to the user, rather than spinning forever.
+    public var isTerminal: Bool {
+        switch self {
+        case .unauthorized, .unsupported: return true
+        case .poweredOff, .other:         return false
+        }
+    }
+}
+
 public enum BLEDriverEvent: Equatable, Sendable {
     case ready
-    case unavailable(reason: String?)
+    case unavailable(BLEAdapterUnavailable)
     case peerDiscovered(BLEPeerHandle)
     case directoryRead(BLEPeerHandle, version: UInt8, psm: UInt16)
     case directoryFailed(BLEPeerHandle, reason: String?)

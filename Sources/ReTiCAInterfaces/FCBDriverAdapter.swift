@@ -84,7 +84,7 @@ actor FCBDriverAdapter {
         case .poweredOn:
             await bringUpPeripheral()
         case .poweredOff, .unauthorized, .unsupported:
-            fireUnavailable("peripheral \(stateName(state))")
+            fireUnavailable(Self.cause(state))
         default:
             break
         }
@@ -95,7 +95,7 @@ actor FCBDriverAdapter {
         case .poweredOn:
             await bringUpCentral()
         case .poweredOff, .unauthorized, .unsupported:
-            fireUnavailable("central \(stateName(state))")
+            fireUnavailable(Self.cause(state))
         default:
             break
         }
@@ -112,7 +112,7 @@ actor FCBDriverAdapter {
             advertising = true
             checkReady()
         } catch {
-            fireUnavailable("peripheral setup failed: \(error)")
+            fireUnavailable(.other("peripheral setup failed: \(error)"))
         }
     }
 
@@ -131,21 +131,21 @@ actor FCBDriverAdapter {
         continuation?.yield(.ready)
     }
 
-    private func fireUnavailable(_ reason: String) {
+    private func fireUnavailable(_ cause: BLEAdapterUnavailable) {
         guard !announcedUnavailable else { return }
         announcedUnavailable = true
-        continuation?.yield(.unavailable(reason: reason))
+        continuation?.yield(.unavailable(cause))
     }
 
-    private func stateName(_ s: CBManagerState) -> String {
+    /// Maps a `CBManagerState` onto the structured cause. Only the three unavailable states are
+    /// mapped here (the call sites gate on them); anything else falls back to `.other` rather than
+    /// pretending to be a permission or hardware signal.
+    static func cause(_ s: CBManagerState) -> BLEAdapterUnavailable {
         switch s {
-        case .poweredOn: return "poweredOn"
-        case .poweredOff: return "poweredOff"
-        case .unauthorized: return "unauthorized"
-        case .unsupported: return "unsupported"
-        case .resetting: return "resetting"
-        case .unknown: return "unknown"
-        @unknown default: return "unknown"
+        case .poweredOff:   return .poweredOff
+        case .unauthorized: return .unauthorized
+        case .unsupported:  return .unsupported
+        default:            return .other(nil)
         }
     }
 

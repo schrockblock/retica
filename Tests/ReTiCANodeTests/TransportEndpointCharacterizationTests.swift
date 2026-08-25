@@ -502,3 +502,23 @@ private func framedHello(_ token: Data) -> Data {
             "peer lifecycle must add no unified delegate other than the deliberate pathLearned; saw \(unifiedDelegates.value)")
     #expect(!unifiedDelegates.value.isEmpty, "the scan must have observed the sentinel pathLearned")
 }
+
+/// S6 surfacing chain: a terminal `unavailable` from the driver becomes a BLEInterface
+/// `adapterUnavailable` delegate, which the container translates and re-emits on the BLE-only hatch
+/// — `.ble(.delegate(.adapterUnavailable(_)))` — carrying the cause unchanged. This is the seam the
+/// app (A5) consumes; it is deliberately NOT on the unified delegate (LXMF has no use for it),
+/// mirroring peerOnline/peerOffline.
+@Test @MainActor func bleAdapterUnauthorizedSurfacesOnTheBLEHatchUnified() async {
+    let (store, events, _) = makeBLE(tokenForChannel: [:], ownToken: Data(repeating: 0x11, count: 16))
+    await store.send(.start)
+    events.yield(.ready)
+    await store.skipReceivedActions(strict: false)
+
+    events.yield(.unavailable(.unauthorized))
+    await store.receive { action in
+        if case .ble(.delegate(.adapterUnavailable(.unauthorized))) = action { return true }
+        return false
+    }
+    await store.send(.stop)
+    await store.skipReceivedActions(strict: false)
+}

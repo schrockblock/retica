@@ -4,6 +4,17 @@ import ReTiCA
 
 public enum BLEInterfaceStatus: Equatable, Sendable {
     case stopped, starting, online, waitingForAdapter
+    /// Terminal: the adapter is unavailable for a reason retrying cannot fix (permission denied or
+    /// no BLE LE radio). Distinct from `waitingForAdapter` — no backoff loop runs — and reached only
+    /// for `BLEAdapterUnavailable.isTerminal` causes. A fresh `.start` leaves it (the user resolved
+    /// the cause and reconnected). See `BLEInterface`'s `.driverEvent(.unavailable)` handling (S6).
+    case unavailable(BLEAdapterUnavailable)
+
+    /// True while parked in a terminal `unavailable` state — used to let `.start` restart from it.
+    var isUnavailableTerminal: Bool {
+        if case .unavailable = self { return true }
+        return false
+    }
 }
 
 /// The Reticulum BLE interface (RBTP v2, Apple profile). Parent lifecycle + all policy:
@@ -60,6 +71,11 @@ public struct BLEInterface {
             case peerOffline(Data)
             case packetReceived(peer: Data, packet: Data)
             case sendFailed(peer: Data, reason: SendFailedReason)
+            /// The adapter became unavailable for a TERMINAL reason (permission denied / no radio).
+            /// Emitted once when entering the terminal state, so a host can surface it to the user
+            /// instead of the interface silently re-probing forever (S6 → app A5). Transient losses
+            /// (`poweredOff`) do NOT emit this — they stay on the internal retry loop.
+            case adapterUnavailable(BLEAdapterUnavailable)
         }
         public enum SendFailedReason: Equatable {
             /// The packet is empty or exceeds `BLEFraming.maxFrameLength` and cannot
@@ -85,7 +101,10 @@ public struct BLEInterface {
         Reduce { state, action in
             switch action {
             case .start:
-                guard state.status == .stopped else { return .none }
+                // Restartable from `.stopped` AND from a terminal `.unavailable` — the latter is the
+                // only way back from a permission denial once the user grants it and reconnects
+                // (there is no retry loop for terminal states, by design).
+                guard state.status == .stopped || state.status.isUnavailableTerminal else { return .none }
                 state.sessionToken = randomBytes(BLEHello.tokenLength)
                 state.status = .starting
                 return startDriver(state: &state)
@@ -279,7 +298,7 @@ public struct BLEInterface {
                 }
                 return .merge(effects)
 
-            case .driverEvent(.unavailable):
+            case let .driverEvent(.unavailable(cause)):
                 guard state.status != .stopped else { return .none }
                 let established = Array(state.peers.keys)
                 let channelIDs = Array(state.channels.keys)
@@ -287,18 +306,30 @@ public struct BLEInterface {
                 state.channels = [:]
                 state.peers = [:]
                 state.pendingPeers = []
-                state.status = .waitingForAdapter
-                let delay = state.adapterRetryDelay
-                state.adapterRetryDelay = min(delay * 2, Self.adapterRetryMax)
+                // Tear the live session down either way; the only difference between terminal and
+                // transient is what happens NEXT — surface-and-stop, or wait-and-retry.
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.driver)]
                 effects += channelIDs.map { .cancel(id: CancelID.hello($0)) }
                 effects += pending.map { .cancel(id: CancelID.establish($0)) }
                 effects += established.map { .send(.delegate(.peerOffline($0))) }
-                effects.append(.run { [clock] send in
-                    try await clock.sleep(for: delay)
-                    await send(.adapterRetry)
+                if cause.isTerminal {
+                    // Permission denied / no radio: retrying cannot help. Land in the terminal state,
+                    // cancel any in-flight retry, and surface the cause to the host exactly once. A
+                    // later `.start` (user resolved it + reconnected) is the way back.
+                    state.status = .unavailable(cause)
+                    effects.append(.cancel(id: CancelID.retry))
+                    effects.append(.send(.delegate(.adapterUnavailable(cause))))
+                } else {
+                    // Transient (poweredOff / setup failure): keep waiting and retry with backoff.
+                    state.status = .waitingForAdapter
+                    let delay = state.adapterRetryDelay
+                    state.adapterRetryDelay = min(delay * 2, Self.adapterRetryMax)
+                    effects.append(.run { [clock] send in
+                        try await clock.sleep(for: delay)
+                        await send(.adapterRetry)
+                    }
+                    .cancellable(id: CancelID.retry, cancelInFlight: true))
                 }
-                .cancellable(id: CancelID.retry, cancelInFlight: true))
                 return .merge(effects)
 
             case .adapterRetry:
