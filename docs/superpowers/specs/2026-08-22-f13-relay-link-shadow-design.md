@@ -14,6 +14,11 @@ unbounded growth. The fix is behavior-aligned with stock Reticulum 1.4.2.
 
 ## Status / severity context
 
+> **SUPERSEDED (2026-08-25):** relay mode is now enabled by a user toggle in ReTiCaMsgr (app
+> item R1 — `.enableRelay` + `setRecursivePathRequests(true)` behind `relayEnabled`), so F13 is
+> **no longer latent**. The fix here was verified correct and load-bearing under the relay-mode
+> review pass — see the addendum at the end of this document.
+
 F13 is **latent today**: every relay branch is gated on `state.transportIdentity != nil`
 (`Transport.swift:40`, set only via `Transport.setTransportIdentity`, `:318-319`), which is reached
 only through `TCPEndpoint.enableRelay` / `BLEEndpoint.enableRelay` — and nothing in the repo calls
@@ -174,6 +179,7 @@ timing (Transport timer tests require it). Each test mutation-verified per the t
   deliberately match reference (no cap) for wire/behavior fidelity and to avoid evicting legitimate
   transit links under load. Revisit only if a relay deployment needs defense beyond reference.
 - **F13 is latent** until an integrator enables relay mode (see "Status / severity context").
+  **[SUPERSEDED 2026-08-25 — relay is now enabled via app R1; see addendum.]**
 
 ## Out of scope
 
@@ -181,3 +187,37 @@ timing (Transport timer tests require it). Each test mutation-verified per the t
 - A count cap or LRU eviction on `linkTable` (deliberately declined; see Accepted limitations).
 - Any wire-format change or change to `Link.linkID` derivation.
 - The other open backlog items (F11, F19, F7, F9, F10, F16).
+
+## Relay-mode review addendum (2026-08-25)
+
+Relay mode was enabled in ReTiCaMsgr (app item **R1**: an opt-in `relayEnabled` toggle sends
+`.enableRelay(identity)` + `.transport(.setRecursivePathRequests(true))`), so the exposures this
+spec hardened are now **live behind a user toggle** rather than latent behind an integrator
+decision. A review pass was run against HEAD.
+
+**Fix verified correct and complete.** Every element above is present in the code and green:
+Part A guards (`Transport.swift:417`, `:712`), race-safe registration ordered before the LINKREQUEST
+transmit in the same merge (`LinkSession.swift:282,322` initiator; `:351,389` responder), leak-free
+unregister on both link-removal paths (`LinkPlane.swift:351-361`), and the Part B validated/unvalidated
+GC (`Transport.swift:427-430`, `:746-750`). Pinned by 10 tests
+(`reflectedLinkRequestForOurOwnLinkIsNotTabled`, `…RegistersItsLinkID`, `…UnregistersItsLinkID`,
+`relayedLinkRequestCreatesUnvalidatedEntry…`, `maintenanceReapsUnvalidatedByDeadline…`,
+`lrproofValidatesEntryWithoutRefreshing…`, and the genuine-relay contrast) — all passing.
+
+**Memory audit.** Every relay-mode structure is bounded except `linkTable`: `seenPacketHashes`,
+`discoveryPrTags` are RingSets; held announces cap at 256/interface; `announceCache`/`announceBlobs`
+GC on path expiry; `localLinkIDs` is unregister-balanced; `discoveryPathRequests` GC on
+`pathRequestTimeout`. `linkTable` remains **time-bound only, no count cap** — this limitation.
+
+**Mobile angle (new since this spec).** The original "Accepted limitations" weighed a desktop/Pi
+integrator. R1 makes relay a **user toggle on iOS**, where the OS kills memory-hungry backgrounded
+apps — so validated-junk `linkTable` growth is a more acute **memory-DoS of the relay function**, and
+it is now user-reachable. It still requires an **active on-mesh attacker** and only applies with relay
+**explicitly enabled** (off by default).
+
+**Decision: accept as-is, matching reference.** Unvalidated junk is already reaped in
+~establishment-timeout seconds; the exposure is validated-junk only, requires an active attacker, and
+matches stock RNS (no cap). **Revisit trigger:** if relay-on-mobile becomes a real deployment, the
+mobile-specific hardening is a *generous* LRU/count cap on `linkTable` (evict the oldest validated
+entry above a few-thousand limit) — local eviction only, no wire change, triggering only under attack,
+not normal load. This does not reopen F13; the shadow-protection is independent of any cap.
