@@ -10,6 +10,7 @@ enum MockDriverCall: Equatable {
     case openChannel(BLEPeerHandle, UInt16)
     case send(BLEChannelID, Data)
     case closeChannel(BLEChannelID)
+    case disconnect(BLEPeerHandle)
 }
 
 // Deterministic fixtures shared by all reducer tests.
@@ -53,6 +54,7 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
             openChannel: { h, psm in calls.withValue { $0.append(.openChannel(h, psm)) } },
             send: { c, d in calls.withValue { $0.append(.send(c, d)) } },
             closeChannel: { c in calls.withValue { $0.append(.closeChannel(c)) } },
+            disconnect: { h in calls.withValue { $0.append(.disconnect(h)) } },
             stop: { calls.withValue { $0.append(.stop) } }
         )
         $0.continuousClock = clock
@@ -186,6 +188,38 @@ func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int 
     await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 2, psm: 0x0081)))
     #expect(!calls.value.contains(.openChannel(peerHandleA, 0x0081)))
     await store.send(.stop) { $0.status = .stopped }
+}
+
+/// S2: a successful `directoryRead` leaves the GATT connection open (the adapter only disconnects on
+/// FAILURE). On a version-mismatch refusal the reducer must tell the driver to disconnect it, or the
+/// scarce iOS BLE connection leaks for the session. Every v1 Pi hits this constantly.
+@Test @MainActor func versionMismatchDisconnectsThePeer() async {
+    let (store, events, calls, _, _) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.directoryRead(peerHandleA, version: 1, psm: 0x0081))
+    await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 1, psm: 0x0081))) {
+        $0.pendingPeers = []
+    }
+    await store.send(.stop) { $0.status = .stopped }
+    await store.finish()
+    #expect(calls.value.contains(.disconnect(peerHandleA)),
+            "version-mismatch refusal must disconnect the readDirectory GATT connection")
+}
+
+/// S2: when the 15 s establishment deadline abandons a peer, the reducer must disconnect it — the
+/// in-flight `readDirectory` (whose `central.connect` may still be hanging) is otherwise never torn
+/// down, and any GATT connection it opened sits open forever.
+@Test @MainActor func establishDeadlineDisconnectsThePeer() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    await clock.advance(by: BLEInterface.establishTimeout)
+    await store.receive(.establishDeadline(peerHandleA)) { $0.pendingPeers = [] }
+    await store.send(.stop) { $0.status = .stopped }
+    await store.finish()
+    #expect(calls.value.contains(.disconnect(peerHandleA)),
+            "the establishment deadline must disconnect the abandoned peer")
 }
 
 @Test @MainActor func discoveryIsIgnoredAtPeerCap() async {

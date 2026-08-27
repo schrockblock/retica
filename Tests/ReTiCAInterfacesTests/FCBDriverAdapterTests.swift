@@ -256,6 +256,43 @@ func fakeConnection(peerID: UUID, psm: UInt16, inbound: [Data] = [],
     await adapter.stop()
 }
 
+/// S1: a peer the REDUCER drops (greylisted / at peer cap / not yet online) is never a driver
+/// failure, so `forget` never runs and — with a permanent dedup — the peer is never re-offered and
+/// stays unreachable for the whole session. The dedup is instead a COOLDOWN: the same peer is
+/// re-offered once the cooldown elapses, turning discovery into a heartbeat the reducer re-evaluates
+/// (so a greylist expiry / freed cap slot / the startup race all recover on the next beat). This is
+/// the punch-list S1 probe, now a regression test.
+@Test @MainActor func discoveryReOffersSamePeerAfterCooldown() async {
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral, now: { now.value })
+    let events = adapter.start(BLEDriverConfig(version: 2, pairingMode: .open))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    _ = await collect(events, count: 1)   // drain .ready
+
+    let p1 = peer(1)
+    let p2 = peer(7)
+    func disc(_ h: BLEPeerHandle) -> DiscoveredPeripheral {
+        DiscoveredPeripheral(
+            peripheral: Peripheral(id: h.id, name: nil, state: .disconnected),
+            advertisementData: AdvertisementData(serviceUUIDs: [serviceUUID]), rssi: -50)
+    }
+
+    // Within the cooldown a duplicate advertisement is still ignored; p2 is the sentinel that lets
+    // `collect(count: 2)` prove the second p1 was NOT emitted.
+    stubs.scanCont.yield(disc(p1))
+    stubs.scanCont.yield(disc(p1))   // same instant → deduped
+    stubs.scanCont.yield(disc(p2))
+    #expect(await collect(events, count: 2) == [.peerDiscovered(p1), .peerDiscovered(p2)])
+
+    // Once the cooldown elapses, the same peer is re-offered — the heartbeat that fixes S1.
+    now.withValue { $0 = $0.addingTimeInterval(FCBDriverAdapter.discoveryCooldown + 1) }
+    stubs.scanCont.yield(disc(p1))
+    #expect(await collect(events, count: 1) == [.peerDiscovered(p1)])
+    await adapter.stop()
+}
+
 @Test @MainActor func readDirectoryHappyPathEmitsDirectoryRead() async {
     let (adapter, stubs, events) = await onlineAdapter()
     let p = peer(2)
@@ -278,6 +315,19 @@ func fakeConnection(peerID: UUID, psm: UInt16, inbound: [Data] = [],
     // The adapter must have called disconnect on the peer after the failure.
     let disconnected = await stubs.calls.disconnected
     #expect(disconnected.contains(p.id), "adapter must best-effort disconnect on directory failure")
+    await adapter.stop()
+}
+
+/// S2: the `disconnect` verb drops a peer's GATT connection via `central.disconnect`. The reducer
+/// calls it when it abandons a peer with no open channel (version-mismatch refusal / establishment
+/// deadline) — the connection `readDirectory` opened is otherwise never closed. Calling it while a
+/// `readDirectory` connect is still pending also unwinds that connect (it throws), so no task leaks.
+@Test @MainActor func disconnectDropsTheGattConnection() async {
+    let (adapter, stubs, _) = await onlineAdapter()
+    let p = peer(3)
+    await adapter.disconnect(p)
+    #expect(await stubs.calls.disconnected.contains(p.id),
+            "disconnect must drop the peer's GATT connection via central.disconnect")
     await adapter.stop()
 }
 

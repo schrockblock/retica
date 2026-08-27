@@ -72,6 +72,12 @@ public struct BLEDriver: Sendable {
     public var openChannel: @Sendable (BLEPeerHandle, UInt16) async -> Void
     public var send: @Sendable (BLEChannelID, Data) async -> Void
     public var closeChannel: @Sendable (BLEChannelID) async -> Void
+    /// Tear down a peer that has NO open channel: cancel any in-flight directory read/connect and
+    /// drop the GATT connection. The reducer calls this when it abandons a peer without ever opening
+    /// a channel — a version-mismatch refusal or the establishment deadline — which otherwise leaves
+    /// the `readDirectory`-opened GATT connection open forever (iOS's concurrent BLE connections are
+    /// scarce). No-op default so mocks that never exercise it need not supply one (S2).
+    public var disconnect: @Sendable (BLEPeerHandle) async -> Void
     public var stop: @Sendable () async -> Void
 
     public init(
@@ -80,6 +86,7 @@ public struct BLEDriver: Sendable {
         openChannel: @escaping @Sendable (BLEPeerHandle, UInt16) async -> Void,
         send: @escaping @Sendable (BLEChannelID, Data) async -> Void,
         closeChannel: @escaping @Sendable (BLEChannelID) async -> Void,
+        disconnect: @escaping @Sendable (BLEPeerHandle) async -> Void = { _ in },
         stop: @escaping @Sendable () async -> Void
     ) {
         self.start = start
@@ -87,6 +94,7 @@ public struct BLEDriver: Sendable {
         self.openChannel = openChannel
         self.send = send
         self.closeChannel = closeChannel
+        self.disconnect = disconnect
         self.stop = stop
     }
 }
@@ -108,6 +116,7 @@ extension BLEDriver: DependencyKey {
         openChannel: unimplemented("BLEDriver.openChannel"),
         send: unimplemented("BLEDriver.send"),
         closeChannel: unimplemented("BLEDriver.closeChannel"),
+        disconnect: unimplemented("BLEDriver.disconnect"),
         stop: unimplemented("BLEDriver.stop")
     )
 }

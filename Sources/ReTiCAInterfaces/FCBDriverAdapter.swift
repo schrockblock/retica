@@ -25,6 +25,15 @@ func rbtpDirectoryService(version: UInt8, psm: UInt16, pairingMode: BLEPairingMo
 actor FCBDriverAdapter {
     private let central: BluetoothCentralClient
     private let peripheral: BluetoothPeripheralClient
+    /// Injected clock for the discovery cooldown (S1). Defaults to `Date.init`; tests drive it.
+    private let now: @Sendable () -> Date
+
+    /// Re-offer a seen peer after this long. A peer the REDUCER drops (greylisted / at peer cap /
+    /// not yet online) is not a driver failure, so `forget` never runs; without a cooldown the peer
+    /// would never be re-offered and stay unreachable for the session. Discovery becomes a heartbeat
+    /// the reducer re-evaluates, so a greylist expiry / freed cap slot / the startup race all recover
+    /// on the next beat. Aligned to the reducer's minimum greylist backoff so recovery is prompt (S1).
+    static let discoveryCooldown: TimeInterval = 5
 
     private var continuation: AsyncStream<BLEDriverEvent>.Continuation?
     private var config = BLEDriverConfig(version: 2, pairingMode: .open)
@@ -36,14 +45,17 @@ actor FCBDriverAdapter {
     private var announcedUnavailable = false
 
     // Populated in later tasks.
-    private var seenPeers: Set<UUID> = []
+    /// Peer id → time of its last `peerDiscovered` offer. A cooldown, not a permanent set (S1).
+    private var seenPeers: [UUID: Date] = [:]
     private var connections: [BLEChannelID: L2CAPConnection] = [:]
     private var reducerClosed: Set<BLEChannelID> = []
     private var publishedPSM: UInt16?
 
-    init(central: BluetoothCentralClient, peripheral: BluetoothPeripheralClient) {
+    init(central: BluetoothCentralClient, peripheral: BluetoothPeripheralClient,
+         now: @escaping @Sendable () -> Date = { Date() }) {
         self.central = central
         self.peripheral = peripheral
+        self.now = now
     }
 
     nonisolated func start(_ config: BLEDriverConfig) -> AsyncStream<BLEDriverEvent> {
@@ -58,7 +70,7 @@ actor FCBDriverAdapter {
         self.continuation = continuation
         self.announcedReady = false
         self.announcedUnavailable = false
-        self.seenPeers = []
+        self.seenPeers = [:]
 
         // Peripheral role: on poweredOn → publish L2CAP → add directory → advertise.
         tasks.append(Task { [peripheral] in
@@ -193,12 +205,16 @@ actor FCBDriverAdapter {
 
     private func handleDiscovered(_ discovered: DiscoveredPeripheral) async {
         let id = discovered.peripheral.id
-        guard !seenPeers.contains(id) else { return }
-        seenPeers.insert(id)
+        let t = now()
+        // Cooldown, not a permanent dedup: suppress re-offers within the window, re-offer after it.
+        if let last = seenPeers[id], t.timeIntervalSince(last) < Self.discoveryCooldown { return }
+        seenPeers[id] = t
         continuation?.yield(.peerDiscovered(BLEPeerHandle(id: id)))
     }
 
-    private func forget(_ id: UUID) { seenPeers.remove(id) }
+    /// Drop the cooldown entry so the very next advertisement re-offers the peer immediately — used on
+    /// genuine failures/disconnects where waiting out the cooldown would needlessly delay recovery.
+    private func forget(_ id: UUID) { seenPeers[id] = nil }
 
     /// Wraps a live L2CAPConnection: mints a channel ID, emits channelOpened,
     /// and pumps incoming() → channelData, with channelClosed on stream end
@@ -226,6 +242,14 @@ actor FCBDriverAdapter {
         if !reducerInitiated {
             continuation?.yield(.channelClosed(id, reason: nil))
         }
+    }
+
+    /// Tear down a peer with no open channel (S2): disconnect the GATT link. `central.disconnect` on
+    /// a peer whose `readDirectory` is still awaiting `central.connect` unwinds that connect (it
+    /// throws), so the in-flight task does not leak. Re-offer is left to the discovery cooldown (S1)
+    /// rather than an immediate `forget`, so a version-mismatch refusal does not churn the radio.
+    func disconnect(_ peer: BLEPeerHandle) async {
+        try? await central.disconnect(peer.id)
     }
 
     func readDirectory(_ peer: BLEPeerHandle) async {
@@ -306,6 +330,7 @@ extension BLEDriver {
             openChannel: { peer, psm in await adapter.openChannel(peer, psm: psm) },
             send: { channel, data in await adapter.send(channel, data: data) },
             closeChannel: { channel in await adapter.closeChannel(channel) },
+            disconnect: { peer in await adapter.disconnect(peer) },
             stop: { await adapter.stop() }
         )
     }

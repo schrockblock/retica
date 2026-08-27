@@ -156,7 +156,11 @@ public struct BLEInterface {
                 guard version == Self.protocolVersion else {
                     state.pendingPeers.remove(handle)
                     state.greylist.recordFailure(handle, now: date())
-                    return .cancel(id: CancelID.establish(handle))
+                    // readDirectory left the GATT connection open; refusing here would leak it (S2).
+                    return .merge(
+                        .cancel(id: CancelID.establish(handle)),
+                        .run { [bleDriver] _ in await bleDriver.disconnect(handle) }
+                    )
                 }
                 return .run { [bleDriver] _ in await bleDriver.openChannel(handle, psm) }
 
@@ -171,7 +175,9 @@ public struct BLEInterface {
                 guard state.pendingPeers.contains(handle) else { return .none }
                 state.pendingPeers.remove(handle)
                 state.greylist.recordFailure(handle, now: date())
-                return .none
+                // Tear down the abandoned peer: cancel a still-hanging connect / drop any GATT
+                // connection readDirectory opened, which nothing else closes (S2).
+                return .run { [bleDriver] _ in await bleDriver.disconnect(handle) }
 
             case let .driverEvent(.channelOpened(channelID, handle, direction)):
                 var effects: [Effect<Action>] = []
