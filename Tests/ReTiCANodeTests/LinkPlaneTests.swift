@@ -1476,7 +1476,8 @@ private func advertisementPacket(linkID: Data, sessionKey: Data, resourceHash: D
 /// stays alive (its inactivity timer keeps getting reset by inbound traffic), so the ONLY thing that
 /// can remove a stalled transfer is the transfer's own receiver watchdog — NOT link teardown.
 ///
-/// The distinction matters. The link's inactivity timer (`staleTime = keepaliveInterval*2 = 60s`)
+/// The distinction matters. The link's inactivity timer (`staleTime` = 60s at rtt≈0, where the
+/// configured 30s floor wins over the RTT-derived 5s keepalive cadence)
 /// fires BEFORE the receiver watchdog's full 16-retry budget (~72.25s at rtt≈0: the initial arm
 /// plus arms for retriesLeft 15…0 sum to Σ_{k=0}^{16}(0.25 + 0.5k) = 17·0.25 + 0.5·136 = 72.25s).
 /// So a single large clock advance tears the whole link down and would let a broken transfer-removal

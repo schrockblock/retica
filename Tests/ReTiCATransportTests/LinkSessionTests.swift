@@ -634,12 +634,22 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 }
 
 @Test @MainActor func establishmentTimerIsCancelledOnceActive() async {
-    // Reach .active, then advance past establishmentTimeout (< keepaliveInterval < staleTime) —
-    // nothing fires because the establishment timer was cancelled at .active.
+    // Reach .active, then advance past establishmentTimeout — the establishment timer was
+    // cancelled at .active, so no establishment deadline fires. The keepalive loop runs at the
+    // RTT-derived cadence (5 s for this store's measured rtt of 0), which is now SHORTER than
+    // establishmentTimeout, so its ticks are drained below: they prove the link is alive, and
+    // draining them is what makes "no establishment deadline" observable rather than merely
+    // skipped by non-exhaustive receiving.
     let clock = TestClock()
     let store = await activeInitiatorStore(owner: Identity(), clock: clock)
     #expect(store.state.status == .active)
+    let cadence = store.state.effectiveKeepalive
+    #expect(cadence < store.state.establishmentTimeout)
     await clock.advance(by: .seconds(store.state.establishmentTimeout))
+    for _ in 0..<Int(store.state.establishmentTimeout / cadence) {
+        await store.receive(.keepaliveDeadline)
+        _ = await captureTransmit(store)
+    }
     #expect(store.state.status == .active)
     // Clean up the running inactivity/keepalive timers.
     await store.send(.close); _ = await captureTransmit(store)
@@ -651,7 +661,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     let clock = TestClock()
     let store = await activeResponderStore(clock: clock)
     #expect(store.state.status == .active)
-    await clock.advance(by: .seconds(store.state.keepaliveInterval * 2))
+    await clock.advance(by: .seconds(store.state.staleTime))
     await store.receive(.inactivityDeadline)
     let close = await captureTransmit(store)                 // LINKCLOSE teardown
     await store.receive(.delegate(.closed(.timedOut)))
@@ -716,7 +726,8 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     // `cancelAll()` in LinkSession.swift). Only repetition proves the loop survives its own output.
     let clock = TestClock()
     let store = await activeInitiatorStore(owner: Identity(), clock: clock)   // arms the keepalive loop
-    let interval = store.state.keepaliveInterval
+    // The cadence the loop was actually armed with — RTT-derived, not the configured interval.
+    let interval = store.state.effectiveKeepalive
     let linkID = store.state.linkID
 
     for _ in 0..<3 {
@@ -727,9 +738,9 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
         #expect(packet.context == .keepalive)
         #expect(packet.payload == Data([0xFF]))                    // unencrypted sentinel
         #expect(packet.destinationHash == linkID)
-        // A live peer answers 0xFE (RNS/Link.py:1125). Feeding it back is what keeps the
-        // INITIATOR's own inactivity timer (staleTime = 2 × interval) from tearing the link down
-        // at t=60, mid-test: an outbound keepalive is not proof of life, only the reply is.
+        // A live peer answers 0xFE (RNS/Link.py:1125). Feeding the reply back exercises the
+        // inbound path that resets the INITIATOR's own inactivity timer: an outbound keepalive
+        // is not proof of life, only the reply is.
         let pong = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                           destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
                           destinationHash: linkID, transportId: nil, payload: Data([0xFE]))
@@ -740,6 +751,64 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     // Clean up (cancels the keepalive + inactivity timers).
     await store.send(.close); _ = await captureTransmit(store)
     await store.receive(.delegate(.closed(.initiatorClosed)))
+}
+
+/// Reference RNS derives a link's keepalive cadence from its measured RTT, clamped to a 5 s
+/// floor, and calls a link stale after twice that (RNS/Link.py:92-99, 795-797) — so **10 s is
+/// the tightest stale window any conforming peer can have**, and only the initiator transmits
+/// keepalives. An initiator whose first keepalive lands after that window never gets one in at
+/// all: the peer tears the link down, both sides reconnect, and the link flaps forever. Observed
+/// against a real RNS 1.5.2 sidecar as a link dropping every ~20 s while TCP stayed up.
+@Test @MainActor func initiatorKeepaliveLandsInsideAnRNSPeerStaleWindow() async {
+    let clock = TestClock()
+    // This store measured its RTT locally during the handshake under a constant clock, so
+    // `rtt` is 0 — the same clamp-to-the-floor case a real fast link produces.
+    let store = await activeInitiatorStore(owner: Identity(), clock: clock)
+    #expect(store.state.rtt == 0)
+
+    // Advance to just inside the tightest window a conforming peer can have. The first
+    // keepalive must already be on the wire by then.
+    await clock.advance(by: .seconds(9))
+    await store.receive(.keepaliveDeadline)
+    let ka = await captureTransmit(store)
+    #expect(Packet(raw: ka)!.context == .keepalive)
+    #expect(Packet(raw: ka)!.payload == Data([0xFF]))
+    #expect(store.state.status == .active)
+
+    await store.send(.close); _ = await captureTransmit(store)
+    await store.receive(.delegate(.closed(.initiatorClosed)))
+}
+
+/// The other half of the derivation. Coupling `staleTime` to the configured interval alone would
+/// let a slow link reap itself between two of its own keepalives; coupling it to the derived
+/// cadence alone would drop the 60 s tolerance fast links have always had. Both halves are
+/// load-bearing, and neither is observable from a store driven at rtt 0.
+@Test @MainActor func keepaliveCadenceAndStaleTimeFollowMeasuredRTT() {
+    func state(rtt: Double?) -> LinkSession.State {
+        var s = LinkSession.State(initiatorTo: Identity(publicKey: Identity().publicKey)!,
+                                  destinationHash: Data(repeating: 0x55, count: 16),
+                                  interfaceID: InterfaceID("i"))
+        s.rtt = rtt
+        return s
+    }
+
+    // Before the handshake measures anything: the configured interval, exactly as before.
+    #expect(state(rtt: nil).effectiveKeepalive == 30)
+    #expect(state(rtt: nil).staleTime == 60)
+
+    // A fast link clamps to RNS's 5 s floor, so its first keepalive lands inside the 10 s stale
+    // window any conforming peer derives from the same RTT — while tolerance keeps its 60 s floor.
+    #expect(state(rtt: 0).effectiveKeepalive == LinkSession.keepaliveMin)
+    #expect(state(rtt: 0).staleTime == 60)
+
+    // A slow link scales the cadence with RTT, and scales tolerance with it so the link is never
+    // reaped between two of its own keepalives.
+    let slow = state(rtt: 1.0)
+    #expect(slow.effectiveKeepalive == LinkSession.keepaliveMaxRTTRatio)
+    #expect(slow.staleTime == slow.effectiveKeepalive * 2)
+
+    // And the cadence is clamped at the ceiling however large RTT gets.
+    #expect(state(rtt: 100).effectiveKeepalive == LinkSession.keepaliveMax)
 }
 
 @Test @MainActor func responderRepliesToKeepaliveWith0xFE() async {
@@ -787,7 +856,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     #expect(initiator.state.status == .active)
 
     // One keepalive fires → 0xFF emitted; initiator stays .active.
-    await initiatorClock.advance(by: .seconds(initiator.state.keepaliveInterval))
+    await initiatorClock.advance(by: .seconds(initiator.state.effectiveKeepalive))
     let ping = await captureTransmit(initiator)
     let pingPacket = Packet(raw: ping)!
     #expect(pingPacket.context == .keepalive)
@@ -802,7 +871,8 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
     // Two synthetic 0xFF deliveries to the responder:
     //   • Each resets its inactivity timer (via the .keepalive case in the reducer).
     //   • Responder replies 0xFE, proving the reset happened.
-    //   • `staleTime` = keepaliveInterval × 2 = 60s; a ping every 30s keeps it from expiring.
+    //   • `staleTime` is 60 s here — the configured floor wins, because this link's derived
+    //     5 s cadence is shorter — so a ping every 5 s keeps it from expiring.
     for _ in 0..<2 {
         let syntheticPing = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                                    destinationType: .link, context: .keepalive, contextFlag: false,
@@ -822,7 +892,7 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 
     // Advance responder's clock past staleTime — no new pings → inactivity deadline fires
     // → LINKCLOSE emitted → .closed(.timedOut).
-    await responderClock.advance(by: .seconds(responder.state.keepaliveInterval * 2))
+    await responderClock.advance(by: .seconds(responder.state.staleTime))
     await responder.receive(.inactivityDeadline)
     _ = await captureTransmit(responder)
     await responder.receive(.delegate(.closed(.timedOut)))
@@ -837,8 +907,9 @@ private func linkPacket(context: PacketContext, payload: Data) -> Data {
 //
 // This probes the timer directly and therefore BITES both halves of the claim. A RESPONDER is
 // used deliberately: it arms no keepalive loop of its own, so the inactivity timer is the only
-// thing consuming the clock and every observation is unambiguous. `keepaliveInterval` is 30 s so
-// `staleTime` is 60 s, and every advance below is derived from that and nothing else:
+// thing consuming the clock and every observation is unambiguous. `staleTime` is 60 s — the
+// configured 30 s floor wins over this link's RTT-derived 5 s cadence — and every advance below
+// is derived from that and nothing else:
 //
 //   t=59  (staleTime - 1)  DATA #1, comfortably inside the original t=60 deadline → re-arm to 119.
 //   t=61  (+2)             past the ORIGINAL deadline. DATA #2 is sent here under EXHAUSTIVE

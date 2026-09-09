@@ -29,6 +29,13 @@ public struct LinkSession {
 
     static let keepaliveByte: UInt8 = 0xFF
     static let keepaliveReplyByte: UInt8 = 0xFE
+    /// Reference RNS's keepalive derivation (RNS/Link.py:83-94, 795-797): the cadence scales
+    /// with measured RTT and is clamped into this range. Both ends of a link derive the SAME
+    /// cadence, because the initiator ships its measured RTT to the responder in the LRRTT
+    /// packet — which is why a link's keepalives always fit inside its peer's stale window.
+    static let keepaliveMaxRTTRatio = 360.0 / 1.75   // KEEPALIVE_MAX / KEEPALIVE_MAX_RTT
+    static let keepaliveMin: TimeInterval = 5        // KEEPALIVE_MIN
+    static let keepaliveMax: TimeInterval = 360      // KEEPALIVE_MAX
     static let resourceSDU = 464
     static let requestMDU = 431
     public static let maxEfficientSize = 1_048_575
@@ -84,8 +91,25 @@ public struct LinkSession {
         public var incomingSegments: [Data: SegmentAccumulator] = [:]   // keyed by originalHash
         public var pendingDataReceipts: [Data: Data] = [:]              // sentPacketHash(32) → caller token
         public var establishmentTimeout: TimeInterval
+        /// The configured keepalive cadence, and the fallback until RTT is measured. Every
+        /// arming site runs after the handshake sets `rtt`, so in practice this is the floor of
+        /// `staleTime` below rather than the cadence — see `effectiveKeepalive` for why using it
+        /// as the cadence breaks RNS interop.
         public var keepaliveInterval: TimeInterval
-        var staleTime: TimeInterval { keepaliveInterval * 2 }
+        /// The cadence this link actually keeps alive: RNS's RTT-derived value once the
+        /// handshake has measured one. A fixed 30 s cannot interoperate, because RNS clamps its
+        /// own derivation to a 5 s floor on a fast link and reaps a link silent for twice that —
+        /// so a peer's tightest stale window is 10 s, and a 30 s keepalive never arrives in time.
+        var effectiveKeepalive: TimeInterval {
+            guard let rtt else { return keepaliveInterval }
+            return min(max(rtt * LinkSession.keepaliveMaxRTTRatio, LinkSession.keepaliveMin),
+                       LinkSession.keepaliveMax)
+        }
+        /// How long this link tolerates INBOUND silence. Never shorter than the configured
+        /// window, and never shorter than two of its own keepalives — the coupling RNS relies on
+        /// so that a link still being kept alive is never reaped by its own watchdog, including
+        /// on a slow link where the derived cadence is far longer than 30 s.
+        var staleTime: TimeInterval { max(keepaliveInterval, effectiveKeepalive) * 2 }
         public var relayNextHop: Data? = nil
         /// Initiator: link to a known destination identity.
         public init(id: UUID = UUID(), initiatorTo destinationIdentity: Identity, destinationHash: Data,
@@ -466,7 +490,7 @@ public struct LinkSession {
                     let established = Action.delegate(.established(linkID: state.linkID, sessionKey: key))
                     let extra = Effect<Action>.merge(.cancel(id: CancelID.establishment),
                                                      inactivityTimer(state.staleTime),
-                                                     keepaliveTimer(state.keepaliveInterval))
+                                                     keepaliveTimer(state.effectiveKeepalive))
                     guard let raw = linkPacket(state.linkID, .linkRequestRTT, cipher) else {
                         return .merge(.send(established), extra)
                     }
