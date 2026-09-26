@@ -115,7 +115,7 @@ func makeStubs() -> AdapterStubs {
         stopAdvertising: { await calls.stopAdvertising() },
         isAdvertising: { true },
         respond: { _, _ in },
-        updateValue: { _, _, _ in },
+        updateValue: { _, _, _ in true },
         publishL2CAPChannel: { e in await calls.publish(e); return publishPSM.value },
         unpublishL2CAPChannel: { psm in await calls.unpublish(psm) },
         l2capConnections: { inbound.stream },
