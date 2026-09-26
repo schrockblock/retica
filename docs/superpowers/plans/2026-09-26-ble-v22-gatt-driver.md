@@ -3146,7 +3146,7 @@ Run: `swift test --filter FCBDriverAdapterTests` — expected: compile errors (`
 
 - [ ] **Step 3: Implement the peripheral role**
 
-In `FCBDriverAdapter.swift` add state after `reducerClosed`:
+In `FCBDriverAdapter.swift` add state after the central-role maps (`outboundByPeer`, `pumps`, `sendQueues`, `draining`; there is no `reducerClosed` — Task 6's fix round removed it):
 
 ```swift
     // Peripheral role: inbound channels (one per subscribed central). Their send FIFOs are the
@@ -3256,13 +3256,12 @@ Replace the five hooks with:
         guard let central = inbound.removeValue(forKey: channel) else { return }
         inboundByCentral[central.id] = nil
         sendQueues[channel] = nil
-        if reducerClosed.remove(channel) == nil {
-            continuation?.yield(.channelClosed(channel, reason: reason))
-        }
+        // A reducer-initiated close removed the mapping in `closeInbound`, so it never reaches here.
+        continuation?.yield(.channelClosed(channel, reason: reason))
     }
 ```
 
-`closeInbound` marks the channel reducer-closed so a later `unsubscribed` for that central emits nothing; `handleSubscription`'s unsubscribed branch finds no mapping and returns, which already satisfies that. Remove the `reducerClosed.insert(channel)` line from `closeInbound` if the compiler warns it is never read for inbound ids — it is not needed because the mapping is gone.
+`closeInbound` removes the channel's mapping, so a later `unsubscribed` for that central finds nothing and emits no `channelClosed` echo — the same echo-suppression rule Task 6's fix round settled on for outbound channels (no `reducerClosed` set).
 
 - [ ] **Step 4: Run to verify pass**
 
