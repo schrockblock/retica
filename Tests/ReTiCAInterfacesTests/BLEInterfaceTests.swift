@@ -219,6 +219,21 @@ func establishInbound(
     await store.send(.stop) { $0.status = .stopped }
 }
 
+@Test @MainActor func establishDeadlineForPeerEstablishedInboundClearsPendingWithoutStrikeOrDisconnect() async {
+    let (store, events, calls, clock, now) = await makeOnlineStore(keepalive: nil)
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA))) { $0.pendingPeers = [peerHandleA] }
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    #expect(store.state.pendingPeers == [peerHandleA])            // inbound open leaves the dial alive
+    await clock.advance(by: BLEInterface.establishTimeout)
+    await store.receive(.establishDeadline(peerHandleA)) { $0.pendingPeers = [] }
+    await store.finish()
+    #expect(!calls.value.contains(.disconnect(peerHandleA)), "must not touch the live inbound link")
+    #expect(!store.state.greylist.isBlocked(peerHandleA, now: now.value), "must not strike")
+    #expect(store.state.peers[identityHigh] == channel1)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
 @Test @MainActor func discoveryIsIgnoredAtPeerCap() async {
     let (store, events, calls, _, _) = await makeOnlineStore(maxPeers: 1)
     events[0].yield(.peerDiscovered(peerHandleA))
@@ -331,6 +346,7 @@ func establishInbound(
     await store.receive(.delegate(.peerOnline(identityHigh)))
     events[0].yield(.identityFailed(peerHandleA, reason: "late failure"))
     await store.receive(.driverEvent(.identityFailed(peerHandleA, reason: "late failure"))) { $0.pendingPeers = [] }
+    #expect(!store.state.greylist.isBlocked(peerHandleA, now: now.value), "late failure for an established peer must not strike")
     now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime + 1))
     events[0].yield(.channelClosed(channel1, reason: nil))
     await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
@@ -579,6 +595,7 @@ func establishInbound(
     #expect(calls.value.contains(.closeChannel(channel1)))
     #expect(!calls.value.contains(.closeChannel(channel2)))
     #expect(store.state.peers[identityLow] == channel2)
+    #expect(store.state.channels.count == 1)
     await store.send(.send(peer: identityLow, packet: Data([0x0E])))
     await store.finish()
     #expect(calls.value.contains(.send(channel2, frags(Data([0x0E])))))
@@ -605,14 +622,16 @@ func establishInbound(
             reassembler: BLEReassembler(), peerIdentity: identityHigh, openedAt: Date(timeIntervalSince1970: 1_000))
         $0.peers[identityHigh] = channel1
     }
+    // Still exhaustive: a send emits no actions, so any queued peerOffline/peerOnline from the
+    // swap would be reported as unhandled here.
+    await store.send(.send(peer: identityHigh, packet: Data([0x0D])))
     store.exhaustivity = .off
     await store.finish()
     #expect(calls.value.contains(.closeChannel(channel2)))
     #expect(!calls.value.contains(.closeChannel(channel1)))
     #expect(store.state.peers[identityHigh] == channel1)
-    await store.send(.send(peer: identityHigh, packet: Data([0x0F])))
-    await store.finish()
-    #expect(calls.value.contains(.send(channel1, frags(Data([0x0F])))))
+    #expect(store.state.channels.count == 1)
+    #expect(calls.value.contains(.send(channel1, frags(Data([0x0D])))))
     await store.send(.stop) { $0.status = .stopped }
 }
 
