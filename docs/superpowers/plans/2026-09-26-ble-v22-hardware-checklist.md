@@ -49,11 +49,12 @@ Record MTU, throughput and latency here for the spec's §2.8 bitrate revision.
 ## Added after the whole-branch review
 - [ ] Packet sizes where length mod (mtu − 5) = 11 (e.g. 188 B at MTU 182) reach the Pi intact:
       no 16-byte fragment on the wire, and no `consuming as handshake` warning in the Pi log.
-- [ ] A resource-transfer burst (> 391 B message) does not lose fragments. **BLOCKER until the
-      FCB write-without-response backpressure lands** (spec §3.4 known limit (c)).
+- [ ] A resource-transfer burst (> 391 B message) does not lose fragments (the outbound drain
+      parks on `canSendWriteWithoutResponse`, spec §3.4).
 - [ ] Bluetooth toggled off and on while `waitingForAdapter` recovers with exactly one service
       and one advertisement (no duplicate service, no alreadyAdvertising retry loop).
-- [ ] Disconnect mid-`openChannel` on live hardware recovers within the 15 s establish deadline.
+- [ ] Disconnect mid-`openChannel` on live hardware fails within a second (FCB fails pending
+      operations).
 - [ ] Two centrals subscribed to one Pi: the Pi's notifications are broadcast to all
       subscribers, so foreign fragments enter our reassembler. Confirm our packets still
       reassemble and nothing wedges.

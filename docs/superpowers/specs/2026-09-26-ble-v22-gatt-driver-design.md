@@ -330,6 +330,12 @@ Peripheral role, on `poweredOn`:
   writeWithoutResponse), Identity (read, static value = `localIdentity`). All `.readable` /
   `.writeable` permissions (no encryption).
 - `startAdvertising([serviceUUID])`.
+- The bring-up is epoch-guarded: it captures the session epoch on entry and re-checks it after
+  each await (`stopAdvertising`, `removeAll`, `add`, `startAdvertising`), setting `advertising`
+  and announcing `ready` only when the check passes. `begin` likewise captures the epoch its
+  own `resetSession` will produce and, if another bump lands while that reset is suspended
+  (a `stop()` mid-`begin`), finishes the new stream instead of coming up. A `stop()` during
+  bring-up therefore never publishes, advertises or emits `ready` for the session it ended.
 - `subscriptions()` stream: `.subscribed(central, TX)` → mint `BLEChannelID`, record
   `central.id → channelID`, emit `channelOpened(.inbound, mtu: central.maximumUpdateValueLength)`.
   `.unsubscribed` → `channelClosed`.
@@ -366,8 +372,22 @@ Central role:
   → `channelData`; stream end or `didDisconnect` → `channelClosed`; the pump task is
   cancelled on every close. Every await in `readIdentity`/`openChannel` re-checks a session
   epoch that `stop()`/restart bumps, so a stale operation never emits into the next session.
-- `send` on an outbound channel: `writeValue(data, h, RX, .withoutResponse)`. Throw →
-  `channelClosed(reason:)` (the connection is gone).
+- `send` on an outbound channel: fragments join the channel's FIFO in `sendQueues` (shared
+  with the notify path: cap 256, one drain loop per channel). Each drain step asks
+  `canSendWriteWithoutResponse(h)`; `true` → `writeValue(data, h, RX, .withoutResponse)` and
+  dequeue. `false` parks the peer (the fragment stays queued) until
+  `CentralEvent.isReadyToSendWriteWithoutResponse(h)`, which unparks it and resumes the drain.
+  Each ready event also bumps a per-peer generation counter, so a check that sees a ready land
+  while it is still in flight re-checks instead of parking forever (the same scheme as the
+  notify path). `didDisconnect` and every session reset clear the park and the counter. Write
+  throw → `channelClosed(reason:)` (the connection is gone); overflow → `channelClosed(reason:
+  "send backlog")`.
+- A disconnect in the middle of `readIdentity` or `openChannel` fails the operation promptly
+  (`identityFailed` / `channelFailed`), not at the reducer's 15 s establish deadline: FCB fails
+  every pending connect / discover / read / write / setNotify continuation with
+  `BluetoothError.disconnected` and ends the peripheral's notification streams when it
+  disconnects, so no adapter task stays suspended. Overlapping `disconnect` calls for one
+  peripheral all resolve.
 - `closeChannel`: outbound → cancel the pump, clear the maps, `disconnect(h)`; every
   adapter-initiated outbound close (write failure, overflow, stream end) also disconnects,
   while the `didDisconnect` path does not (the link is already down). Inbound → there is no
@@ -375,24 +395,6 @@ Central role:
   the reducer (it still answers writes with `.success`, as CoreBluetooth requires) and lets the
   peer's own timers end the link. `disconnect(h)`, `stop`, discovery cooldown (S1), `forget`:
   unchanged.
-
-**Known limits until the FCB follow-up.** The adapter is only as robust as the live FCB
-client underneath it, which today has three gaps:
-
-- (a) Live FCB does not fail pending connect / discover / read / write / setNotify
-  continuations, nor finish notification streams, on `didDisconnect`. A disconnect in the
-  middle of `readIdentity` or `openChannel` therefore recovers only through the reducer's 15 s
-  establish deadline, and the suspended adapter task leaks.
-- (b) FCB's `disconnect` overwrites a pending disconnect continuation, so two overlapping
-  disconnects of the same peripheral strand the first caller.
-- (c) Write-without-response has no backpressure: `canSendWriteWithoutResponse` and its
-  `peripheralIsReady(toSendWriteWithoutResponse:)` event are not exposed, so the outbound
-  (central-role) drain writes blindly and a resource-transfer burst can drop fragments.
-
-Follow-up: an FCB branch that fails every pending continuation (and finishes notification
-streams) on disconnect, never overwrites `pendingDisconnect`, and exposes write-without-response
-readiness so the outbound drain parks on it the way the notify path parks on
-`isReadyToUpdateSubscribers`.
 
 Removed: L2CAP publish/open/unpublish, `L2CAPConnection` pump, `rbtpDirectoryService`, all
 RBTP UUIDs.
