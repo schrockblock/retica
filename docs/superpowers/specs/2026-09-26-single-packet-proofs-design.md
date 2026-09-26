@@ -175,8 +175,11 @@ feature and honest delivery statuses are a separate project that builds on this 
   project.
 - **ReTiCaMsgr:** a minimal compile fix in the app repo, in the same project. It updates the
   `messageReceived` pattern match in `AppFeature.swift` and every test that builds that action, adding
-  `method:` and ignoring it. No behaviour change: the app keeps ignoring `deliveryConfirmed` until the
-  follow-up Info project.
+  `method:` and ignoring it. Correction at final review: the app cannot keep ignoring
+  `deliveryConfirmed`. With proofs, a proving peer yields `deliveryConfirmed` and no later
+  `deliveryFailed`, so an ignored confirmation would leave the row "sending" forever. The app branch
+  therefore maps `deliveryConfirmed` to a new "delivered" status, which a later `propagationAccepted`
+  or `deliveryFailed` never overwrites. Richer delivery info stays with the follow-up Info project.
 - **Wire compatibility:**
   - Reference peers already send implicit proofs and accept both forms, so our implicit proofs are
     accepted.
@@ -266,8 +269,17 @@ where they conflict.
    - Accepted gap, logged for a follow-up: a delivery copy still in its stamp search isn't counted
      as outstanding. So if the propagated copy fails first, `deliveryFailed` can fire for a message
      whose delivery copy still goes out.
+   - Accepted gap, logged for a follow-up (found at final review): while the propagated copy is in
+     `LXMFNode`'s propagation-node stamp search (`LXMFNode.swift:484-495`), it has not been handed to
+     the router yet, so `isOutstanding` doesn't count it. If the delivery copy runs out of attempts
+     first, `deliveryFailed` can fire before the propagated copy is armed, and a second time if the
+     propagated copy later fails too. This affects every user with a propagation node configured,
+     not only peers with a stamp cost. It predates this work. The proper fix is a "propagated copy
+     pending" marker, set when the stamp search starts and honoured by `isOutstanding`.
 
-   Both of the gaps above affect only peers with a delivery stamp cost, or cancellation.
+   The cancellation gap and the delivery-stamp-search gap affect only peers with a delivery stamp
+   cost, or cancellation. The propagated-stamp-search gap does not: it affects every user with a
+   propagation node.
 4. **Chosen constants:** `receiptTimeoutBase = 6` s and `receiptTimeoutPerHop = 6` s (reference
    `DEFAULT_PER_HOP_TIMEOUT`), and `maxPendingReceipts = 1024` (reference `MAX_RECEIPTS`).
 5. **The app compile fix is larger than stated.** Besides the `messageReceived` pattern, it also
