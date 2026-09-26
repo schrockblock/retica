@@ -20,10 +20,14 @@ func bleV22Service(localIdentity: Data) -> MutableService {
 enum FCBAdapterError: Error, CustomStringConvertible {
     case missingCharacteristic(String)
     case shortIdentity(Int)
+    /// The session ended (stop()/restart, or the peer disconnected) while an operation was
+    /// in flight; the operation aborts silently instead of reporting a false failure.
+    case sessionEnded
     var description: String {
         switch self {
         case let .missingCharacteristic(name): return "peer lacks \(name) characteristic"
         case let .shortIdentity(n): return "identity read returned \(n) bytes"
+        case .sessionEnded: return "session ended"
         }
     }
 }
@@ -42,6 +46,11 @@ actor FCBDriverAdapter {
     private var config = BLEDriverConfig(localIdentity: Data(repeating: 0, count: BLEProtocol.identityLength))
     private var tasks: [Task<Void, Never>] = []
 
+    /// Bumped at the start of every resetSession (stop()/restart). Operations capture it on entry
+    /// and check it after every suspension point; a mismatch means "this session is gone" and the
+    /// operation aborts silently (no event into whatever session is now live).
+    private var epoch = 0
+
     private var advertising = false
     private var scanning = false
     private var announcedReady = false
@@ -51,7 +60,11 @@ actor FCBDriverAdapter {
     // Central role: outbound channels.
     private var outbound: [BLEChannelID: UUID] = [:]      // channel → peripheral id
     private var outboundByPeer: [UUID: BLEChannelID] = [:]
-    private var reducerClosed: Set<BLEChannelID> = []
+    // Notification pumps, one per open outbound channel, so closes can cancel them.
+    private var pumps: [BLEChannelID: Task<Void, Never>] = [:]
+    // openChannel bookkeeping: peers mid-handshake, and ones that disconnected during that window.
+    private var pendingOpens: Set<UUID> = []
+    private var abortedOpens: Set<UUID> = []
     // Per-channel send FIFOs (both roles) and the set of channels a drain loop is emptying.
     static let sendQueueCap = 256
     private var sendQueues: [BLEChannelID: [Data]] = [:]
@@ -148,14 +161,16 @@ actor FCBDriverAdapter {
     }
 
     private func resetSession() async {
+        epoch += 1   // first: invalidate any operation still in flight from the outgoing session
         for t in tasks { t.cancel() }
         tasks = []
+        for pump in pumps.values { pump.cancel() }
+        pumps = [:]
         advertising = false
         scanning = false
         for peerID in outbound.values { try? await central.disconnect(peerID) }
         outbound = [:]
         outboundByPeer = [:]
-        reducerClosed = []
         sendQueues = [:]
         draining = []
         resetPeripheralSession()
@@ -167,14 +182,15 @@ actor FCBDriverAdapter {
 
     private func subscribeCentralEvents() {
         tasks.append(Task { [central] in
-            for await event in central.events() { self.handleCentralEvent(event) }
+            for await event in central.events() { await self.handleCentralEvent(event) }
         })
     }
 
-    private func handleCentralEvent(_ event: CentralEvent) {
+    private func handleCentralEvent(_ event: CentralEvent) async {
         if case let .didDisconnect(p, _) = event {
             forget(p.id)
-            if let cid = outboundByPeer[p.id] { outboundDidClose(cid, reason: "disconnected") }
+            if pendingOpens.contains(p.id) { abortedOpens.insert(p.id) }
+            if let cid = outboundByPeer[p.id] { await outboundDidClose(cid, reason: "disconnected") }
         }
     }
 
@@ -191,45 +207,61 @@ actor FCBDriverAdapter {
     // MARK: - Central role
 
     func readIdentity(_ peer: BLEPeerHandle) async {
+        let myEpoch = epoch
         do {
             _ = try await central.connect(peer.id, nil)
+            guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
             _ = try await central.discoverServices(peer.id, [bleV22ServiceUUID])
+            guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
             let chars = try await central.discoverCharacteristics(
                 peer.id, bleV22ServiceUUID, [bleV22TXCharUUID, bleV22RXCharUUID, bleV22IdentityCharUUID])
+            guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
             guard chars.contains(where: { $0.id == bleV22IdentityCharUUID }) else {
                 throw FCBAdapterError.missingCharacteristic("Identity")
             }
             let identity = try await central.readValue(peer.id, bleV22IdentityCharUUID)
+            guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
             guard identity.count == BLEProtocol.identityLength else { throw FCBAdapterError.shortIdentity(identity.count) }
             continuation?.yield(.identityRead(peer, identity: Data(identity)))
         } catch {
             forget(peer.id)
             try? await central.disconnect(peer.id)
-            continuation?.yield(.identityFailed(peer, reason: "\(error)"))
+            if epoch == myEpoch { continuation?.yield(.identityFailed(peer, reason: "\(error)")) }
         }
     }
 
     func openChannel(_ peer: BLEPeerHandle) async {
+        let myEpoch = epoch
         let channelID = BLEChannelID(id: UUID())
         // Create the notification stream BEFORE enabling notifications so nothing is missed.
         let stream = central.notifications(peer.id, bleV22TXCharUUID)
         let pump = Task { [stream] in
             do { for try await chunk in stream { self.emitChannelData(channelID, chunk) } } catch {}
-            self.outboundDidClose(channelID, reason: "notifications ended")
+            await self.outboundDidClose(channelID, reason: "notifications ended")
         }
+        pendingOpens.insert(peer.id)
+        abortedOpens.remove(peer.id)
+        defer { pendingOpens.remove(peer.id) }
         do {
             try await central.setNotify(true, peer.id, bleV22TXCharUUID)
-            try await central.writeValue(config.localIdentity, peer.id, bleV22RXCharUUID, .withResponse)
+            guard epoch == myEpoch else { throw FCBAdapterError.sessionEnded }
+            // MTU first: the handshake write is the last suspension before we register the
+            // channel, so nothing can race the maps once it returns.
             let mtu = await central.maximumWriteValueLength(peer.id, .withoutResponse)
+            guard epoch == myEpoch else { throw FCBAdapterError.sessionEnded }
+            try await central.writeValue(config.localIdentity, peer.id, bleV22RXCharUUID, .withResponse)
+            guard epoch == myEpoch, !abortedOpens.contains(peer.id) else { throw FCBAdapterError.sessionEnded }
+            // No suspension from here to the yield: the maps are live before any event can race them.
             outbound[channelID] = peer.id
             outboundByPeer[peer.id] = channelID
-            tasks.append(pump)
+            pumps[channelID] = pump
             continuation?.yield(.channelOpened(channelID, peer, direction: .outbound, mtu: mtu))
         } catch {
             pump.cancel()
+            abortedOpens.remove(peer.id)
             forget(peer.id)
             try? await central.disconnect(peer.id)
-            continuation?.yield(.channelFailed(peer, reason: "\(error)"))
+            if epoch == myEpoch { continuation?.yield(.channelFailed(peer, reason: "\(error)")) }
         }
     }
 
@@ -238,13 +270,15 @@ actor FCBDriverAdapter {
         continuation?.yield(.channelData(id, data))
     }
 
-    private func outboundDidClose(_ id: BLEChannelID, reason: String?) {
+    /// Every adapter-initiated outbound close drops the GATT link too (spec §3.4): a redundant
+    /// disconnect on an already-dropped link is harmless.
+    private func outboundDidClose(_ id: BLEChannelID, reason: String?) async {
         guard let peerID = outbound.removeValue(forKey: id) else { return }
         outboundByPeer[peerID] = nil
         sendQueues[id] = nil
-        if reducerClosed.remove(id) == nil {
-            continuation?.yield(.channelClosed(id, reason: reason))
-        }
+        pumps.removeValue(forKey: id)?.cancel()
+        continuation?.yield(.channelClosed(id, reason: reason))
+        try? await central.disconnect(peerID)
     }
 
     // MARK: - BLEDriver verbs
@@ -255,7 +289,7 @@ actor FCBDriverAdapter {
         guard outbound[channel] != nil || isInbound(channel) else { return }
         sendQueues[channel, default: []].append(contentsOf: fragments)
         if sendQueues[channel]!.count > Self.sendQueueCap {
-            if outbound[channel] != nil { outboundDidClose(channel, reason: "send backlog") }
+            if outbound[channel] != nil { await outboundDidClose(channel, reason: "send backlog") }
             else { inboundDidClose(channel, reason: "notify backlog") }
             return
         }
@@ -271,7 +305,7 @@ actor FCBDriverAdapter {
         while let next = sendQueues[channel]?.first {
             if let peerID = outbound[channel] {
                 do { try await central.writeValue(next, peerID, bleV22RXCharUUID, .withoutResponse) }
-                catch { outboundDidClose(channel, reason: "write failed: \(error)"); return }
+                catch { await outboundDidClose(channel, reason: "write failed: \(error)"); return }
             } else if isInbound(channel) {
                 guard await notifyInbound(channel, next) else { return }   // parked or closed
             } else {
@@ -285,9 +319,10 @@ actor FCBDriverAdapter {
 
     func closeChannel(_ channel: BLEChannelID) async {
         if let peerID = outbound[channel] {
-            reducerClosed.insert(channel)
+            pumps.removeValue(forKey: channel)?.cancel()
             outbound[channel] = nil
             outboundByPeer[peerID] = nil
+            sendQueues[channel] = nil
             try? await central.disconnect(peerID)
             return
         }

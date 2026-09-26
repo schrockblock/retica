@@ -12,6 +12,51 @@ let identityCharUUID = CBUUID(string: BLEProtocol.identityCharUUID)
 let adapterLocalIdentity = Data(repeating: 0x11, count: 16)
 let adapterPeerIdentity = Data(repeating: 0xEE, count: 16)
 
+/// Broadcasts each yielded value to every currently-registered listener stream. A plain
+/// `AsyncStream` only ever feeds ONE physical buffer/continuation: if `.state()` is called again
+/// after a stop()/start() cycle (as the live CBCentralManager/CBPeripheralManager-backed
+/// implementation supports), a single-shot stream would non-deterministically hand later yields
+/// to whichever consumer — old, cancelled one or new one — happens to read first. This mirrors a
+/// live "keeps notifying every current subscriber" `.state()` so restart tests aren't racy against
+/// stub plumbing rather than the adapter itself.
+final class Broadcaster<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [Int: AsyncStream<Value>.Continuation] = [:]
+    private var nextID = 0
+    // Replays the most recent value to a newly-registered listener (mirrors a real
+    // CBCentralManager/CBPeripheralManager `.state`, which reads as "current, then updates" —
+    // and also closes the gap between a synchronous `yield()` and the async Task that hasn't
+    // reached `for await state in ...state()` yet, whether that's the very first subscriber or a
+    // fresh one after a stop()/start() cycle).
+    private var lastValue: Value?
+
+    func yield(_ value: Value) {
+        lock.lock()
+        lastValue = value
+        let all = Array(continuations.values)
+        lock.unlock()
+        for c in all { c.yield(value) }
+    }
+
+    func makeStream() -> AsyncStream<Value> {
+        AsyncStream { continuation in
+            lock.lock()
+            let id = nextID
+            nextID += 1
+            continuations[id] = continuation
+            let replay = lastValue
+            lock.unlock()
+            if let replay { continuation.yield(replay) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.continuations[id] = nil
+                self.lock.unlock()
+            }
+        }
+    }
+}
+
 /// Records the FCB commands the adapter invokes.
 actor AdapterCalls {
     var addedServices: [MutableService] = []
@@ -52,8 +97,8 @@ struct AdapterStubs {
     var central: BluetoothCentralClient
     var peripheral: BluetoothPeripheralClient
     let calls: AdapterCalls
-    let centralState: AsyncStream<CBManagerState>.Continuation
-    let peripheralState: AsyncStream<CBManagerState>.Continuation
+    let centralState: Broadcaster<CBManagerState>
+    let peripheralState: Broadcaster<CBManagerState>
     let scanCont: AsyncStream<DiscoveredPeripheral>.Continuation
     let centralEvents: AsyncStream<CentralEvent>.Continuation
     let writeRequests: AsyncStream<[WriteRequest]>.Continuation
@@ -67,13 +112,17 @@ struct AdapterStubs {
     let updateResult: LockIsolated<Bool>               // peripheral.updateValue return
     /// Notification continuations per peripheral id, minted when the adapter subscribes.
     let notifications: LockIsolated<[UUID: AsyncThrowingStream<Data, any Error>.Continuation]>
+    /// Opt-in race hooks, off by default so they don't perturb unrelated tests.
+    let notifyOnHandshake: LockIsolated<Data?>         // yielded on the peer's notify stream once the handshake write lands
+    let disconnectDuringHandshake: LockIsolated<Bool>  // fire .didDisconnect mid-handshake-write
+    let readDelay: LockIsolated<UInt64>                // extra nanoseconds readValue sleeps before returning
 }
 
 @MainActor
 func makeStubs() -> AdapterStubs {
     let calls = AdapterCalls()
-    let cState = AsyncStream<CBManagerState>.makeStream()
-    let pState = AsyncStream<CBManagerState>.makeStream()
+    let cState = Broadcaster<CBManagerState>()
+    let pState = Broadcaster<CBManagerState>()
     let scan = AsyncStream<DiscoveredPeripheral>.makeStream()
     let cEvents = AsyncStream<CentralEvent>.makeStream()
     let writes = AsyncStream<[WriteRequest]>.makeStream()
@@ -85,9 +134,12 @@ func makeStubs() -> AdapterStubs {
     let mtu = LockIsolated(512)
     let updateResult = LockIsolated(true)
     let notifications = LockIsolated<[UUID: AsyncThrowingStream<Data, any Error>.Continuation]>([:])
+    let notifyOnHandshake = LockIsolated<Data?>(nil)
+    let disconnectDuringHandshake = LockIsolated(false)
+    let readDelay = LockIsolated<UInt64>(0)
 
     let central = BluetoothCentralClient(
-        state: { cState.stream },
+        state: { cState.makeStream() },
         authorization: { .allowedAlways },
         scan: { _, _ in Task { await calls.scan() }; return scan.stream },
         stopScan: { await calls.stopScan() },
@@ -103,6 +155,7 @@ func makeStubs() -> AdapterStubs {
             }
         },
         readValue: { id, c in
+            if readDelay.value > 0 { try? await Task.sleep(nanoseconds: readDelay.value) }
             await calls.read(id, c)
             guard let r = identityResult.value else { throw BluetoothError.operationCancelled }
             return r
@@ -112,10 +165,26 @@ func makeStubs() -> AdapterStubs {
             // overlap here (a bare actor hop resolves too fast to force interleaving reliably).
             try? await Task.sleep(nanoseconds: 5_000_000)
             await calls.write(d, id, c, t)
+            if t == .withResponse {
+                if let payload = notifyOnHandshake.value, let cont = notifications.value[id] {
+                    cont.yield(payload)
+                }
+                if disconnectDuringHandshake.value {
+                    cEvents.continuation.yield(.didDisconnect(Peripheral(id: id, name: nil, state: .disconnected), nil))
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+            }
             if writeShouldThrow.value { throw BluetoothError.disconnected(peripheralID: id, underlying: nil) }
         },
         setNotify: { on, id, c in await calls.notify(on, id, c) },
-        maximumWriteValueLength: { _, _ in mtu.value },
+        maximumWriteValueLength: { _, _ in
+            // A real suspension point (not just an actor-hop) so a pump task with an
+            // already-buffered notification actually gets a scheduling turn here — otherwise
+            // openChannel's tight sequence of awaits never yields the thread and a map-ordering
+            // bug around this call can't be observed from the test side.
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            return mtu.value
+        },
         notifications: { id, _ in
             AsyncThrowingStream { cont in notifications.withValue { $0[id] = cont } }
         },
@@ -124,7 +193,7 @@ func makeStubs() -> AdapterStubs {
     )
 
     let peripheral = BluetoothPeripheralClient(
-        state: { pState.stream },
+        state: { pState.makeStream() },
         authorization: { .allowedAlways },
         add: { s in await calls.addService(s); return Service(id: s.id, peripheralID: UUID(), isPrimary: true) },
         remove: { _ in },
@@ -147,28 +216,36 @@ func makeStubs() -> AdapterStubs {
 
     return AdapterStubs(
         central: central, peripheral: peripheral, calls: calls,
-        centralState: cState.continuation, peripheralState: pState.continuation,
+        centralState: cState, peripheralState: pState,
         scanCont: scan.continuation, centralEvents: cEvents.continuation,
         writeRequests: writes.continuation, subscriptions: subs.continuation,
         peripheralEvents: pEvents.continuation,
         identityResult: identityResult, charsResult: charsResult, writeShouldThrow: writeShouldThrow,
-        mtu: mtu, updateResult: updateResult, notifications: notifications)
+        mtu: mtu, updateResult: updateResult, notifications: notifications,
+        notifyOnHandshake: notifyOnHandshake, disconnectDuringHandshake: disconnectDuringHandshake,
+        readDelay: readDelay)
 }
 
-/// Collect up to `count` events (or until the stream ends) with a bounded wait.
+/// Collect up to `count` events (or until the stream ends, or ~2s elapses) with a bounded wait.
+/// Returns whatever was accumulated even when the bound is hit before `count` is reached, so a
+/// test can assert "at most N events, and here's exactly what came" rather than only a full match.
 func collect(_ stream: AsyncStream<BLEDriverEvent>, count: Int) async -> [BLEDriverEvent] {
-    var out: [BLEDriverEvent] = []
-    await withTaskGroup(of: [BLEDriverEvent].self) { group in
+    let acc = LockIsolated<[BLEDriverEvent]>([])
+    await withTaskGroup(of: Void.self) { group in
         group.addTask {
-            var acc: [BLEDriverEvent] = []
-            for await e in stream { acc.append(e); if acc.count >= count { break } }
-            return acc
+            for await e in stream {
+                let reachedCount = acc.withValue { value -> Bool in
+                    value.append(e)
+                    return value.count >= count
+                }
+                if reachedCount { break }
+            }
         }
-        group.addTask { try? await Task.sleep(nanoseconds: 2_000_000_000); return [] }
-        out = await group.next() ?? []
+        group.addTask { try? await Task.sleep(nanoseconds: 2_000_000_000) }
+        await group.next()
         group.cancelAll()
     }
-    return out
+    return acc.value
 }
 
 func peer(_ b: UInt8) -> BLEPeerHandle { BLEPeerHandle(id: UUID(uuidString: "0000000\(b)-0000-0000-0000-000000000000")!) }
@@ -228,7 +305,9 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
     stubs.centralState.yield(.poweredOff)
     stubs.peripheralState.yield(.poweredOff)
-    #expect(await collect(events, count: 1) == [.unavailable(.poweredOff)])
+    // Both streams fire poweredOff; ask for 2 events but expect exactly one — the guard against
+    // a duplicate .unavailable must actually be doing something.
+    #expect(await collect(events, count: 2) == [.unavailable(.poweredOff)])
     await adapter.stop()
 }
 
@@ -425,8 +504,9 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
 }
 
 @Test @MainActor func sendToUnknownChannelIsDropped() async {
-    let (adapter, _, _) = await onlineAdapter()
+    let (adapter, stubs, _) = await onlineAdapter()
     await adapter.send(BLEChannelID(id: UUID()), fragments: [Data([1])])
+    #expect(await stubs.calls.writes.isEmpty)
     await adapter.stop()
 }
 
@@ -445,5 +525,99 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     #expect(payload.count == 5)
     #expect(payload == [Data([1]), Data([2]), Data([3]), Data([9]), Data([8])]
             || payload == [Data([9]), Data([8]), Data([1]), Data([2]), Data([3])])
+    await adapter.stop()
+}
+
+// MARK: - Open-window / session-epoch / close-semantics / pump-lifecycle regressions
+
+@Test @MainActor func firstNotificationRightAfterHandshakeIsNotLost() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(1)
+    await adapter.readIdentity(p)
+    _ = await collect(events, count: 1)   // identityRead
+    stubs.notifyOnHandshake.setValue(Data([0xAA]))
+    await adapter.openChannel(p)
+    let got = await collect(events, count: 2)
+    guard got.count == 2, case let .channelOpened(cid, hp, dir, _) = got[0] else {
+        Issue.record("expected channelOpened then channelData, got \(got)")
+        await adapter.stop()
+        return
+    }
+    #expect(hp == p && dir == .outbound)
+    #expect(got[1] == .channelData(cid, Data([0xAA])))
+    await adapter.stop()
+}
+
+@Test @MainActor func disconnectDuringOpenChannelYieldsChannelFailed() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(2)
+    await adapter.readIdentity(p)
+    _ = await collect(events, count: 1)   // identityRead
+    stubs.disconnectDuringHandshake.setValue(true)
+    await adapter.openChannel(p)
+    let got = await collect(events, count: 1)
+    guard case .channelFailed(p, _)? = got.first else { Issue.record("expected channelFailed, got \(got)"); await adapter.stop(); return }
+    #expect(!got.contains { if case .channelOpened = $0 { return true }; return false })
+    await adapter.stop()
+}
+
+@Test @MainActor func opsResumingAfterStopAreSilent() async {
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
+    let events1 = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    _ = await collect(events1, count: 1)   // .ready
+
+    stubs.readDelay.setValue(200_000_000)
+    let p = peer(3)
+    let readTask = Task { await adapter.readIdentity(p) }
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    await adapter.stop()
+
+    let events2 = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    _ = await collect(events2, count: 1)   // .ready for the new session
+
+    let recorded = LockIsolated<[BLEDriverEvent]>([])
+    let drain = Task { for await e in events2 { recorded.withValue { $0.append(e) } } }
+    try? await Task.sleep(nanoseconds: 500_000_000)
+    let leaked = recorded.value.contains {
+        switch $0 {
+        case .identityRead, .identityFailed: return true
+        default: return false
+        }
+    }
+    #expect(!leaked)
+    drain.cancel()
+    readTask.cancel()
+    await adapter.stop()
+}
+
+@Test @MainActor func adapterCloseDisconnectsTheLink() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(5)
+    guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
+    stubs.writeShouldThrow.setValue(true)
+    await adapter.send(cid, fragments: [Data([1])])
+    guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed"); await adapter.stop(); return }
+    #expect(await stubs.calls.disconnected.contains(p.id))
+    await adapter.stop()
+}
+
+@Test @MainActor func closeChannelCancelsThePump() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(6)
+    guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
+    await adapter.closeChannel(cid)
+
+    let recorded = LockIsolated<[BLEDriverEvent]>([])
+    let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
+    stubs.notifications.value[p.id]?.yield(Data([0x01]))
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let gotChannelData = recorded.value.contains { if case .channelData = $0 { return true }; return false }
+    #expect(!gotChannelData)
+    drain.cancel()
     await adapter.stop()
 }
