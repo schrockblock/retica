@@ -97,7 +97,7 @@ private func makeBLE(tokenForChannel: [BLEChannelID: Data], ownToken: Data)
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
             readIdentity: { _ in }, openChannel: { _ in },
-            send: { chan, data in sent.withValue { $0.append((tokenForChannel[chan] ?? Data(), data)) } },
+            send: { chan, fragments in sent.withValue { for f in fragments { $0.append((tokenForChannel[chan] ?? Data(), f)) } } },
             closeChannel: { _ in }, stop: { })
     }
     store.exhaustivity = .off

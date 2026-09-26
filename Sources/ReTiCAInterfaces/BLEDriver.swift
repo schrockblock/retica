@@ -59,8 +59,8 @@ public struct BLEDriver: Sendable {
     public var readIdentity: @Sendable (BLEPeerHandle) async -> Void
     /// Subscribe to TX and write our identity to RX. Result arrives as channelOpened/channelFailed.
     public var openChannel: @Sendable (BLEPeerHandle) async -> Void
-    /// One fragment or keepalive. Central: RX write without response. Peripheral: TX notify.
-    public var send: @Sendable (BLEChannelID, Data) async -> Void
+    /// One packet's fragments — or a single keepalive — delivered in order and never interleaved with another call's fragments on the same channel. Central: sequential RX writes without response. Peripheral: TX notifies.
+    public var send: @Sendable (BLEChannelID, [Data]) async -> Void
     public var closeChannel: @Sendable (BLEChannelID) async -> Void
     /// Tear down a peer that has NO open channel (cancel in-flight connect, drop the GATT link).
     public var disconnect: @Sendable (BLEPeerHandle) async -> Void
@@ -70,7 +70,7 @@ public struct BLEDriver: Sendable {
         start: @escaping @Sendable (BLEDriverConfig) -> AsyncStream<BLEDriverEvent>,
         readIdentity: @escaping @Sendable (BLEPeerHandle) async -> Void,
         openChannel: @escaping @Sendable (BLEPeerHandle) async -> Void,
-        send: @escaping @Sendable (BLEChannelID, Data) async -> Void,
+        send: @escaping @Sendable (BLEChannelID, [Data]) async -> Void,
         closeChannel: @escaping @Sendable (BLEChannelID) async -> Void,
         disconnect: @escaping @Sendable (BLEPeerHandle) async -> Void = { _ in },
         stop: @escaping @Sendable () async -> Void

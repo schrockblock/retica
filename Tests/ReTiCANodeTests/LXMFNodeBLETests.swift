@@ -36,7 +36,7 @@ private func makeBLENode(_ identity: Identity)
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
             readIdentity: { _ in }, openChannel: { _ in },
-            send: { _, data in sent.withValue { $0.append(data) } },
+            send: { _, fragments in sent.withValue { $0.append(contentsOf: fragments) } },
             closeChannel: { _ in }, stop: { }
         )
     }
@@ -226,7 +226,7 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
             readIdentity: { _ in }, openChannel: { _ in },
-            send: { _, data in sent.withValue { $0.append(data) } },
+            send: { _, fragments in sent.withValue { $0.append(contentsOf: fragments) } },
             closeChannel: { _ in }, stop: { }
         )
     }

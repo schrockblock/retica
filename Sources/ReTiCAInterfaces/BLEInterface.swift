@@ -169,20 +169,28 @@ public struct BLEInterface {
                 guard state.pendingPeers.contains(handle) else { return .none }
                 state.pendingPeers.remove(handle)
                 state.pendingIdentities[handle] = nil
-                state.greylist.recordFailure(handle, now: date())
+                if !hasEstablishedChannel(state, handle) {
+                    state.greylist.recordFailure(handle, now: date())
+                }
                 return .cancel(id: CancelID.establish(handle))
 
             case let .establishDeadline(handle):
                 guard state.pendingPeers.contains(handle) else { return .none }
                 state.pendingPeers.remove(handle)
                 state.pendingIdentities[handle] = nil
+                // The peer came in the other way while we were dialing: leave its link alone.
+                if hasEstablishedChannel(state, handle) { return .none }
                 state.greylist.recordFailure(handle, now: date())
                 return .run { [bleDriver] _ in await bleDriver.disconnect(handle) }
 
             case let .driverEvent(.channelOpened(channelID, handle, direction, mtu)):
-                var effects: [Effect<Action>] = [.cancel(id: CancelID.establish(handle))]
-                state.pendingPeers.remove(handle)
-                let pendingIdentity = state.pendingIdentities.removeValue(forKey: handle)
+                var effects: [Effect<Action>] = []
+                var pendingIdentity: Data? = nil
+                if direction == .outbound {
+                    state.pendingPeers.remove(handle)
+                    pendingIdentity = state.pendingIdentities.removeValue(forKey: handle)
+                    effects.append(.cancel(id: CancelID.establish(handle)))
+                }
                 let now = date()
                 guard state.status == .online,
                       state.peers.count < state.maxPeers,
@@ -232,14 +240,12 @@ public struct BLEInterface {
                 guard let fragments = try? channel.fragmenter.fragment(packet) else {
                     return .send(.delegate(.sendFailed(peer: peer, reason: .unfragmentable)))
                 }
-                return .run { [bleDriver] _ in
-                    for fragment in fragments { await bleDriver.send(channelID, fragment) }
-                }
+                return .run { [bleDriver] _ in await bleDriver.send(channelID, fragments) }
 
             case let .keepalive(channelID):
                 guard let channel = state.channels[channelID], channel.direction == .outbound,
                       channel.peerIdentity != nil else { return .none }
-                return .run { [bleDriver] _ in await bleDriver.send(channelID, BLEKeepalive.frame) }
+                return .run { [bleDriver] _ in await bleDriver.send(channelID, [BLEKeepalive.frame]) }
 
             case let .handshakeDeadline(channelID):
                 guard let channel = state.channels[channelID], channel.peerIdentity == nil else { return .none }
@@ -297,6 +303,10 @@ public struct BLEInterface {
                 return .none
             }
         }
+    }
+
+    private func hasEstablishedChannel(_ state: State, _ handle: BLEPeerHandle) -> Bool {
+        state.channels.values.contains { $0.peer == handle && $0.peerIdentity != nil }
     }
 
     private func startDriver(state: inout State) -> Effect<Action> {
