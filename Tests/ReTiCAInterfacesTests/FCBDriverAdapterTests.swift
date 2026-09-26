@@ -355,7 +355,7 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     _ = await collect(events, count: 1)   // identityRead
     await adapter.openChannel(p)
     let opened = await collect(events, count: 1)
-    guard case let .channelOpened(cid, _, _, _)? = opened.first else { Issue.record("no channelOpened: \(opened)"); return nil }
+    guard case let .channelOpened(cid, _, _, _, _)? = opened.first else { Issue.record("no channelOpened: \(opened)"); return nil }
     return cid
 }
 
@@ -584,7 +584,7 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     _ = await collect(events, count: 1)
     await adapter.openChannel(p)
     let opened = await collect(events, count: 1)
-    guard case let .channelOpened(_, hp, dir, mtu)? = opened.first else { Issue.record("no channelOpened: \(opened)"); await adapter.stop(); return }
+    guard case let .channelOpened(_, hp, dir, mtu, _)? = opened.first else { Issue.record("no channelOpened: \(opened)"); await adapter.stop(); return }
     #expect(hp == p && dir == .outbound && mtu == 185)
     let notify = await stubs.calls.setNotify
     #expect(notify.count == 1)
@@ -807,7 +807,7 @@ func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
     stubs.notifyOnHandshake.setValue(Data([0xAA]))
     await adapter.openChannel(p)
     let got = await collect(events, count: 2)
-    guard got.count == 2, case let .channelOpened(cid, hp, dir, _) = got[0] else {
+    guard got.count == 2, case let .channelOpened(cid, hp, dir, _, _) = got[0] else {
         Issue.record("expected channelOpened then channelData, got \(got)")
         await adapter.stop()
         return
@@ -923,7 +923,7 @@ func rxWrite(_ c: Central, _ value: Data) -> WriteRequest {
 func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEvent>, _ c: Central) async -> BLEChannelID? {
     stubs.subscriptions.yield(.subscribed(central: c, characteristic: txChar()))
     let got = await collect(events, count: 1)
-    guard case let .channelOpened(cid, hp, dir, mtu)? = got.first else { Issue.record("no inbound channelOpened: \(got)"); return nil }
+    guard case let .channelOpened(cid, hp, dir, mtu, _)? = got.first else { Issue.record("no inbound channelOpened: \(got)"); return nil }
     #expect(hp == BLEPeerHandle(id: c.id) && dir == .inbound && mtu == c.maximumUpdateValueLength)
     return cid
 }
@@ -975,7 +975,7 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     stubs.subscriptions.yield(.subscribed(central: c, characteristic: txChar()))
     let got = await collect(events, count: 2)
     #expect(got.contains { if case .channelClosed(first, _) = $0 { return true }; return false })
-    #expect(got.contains { if case let .channelOpened(cid, _, .inbound, _) = $0 { return cid != first }; return false })
+    #expect(got.contains { if case let .channelOpened(cid, _, .inbound, _, _) = $0 { return cid != first }; return false })
     await adapter.stop()
 }
 
@@ -1060,7 +1060,7 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     now.withValue { $0 = $0.addingTimeInterval(1) }
     stubs.subscriptions.yield(.subscribed(central: c, characteristic: txChar()))
     let got = await collect(events, count: 2)
-    guard got.count == 2, case let .channelOpened(cid, _, .inbound, _) = got[0] else { Issue.record("unexpected: \(got)"); await adapter.stop(); return }
+    guard got.count == 2, case let .channelOpened(cid, _, .inbound, _, _) = got[0] else { Issue.record("unexpected: \(got)"); await adapter.stop(); return }
     #expect(got[1] == .channelData(cid, adapterPeerIdentity))
     await adapter.stop()
 }

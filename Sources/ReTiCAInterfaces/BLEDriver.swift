@@ -36,16 +36,23 @@ public enum BLEAdapterUnavailable: Equatable, Sendable {
     }
 }
 
+/// Which data plane a channel uses. `.gatt` = v2.2 characteristics with fragmentation;
+/// `.l2cap` = v3 length-framed L2CAP CoC (no fragmentation).
+public enum BLEChannelTransport: Equatable, Sendable { case gatt, l2cap }
+
 public enum BLEDriverEvent: Equatable, Sendable {
     case ready
     case unavailable(BLEAdapterUnavailable)
     case peerDiscovered(BLEPeerHandle)
-    /// Central role: the peer's Identity characteristic was read (16 bytes).
-    case identityRead(BLEPeerHandle, identity: Data)
+    /// Central role: the peer's Identity characteristic was read (16 bytes). `psm` is the peer's
+    /// v3 L2CAP listener if it publishes one (nil: absent, unreadable, short, or 0 → GATT only).
+    case identityRead(BLEPeerHandle, identity: Data, psm: UInt16? = nil)
     case identityFailed(BLEPeerHandle, reason: String?)
-    /// Outbound: after TX subscription + handshake write succeeded. Inbound: a central
-    /// subscribed to our TX. `mtu` is the fragment size for this channel.
-    case channelOpened(BLEChannelID, BLEPeerHandle, direction: BLEChannelDirection, mtu: Int)
+    /// Outbound: after the handshake succeeded on the chosen path. Inbound: a central subscribed
+    /// to our TX (.gatt) or opened an L2CAP channel to us (.l2cap). `mtu` is the GATT fragment size
+    /// and is 0 for .l2cap.
+    case channelOpened(BLEChannelID, BLEPeerHandle, direction: BLEChannelDirection, mtu: Int,
+                       transport: BLEChannelTransport = .gatt)
     case channelFailed(BLEPeerHandle, reason: String?)
     /// One RX write (peripheral role) or one TX notification (central role).
     case channelData(BLEChannelID, Data)
@@ -59,6 +66,10 @@ public struct BLEDriver: Sendable {
     public var readIdentity: @Sendable (BLEPeerHandle) async -> Void
     /// Subscribe to TX and write our identity to RX. Result arrives as channelOpened/channelFailed.
     public var openChannel: @Sendable (BLEPeerHandle) async -> Void
+    /// v3: open an L2CAP CoC to `psm` on the peer's existing link (10 s limit), send the 16-byte
+    /// handshake frame, then emit channelOpened(.outbound, transport: .l2cap). Failure emits
+    /// channelFailed WITHOUT disconnecting — the reducer falls back to the GATT path on the same link.
+    public var openL2CAPChannel: @Sendable (BLEPeerHandle, UInt16) async -> Void
     /// One packet's fragments — or a single keepalive — delivered in order and never interleaved with another call's fragments on the same channel. Central: sequential RX writes without response. Peripheral: TX notifies.
     public var send: @Sendable (BLEChannelID, [Data]) async -> Void
     public var closeChannel: @Sendable (BLEChannelID) async -> Void
@@ -70,6 +81,7 @@ public struct BLEDriver: Sendable {
         start: @escaping @Sendable (BLEDriverConfig) -> AsyncStream<BLEDriverEvent>,
         readIdentity: @escaping @Sendable (BLEPeerHandle) async -> Void,
         openChannel: @escaping @Sendable (BLEPeerHandle) async -> Void,
+        openL2CAPChannel: @escaping @Sendable (BLEPeerHandle, UInt16) async -> Void = { _, _ in },
         send: @escaping @Sendable (BLEChannelID, [Data]) async -> Void,
         closeChannel: @escaping @Sendable (BLEChannelID) async -> Void,
         disconnect: @escaping @Sendable (BLEPeerHandle) async -> Void = { _ in },
@@ -78,6 +90,7 @@ public struct BLEDriver: Sendable {
         self.start = start
         self.readIdentity = readIdentity
         self.openChannel = openChannel
+        self.openL2CAPChannel = openL2CAPChannel
         self.send = send
         self.closeChannel = closeChannel
         self.disconnect = disconnect
@@ -91,6 +104,7 @@ extension BLEDriver: DependencyKey {
         return .fcb(central: .liveValue, peripheral: .liveValue)
         #else
         return BLEDriver(start: { _ in .finished }, readIdentity: { _ in }, openChannel: { _ in },
+                         openL2CAPChannel: { _, _ in },
                          send: { _, _ in }, closeChannel: { _ in }, stop: {})
         #endif
     }
@@ -99,6 +113,7 @@ extension BLEDriver: DependencyKey {
         start: unimplemented("BLEDriver.start", placeholder: AsyncStream { $0.finish() }),
         readIdentity: unimplemented("BLEDriver.readIdentity"),
         openChannel: unimplemented("BLEDriver.openChannel"),
+        openL2CAPChannel: unimplemented("BLEDriver.openL2CAPChannel"),
         send: unimplemented("BLEDriver.send"),
         closeChannel: unimplemented("BLEDriver.closeChannel"),
         disconnect: unimplemented("BLEDriver.disconnect"),

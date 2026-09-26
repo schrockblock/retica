@@ -92,7 +92,7 @@ struct FCBDriverAdapterCBMTests {
 
         await driver.openChannel(handle)
         let opened = await waitFor { if case .channelOpened = $0 { return true }; if case .channelFailed = $0 { return true }; return false }
-        guard case let .channelOpened(cid, h, dir, mtu)? = opened else { Issue.record("expected channelOpened, got \(String(describing: opened))"); await driver.stop(); return }
+        guard case let .channelOpened(cid, h, dir, mtu, _)? = opened else { Issue.record("expected channelOpened, got \(String(describing: opened))"); await driver.stop(); return }
         #expect(h == handle && dir == .outbound && mtu >= BLEFragmenter.minimumMTU)
         #expect(delegate.writes.value.first == adapterLocalIdentity)   // the handshake reached the peripheral
 

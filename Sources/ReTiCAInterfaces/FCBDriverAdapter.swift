@@ -447,6 +447,11 @@ actor FCBDriverAdapter {
         try? await central.disconnect(peer.id)
     }
 
+    // TODO(Task 4): replace with a real L2CAP CoC open + handshake write.
+    func openL2CAPChannel(_ peer: BLEPeerHandle, psm: UInt16) async {
+        continuation?.yield(.channelFailed(peer, reason: "L2CAP not implemented yet"))
+    }
+
     func stop() async {
         await resetSession()   // also stops scanning/advertising and removes the service
     }
@@ -571,6 +576,7 @@ extension BLEDriver {
             start: { config in adapter.start(config) },
             readIdentity: { peer in await adapter.readIdentity(peer) },
             openChannel: { peer in await adapter.openChannel(peer) },
+            openL2CAPChannel: { peer, psm in await adapter.openL2CAPChannel(peer, psm: psm) },
             send: { channel, fragments in await adapter.send(channel, fragments: fragments) },
             closeChannel: { channel in await adapter.closeChannel(channel) },
             disconnect: { peer in await adapter.disconnect(peer) },

@@ -144,7 +144,7 @@ public struct BLEInterface {
                     .cancellable(id: CancelID.establish(handle), cancelInFlight: true)
                 )
 
-            case let .driverEvent(.identityRead(handle, identity)):
+            case let .driverEvent(.identityRead(handle, identity, _)):
                 guard state.pendingPeers.contains(handle) else { return .none }
                 guard identity.count == BLEProtocol.identityLength, identity != state.localIdentity else {
                     state.pendingPeers.remove(handle)
@@ -183,7 +183,7 @@ public struct BLEInterface {
                 state.greylist.recordFailure(handle, now: date())
                 return .run { [bleDriver] _ in await bleDriver.disconnect(handle) }
 
-            case let .driverEvent(.channelOpened(channelID, handle, direction, mtu)):
+            case let .driverEvent(.channelOpened(channelID, handle, direction, mtu, _)):
                 var effects: [Effect<Action>] = []
                 var pendingIdentity: Data? = nil
                 if direction == .outbound {

@@ -11,6 +11,7 @@ enum MockDriverCall: Equatable {
     case send(BLEChannelID, [Data])
     case closeChannel(BLEChannelID)
     case disconnect(BLEPeerHandle)
+    case openL2CAPChannel(BLEPeerHandle, UInt16)
 }
 
 // Deterministic fixtures shared by all reducer tests.
@@ -51,6 +52,7 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1,
             },
             readIdentity: { h in calls.withValue { $0.append(.readIdentity(h)) } },
             openChannel: { h in calls.withValue { $0.append(.openChannel(h)) } },
+            openL2CAPChannel: { h, psm in calls.withValue { $0.append(.openL2CAPChannel(h, psm)) } },
             send: { c, d in calls.withValue { $0.append(.send(c, d)) } },
             closeChannel: { c in calls.withValue { $0.append(.closeChannel(c)) } },
             disconnect: { h in calls.withValue { $0.append(.disconnect(h)) } },
@@ -137,6 +139,15 @@ func establishInbound(
     await store.receive(.driverEvent(.ready)) { $0.status = .online }
     await store.send(.stop) { $0.status = .stopped }
     #expect(calls.value.contains(.stop))
+}
+
+@Test @MainActor func seamCarriesTransportAndPSMWithGattDefaults() {
+    let opened = BLEDriverEvent.channelOpened(channel1, peerHandleA, direction: .outbound, mtu: 23)
+    #expect(opened == .channelOpened(channel1, peerHandleA, direction: .outbound, mtu: 23, transport: .gatt))
+    let read = BLEDriverEvent.identityRead(peerHandleA, identity: identityHigh)
+    #expect(read == .identityRead(peerHandleA, identity: identityHigh, psm: nil))
+    #expect(BLEDriverEvent.identityRead(peerHandleA, identity: identityHigh, psm: 0x0081)
+            != .identityRead(peerHandleA, identity: identityHigh))
 }
 
 // MARK: - Discovery / establishment (central role)
