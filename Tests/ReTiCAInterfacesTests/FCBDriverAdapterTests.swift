@@ -86,6 +86,9 @@ actor AdapterCalls {
     func stopAdvertising() { stoppedAdvertising += 1; peripheralOrder.append("stopAdvertising") }
     func removeAll() { removedAll += 1; peripheralOrder.append("removeAll") }
     func startRemoveAll() { removeAllStarted += 1 }
+    /// canSendWriteWithoutResponse calls that have STARTED — and already decided their answer.
+    var canSendStarted = 0
+    func startCanSend() { canSendStarted += 1 }
     func connect(_ id: UUID) { connected.append(id) }
     func disconnect(_ id: UUID) { disconnected.append(id) }
     func discoverServices(_ id: UUID) { discoveredServices.append(id) }
@@ -130,6 +133,7 @@ struct AdapterStubs {
     let canSend: LockIsolated<Bool>                    // central.canSendWriteWithoutResponse return
     let canSendDelayNanos: LockIsolated<UInt64>        // nanoseconds canSendWriteWithoutResponse stays in flight before returning
     let removeAllHeld: LockIsolated<Bool>              // while true, peripheral.removeAll stays in flight (a deterministic "slow" removeAll)
+    let canSendHeld: LockIsolated<Bool>                // while true, canSendWriteWithoutResponse stays in flight (after deciding its answer)
 }
 
 @MainActor
@@ -156,6 +160,7 @@ func makeStubs() -> AdapterStubs {
     let canSend = LockIsolated(true)
     let canSendDelayNanos = LockIsolated<UInt64>(0)
     let removeAllHeld = LockIsolated(false)
+    let canSendHeld = LockIsolated(false)
 
     let central = BluetoothCentralClient(
         state: { cState.makeStream() },
@@ -226,7 +231,12 @@ func makeStubs() -> AdapterStubs {
             // Like updateValue: the answer is decided when the check is made; the opt-in delay
             // only keeps the check in flight before that answer is returned.
             let result = canSend.value
-            if canSendDelayNanos.value > 0 { try? await Task.sleep(nanoseconds: canSendDelayNanos.value) }
+            let delay = canSendDelayNanos.value
+            // Recorded only after the answer (and delay) are fixed: a test that waits for this can
+            // flip the knobs without racing the check it is aiming at.
+            await calls.startCanSend()
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            while canSendHeld.value { try? await Task.sleep(nanoseconds: 2_000_000) }
             return result
         }
     )
@@ -274,7 +284,8 @@ func makeStubs() -> AdapterStubs {
         mtu: mtu, updateResult: updateResult, notifications: notifications, terminated: terminated,
         notifyOnHandshake: notifyOnHandshake, disconnectDuringHandshake: disconnectDuringHandshake,
         readDelay: readDelay, updateDelayNanos: updateDelayNanos,
-        canSend: canSend, canSendDelayNanos: canSendDelayNanos, removeAllHeld: removeAllHeld)
+        canSend: canSend, canSendDelayNanos: canSendDelayNanos, removeAllHeld: removeAllHeld,
+        canSendHeld: canSendHeld)
 }
 
 /// How long a test waits for an event it EXPECTS. Generous on purpose: it only bounds a hang, and
@@ -722,13 +733,15 @@ func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
     guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
     stubs.canSend.setValue(false)
     stubs.canSendDelayNanos.setValue(200_000_000)       // the first check is in flight for 200 ms, then says false
+    let calls = stubs.calls
     let sending = Task { await adapter.send(cid, fragments: [Data([1])]) }
-    try? await Task.sleep(nanoseconds: 50_000_000)
+    // Gate: the first check has started and already decided `false`, so the flips below can only
+    // affect LATER checks (a fixed sleep let a loaded machine flip them first: trivial pass).
+    #expect(await waitUntil(within: eventWait) { await calls.canSendStarted >= 1 })
     stubs.canSend.setValue(true)                        // every later check says true
     stubs.canSendDelayNanos.setValue(0)
     stubs.centralEvents.yield(readyToSend(p))           // consumed while the first check is still suspended
     await sending.value
-    let calls = stubs.calls
     // No second ready event is ever sent: only the generation re-check can get [1] out.
     let written = await waitUntil(within: eventWait) { await calls.withoutResponseWrites.count >= 1 }
     #expect(written, "false after a consumed ready must re-check, not park")
@@ -751,6 +764,30 @@ func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
     guard let cid2 = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
     await adapter.send(cid2, fragments: [Data([2])])
     #expect(await stubs.calls.withoutResponseWrites.contains(Data([2])), "a park must not outlive the link it was for")
+    await adapter.stop()
+}
+
+@Test @MainActor func disconnectDuringCanSendCheckDoesNotLeaveAStalePark() async {
+    // FCB forgets a peripheral before emitting .didDisconnect, so a check in flight across the
+    // disconnect answers `false`. It must not park the peer after .didDisconnect cleared it: the
+    // peripheral id survives a reconnect, and no ready event would ever unpark it.
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(4)
+    guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
+    let calls = stubs.calls
+    stubs.canSend.setValue(false)
+    stubs.canSendHeld.setValue(true)                    // the check stays in flight until released
+    let sending = Task { await adapter.send(cid, fragments: [Data([1])]) }
+    #expect(await waitUntil(within: eventWait) { await calls.canSendStarted >= 1 })
+    stubs.centralEvents.yield(.didDisconnect(Peripheral(id: p.id, name: nil, state: .disconnected), nil))
+    guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed"); await adapter.stop(); return }
+    stubs.canSendHeld.setValue(false)                   // the check now returns `false` into a closed channel
+    await sending.value
+    stubs.canSend.setValue(true)
+    guard let cid2 = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
+    await adapter.send(cid2, fragments: [Data([2])])
+    #expect(await waitUntil(within: eventWait) { await calls.withoutResponseWrites.contains(Data([2])) },
+            "a check that outlived its channel must not park the next link to the same peer")
     await adapter.stop()
 }
 

@@ -407,8 +407,14 @@ actor FCBDriverAdapter {
             guard !writeParked.contains(peerID), outbound[channel] != nil else { return false }
             let generation = writeReadyGeneration[peerID, default: 0]
             let myEpoch = epoch
-            guard await central.canSendWriteWithoutResponse(peerID) else {
-                guard epoch == myEpoch else { return false }   // a session reset mid-check must not touch the next session
+            let canSend = await central.canSendWriteWithoutResponse(peerID)
+            // Before either branch touches state: the session and THIS channel must still be live.
+            // FCB forgets a peripheral before emitting .didDisconnect, so a check in flight across
+            // a disconnect answers `false` — parking on it would outlive the .didDisconnect clear
+            // and mute the next link to the same (stable) peripheral id. A stale `true` must not
+            // write an old channel's fragment onto a new link either.
+            guard epoch == myEpoch, outbound[channel] == peerID else { return false }
+            guard canSend else {
                 // A ready event landed while this check was in flight: it was meant for us, re-check now.
                 if generation != writeReadyGeneration[peerID, default: 0] { continue }
                 writeParked.insert(peerID)
@@ -416,6 +422,7 @@ actor FCBDriverAdapter {
             }
             do {
                 try await central.writeValue(fragment, peerID, bleV22RXCharUUID, .withoutResponse)
+                guard epoch == myEpoch, outbound[channel] == peerID else { return false }
                 return true
             } catch {
                 await outboundDidClose(channel, reason: "write failed: \(error)", disconnect: true)
