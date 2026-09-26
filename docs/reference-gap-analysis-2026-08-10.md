@@ -9,7 +9,7 @@
 >
 > **Ten of the defects this document describes have since been FIXED.** Each is annotated inline
 > with its commit, but if you are skimming: §1.1, §1.2, §1.3, §1.4, §1.5, §2.1, §2.2, §2.4, §2.5
-> and §2.6 are all closed. **Still live:** §1.6 (deferred by decision), §1.7, §1.8, §2.3 (narrowed,
+> and §2.6 are all closed. **Still live:** §1.6 (relay half only, see there), §1.7, §1.8, §2.3 (narrowed,
 > see below), §2.7, and everything in §3-§9 except where annotated.
 >
 > Eight of those fixes landed *before this document's own last edit* — I executed them and failed
@@ -191,6 +191,15 @@ does this correctly with an explicit "advertised == enforced" comment, which con
 invariant and makes `PNNode` the outlier.
 
 ### 1.6 No PROOF handling for non-link packets **[verified]**
+
+> **Endpoint half RESOLVED (2026-09-26)** by `docs/superpowers/specs/2026-09-26-single-packet-proofs-design.md`.
+> ReTiCA now proves inbound opportunistic LXMF packets (`Transport.Action.proveSingle`, driven by
+> `LXMFNode`), and validates implicit and explicit proofs for its own opportunistic sends against a
+> receipt table (`Transport.State.pendingReceipts`), so break (a) below is closed for LXMF delivery
+> destinations (arbitrary single packets still unproved), and `LXMFRouter` reports
+> `deliveryConfirmed` for opportunistic messages. **Still open:** break (b) — ReTiCA has no
+> reverse table, so a ReTiCA relay does not route proofs for third parties (Transport.py:1690,
+> 2340-2348).
 
 `Transport.swift` dispatches only `.announce` (332), `.data` (467), `.linkRequest` (555), then
 `default: return .none` (570). There is no `.proof` case, no `Identity.prove`, no

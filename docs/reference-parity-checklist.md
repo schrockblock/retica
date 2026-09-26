@@ -601,9 +601,11 @@ exactly the class Tier 1 just closed.*
       actively breaks.
 - [ ] **`Buffer`** — downstream of `Channel`. Blocks `rnx`-style remote execution and any
       `BufferedRWPair` peer.
-- [ ] **Non-link proofs / `PacketReceipt` / reverse table** (§1.6, deferred by decision) — a
-      reference peer proving a plain DATA packet to a ReTiCA destination **always times out**, on a
-      message we received fine. Also breaks proof relay *through* a ReTiCA node.
+- [~] **Non-link proofs / `PacketReceipt` / reverse table** (§1.6) — **endpoint DONE**
+      (`docs/superpowers/specs/2026-09-26-single-packet-proofs-design.md`): ReTiCA proves inbound
+      opportunistic LXMF packets, so a reference sender no longer times out on messages we
+      received, and validates implicit and explicit proofs for its own opportunistic sends.
+      **Still open:** the reverse table — a ReTiCA relay does not route proofs for third parties.
 - [ ] **Tunnels** — no path restoration when a transport peer reappears; every TCP reconnect
       (backgrounding, cell↔Wi-Fi handoff) loses the peer's routes to us.
 - [~] **Interfaces: 3 of 15** (was 2 of 15) — **TCP server DONE** (lib `f363dff` `TCPServerEndpoint`

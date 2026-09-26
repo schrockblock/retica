@@ -97,7 +97,7 @@ Plus a cross-val constant test: `LXMFDelivery.pathRequestWaitSeconds == f.pathRe
 
 ## Deferred (not in this slice)
 
-- **Path rediscovery** (`LXMRouter.py:2743-2752`): when a path *is* known but delivery keeps failing, `drop_path` + re-request to refresh a possibly-stale path. Our receipt-less opportunistic delivery cannot detect "still failing after a path was found," so this branch would be inert and untestable in our stack; it would also need a new `.dropPath` delegate. Revisit if/when opportunistic delivery gains a receipt.
+- **Path rediscovery** (`LXMRouter.py:2743-2752`): when a path *is* known but delivery keeps failing, `drop_path` + re-request to refresh a possibly-stale path. Our receipt-less opportunistic delivery cannot detect "still failing after a path was found," so this branch would be inert and untestable in our stack; it would also need a new `.dropPath` delegate. Revisit if/when opportunistic delivery gains a receipt. (It now has one — see `docs/superpowers/specs/2026-09-26-single-packet-proofs-design.md`. Rediscovery itself is still not implemented.)
 - Link-CLOSED recovery + inactivity teardown (`LINK_MAX_INACTIVITY=600`) → LXMF-4c-3.
 
 ## Constraints

@@ -261,6 +261,13 @@ where they conflict.
    - `.send(desiredMethod: .propagated)` fails the delivery copy.
    - Accepted gap: if one copy fails, and another copy is armed later and also fails,
      `deliveryFailed` can fire twice.
+   - Accepted gap, logged for a follow-up: `LXMFNode`'s `.cancelDeliveryStamps` emits
+     `deliveryFailed` directly, bypassing `fail`.
+   - Accepted gap, logged for a follow-up: a delivery copy still in its stamp search isn't counted
+     as outstanding. So if the propagated copy fails first, `deliveryFailed` can fire for a message
+     whose delivery copy still goes out.
+
+   Both of the gaps above affect only peers with a delivery stamp cost, or cancellation.
 4. **Chosen constants:** `receiptTimeoutBase = 6` s and `receiptTimeoutPerHop = 6` s (reference
    `DEFAULT_PER_HOP_TIMEOUT`), and `maxPendingReceipts = 1024` (reference `MAX_RECEIPTS`).
 5. **The app compile fix is larger than stated.** Besides the `messageReceived` pattern, it also
