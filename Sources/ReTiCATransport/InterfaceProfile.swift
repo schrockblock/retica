@@ -47,8 +47,9 @@ public struct InterfaceProfile: Equatable, Sendable {
 
     /// Reference TCPInterface declared values (TCPInterface.py:76, 42).
     public static let tcp = InterfaceProfile(name: "tcp", bitrate: 10_000_000, hwMTU: 262_144)
-    /// Reference (fork) BLEInterface declared values (BLEInterface.py:40, 41).
-    public static let ble = InterfaceProfile(name: "ble", bitrate: 80_000, hwMTU: 1196)
+    /// ble-reticulum protocol v2.2 peers: HW_MTU 500 (BLEInterface.HW_MTU in the reference);
+    /// 80 kbps is a conservative guess until measured live (spec §2.8).
+    public static let ble = InterfaceProfile(name: "ble", bitrate: 80_000, hwMTU: 500)
     /// Reference base-class defaults (Interface.py:104-105).
     public static let `default` = InterfaceProfile(name: "default", bitrate: 62_500)
 }

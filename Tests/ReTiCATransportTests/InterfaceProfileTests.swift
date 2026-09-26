@@ -20,7 +20,7 @@ import Testing
     #expect(InterfaceProfile.tcp.hwMTU == 262_144)
     #expect(InterfaceProfile.tcp.mode == .full)
     #expect(InterfaceProfile.ble.bitrate == 80_000)
-    #expect(InterfaceProfile.ble.hwMTU == 1196)
+    #expect(InterfaceProfile.ble.hwMTU == 500)
     #expect(InterfaceProfile.ble.mode == .full)
     #expect(InterfaceProfile.default.bitrate == 62_500)
     #expect(InterfaceProfile.default.hwMTU == nil)
