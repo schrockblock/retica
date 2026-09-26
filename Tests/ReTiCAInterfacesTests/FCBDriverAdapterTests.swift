@@ -119,6 +119,7 @@ struct AdapterStubs {
     let notifyOnHandshake: LockIsolated<Data?>         // yielded on the peer's notify stream once the handshake write lands
     let disconnectDuringHandshake: LockIsolated<Bool>  // fire .didDisconnect mid-handshake-write
     let readDelay: LockIsolated<UInt64>                // extra nanoseconds readValue sleeps before returning
+    let updateDelayNanos: LockIsolated<UInt64>         // nanoseconds updateValue stays in flight before returning
 }
 
 @MainActor
@@ -141,6 +142,7 @@ func makeStubs() -> AdapterStubs {
     let notifyOnHandshake = LockIsolated<Data?>(nil)
     let disconnectDuringHandshake = LockIsolated(false)
     let readDelay = LockIsolated<UInt64>(0)
+    let updateDelayNanos = LockIsolated<UInt64>(0)
 
     let central = BluetoothCentralClient(
         state: { cState.makeStream() },
@@ -219,7 +221,14 @@ func makeStubs() -> AdapterStubs {
         stopAdvertising: { await calls.stopAdvertising() },
         isAdvertising: { true },
         respond: { id, code in await calls.respond(id, code) },
-        updateValue: { d, c, ids in await calls.update(d, c, ids); return updateResult.value },
+        updateValue: { d, c, ids in
+            // The result is decided when the attempt is made (as CoreBluetooth's is); the opt-in
+            // delay only keeps the call in flight before that result is returned.
+            let result = updateResult.value
+            await calls.update(d, c, ids)
+            if updateDelayNanos.value > 0 { try? await Task.sleep(nanoseconds: updateDelayNanos.value) }
+            return result
+        },
         publishL2CAPChannel: { _ in 0 },
         unpublishL2CAPChannel: { _ in },
         l2capConnections: { .finished },
@@ -240,7 +249,7 @@ func makeStubs() -> AdapterStubs {
         identityResult: identityResult, charsResult: charsResult, writeShouldThrow: writeShouldThrow,
         mtu: mtu, updateResult: updateResult, notifications: notifications, terminated: terminated,
         notifyOnHandshake: notifyOnHandshake, disconnectDuringHandshake: disconnectDuringHandshake,
-        readDelay: readDelay)
+        readDelay: readDelay, updateDelayNanos: updateDelayNanos)
 }
 
 /// Collect up to `count` events (or until the stream ends, or ~2s elapses) with a bounded wait.
@@ -763,6 +772,27 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     try? await Task.sleep(nanoseconds: 200_000_000)
     let updates = await stubs.calls.updates
     #expect(updates.map(\.0) == [Data([1]), Data([1]), Data([2])])   // [1] retried, then [2]
+    await adapter.stop()
+}
+
+@Test @MainActor func readyEventArrivingMidAttemptDoesNotParkForever() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(9)
+    guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    stubs.updateResult.setValue(false)
+    stubs.updateDelayNanos.setValue(200_000_000)          // the first attempt is in flight for 200 ms
+    let sending = Task { await adapter.send(cid, fragments: [Data([1])]) }
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    stubs.updateResult.setValue(true)
+    stubs.updateDelayNanos.setValue(0)
+    stubs.peripheralEvents.yield(.isReadyToUpdateSubscribers)  // consumed while the attempt is still suspended
+    await sending.value
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    let updates = await stubs.calls.updates
+    #expect(updates.map(\.0) == [Data([1]), Data([1])], "false after a consumed ready must retry, not park")
+    // Still unparked: a later send goes straight out with no further ready event.
+    await adapter.send(cid, fragments: [Data([2])])
+    #expect(await stubs.calls.updates.map(\.0) == [Data([1]), Data([1]), Data([2])])
     await adapter.stop()
 }
 

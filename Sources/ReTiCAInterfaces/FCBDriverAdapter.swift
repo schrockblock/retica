@@ -83,6 +83,9 @@ actor FCBDriverAdapter {
     private var inbound: [BLEChannelID: Central] = [:]
     private var inboundByCentral: [UUID: BLEChannelID] = [:]
     private var notifyParked = false
+    // Bumped by every isReadyToUpdateSubscribers. A notify attempt that sees it change while in
+    // flight retries instead of parking: the ready that would have unparked it is already consumed.
+    private var readyGeneration = 0
     private var heldWrites: [UUID: (data: Data, at: Date)] = [:]
 
     init(central: BluetoothCentralClient, peripheral: BluetoothPeripheralClient,
@@ -405,6 +408,7 @@ actor FCBDriverAdapter {
         inbound = [:]
         inboundByCentral = [:]
         notifyParked = false
+        readyGeneration = 0
         heldWrites = [:]
     }
 
@@ -451,20 +455,27 @@ actor FCBDriverAdapter {
     /// One notify attempt for the drain loop. true = sent, dequeue it; false = leave it queued
     /// (CoreBluetooth's queue is full → parked until isReadyToUpdateSubscribers) or the channel closed.
     private func notifyInbound(_ channel: BLEChannelID, _ fragment: Data) async -> Bool {
-        guard !notifyParked, let central = inbound[channel] else { return false }
-        let myEpoch = epoch
-        do {
-            let ok = try await peripheral.updateValue(fragment, bleV22TXCharUUID, [central.id])
-            // A session reset mid-notify must not park the next session.
-            if !ok && epoch == myEpoch { notifyParked = true }
-            return ok
-        } catch {
-            inboundDidClose(channel, reason: "notify failed: \(error)")
-            return false
+        while true {
+            guard !notifyParked, let central = inbound[channel] else { return false }
+            let generation = readyGeneration
+            let myEpoch = epoch
+            do {
+                let ok = try await peripheral.updateValue(fragment, bleV22TXCharUUID, [central.id])
+                guard epoch == myEpoch else { return false }   // a session reset mid-notify must not touch the next session
+                if ok { return true }
+                // A ready event landed while this attempt was in flight: it was meant for us, retry now.
+                if generation != readyGeneration { continue }
+                notifyParked = true
+                return false
+            } catch {
+                inboundDidClose(channel, reason: "notify failed: \(error)")
+                return false
+            }
         }
     }
 
     private func notifyReady() async {
+        readyGeneration += 1
         notifyParked = false
         for channel in inbound.keys.sorted(by: { $0.id.uuidString < $1.id.uuidString }) where sendQueues[channel] != nil {
             await drain(channel)
