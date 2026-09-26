@@ -594,8 +594,10 @@ public struct LXMFNode {
                     return .none
                 }
 
-            case let .router(.delegate(.sendOpportunistic(dest, payload))):
-                return .send(.endpoint(.send(destinationHash: dest, plaintext: payload)))
+            case let .router(.delegate(.sendOpportunistic(dest, payload, messageHash))):
+                // The message hash is the receipt token: every resend is a new packet with its own
+                // receipt under the same token, so a proof for any attempt confirms the message.
+                return .send(.endpoint(.send(destinationHash: dest, plaintext: payload, receiptToken: messageHash)))
 
             case let .endpoint(.delegate(.messageReceived(destHash, plaintext, packetHash, interfaceID))):
                 // Reference `LXMRouter.delivery_packet` (LXMRouter.py:1926-1927) calls `packet.prove()`
@@ -743,6 +745,9 @@ public struct LXMFNode {
                 // Treat a lost packet the same as a retry-due so the message isn't silently dropped.
                 // Same reasoning as above: a link receipt is always the propagated copy's.
                 return .send(.router(.retryDue(messageHash: token, leg: .propagated)))
+
+            case let .endpoint(.delegate(.singlePacketDelivered(token))):
+                return .send(.router(.opportunisticDelivered(messageHash: token)))
 
             case let .router(.delegate(.closeLink(dest))):
                 guard let linkID = state.directLinks[dest] else { return .none }

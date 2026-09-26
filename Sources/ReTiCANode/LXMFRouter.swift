@@ -192,6 +192,9 @@ public struct LXMFRouter {
         /// A receipt for one copy of a message. The copy is named by the path that produced the
         /// receipt, never inferred from which copy was armed last.
         case delivered(messageHash: Data, leg: Leg)
+        /// A single-packet proof arrived for one of this message's opportunistic packets (Transport
+        /// `singlePacketDelivered`, token = message hash). Confirms the DELIVERY copy.
+        case opportunisticDelivered(messageHash: Data)
         case resourceDeliveredOnLink(linkID: Data)
         case retryDue(messageHash: Data, leg: Leg)
         case idleDeadline(destinationHash: Data, linkID: Data)
@@ -201,7 +204,9 @@ public struct LXMFRouter {
         public enum Delegate: Equatable {
             case messageDelivered(message: LXMessage, signatureValidated: Bool)
             case duplicateDropped(hash: Data)
-            case sendOpportunistic(destinationHash: Data, payload: Data)
+            /// `messageHash` becomes the packet's receipt token, so a proof for ANY attempt of this
+            /// message comes back as `.opportunisticDelivered(messageHash:)`.
+            case sendOpportunistic(destinationHash: Data, payload: Data, messageHash: Data)
             case requestLink(destinationHash: Data)
             case requestPath(destinationHash: Data)
             case sendDirect(linkID: Data, data: Data, asResource: Bool)
@@ -410,7 +415,8 @@ public struct LXMFRouter {
                                                           payload: message.opportunisticPayload)
                     arm(&state, key, resend)
                     return .merge(.send(.delegate(.sendOpportunistic(destinationHash: message.destinationHash,
-                                                                     payload: message.opportunisticPayload))),
+                                                                     payload: message.opportunisticPayload,
+                                                                     messageHash: message.hash))),
                                   retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 case .direct:
                     let dest = message.destinationHash
@@ -582,6 +588,9 @@ public struct LXMFRouter {
             case let .delivered(hash, leg):
                 return succeed(&state, DeliveryKey(messageHash: hash, leg: leg))
 
+            case let .opportunisticDelivered(hash):
+                return succeed(&state, .delivery(hash))
+
             case let .resourceDeliveredOnLink(linkID):
                 guard let key = state.linkResourceInFlight[linkID] else { return .none }
                 state.linkResourceInFlight[linkID] = nil
@@ -603,7 +612,8 @@ public struct LXMFRouter {
                         return .merge(.send(.delegate(.requestPath(destinationHash: destinationHash))),
                                       retryTimer(key, LXMFDelivery.pathRequestWaitSeconds))
                     }
-                    return .merge(.send(.delegate(.sendOpportunistic(destinationHash: destinationHash, payload: payload))),
+                    return .merge(.send(.delegate(.sendOpportunistic(destinationHash: destinationHash, payload: payload,
+                                                                     messageHash: hash))),
                                   retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 case let .direct(destinationHash, data, asResource):
                     if case let .active(linkID) = state.directLinks[destinationHash] {

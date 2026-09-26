@@ -130,7 +130,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .opportunistic))
     await store.receive { action in
-        if case let .delegate(.sendOpportunistic(dest, payload)) = action {
+        if case let .delegate(.sendOpportunistic(dest, payload, _)) = action {
             #expect(dest == msg.destinationHash); #expect(payload == msg.opportunisticPayload); return true
         }
         return false
@@ -561,7 +561,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // Path now known → next retry resends opportunistically instead of requesting a path again.
     await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
     await store.receive { action in
-        if case let .delegate(.sendOpportunistic(dest, _)) = action { #expect(dest == msg.destinationHash); return true }
+        if case let .delegate(.sendOpportunistic(dest, _, _)) = action { #expect(dest == msg.destinationHash); return true }
         return false
     }
     await store.send(.delivered(messageHash: msg.hash, leg: .delivery))
