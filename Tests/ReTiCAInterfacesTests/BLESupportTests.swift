@@ -338,3 +338,35 @@ private func reassembleExactlyAtEnd(_ fragments: [Data]) throws -> Data? {
     #expect(!BLEKeepalive.isKeepalive(Data([0x00, 0x00])))
     #expect(!BLEKeepalive.isKeepalive(Data()))
 }
+
+// MARK: - L2CAP length framing (v3)
+
+@Test func l2capFrameIsBigEndianLengthPrefixed() throws {
+    #expect(try BLEFraming.frame(Data([0xAA, 0xBB, 0xCC])) == Data([0x00, 0x03, 0xAA, 0xBB, 0xCC]))
+    let big = Data(repeating: 0x42, count: 300)
+    #expect(try BLEFraming.frame(big) == Data([0x01, 0x2C]) + big)
+    #expect(BLEFraming.keepaliveFrame == Data([0x00, 0x01, 0x00]))
+}
+
+@Test func l2capFrameRejectsEmptyAndOversized() {
+    #expect(throws: BLEFramingError.invalidLength(0)) { try BLEFraming.frame(Data()) }
+    #expect(throws: BLEFramingError.invalidLength(1197)) { try BLEFraming.frame(Data(repeating: 0, count: 1197)) }
+    #expect((try? BLEFraming.frame(Data(repeating: 0, count: 1196))) != nil)
+}
+
+@Test func l2capDeframerRecoversCoalescedAndSplitRecords() throws {
+    var buffer = BLEFrameBuffer()
+    let a = Data([0x01]); let b = Data((0..<30).map { UInt8($0) })
+    #expect(try buffer.append(BLEFraming.frame(a) + BLEFraming.frame(b)) == [a, b])
+    let framed = try BLEFraming.frame(b)
+    #expect(try buffer.append(framed.prefix(1)) == [])
+    #expect(try buffer.append(framed.dropFirst(1).prefix(10)) == [])
+    #expect(try buffer.append(framed.dropFirst(11)) == [b])
+}
+
+@Test func l2capDeframerThrowsOnZeroOrOversizedLength() {
+    var zero = BLEFrameBuffer()
+    #expect(throws: BLEFramingError.invalidLength(0)) { _ = try zero.append(Data([0x00, 0x00, 0xFF])) }
+    var big = BLEFrameBuffer()
+    #expect(throws: BLEFramingError.invalidLength(1197)) { _ = try big.append(Data([0x04, 0xAD])) }   // 0x04AD = 1197
+}

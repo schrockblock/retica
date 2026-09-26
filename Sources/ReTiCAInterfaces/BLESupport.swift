@@ -253,3 +253,55 @@ public enum BLEKeepalive {
     public static let frame = Data([0x00])
     public static func isKeepalive(_ data: Data) -> Bool { data.count == 1 && data[data.startIndex] == 0x00 }
 }
+
+// MARK: - L2CAP length framing (BLE Protocol v3)
+
+public enum BLEFramingError: Error, Equatable {
+    case invalidLength(Int)
+}
+
+/// v3 channel framing: [len: 2 bytes big-endian][payload], 1 <= len <= 1196. No fragmentation
+/// layer rides on top; the kernel's credit-based flow control segments the stream.
+public enum BLEFraming {
+    public static let maxFrameLength = 1196
+    public static let headerLength = 2
+    /// len 1, payload 0x00 — ignored by receivers (wire spec §Keepalive).
+    public static let keepaliveFrame = Data([0x00, 0x01, 0x00])
+
+    public static func frame(_ packet: Data) throws -> Data {
+        guard packet.count >= 1, packet.count <= maxFrameLength else {
+            throw BLEFramingError.invalidLength(packet.count)
+        }
+        var out = Data([UInt8(packet.count >> 8), UInt8(packet.count & 0xFF)])
+        out.append(packet)
+        return out
+    }
+}
+
+/// Streaming deframer. Accumulates bytes and yields complete records; throws on a malformed
+/// length prefix. There is no resynchronisation: the caller closes the channel.
+public struct BLEFrameBuffer: Equatable, Sendable {
+    public let maxFrameLength: Int
+    var buffer: Data
+
+    public init(maxFrameLength: Int = BLEFraming.maxFrameLength) {
+        self.maxFrameLength = maxFrameLength
+        self.buffer = Data()
+    }
+
+    public mutating func append(_ data: Data) throws -> [Data] {
+        buffer.append(data)
+        var records: [Data] = []
+        while buffer.count >= BLEFraming.headerLength {
+            let b0 = Int(buffer[buffer.startIndex])
+            let b1 = Int(buffer[buffer.startIndex + 1])
+            let length = (b0 << 8) | b1
+            guard length >= 1, length <= maxFrameLength else { throw BLEFramingError.invalidLength(length) }
+            guard buffer.count >= BLEFraming.headerLength + length else { break }
+            let start = buffer.startIndex + BLEFraming.headerLength
+            records.append(Data(buffer[start ..< start + length]))
+            buffer = Data(buffer[(start + length)...])
+        }
+        return records
+    }
+}
