@@ -72,13 +72,15 @@ private func peer(stampCost: Int?, learnedAt: Date) -> LXMFNode.LearnedPeer {
     let capturedMessage = LockIsolated<LXMessage?>(nil)
     await store.send(.send(destinationHash: peerDestHash, title: Data("t".utf8),
                            content: Data("c".utf8), method: .opportunistic))
-    await store.receive { action in
+    // Explicit timeout: the stamp search is CPU-bound and can outlast TestStore's 1 s default on a
+    // loaded machine (it did, under the parallel full suite).
+    await store.receive({ action in
         if case let .router(.send(m, _)) = action {
             capturedMessage.setValue(m)
             return true
         }
         return false
-    }
+    }, timeout: .seconds(10))
     let msg = try #require(capturedMessage.value)
     #expect(msg.stamp != nil, "rehydrated cost must drive stamp generation")
     #expect(msg.validateStamp(targetCost: cost))

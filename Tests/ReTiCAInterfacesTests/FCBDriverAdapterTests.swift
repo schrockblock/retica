@@ -65,6 +65,8 @@ actor AdapterCalls {
     var stopScanned = 0
     var stoppedAdvertising = 0
     var removedAll = 0
+    /// removeAll calls that have STARTED (a held call counts here before it counts in `removedAll`).
+    var removeAllStarted = 0
     var connected: [UUID] = []
     var disconnected: [UUID] = []
     var discoveredServices: [UUID] = []
@@ -83,6 +85,7 @@ actor AdapterCalls {
     func stopScan() { stopScanned += 1 }
     func stopAdvertising() { stoppedAdvertising += 1; peripheralOrder.append("stopAdvertising") }
     func removeAll() { removedAll += 1; peripheralOrder.append("removeAll") }
+    func startRemoveAll() { removeAllStarted += 1 }
     func connect(_ id: UUID) { connected.append(id) }
     func disconnect(_ id: UUID) { disconnected.append(id) }
     func discoverServices(_ id: UUID) { discoveredServices.append(id) }
@@ -126,7 +129,7 @@ struct AdapterStubs {
     let updateDelayNanos: LockIsolated<UInt64>         // nanoseconds updateValue stays in flight before returning
     let canSend: LockIsolated<Bool>                    // central.canSendWriteWithoutResponse return
     let canSendDelayNanos: LockIsolated<UInt64>        // nanoseconds canSendWriteWithoutResponse stays in flight before returning
-    let removeAllDelayNanos: LockIsolated<UInt64>      // nanoseconds peripheral.removeAll stays in flight before it is recorded
+    let removeAllHeld: LockIsolated<Bool>              // while true, peripheral.removeAll stays in flight (a deterministic "slow" removeAll)
 }
 
 @MainActor
@@ -152,7 +155,7 @@ func makeStubs() -> AdapterStubs {
     let updateDelayNanos = LockIsolated<UInt64>(0)
     let canSend = LockIsolated(true)
     let canSendDelayNanos = LockIsolated<UInt64>(0)
-    let removeAllDelayNanos = LockIsolated<UInt64>(0)
+    let removeAllHeld = LockIsolated(false)
 
     let central = BluetoothCentralClient(
         state: { cState.makeStream() },
@@ -234,7 +237,8 @@ func makeStubs() -> AdapterStubs {
         add: { s in await calls.addService(s); return Service(id: s.id, peripheralID: UUID(), isPrimary: true) },
         remove: { _ in },
         removeAll: {
-            if removeAllDelayNanos.value > 0 { try? await Task.sleep(nanoseconds: removeAllDelayNanos.value) }
+            await calls.startRemoveAll()
+            while removeAllHeld.value { try? await Task.sleep(nanoseconds: 2_000_000) }
             await calls.removeAll()
         },
         startAdvertising: { d in await calls.advertise(d) },
@@ -270,13 +274,21 @@ func makeStubs() -> AdapterStubs {
         mtu: mtu, updateResult: updateResult, notifications: notifications, terminated: terminated,
         notifyOnHandshake: notifyOnHandshake, disconnectDuringHandshake: disconnectDuringHandshake,
         readDelay: readDelay, updateDelayNanos: updateDelayNanos,
-        canSend: canSend, canSendDelayNanos: canSendDelayNanos, removeAllDelayNanos: removeAllDelayNanos)
+        canSend: canSend, canSendDelayNanos: canSendDelayNanos, removeAllHeld: removeAllHeld)
 }
 
-/// Collect up to `count` events (or until the stream ends, or ~2s elapses) with a bounded wait.
+/// How long a test waits for an event it EXPECTS. Generous on purpose: it only bounds a hang, and
+/// a passing test returns as soon as the event lands, so a loaded machine can't turn it into a flake.
+let eventWait: UInt64 = 10_000_000_000
+/// How long a test watches for an event it expects NOT to arrive (a wall-clock window by nature).
+let quietWindow: UInt64 = 2_000_000_000
+
+/// Collect up to `count` events (or until the stream ends, or `within` elapses) with a bounded wait.
 /// Returns whatever was accumulated even when the bound is hit before `count` is reached, so a
 /// test can assert "at most N events, and here's exactly what came" rather than only a full match.
-func collect(_ stream: AsyncStream<BLEDriverEvent>, count: Int) async -> [BLEDriverEvent] {
+/// A timed-out collect cancels its consumer, which finishes an AsyncStream: after that the stream
+/// yields nothing more, so only use a short `within` as a test's last read of that stream.
+func collect(_ stream: AsyncStream<BLEDriverEvent>, count: Int, within nanos: UInt64 = eventWait) async -> [BLEDriverEvent] {
     let acc = LockIsolated<[BLEDriverEvent]>([])
     await withTaskGroup(of: Void.self) { group in
         group.addTask {
@@ -288,7 +300,7 @@ func collect(_ stream: AsyncStream<BLEDriverEvent>, count: Int) async -> [BLEDri
                 if reachedCount { break }
             }
         }
-        group.addTask { try? await Task.sleep(nanoseconds: 2_000_000_000) }
+        group.addTask { try? await Task.sleep(nanoseconds: nanos) }
         await group.next()
         group.cancelAll()
     }
@@ -319,7 +331,8 @@ func onlineAdapter() async -> (FCBDriverAdapter, AdapterStubs, AsyncStream<BLEDr
     let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
     stubs.peripheralState.yield(.poweredOn)
     stubs.centralState.yield(.poweredOn)
-    _ = await collect(events, count: 1)   // .ready
+    let collected = await collect(events, count: 1)
+    #expect(collected == [.ready])
     return (adapter, stubs, events)
 }
 
@@ -352,7 +365,9 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     #expect(svc.characteristics.contains { $0.id == rxCharUUID && $0.properties == [.write, .writeWithoutResponse] && $0.permissions == .writeable })
     #expect(svc.characteristics.contains { $0.id == identityCharUUID && $0.properties == .read && $0.value == adapterLocalIdentity })
     #expect(await stubs.calls.advertised.first??.serviceUUIDs == [serviceUUID])
-    #expect(await stubs.calls.scanned == 1)
+    // The stub records the scan from an unstructured Task, which may land after .ready: poll.
+    let calls = stubs.calls
+    #expect(await waitUntil(within: 1_000_000_000) { await calls.scanned >= 1 })
     await adapter.stop()
 }
 
@@ -364,7 +379,7 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     stubs.peripheralState.yield(.poweredOff)
     // Both streams fire poweredOff; ask for 2 events but expect exactly one — the guard against
     // a duplicate .unavailable must actually be doing something.
-    #expect(await collect(events, count: 2) == [.unavailable(.poweredOff)])
+    #expect(await collect(events, count: 2, within: quietWindow) == [.unavailable(.poweredOff)])
     await adapter.stop()
 }
 
@@ -372,13 +387,16 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     let stubs = makeStubs()
     let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
     let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    // One consumer for both legs: a timed-out `collect` would cancel its reader and finish the stream.
     let recorded = LockIsolated<[BLEDriverEvent]>([])
     let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
     stubs.centralState.yield(.poweredOn)
-    try? await Task.sleep(nanoseconds: 300_000_000)
-    #expect(recorded.value == [])
+    // Scanning alone: wait for .ready or a 300 ms timeout, and it must be the timeout.
+    let readyWhileOnlyScanning = await waitUntil(within: 300_000_000) { recorded.value.contains(.ready) }
+    #expect(!readyWhileOnlyScanning)
     stubs.peripheralState.yield(.poweredOn)
-    try? await Task.sleep(nanoseconds: 300_000_000)
+    // Advertising too: .ready arrives (event-driven, no fixed sleep).
+    #expect(await waitUntil(within: eventWait) { !recorded.value.isEmpty })
     #expect(recorded.value == [.ready])
     await adapter.stop()
     drain.cancel()
@@ -436,15 +454,18 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
     stubs.peripheralState.yield(.poweredOn)             // replayed to any session that subscribes
     stubs.centralState.yield(.poweredOn)
-    stubs.removeAllDelayNanos.setValue(100_000_000)     // begin's own clean-up is in flight for 100 ms
+    stubs.removeAllHeld.setValue(true)                  // begin's own clean-up stays in flight until released
     let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
     let recorded = LockIsolated<[BLEDriverEvent]>([])
     let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
     let calls = stubs.calls
-    // begin's resetSession has issued stopAdvertising, so it is now suspended in the slow removeAll.
-    #expect(await waitUntil(within: 2_000_000_000) { await calls.stoppedAdvertising >= 1 })
-    try? await Task.sleep(nanoseconds: 20_000_000)
-    await adapter.stop()
+    // begin's resetSession is now suspended in the held removeAll.
+    #expect(await waitUntil(within: eventWait) { await calls.removeAllStarted >= 1 })
+    let stopping = Task { await adapter.stop() }
+    // stop()'s resetSession (which bumped the epoch first) has reached its own removeAll.
+    #expect(await waitUntil(within: eventWait) { await calls.removeAllStarted >= 2 })
+    stubs.removeAllHeld.setValue(false)                 // begin resumes into a session that already ended
+    await stopping.value
     try? await Task.sleep(nanoseconds: 500_000_000)     // long past when a zombie bring-up would advertise
     #expect(!recorded.value.contains(.ready))
     #expect(await calls.advertised.count == 0, "bring-up must never run for a session stopped mid-begin")
@@ -459,15 +480,19 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     let recorded = LockIsolated<[BLEDriverEvent]>([])
     let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
     let calls = stubs.calls
-    // begin's own clean-up has finished (the session is live) before removeAll turns slow.
-    #expect(await waitUntil(within: 2_000_000_000) { await calls.removedAll >= 1 })
-    stubs.removeAllDelayNanos.setValue(100_000_000)     // the bring-up's removeAll is in flight for 100 ms
+    // begin's own clean-up has finished (the session is live) before removeAll is held.
+    #expect(await waitUntil(within: eventWait) { await calls.removedAll >= 1 })
+    stubs.removeAllHeld.setValue(true)                  // the bring-up's removeAll stays in flight until released
     stubs.centralState.yield(.poweredOn)
     stubs.peripheralState.yield(.poweredOn)
-    // The bring-up has issued its stopAdvertising, so it is now suspended in the slow removeAll.
-    #expect(await waitUntil(within: 2_000_000_000) { await calls.stoppedAdvertising >= 2 })
-    await adapter.stop()
-    try? await Task.sleep(nanoseconds: 500_000_000)     // long past when the bring-up's removeAll returns
+    // The bring-up is now suspended in the held removeAll.
+    #expect(await waitUntil(within: eventWait) { await calls.removeAllStarted >= 2 })
+    let stopping = Task { await adapter.stop() }
+    // stop()'s resetSession (which bumped the epoch first) has reached its own removeAll.
+    #expect(await waitUntil(within: eventWait) { await calls.removeAllStarted >= 3 })
+    stubs.removeAllHeld.setValue(false)                 // the bring-up resumes into a session that already ended
+    await stopping.value
+    try? await Task.sleep(nanoseconds: 500_000_000)     // long past when a resumed bring-up would publish
     #expect(await calls.addedServices.count == 0, "no service published for a stopped session")
     #expect(await calls.advertised.count == 0, "no advertising for a stopped session")
     #expect(!recorded.value.contains(.ready))
@@ -685,7 +710,7 @@ func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
     stubs.canSend.setValue(true)
     stubs.centralEvents.yield(readyToSend(p))
     let calls = stubs.calls
-    let resumed = await waitUntil(within: 500_000_000) { await calls.withoutResponseWrites.count >= 2 }
+    let resumed = await waitUntil(within: eventWait) { await calls.withoutResponseWrites.count >= 2 }
     #expect(resumed)
     #expect(await calls.withoutResponseWrites == [Data([1]), Data([2])])
     await adapter.stop()
@@ -705,7 +730,7 @@ func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
     await sending.value
     let calls = stubs.calls
     // No second ready event is ever sent: only the generation re-check can get [1] out.
-    let written = await waitUntil(within: 500_000_000) { await calls.withoutResponseWrites.count >= 1 }
+    let written = await waitUntil(within: eventWait) { await calls.withoutResponseWrites.count >= 1 }
     #expect(written, "false after a consumed ready must re-check, not park")
     #expect(await calls.withoutResponseWrites == [Data([1])])
     // Still unparked: a later send goes straight out with no further ready event.
@@ -821,8 +846,8 @@ func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
     let isTerminated: Bool
     if case .terminated? = result { isTerminated = true } else { isTerminated = false }
     #expect(isTerminated)
-    try? await Task.sleep(nanoseconds: 200_000_000)
-    #expect(stubs.terminated.value.contains(p.id))
+    let terminated = stubs.terminated
+    #expect(await waitUntil(within: eventWait) { terminated.value.contains(p.id) })
     await adapter.stop()
 }
 
@@ -939,7 +964,8 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     #expect(await stubs.calls.updates.count == 1)   // tried [1] once, parked; [2] never attempted
     stubs.updateResult.setValue(true)
     stubs.peripheralEvents.yield(.isReadyToUpdateSubscribers)
-    try? await Task.sleep(nanoseconds: 200_000_000)
+    let calls = stubs.calls
+    _ = await waitUntil(within: eventWait) { await calls.updates.count >= 3 }
     let updates = await stubs.calls.updates
     #expect(updates.map(\.0) == [Data([1]), Data([1]), Data([2])])   // [1] retried, then [2]
     await adapter.stop()
@@ -957,7 +983,8 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     stubs.updateDelayNanos.setValue(0)
     stubs.peripheralEvents.yield(.isReadyToUpdateSubscribers)  // consumed while the attempt is still suspended
     await sending.value
-    try? await Task.sleep(nanoseconds: 100_000_000)
+    let calls = stubs.calls
+    _ = await waitUntil(within: eventWait) { await calls.updates.count >= 2 }
     let updates = await stubs.calls.updates
     #expect(updates.map(\.0) == [Data([1]), Data([1])], "false after a consumed ready must retry, not park")
     // Still unparked: a later send goes straight out with no further ready event.
@@ -1005,10 +1032,15 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     _ = await collect(events, count: 1)
     let c = centralValue(1)
     stubs.writeRequests.yield([rxWrite(c, adapterPeerIdentity)])
-    try? await Task.sleep(nanoseconds: 100_000_000)
+    // Batches are handled one at a time, in order: once a second (unrelated) batch has been
+    // responded to, the first one is held — stamped with the current `now`, before we advance it.
+    let sentinel = rxWrite(centralValue(2), Data([0]))
+    stubs.writeRequests.yield([sentinel])
+    let calls = stubs.calls
+    #expect(await waitUntil(within: eventWait) { await calls.responded.contains { $0.0 == sentinel.id } })
     now.withValue { $0 = $0.addingTimeInterval(FCBDriverAdapter.heldWriteWindow + 0.5) }
     stubs.subscriptions.yield(.subscribed(central: c, characteristic: txChar()))
-    let got = await collect(events, count: 2)   // times out after the single channelOpened
+    let got = await collect(events, count: 2, within: quietWindow)   // times out after the single channelOpened
     #expect(got.count == 1)
     await adapter.stop()
 }
@@ -1038,7 +1070,7 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     _ = await collect(events, count: 1)
     let req = ReadRequest(id: UUID(), central: centralValue(3), characteristic: txChar(), offset: 0)
     reads.continuation.yield(req)
-    try? await Task.sleep(nanoseconds: 100_000_000)
-    #expect(await stubs.calls.responded.contains { $0.0 == req.id && $0.1 == .success })
+    let calls = stubs.calls
+    #expect(await waitUntil(within: eventWait) { await calls.responded.contains { $0.0 == req.id && $0.1 == .success } })
     await adapter.stop()
 }
