@@ -126,6 +126,7 @@ struct AdapterStubs {
     let updateDelayNanos: LockIsolated<UInt64>         // nanoseconds updateValue stays in flight before returning
     let canSend: LockIsolated<Bool>                    // central.canSendWriteWithoutResponse return
     let canSendDelayNanos: LockIsolated<UInt64>        // nanoseconds canSendWriteWithoutResponse stays in flight before returning
+    let removeAllDelayNanos: LockIsolated<UInt64>      // nanoseconds peripheral.removeAll stays in flight before it is recorded
 }
 
 @MainActor
@@ -151,6 +152,7 @@ func makeStubs() -> AdapterStubs {
     let updateDelayNanos = LockIsolated<UInt64>(0)
     let canSend = LockIsolated(true)
     let canSendDelayNanos = LockIsolated<UInt64>(0)
+    let removeAllDelayNanos = LockIsolated<UInt64>(0)
 
     let central = BluetoothCentralClient(
         state: { cState.makeStream() },
@@ -231,7 +233,10 @@ func makeStubs() -> AdapterStubs {
         authorization: { .allowedAlways },
         add: { s in await calls.addService(s); return Service(id: s.id, peripheralID: UUID(), isPrimary: true) },
         remove: { _ in },
-        removeAll: { await calls.removeAll() },
+        removeAll: {
+            if removeAllDelayNanos.value > 0 { try? await Task.sleep(nanoseconds: removeAllDelayNanos.value) }
+            await calls.removeAll()
+        },
         startAdvertising: { d in await calls.advertise(d) },
         stopAdvertising: { await calls.stopAdvertising() },
         isAdvertising: { true },
@@ -265,7 +270,7 @@ func makeStubs() -> AdapterStubs {
         mtu: mtu, updateResult: updateResult, notifications: notifications, terminated: terminated,
         notifyOnHandshake: notifyOnHandshake, disconnectDuringHandshake: disconnectDuringHandshake,
         readDelay: readDelay, updateDelayNanos: updateDelayNanos,
-        canSend: canSend, canSendDelayNanos: canSendDelayNanos)
+        canSend: canSend, canSendDelayNanos: canSendDelayNanos, removeAllDelayNanos: removeAllDelayNanos)
 }
 
 /// Collect up to `count` events (or until the stream ends, or ~2s elapses) with a bounded wait.
@@ -424,6 +429,49 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     #expect(between.contains("removeAll"), "order: \(order)")
     #expect(between.contains("stopAdvertising"), "order: \(order)")
     await adapter.stop()
+}
+
+@Test @MainActor func stopDuringBeginLeavesNoZombieSession() async {
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
+    stubs.peripheralState.yield(.poweredOn)             // replayed to any session that subscribes
+    stubs.centralState.yield(.poweredOn)
+    stubs.removeAllDelayNanos.setValue(100_000_000)     // begin's own clean-up is in flight for 100 ms
+    let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    let recorded = LockIsolated<[BLEDriverEvent]>([])
+    let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
+    let calls = stubs.calls
+    // begin's resetSession has issued stopAdvertising, so it is now suspended in the slow removeAll.
+    #expect(await waitUntil(within: 2_000_000_000) { await calls.stoppedAdvertising >= 1 })
+    try? await Task.sleep(nanoseconds: 20_000_000)
+    await adapter.stop()
+    try? await Task.sleep(nanoseconds: 500_000_000)     // long past when a zombie bring-up would advertise
+    #expect(!recorded.value.contains(.ready))
+    #expect(await calls.advertised.count == 0, "bring-up must never run for a session stopped mid-begin")
+    drain.cancel()
+    await adapter.stop()
+}
+
+@Test @MainActor func stopDuringBringUpDoesNotAdvertiseAfterwards() async {
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
+    let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    let recorded = LockIsolated<[BLEDriverEvent]>([])
+    let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
+    let calls = stubs.calls
+    // begin's own clean-up has finished (the session is live) before removeAll turns slow.
+    #expect(await waitUntil(within: 2_000_000_000) { await calls.removedAll >= 1 })
+    stubs.removeAllDelayNanos.setValue(100_000_000)     // the bring-up's removeAll is in flight for 100 ms
+    stubs.centralState.yield(.poweredOn)
+    stubs.peripheralState.yield(.poweredOn)
+    // The bring-up has issued its stopAdvertising, so it is now suspended in the slow removeAll.
+    #expect(await waitUntil(within: 2_000_000_000) { await calls.stoppedAdvertising >= 2 })
+    await adapter.stop()
+    try? await Task.sleep(nanoseconds: 500_000_000)     // long past when the bring-up's removeAll returns
+    #expect(await calls.addedServices.count == 0, "no service published for a stopped session")
+    #expect(await calls.advertised.count == 0, "no advertising for a stopped session")
+    #expect(!recorded.value.contains(.ready))
+    drain.cancel()
 }
 
 // MARK: - Discovery

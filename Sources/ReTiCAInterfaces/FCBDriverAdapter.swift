@@ -107,7 +107,11 @@ actor FCBDriverAdapter {
     }
 
     private func begin(config: BLEDriverConfig, continuation: AsyncStream<BLEDriverEvent>.Continuation) async {
+        // resetSession bumps the epoch first; any other bump while it is suspended means a stop()
+        // (or a newer start) arrived mid-begin, and this session must never come up.
+        let myEpoch = epoch + 1
         await resetSession()
+        guard epoch == myEpoch else { continuation.finish(); return }
         self.config = config
         self.continuation = continuation
         announcedReady = false
@@ -142,16 +146,24 @@ actor FCBDriverAdapter {
     }
 
     private func bringUpPeripheral() async {
+        // Every step re-checks the epoch: a stop()/restart while this is suspended must not
+        // publish, advertise or announce anything for the session that just ended.
+        let myEpoch = epoch
         // A repeat poweredOn (Bluetooth toggled off→on) must not publish a second copy of the
         // service or hit alreadyAdvertising: tear down whatever an earlier bring-up left behind.
         await peripheral.stopAdvertising()
+        guard epoch == myEpoch else { return }
         await peripheral.removeAll()
+        guard epoch == myEpoch else { return }
         do {
             _ = try await peripheral.add(bleV22Service(localIdentity: config.localIdentity))
+            guard epoch == myEpoch else { return }
             try await peripheral.startAdvertising(AdvertisementData(serviceUUIDs: [bleV22ServiceUUID]))
+            guard epoch == myEpoch else { return }
             advertising = true
             checkReady()
         } catch {
+            guard epoch == myEpoch else { return }
             fireUnavailable(.other("peripheral setup failed: \(error)"))
         }
     }
