@@ -25,10 +25,9 @@ func tcpDriverEndpoint(host: String, port: UInt16, reconnectOnDrop: Bool = true,
                            interfaceID: interfaceID, profile: profile))
 }
 
-/// A `TransportEndpoint.State` running a BLE driver. Same argument shape as the old
-/// `BLEEndpoint.State(maxPeers:pairingMode:profile:)`.
-func bleDriverEndpoint(maxPeers: Int = BLEInterface.defaultMaxPeers,
-                       pairingMode: BLEPairingMode = .open,
+/// A `TransportEndpoint.State` running a BLE driver keyed by `localIdentity`.
+func bleDriverEndpoint(localIdentity: Data = Data(repeating: 0x5A, count: 16),
+                       maxPeers: Int = BLEInterface.defaultMaxPeers,
                        profile: InterfaceProfile = .ble) -> TransportEndpoint.State {
-    .ble(BLEEndpoint.State(maxPeers: maxPeers, pairingMode: pairingMode, profile: profile))
+    .ble(BLEEndpoint.State(localIdentity: localIdentity, maxPeers: maxPeers, profile: profile))
 }

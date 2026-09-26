@@ -31,7 +31,7 @@ private func makeStore() -> TestStore<TransportEndpoint.State, TransportEndpoint
         // directly and never rely on the driver.
         $0.bleDriver = BLEDriver(
             start: { _ in AsyncStream { $0.finish() } },
-            readDirectory: { _ in }, openChannel: { _, _ in },
+            readIdentity: { _ in }, openChannel: { _ in },
             send: { _, _ in }, closeChannel: { _ in }, stop: { }
         )
     }

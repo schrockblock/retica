@@ -30,7 +30,7 @@ private func makeTCP() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
 
 @MainActor
 private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.Action> {
-    let store = TestStore(initialState: .ble(BLEEndpoint.State())) {
+    let store = TestStore(initialState: .ble(BLEEndpoint.State(localIdentity: Data(repeating: 0x5A, count: 16)))) {
         TransportEndpoint()
     } withDependencies: {
         $0.continuousClock = TestClock()
@@ -38,7 +38,7 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
         $0.uuid = .incrementing
         $0.bleDriver = BLEDriver(
             start: { _ in AsyncStream { $0.finish() } },
-            readDirectory: { _ in }, openChannel: { _, _ in },
+            readIdentity: { _ in }, openChannel: { _ in },
             send: { _, _ in }, closeChannel: { _ in }, stop: { }
         )
     }
@@ -169,7 +169,7 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
     #expect(tcpState.links.isEmpty)
     #expect(tcpState.registrations.isEmpty)
 
-    var bleState = TransportEndpoint.State.ble(BLEEndpoint.State())
+    var bleState = TransportEndpoint.State.ble(BLEEndpoint.State(localIdentity: Data(repeating: 0x5A, count: 16)))
     bleState.transport.learned[dest] = learned
     #expect(bleState.learned[dest]?.identity.hash == identity.hash)
     #expect(bleState.links.isEmpty)
@@ -183,7 +183,7 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
     tcp.transport.interfaces[InterfaceID("tcp")] = .tcp
     #expect(tcp.interfaces == [InterfaceID("tcp"): .tcp])
 
-    var ble = TransportEndpoint.State.ble(BLEEndpoint.State())
+    var ble = TransportEndpoint.State.ble(BLEEndpoint.State(localIdentity: Data(repeating: 0x5A, count: 16)))
     ble.transport.interfaces[InterfaceID("ble-1")] = .ble
     #expect(ble.interfaces == [InterfaceID("ble-1"): .ble])
 }

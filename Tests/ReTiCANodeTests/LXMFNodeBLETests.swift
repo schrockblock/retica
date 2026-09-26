@@ -6,11 +6,6 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
-// A framed HELLO carrying `token` (the wire form the peer sends first on a channel).
-private func framedHello(_ token: Data) -> Data {
-    try! BLEFraming.frame(BLEHello.pack(version: BLEInterface.protocolVersion, token: token))
-}
-
 private let ownToken   = Data(repeating: 0x5A, count: 16)
 private let peerToken  = Data(repeating: 0xC7, count: 16)
 private let peerTokenB = Data(repeating: 0xD4, count: 16)   // second session token for reconnect test
@@ -18,6 +13,9 @@ private let channel    = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0
 private let handle     = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000002")!)
 private let channel2   = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000003")!)
 private let handle2    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000004")!)
+private let bleMTU = 512
+/// One fragment (payload 507 ≥ any test packet) with the 5-byte v2.2 header.
+private func bleFrag(_ packet: Data) -> Data { try! BLEFragmenter(mtu: bleMTU).fragment(packet)[0] }
 
 /// An LXMFNode running over BLE, with a controllable mock driver.
 @MainActor
@@ -28,17 +26,16 @@ private func makeBLENode(_ identity: Identity)
     let events = AsyncStream<BLEDriverEvent>.makeStream()
     let sent = LockIsolated<[Data]>([])          // framed bytes handed to the driver
     let store = TestStore(
-        initialState: LXMFNode.State(identity: identity, endpoint: BLEEndpoint.State())
+        initialState: LXMFNode.State(identity: identity, endpoint: BLEEndpoint.State(localIdentity: ownToken))
     ) {
         LXMFNode()
     } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
         $0.uuid = .incrementing
-        $0.bleRandomBytes = BLERandomBytesGenerator { _ in ownToken }
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
-            readDirectory: { _ in }, openChannel: { _, _ in },
+            readIdentity: { _ in }, openChannel: { _ in },
             send: { _, data in sent.withValue { $0.append(data) } },
             closeChannel: { _ in }, stop: { }
         )
@@ -68,8 +65,8 @@ private func bringPeerOnlineWith(_ store: TestStore<LXMFNode.State, LXMFNode.Act
         await store.send(.endpoint(.start))
         events.yield(.ready)              // BLEInterface gates channelOpened on .online
     }
-    events.yield(.channelOpened(channelID, peerHandle, direction: .inbound))
-    events.yield(.channelData(channelID, framedHello(token)))
+    events.yield(.channelOpened(channelID, peerHandle, direction: .inbound, mtu: bleMTU))
+    events.yield(.channelData(channelID, token))
     await store.receive { action in
         if case .endpoint(.transport(.interfaceConnected)) = action { return true }
         return false
@@ -88,7 +85,7 @@ private func makeLXMFAnnouncePacket(identity: Identity, emitted: UInt64) -> (Dat
     let packet = Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
                         destinationHash: destHash, transportId: nil, payload: payload)
-    return (try! BLEFraming.frame(try! packet.packed()), destHash)
+    return (bleFrag(try! packet.packed()), destHash)
 }
 
 @MainActor
@@ -130,7 +127,7 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
                         destinationType: .single, context: .none, contextFlag: false, hops: 0,
                         destinationHash: bDeliveryHash, transportId: nil,
                         payload: dest.encrypt(msg.opportunisticPayload))
-    events.yield(.channelData(channel, try! BLEFraming.frame(try! packet.packed())))
+    events.yield(.channelData(channel, bleFrag(try! packet.packed())))
 
     let gotContent = LockIsolated<Data?>(nil)
     await store.receive { action in
@@ -158,7 +155,7 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     let announce = Packet(headerType: .header1, packetType: .announce, transportType: .broadcast,
                           destinationType: .single, context: .none, contextFlag: false, hops: 1,
                           destinationHash: bDest.hash, transportId: nil, payload: payload)
-    events.yield(.channelData(channel, try! BLEFraming.frame(try! announce.packed())))
+    events.yield(.channelData(channel, bleFrag(try! announce.packed())))
     await store.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
 
     // Send an opportunistic LXMF message; it must reach the peer as a framed DATA packet.
@@ -178,7 +175,7 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
         Issue.record("nothing reached the BLE driver")
         return
     }
-    let raw = Data(framed.dropFirst(BLEFraming.headerLength))
+    let raw = Data(framed.dropFirst(BLEFragmenter.headerLength))
     let outPacket = Packet(raw: raw)
     #expect(outPacket?.packetType == .data)
     #expect(outPacket?.destinationHash == bDest.hash)
@@ -219,17 +216,16 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
     let events = AsyncStream<BLEDriverEvent>.makeStream()
     let sent = LockIsolated<[Data]>([])
     let store = TestStore(
-        initialState: LXMFNode.State(identity: aIdentity, endpoint: BLEEndpoint.State())
+        initialState: LXMFNode.State(identity: aIdentity, endpoint: BLEEndpoint.State(localIdentity: ownToken))
     ) {
         LXMFNode()
     } withDependencies: {
         $0.continuousClock = clock
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
         $0.uuid = .incrementing
-        $0.bleRandomBytes = BLERandomBytesGenerator { _ in ownToken }
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
-            readDirectory: { _ in }, openChannel: { _, _ in },
+            readIdentity: { _ in }, openChannel: { _ in },
             send: { _, data in sent.withValue { $0.append(data) } },
             closeChannel: { _ in }, stop: { }
         )
@@ -324,7 +320,7 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
         Issue.record("nothing reached the BLE driver after reconnect")
         return
     }
-    let rawPkt = Data(lastSent.dropFirst(BLEFraming.headerLength))
+    let rawPkt = Data(lastSent.dropFirst(BLEFragmenter.headerLength))
     #expect(Packet(raw: rawPkt)?.packetType == .linkRequest,
             "the packet emitted after path re-learn must be a LINKREQUEST")
 

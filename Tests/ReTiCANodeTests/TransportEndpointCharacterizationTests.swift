@@ -88,16 +88,15 @@ private func makeBLE(tokenForChannel: [BLEChannelID: Data], ownToken: Data)
         LockIsolated<[(Data, Data)]>) {
     let events = AsyncStream<BLEDriverEvent>.makeStream()
     let sent = LockIsolated<[(Data, Data)]>([])
-    let store = TestStore(initialState: TransportEndpoint.State.ble(BLEEndpoint.State())) {
+    let store = TestStore(initialState: .ble(BLEEndpoint.State(localIdentity: ownToken))) {
         TransportEndpoint()
     } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 0))
         $0.uuid = .incrementing
-        $0.bleRandomBytes = BLERandomBytesGenerator { _ in ownToken }
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
-            readDirectory: { _ in }, openChannel: { _, _ in },
+            readIdentity: { _ in }, openChannel: { _ in },
             send: { chan, data in sent.withValue { $0.append((tokenForChannel[chan] ?? Data(), data)) } },
             closeChannel: { _ in }, stop: { })
     }
@@ -120,9 +119,9 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     return (try! packet.packed(), destHash)
 }
 
-private func framedHello(_ token: Data) -> Data {
-    try! BLEFraming.frame(BLEHello.pack(version: BLEInterface.protocolVersion, token: token))
-}
+private let bleMTU = 512
+/// One fragment (payload 507 ≥ any test packet) with the 5-byte v2.2 header.
+private func bleFrag(_ packet: Data) -> Data { try! BLEFragmenter(mtu: bleMTU).fragment(packet)[0] }
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. F8 stale-path gate (TCP)
@@ -385,10 +384,10 @@ private func framedHello(_ token: Data) -> Data {
     // Bring BOTH peers online through the real BLEInterface handshake (driver dependency only).
     await store.send(.start)
     events.yield(.ready)
-    events.yield(.channelOpened(channelA, handleA, direction: .inbound))
-    events.yield(.channelData(channelA, framedHello(tokenA)))
-    events.yield(.channelOpened(channelB, handleB, direction: .inbound))
-    events.yield(.channelData(channelB, framedHello(tokenB)))
+    events.yield(.channelOpened(channelA, handleA, direction: .inbound, mtu: bleMTU))
+    events.yield(.channelData(channelA, tokenA))
+    events.yield(.channelOpened(channelB, handleB, direction: .inbound, mtu: bleMTU))
+    events.yield(.channelData(channelB, tokenB))
     await store.skipReceivedActions(strict: false)
     #expect(store.state.interfaces[bleInterfaceID(tokenA)] != nil, "peer A interface must be up")
     #expect(store.state.interfaces[bleInterfaceID(tokenB)] != nil, "peer B interface must be up")
@@ -397,7 +396,7 @@ private func framedHello(_ token: Data) -> Data {
     let remote = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
                                                      aspects: ["svc"], hops: 1, emitted: 1000)
-    events.yield(.channelData(channelA, try! BLEFraming.frame(announceRaw)))
+    events.yield(.channelData(channelA, bleFrag(announceRaw)))
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
     #expect(store.state.learned[destHash]?.interfaceID == bleInterfaceID(tokenA),
             "the destination must be learned on peer A's interface")
@@ -413,7 +412,7 @@ private func framedHello(_ token: Data) -> Data {
     // Every transmit for this send routed to A, never B — no leakage to the wrong peer.
     #expect(transmits.allSatisfy { $0.0 == tokenA },
             "no transmit for this send may reach peer B")
-    let outPacket = try #require(Packet(raw: Data(dataTransmit.1.dropFirst(BLEFraming.headerLength))))
+    let outPacket = try #require(Packet(raw: Data(dataTransmit.1.dropFirst(BLEFragmenter.headerLength))))
     #expect(outPacket.packetType == .data)
     #expect(outPacket.destinationHash == destHash)
 
@@ -456,10 +455,10 @@ private func framedHello(_ token: Data) -> Data {
     // Bring BOTH peers ONLINE via the driver.
     await store.send(.start)
     events.yield(.ready)
-    events.yield(.channelOpened(channelA, handleA, direction: .inbound))
-    events.yield(.channelData(channelA, framedHello(tokenA)))
-    events.yield(.channelOpened(channelB, handleB, direction: .inbound))
-    events.yield(.channelData(channelB, framedHello(tokenB)))
+    events.yield(.channelOpened(channelA, handleA, direction: .inbound, mtu: bleMTU))
+    events.yield(.channelData(channelA, tokenA))
+    events.yield(.channelOpened(channelB, handleB, direction: .inbound, mtu: bleMTU))
+    events.yield(.channelData(channelB, tokenB))
     await store.skipReceivedActions(strict: false)
     #expect(store.state.interfaces[bleInterfaceID(tokenA)] != nil, "peer A must be online")
     #expect(store.state.interfaces[bleInterfaceID(tokenB)] != nil, "peer B must be online")
@@ -472,7 +471,7 @@ private func framedHello(_ token: Data) -> Data {
     let remote = Identity()
     let (announceRaw, _) = makeAnnouncePacket(identity: remote, appName: "app", aspects: ["svc"],
                                               hops: 1, emitted: 1000)
-    events.yield(.channelData(channelA, try! BLEFraming.frame(announceRaw)))
+    events.yield(.channelData(channelA, bleFrag(announceRaw)))
 
     await store.receive { action in
         if case let .delegate(d) = action {

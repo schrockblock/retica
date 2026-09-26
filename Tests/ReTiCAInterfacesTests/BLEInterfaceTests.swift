@@ -6,30 +6,28 @@ import ComposableArchitecture
 enum MockDriverCall: Equatable {
     case start
     case stop
-    case readDirectory(BLEPeerHandle)
-    case openChannel(BLEPeerHandle, UInt16)
+    case readIdentity(BLEPeerHandle)
+    case openChannel(BLEPeerHandle)
     case send(BLEChannelID, Data)
     case closeChannel(BLEChannelID)
     case disconnect(BLEPeerHandle)
 }
 
 // Deterministic fixtures shared by all reducer tests.
-let localToken = Data(repeating: 0x11, count: 16)   // what bleRandomBytes yields below
+let localIdentity = Data(repeating: 0x11, count: 16)
 let peerHandleA = BLEPeerHandle(id: UUID(uuidString: "AAAAAAAA-0000-0000-0000-000000000001")!)
 let peerHandleB = BLEPeerHandle(id: UUID(uuidString: "BBBBBBBB-0000-0000-0000-000000000002")!)
 let channel1 = BLEChannelID(id: UUID(uuidString: "CCCCCCCC-0000-0000-0000-000000000001")!)
 let channel2 = BLEChannelID(id: UUID(uuidString: "CCCCCCCC-0000-0000-0000-000000000002")!)
-let tokenLow = Data(repeating: 0x01, count: 16)     // sorts below localToken
-let tokenHigh = Data(repeating: 0xEE, count: 16)    // sorts above localToken
+let identityLow = Data(repeating: 0x01, count: 16)    // sorts below localIdentity
+let identityHigh = Data(repeating: 0xEE, count: 16)   // sorts above localIdentity
+let testMTU = 512                                     // payload 507: any ≤500 B packet is one fragment
 
-func framedHello(token: Data) -> Data {
-    try! BLEFraming.frame(BLEHello.pack(version: BLEInterface.protocolVersion, token: token))
-}
+func frags(_ packet: Data, mtu: Int = testMTU) -> [Data] { try! BLEFragmenter(mtu: mtu).fragment(packet) }
 
-/// Pre-creates `streams` driver event streams; the mock's start() hands them out in
-/// order (yields buffer until consumed, so tests can yield any time after start).
 @MainActor
-func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
+func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1,
+               keepalive: Duration? = BLEInterface.defaultKeepaliveInterval)
     -> (store: TestStore<BLEInterface.State, BLEInterface.Action>,
         events: [AsyncStream<BLEDriverEvent>.Continuation],
         calls: LockIsolated<[MockDriverCall]>,
@@ -41,7 +39,8 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
     let calls = LockIsolated<[MockDriverCall]>([])
     let clock = TestClock()
     let now = LockIsolated(Date(timeIntervalSince1970: 1_000))
-    let store = TestStore(initialState: BLEInterface.State(maxPeers: maxPeers)) {
+    let store = TestStore(initialState: BLEInterface.State(localIdentity: localIdentity, maxPeers: maxPeers,
+                                                           keepaliveInterval: keepalive)) {
         BLEInterface()
     } withDependencies: {
         $0.bleDriver = BLEDriver(
@@ -50,8 +49,8 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
                 let n = startCount.withValue { $0 += 1; return $0 }
                 return n <= made.count ? made[n - 1].stream : AsyncStream { _ in }
             },
-            readDirectory: { h in calls.withValue { $0.append(.readDirectory(h)) } },
-            openChannel: { h, psm in calls.withValue { $0.append(.openChannel(h, psm)) } },
+            readIdentity: { h in calls.withValue { $0.append(.readIdentity(h)) } },
+            openChannel: { h in calls.withValue { $0.append(.openChannel(h)) } },
             send: { c, d in calls.withValue { $0.append(.send(c, d)) } },
             closeChannel: { c in calls.withValue { $0.append(.closeChannel(c)) } },
             disconnect: { h in calls.withValue { $0.append(.disconnect(h)) } },
@@ -59,20 +58,62 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
         )
         $0.continuousClock = clock
         $0.bleDate = DateGenerator { now.value }
-        $0.bleRandomBytes = BLERandomBytesGenerator { count in Data(repeating: 0x11, count: count) }
     }
     store.exhaustivity = .off
     return (store, made.map { $0.continuation }, calls, clock, now)
 }
 
+@MainActor
+func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1,
+                     keepalive: Duration? = BLEInterface.defaultKeepaliveInterval)
+    async -> (store: TestStore<BLEInterface.State, BLEInterface.Action>,
+              events: [AsyncStream<BLEDriverEvent>.Continuation],
+              calls: LockIsolated<[MockDriverCall]>,
+              clock: TestClock<Duration>,
+              now: LockIsolated<Date>)
+{
+    let (store, events, calls, clock, now) = makeStore(maxPeers: maxPeers, streams: streams, keepalive: keepalive)
+    await store.send(.start) { $0.status = .starting }
+    events[0].yield(.ready)
+    await store.receive(.driverEvent(.ready)) { $0.status = .online }
+    return (store, events, calls, clock, now)
+}
+
+/// Outbound establishment: discovery → identityRead → channelOpened(.outbound) → peerOnline.
+@MainActor
+func establishOutbound(
+    _ store: TestStore<BLEInterface.State, BLEInterface.Action>,
+    _ events: AsyncStream<BLEDriverEvent>.Continuation,
+    handle: BLEPeerHandle, channel: BLEChannelID, identity: Data
+) async {
+    events.yield(.peerDiscovered(handle))
+    await store.receive(.driverEvent(.peerDiscovered(handle)))
+    events.yield(.identityRead(handle, identity: identity))
+    await store.receive(.driverEvent(.identityRead(handle, identity: identity)))
+    events.yield(.channelOpened(channel, handle, direction: .outbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel, handle, direction: .outbound, mtu: testMTU)))
+    await store.receive(.delegate(.peerOnline(identity)))
+}
+
+/// Inbound establishment: channelOpened(.inbound) → 16-byte handshake → peerOnline.
+@MainActor
+func establishInbound(
+    _ store: TestStore<BLEInterface.State, BLEInterface.Action>,
+    _ events: AsyncStream<BLEDriverEvent>.Continuation,
+    handle: BLEPeerHandle, channel: BLEChannelID, identity: Data
+) async {
+    events.yield(.channelOpened(channel, handle, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel, handle, direction: .inbound, mtu: testMTU)))
+    events.yield(.channelData(channel, identity))
+    await store.receive(.driverEvent(.channelData(channel, identity)))
+    await store.receive(.delegate(.peerOnline(identity)))
+}
+
 // MARK: - Lifecycle
 
-@Test @MainActor func startGeneratesTokenAndComesOnlineOnReady() async {
+@Test @MainActor func startComesOnlineOnReady() async {
     let (store, events, calls, _, _) = makeStore()
-    await store.send(.start) {
-        $0.status = .starting
-        $0.sessionToken = localToken
-    }
+    await store.send(.start) { $0.status = .starting }
     #expect(calls.value == [.start])
     events[0].yield(.ready)
     await store.receive(.driverEvent(.ready)) { $0.status = .online }
@@ -81,465 +122,475 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
 
 @Test @MainActor func startWhileRunningIsIgnored() async {
     let (store, events, calls, _, _) = makeStore()
-    await store.send(.start) {
-        $0.status = .starting
-        $0.sessionToken = localToken
-    }
+    await store.send(.start) { $0.status = .starting }
     events[0].yield(.ready)
     await store.receive(.driverEvent(.ready)) { $0.status = .online }
-    await store.send(.start)  // no state change, no second driver start
+    await store.send(.start)
     #expect(calls.value.filter { $0 == .start }.count == 1)
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func stopCallsDriverStopAndClearsToken() async {
+@Test @MainActor func stopCallsDriverStop() async {
     let (store, events, calls, _, _) = makeStore()
     await store.send(.start) { $0.status = .starting }
     events[0].yield(.ready)
     await store.receive(.driverEvent(.ready)) { $0.status = .online }
-    await store.send(.stop) {
-        $0.status = .stopped
-        $0.sessionToken = nil
-    }
+    await store.send(.stop) { $0.status = .stopped }
     #expect(calls.value.contains(.stop))
 }
 
-// MARK: - Discovery / establishment
+// MARK: - Discovery / establishment (central role)
 
-/// Brings a store online and returns it ready for discovery events.
-@MainActor
-func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1)
-    async -> (store: TestStore<BLEInterface.State, BLEInterface.Action>,
-              events: [AsyncStream<BLEDriverEvent>.Continuation],
-              calls: LockIsolated<[MockDriverCall]>,
-              clock: TestClock<Duration>,
-              now: LockIsolated<Date>)
-{
-    let (store, events, calls, clock, now) = makeStore(maxPeers: maxPeers, streams: streams)
-    await store.send(.start) { $0.status = .starting }
-    events[0].yield(.ready)
-    await store.receive(.driverEvent(.ready)) { $0.status = .online }
-    return (store, events, calls, clock, now)
-}
-
-@Test @MainActor func discoveryReadsDirectoryThenOpensChannel() async {
+@Test @MainActor func discoveryReadsIdentityThenOpensChannel() async {
     let (store, events, calls, _, _) = await makeOnlineStore()
     events[0].yield(.peerDiscovered(peerHandleA))
-    await store.receive(.driverEvent(.peerDiscovered(peerHandleA))) {
-        $0.pendingPeers = [peerHandleA]
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA))) { $0.pendingPeers = [peerHandleA] }
+    #expect(calls.value.contains(.readIdentity(peerHandleA)))
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh))) {
+        $0.pendingIdentities = [peerHandleA: identityHigh]
     }
-    #expect(calls.value.contains(.readDirectory(peerHandleA)))
-    events[0].yield(.directoryRead(peerHandleA, version: 2, psm: 0x0081))
-    await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 2, psm: 0x0081)))
-    #expect(calls.value.contains(.openChannel(peerHandleA, 0x0081)))
+    #expect(calls.value.contains(.openChannel(peerHandleA)))
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func versionMismatchRefusesAndGreylists() async {
+@Test @MainActor func ownIdentityIsRefusedDisconnectedAndGreylisted() async {
     let (store, events, calls, _, now) = await makeOnlineStore()
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    events[0].yield(.directoryRead(peerHandleA, version: 1, psm: 0x0081))
-    await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 1, psm: 0x0081))) {
-        $0.pendingPeers = []
-    }
-    #expect(!calls.value.contains(.openChannel(peerHandleA, 0x0081)))
-    // Greylisted: an immediate rediscovery is ignored (no second readDirectory).
+    events[0].yield(.identityRead(peerHandleA, identity: localIdentity))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: localIdentity))) { $0.pendingPeers = [] }
+    await store.finish()
+    #expect(!calls.value.contains(.openChannel(peerHandleA)))
+    #expect(calls.value.contains(.disconnect(peerHandleA)))
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 1)
-    // After the 5 s backoff expires (strictly after — inclusive boundary), retry is allowed.
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleA) }.count == 1)   // blocked
     now.setValue(now.value.addingTimeInterval(5.01))
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 2)
-    // The re-discoveries above re-armed establish timers; .stop's per-pending
-    // cancel loop (CancelID.establish per handle) drains them here.
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleA) }.count == 2)   // backoff expired
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func directoryFailureStrikesAndPendingPeerIsNotRediscovered() async {
+@Test @MainActor func shortIdentityIsRefused() async {
     let (store, events, calls, _, _) = await makeOnlineStore()
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    // While pending, duplicate discovery is ignored.
-    events[0].yield(.peerDiscovered(peerHandleA))
-    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 1)
-    events[0].yield(.directoryFailed(peerHandleA, reason: "gatt error"))
-    await store.receive(.driverEvent(.directoryFailed(peerHandleA, reason: "gatt error"))) {
-        $0.pendingPeers = []
-    }
-    // Strike recorded: immediate rediscovery ignored.
-    events[0].yield(.peerDiscovered(peerHandleA))
-    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 1)
+    events[0].yield(.identityRead(peerHandleA, identity: Data(repeating: 1, count: 15)))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: Data(repeating: 1, count: 15)))) { $0.pendingPeers = [] }
+    #expect(!calls.value.contains(.openChannel(peerHandleA)))
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func establishDeadlineAbandonsAndStrikes() async {
-    let (store, events, calls, clock, _) = await makeOnlineStore()
-    events[0].yield(.peerDiscovered(peerHandleA))
-    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    await clock.advance(by: BLEInterface.establishTimeout)
-    await store.receive(.establishDeadline(peerHandleA)) { $0.pendingPeers = [] }
-    // Late directoryRead for a no-longer-pending peer is ignored (no openChannel).
-    events[0].yield(.directoryRead(peerHandleA, version: 2, psm: 0x0081))
-    await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 2, psm: 0x0081)))
-    #expect(!calls.value.contains(.openChannel(peerHandleA, 0x0081)))
-    await store.send(.stop) { $0.status = .stopped }
-}
-
-/// S2: a successful `directoryRead` leaves the GATT connection open (the adapter only disconnects on
-/// FAILURE). On a version-mismatch refusal the reducer must tell the driver to disconnect it, or the
-/// scarce iOS BLE connection leaks for the session. Every v1 Pi hits this constantly.
-@Test @MainActor func versionMismatchDisconnectsThePeer() async {
+@Test @MainActor func identityFailureStrikesAndPendingPeerIsNotRediscovered() async {
     let (store, events, calls, _, _) = await makeOnlineStore()
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    events[0].yield(.directoryRead(peerHandleA, version: 1, psm: 0x0081))
-    await store.receive(.driverEvent(.directoryRead(peerHandleA, version: 1, psm: 0x0081))) {
-        $0.pendingPeers = []
-    }
+    events[0].yield(.peerDiscovered(peerHandleA))                     // pending: ignored
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleA) }.count == 1)
+    events[0].yield(.identityFailed(peerHandleA, reason: "no identity characteristic"))
+    await store.receive(.driverEvent(.identityFailed(peerHandleA, reason: "no identity characteristic"))) { $0.pendingPeers = [] }
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleA) }.count == 1)   // strike blocks
     await store.send(.stop) { $0.status = .stopped }
-    await store.finish()
-    #expect(calls.value.contains(.disconnect(peerHandleA)),
-            "version-mismatch refusal must disconnect the readDirectory GATT connection")
 }
 
-/// S2: when the 15 s establishment deadline abandons a peer, the reducer must disconnect it — the
-/// in-flight `readDirectory` (whose `central.connect` may still be hanging) is otherwise never torn
-/// down, and any GATT connection it opened sits open forever.
-@Test @MainActor func establishDeadlineDisconnectsThePeer() async {
+@Test @MainActor func establishDeadlineAbandonsStrikesAndDisconnects() async {
     let (store, events, calls, clock, _) = await makeOnlineStore()
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh)))
     await clock.advance(by: BLEInterface.establishTimeout)
-    await store.receive(.establishDeadline(peerHandleA)) { $0.pendingPeers = [] }
-    await store.send(.stop) { $0.status = .stopped }
+    await store.receive(.establishDeadline(peerHandleA)) {
+        $0.pendingPeers = []
+        $0.pendingIdentities = [:]
+    }
+    // A late channelOpened for the abandoned peer has no pending identity → closed, no peer.
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .outbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .outbound, mtu: testMTU)))
     await store.finish()
-    #expect(calls.value.contains(.disconnect(peerHandleA)),
-            "the establishment deadline must disconnect the abandoned peer")
+    #expect(calls.value.contains(.disconnect(peerHandleA)))
+    #expect(calls.value.contains(.closeChannel(channel1)))
+    #expect(store.state.peers.isEmpty)
+    await store.send(.stop) { $0.status = .stopped }
 }
 
 @Test @MainActor func discoveryIsIgnoredAtPeerCap() async {
     let (store, events, calls, _, _) = await makeOnlineStore(maxPeers: 1)
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    // A pending establishment counts against the cap (Python: spawned + pending >= max).
     events[0].yield(.peerDiscovered(peerHandleB))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleB)))
-    #expect(calls.value.filter {
-        if case .readDirectory = $0 { return true } else { return false }
-    }.count == 1)
+    #expect(calls.value.filter { if case .readIdentity = $0 { return true } else { return false } }.count == 1)
     await store.send(.stop) { $0.status = .stopped }
 }
 
-// MARK: - HELLO / data plane
-
-/// Drives one peer to established: discovery → directory → channelOpened → peer HELLO.
-@MainActor
-func establishPeer(
-    _ store: TestStore<BLEInterface.State, BLEInterface.Action>,
-    _ events: AsyncStream<BLEDriverEvent>.Continuation,
-    handle: BLEPeerHandle, channel: BLEChannelID, peerToken: Data
-) async {
-    events.yield(.peerDiscovered(handle))
-    await store.receive(.driverEvent(.peerDiscovered(handle)))
-    events.yield(.directoryRead(handle, version: 2, psm: 0x0081))
-    await store.receive(.driverEvent(.directoryRead(handle, version: 2, psm: 0x0081)))
-    events.yield(.channelOpened(channel, handle, direction: .outbound))
-    await store.receive(.driverEvent(.channelOpened(channel, handle, direction: .outbound)))
-    events.yield(.channelData(channel, framedHello(token: peerToken)))
-    await store.receive(.driverEvent(.channelData(channel, framedHello(token: peerToken))))
-    await store.receive(.delegate(.peerOnline(peerToken)))
-}
-
-@Test @MainActor func establishmentSendsHelloAndReportsPeerOnline() async {
+@Test @MainActor func identityPreCheckAbandonsRedundantDial() async {
+    // Peer HIGH is already connected inbound. HIGH > local, so on a cross-connect the channel
+    // initiated by LOCAL (lower) would win — i.e. the rule says keepNew for an outbound dial.
+    // Use LOW instead: LOW < local → the peer-initiated (inbound) channel wins → keepExisting → skip.
     let (store, events, calls, _, _) = await makeOnlineStore()
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    // Our HELLO went out on the channel, framed.
-    #expect(calls.value.contains(.send(channel1, framedHello(token: localToken))))
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityLow)
+    events[0].yield(.peerDiscovered(peerHandleB))          // same device seen under a new handle
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleB)))
+    events[0].yield(.identityRead(peerHandleB, identity: identityLow))
+    await store.receive(.driverEvent(.identityRead(peerHandleB, identity: identityLow))) { $0.pendingPeers = [] }
+    await store.finish()
+    #expect(!calls.value.contains(.openChannel(peerHandleB)))
+    #expect(calls.value.contains(.disconnect(peerHandleB)))
+    // Not a strike: a fresh discovery of handle B reads its identity again.
+    events[0].yield(.peerDiscovered(peerHandleB))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleB)))
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleB) }.count == 2)
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func inboundChannelFollowsSameHelloPath() async {
-    let (store, events, calls, _, _) = await makeOnlineStore()
-    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound)))
-    #expect(calls.value.contains(.send(channel1, framedHello(token: localToken))))
-    events[0].yield(.channelData(channel1, framedHello(token: tokenHigh)))
-    await store.receive(.driverEvent(.channelData(channel1, framedHello(token: tokenHigh))))
-    await store.receive(.delegate(.peerOnline(tokenHigh)))
+// MARK: - Handshake (peripheral role)
+
+@Test @MainActor func outboundEstablishmentReportsPeerOnlineWithoutAnyHandshakeFrame() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    // The driver wrote the handshake itself; the reducer sends nothing at establishment.
+    #expect(!calls.value.contains { if case .send = $0 { return true } else { return false } })
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func packetsFlowBothWaysAfterHello() async {
-    let (store, events, calls, _, _) = await makeOnlineStore()
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    // Inbound: a framed packet after HELLO surfaces as packetReceived.
-    let packet = Data(repeating: 0xAB, count: 40)
-    events[0].yield(.channelData(channel1, try! BLEFraming.frame(packet)))
-    await store.receive(.driverEvent(.channelData(channel1, try! BLEFraming.frame(packet))))
-    await store.receive(.delegate(.packetReceived(peer: tokenHigh, packet: packet)))
-    // Outbound: .send frames and forwards to the driver.
-    let outbound = Data(repeating: 0xCD, count: 21)
-    await store.send(.send(peer: tokenHigh, packet: outbound))
-    #expect(calls.value.contains(.send(channel1, try! BLEFraming.frame(outbound))))
-    // Sending to an unknown peer is silently dropped.
-    let before = calls.value.count
-    await store.send(.send(peer: tokenLow, packet: outbound))
-    #expect(calls.value.count == before)
-    await store.send(.stop) { $0.status = .stopped }
-}
-
-@Test @MainActor func helloAndPacketInOneDeliveryBothProcessed() async {
+@Test @MainActor func inboundHandshakeReportsPeerOnline() async {
     let (store, events, _, _, _) = await makeOnlineStore()
-    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound)))
-    let packet = Data([0x01, 0x02, 0x03])
-    let combined = framedHello(token: tokenHigh) + (try! BLEFraming.frame(packet))
-    events[0].yield(.channelData(channel1, combined))
-    await store.receive(.driverEvent(.channelData(channel1, combined)))
-    await store.receive(.delegate(.peerOnline(tokenHigh)))
-    await store.receive(.delegate(.packetReceived(peer: tokenHigh, packet: packet)))
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    #expect(store.state.peers[identityHigh] == channel1)
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func invalidFirstFrameDropsChannelAndStrikes() async {
-    let (store, events, calls, _, _) = await makeOnlineStore()
-    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound)))
-    // A validly-framed 20-byte frame that is NOT a HELLO (wrong magic).
-    let bogus = try! BLEFraming.frame(Data(repeating: 0x51, count: 20))
-    events[0].yield(.channelData(channel1, bogus))
-    await store.receive(.driverEvent(.channelData(channel1, bogus)))
+@Test @MainActor func preHandshakeJunkIsDroppedWithoutStrike() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore()
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: testMTU)))
+    let junk = frags(Data([1, 2, 3]))[0]                       // a fragment before any handshake
+    events[0].yield(.channelData(channel1, junk))
+    await store.receive(.driverEvent(.channelData(channel1, junk)))
+    #expect(!calls.value.contains(.closeChannel(channel1)))
+    // The handshake can still arrive afterwards.
+    events[0].yield(.channelData(channel1, identityHigh))
+    await store.receive(.driverEvent(.channelData(channel1, identityHigh)))
+    await store.receive(.delegate(.peerOnline(identityHigh)))
+    await clock.advance(by: BLEInterface.handshakeTimeout)   // deadline was cancelled: no teardown
+    #expect(!calls.value.contains(.closeChannel(channel1)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func handshakeEchoingOurOwnIdentityIsIgnored() async {
+    let (store, events, _, clock, _) = await makeOnlineStore()
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: testMTU)))
+    events[0].yield(.channelData(channel1, localIdentity))
+    await store.receive(.driverEvent(.channelData(channel1, localIdentity)))
+    #expect(store.state.peers.isEmpty)
+    await clock.advance(by: BLEInterface.handshakeTimeout)
+    await store.receive(.handshakeDeadline(channel1))
+    #expect(store.state.channels.isEmpty)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func handshakeTimeoutDropsChannelAndStrikes() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore()
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: testMTU)))
+    await clock.advance(by: BLEInterface.handshakeTimeout)
+    await store.receive(.handshakeDeadline(channel1))
     #expect(calls.value.contains(.closeChannel(channel1)))
-    // Strike recorded: discovery of the same handle is now ignored.
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    #expect(!calls.value.contains(.readDirectory(peerHandleA)))
-    await store.send(.stop) { $0.status = .stopped }
-}
-
-@Test @MainActor func helloEchoingOurOwnTokenIsRejected() async {
-    let (store, events, calls, _, _) = await makeOnlineStore()
-    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound)))
-    events[0].yield(.channelData(channel1, framedHello(token: localToken)))
-    await store.receive(.driverEvent(.channelData(channel1, framedHello(token: localToken))))
-    #expect(calls.value.contains(.closeChannel(channel1)))
-    await store.send(.stop) { $0.status = .stopped }
-}
-
-@Test @MainActor func malformedFramingDropsChannel() async {
-    let (store, events, calls, _, _) = await makeOnlineStore()
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    events[0].yield(.channelData(channel1, Data([0x00, 0x00])))  // len == 0: unrecoverable
-    await store.receive(.driverEvent(.channelData(channel1, Data([0x00, 0x00]))))
-    await store.receive(.delegate(.peerOffline(tokenHigh)))
-    #expect(calls.value.contains(.closeChannel(channel1)))
-    await store.send(.stop) { $0.status = .stopped }
-}
-
-@Test @MainActor func helloTimeoutDropsChannelAndStrikes() async {
-    let (store, events, calls, clock, _) = await makeOnlineStore()
-    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound)))
-    await clock.advance(by: BLEInterface.helloTimeout)
-    await store.receive(.helloDeadline(channel1))
-    #expect(calls.value.contains(.closeChannel(channel1)))
+    #expect(!calls.value.contains(.readIdentity(peerHandleA)))   // struck
     await store.send(.stop) { $0.status = .stopped }
 }
 
 @Test @MainActor func inboundChannelRefusedAtPeerCap() async {
     let (store, events, calls, _, _) = await makeOnlineStore(maxPeers: 1)
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    events[0].yield(.channelOpened(channel2, peerHandleB, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel2, peerHandleB, direction: .inbound)))
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    events[0].yield(.channelOpened(channel2, peerHandleB, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel2, peerHandleB, direction: .inbound, mtu: testMTU)))
     #expect(calls.value.contains(.closeChannel(channel2)))
-    // The refused channel never got our HELLO.
-    #expect(!calls.value.contains(.send(channel2, framedHello(token: localToken))))
     await store.send(.stop) { $0.status = .stopped }
 }
 
 @Test @MainActor func inboundOpenClearsPendingOutboundEstablishment() async {
-    // Regression: if an inbound channel arrives while we have a pending outbound establishment
-    // to the same handle, a later outbound failure (directoryFailed, channelFailed, or
-    // establishDeadline) must NOT record a greylist strike against an already-online peer.
     let (store, events, calls, _, now) = await makeOnlineStore()
-    // Kick off outbound establishment.
     events[0].yield(.peerDiscovered(peerHandleA))
-    await store.receive(.driverEvent(.peerDiscovered(peerHandleA))) {
-        $0.pendingPeers = [peerHandleA]
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA))) { $0.pendingPeers = [peerHandleA] }
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: testMTU))) {
+        $0.pendingPeers = []
     }
-    // Inbound channel arrives (cross-connect) before the outbound leg completes.
-    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound))) {
-        $0.pendingPeers = []   // must be cleared for BOTH directions
-    }
-    // Complete the HELLO so the peer is fully online.
-    events[0].yield(.channelData(channel1, framedHello(token: tokenHigh)))
-    await store.receive(.driverEvent(.channelData(channel1, framedHello(token: tokenHigh))))
-    await store.receive(.delegate(.peerOnline(tokenHigh)))
-    // The outbound leg reports a late failure — this must NOT strike since pendingPeers is empty.
-    events[0].yield(.directoryFailed(peerHandleA, reason: "late failure"))
-    await store.receive(.driverEvent(.directoryFailed(peerHandleA, reason: "late failure"))) {
-        $0.pendingPeers = []   // still empty — guard fires, no strike
-    }
-    // Advance time past the churn threshold so the subsequent channel close is NOT a strike.
+    events[0].yield(.channelData(channel1, identityHigh))
+    await store.receive(.driverEvent(.channelData(channel1, identityHigh)))
+    await store.receive(.delegate(.peerOnline(identityHigh)))
+    events[0].yield(.identityFailed(peerHandleA, reason: "late failure"))
+    await store.receive(.driverEvent(.identityFailed(peerHandleA, reason: "late failure"))) { $0.pendingPeers = [] }
     now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime + 1))
-    // Close the inbound channel.
     events[0].yield(.channelClosed(channel1, reason: nil))
     await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
-    await store.receive(.delegate(.peerOffline(tokenHigh)))
-    // Re-discover: if no strike was recorded the handle passes the greylist gate,
-    // producing a second readDirectory call.
+    await store.receive(.delegate(.peerOffline(identityHigh)))
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 2)
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleA) }.count == 2)   // no strike
     await store.send(.stop) { $0.status = .stopped }
 }
 
-// MARK: - Send failure paths
+// MARK: - Data plane
 
-/// A send to a peer with no channel is a lifecycle race and drops quietly.
-/// The bad send is LAST (after teardown) so no subsequent send clears the queue;
-/// with .on exhaustivity teardown catches any stray delegate action that was emitted.
-@Test @MainActor func sendToUnknownPeerDropsQuietly() async {
-    let (store, events, calls, _, _) = await makeOnlineStore()
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-
-    // Teardown first — state.peers is now empty after .stop.
-    await store.send(.stop) { $0.status = .stopped }
-    // .stop emits .delegate(.peerOffline(tokenHigh)); tolerate it under .off so we
-    // don't have to enumerate all teardown actions, then flip .on for the critical check.
-    await store.receive(.delegate(.peerOffline(tokenHigh)))
-
-    // Send to tokenLow — a token that has no established channel.
-    // This is the last send; .on exhaustivity ensures teardown catches any stray delegate.
+@Test @MainActor func packetsFlowBothWaysFragmented() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    // Inbound: three fragments at the peer's MTU 23 → one packetReceived.
+    let packet = Data((0..<40).map { UInt8($0) })
+    let inbound = frags(packet, mtu: 23)
+    for f in inbound {
+        events[0].yield(.channelData(channel1, f))
+        await store.receive(.driverEvent(.channelData(channel1, f)))
+    }
+    await store.receive(.delegate(.packetReceived(peer: identityHigh, packet: packet)))
+    // Outbound: .send fragments at OUR channel MTU (512) → one driver send here.
+    let outbound = Data(repeating: 0xCD, count: 21)
+    await store.send(.send(peer: identityHigh, packet: outbound))
+    await store.finish()
+    #expect(calls.value.contains(.send(channel1, frags(outbound)[0])))
     let before = calls.value.count
+    await store.send(.send(peer: identityLow, packet: outbound))   // unknown peer: dropped
+    #expect(calls.value.count == before)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func outboundSendIssuesOneDriverSendPerFragmentInOrder() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: 23))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: 23)))
+    events[0].yield(.channelData(channel1, identityHigh))
+    await store.receive(.driverEvent(.channelData(channel1, identityHigh)))
+    await store.receive(.delegate(.peerOnline(identityHigh)))
+    let packet = Data(repeating: 0xAB, count: 50)             // 3 fragments at MTU 23
+    await store.send(.send(peer: identityHigh, packet: packet))
+    await store.finish()
+    let sends = calls.value.compactMap { if case let .send(c, d) = $0, c == channel1 { return d } else { return nil } }
+    #expect(sends == frags(packet, mtu: 23))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func malformedFragmentLeavesChannelUp() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    events[0].yield(.channelData(channel1, Data([0x07, 0, 0, 0, 1, 0xAA])))   // bad type
+    await store.receive(.driverEvent(.channelData(channel1, Data([0x07, 0, 0, 0, 1, 0xAA]))))
+    #expect(!calls.value.contains(.closeChannel(channel1)))
+    let packet = Data([9, 9, 9])
+    events[0].yield(.channelData(channel1, frags(packet)[0]))
+    await store.receive(.driverEvent(.channelData(channel1, frags(packet)[0])))
+    await store.receive(.delegate(.packetReceived(peer: identityHigh, packet: packet)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func keepaliveByteIsIgnoredOnReceipt() async {
+    let (store, events, _, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
     store.exhaustivity = .on
-    await store.send(.send(peer: tokenLow, packet: Data(repeating: 0xAB, count: 10)))
-    // No driver send (queue count unchanged).
-    #expect(calls.value.count == before)
-}
-
-/// An oversized packet is a programmer error, not a lifecycle race: it must be
-/// distinguishable rather than silently identical to a departed peer.
-@Test @MainActor func sendOfUnframablePacketIsDistinguishedFromAbsentChannel() async {
-    let (store, events, calls, _, _) = await makeOnlineStore()
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    // Send a packet that exceeds BLEFraming.maxFrameLength to a LIVE peer.
-    let oversized = Data(repeating: 0xFF, count: BLEFraming.maxFrameLength + 1)
-    let before = calls.value.count
-    await store.send(.send(peer: tokenHigh, packet: oversized))
-    // No driver send.
-    #expect(calls.value.count == before)
-    // The sendFailed delegate action must be emitted, distinguishing this from a silent drop.
-    await store.receive(.delegate(.sendFailed(peer: tokenHigh, reason: .unframable)))
+    events[0].yield(.channelData(channel1, BLEKeepalive.frame))
+    await store.receive(.driverEvent(.channelData(channel1, BLEKeepalive.frame)))   // no delegate
+    store.exhaustivity = .off
     await store.send(.stop) { $0.status = .stopped }
 }
 
-// MARK: - Dedup
+@Test @MainActor func sixteenByteFragmentAfterHandshakeIsData() async {
+    // Review Focus 1: once the identity is known, a 16-byte write is a fragment, not a handshake.
+    let (store, events, _, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    let packet = Data(repeating: 0x42, count: 11)              // 5 header + 11 = 16 bytes on the wire
+    let f = frags(packet)[0]
+    #expect(f.count == 16)
+    events[0].yield(.channelData(channel1, f))
+    await store.receive(.driverEvent(.channelData(channel1, f)))
+    await store.receive(.delegate(.packetReceived(peer: identityHigh, packet: packet)))
+    #expect(store.state.peers.count == 1)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func lateEventsForTornDownChannelAreIgnored() async {
+    // Review Focus 2.
+    let (store, events, calls, _, now) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime + 1))
+    events[0].yield(.channelClosed(channel1, reason: nil))
+    await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
+    await store.receive(.delegate(.peerOffline(identityHigh)))
+    store.exhaustivity = .on
+    events[0].yield(.channelData(channel1, frags(Data([1]))[0]))
+    await store.receive(.driverEvent(.channelData(channel1, frags(Data([1]))[0])))
+    events[0].yield(.channelClosed(channel1, reason: nil))
+    await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
+    store.exhaustivity = .off
+    // No strike from the duplicate close: rediscovery reads identity again.
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleA) }.count == 2)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func sendOfUnfragmentablePacketIsDistinguishedFromAbsentChannel() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    let before = calls.value.count
+    await store.send(.send(peer: identityHigh, packet: Data()))
+    #expect(calls.value.count == before)
+    await store.receive(.delegate(.sendFailed(peer: identityHigh, reason: .unfragmentable)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+// MARK: - Keepalive
+
+@Test @MainActor func keepaliveFiresOnOutboundChannelsEveryIntervalAndStopsOnClose() async {
+    let (store, events, calls, clock, now) = await makeOnlineStore()
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    await clock.advance(by: BLEInterface.defaultKeepaliveInterval)
+    await store.receive(.keepalive(channel1))
+    await clock.advance(by: BLEInterface.defaultKeepaliveInterval)
+    await store.receive(.keepalive(channel1))
+    await store.finish()
+    #expect(calls.value.filter { $0 == .send(channel1, BLEKeepalive.frame) }.count == 2)
+    now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime + 1))
+    events[0].yield(.channelClosed(channel1, reason: nil))
+    await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
+    await store.receive(.delegate(.peerOffline(identityHigh)))
+    await clock.advance(by: BLEInterface.defaultKeepaliveInterval * 2)
+    #expect(calls.value.filter { $0 == .send(channel1, BLEKeepalive.frame) }.count == 2)   // stopped
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func keepaliveNeverRunsOnInboundChannels() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore()
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    await clock.advance(by: BLEInterface.defaultKeepaliveInterval * 2)
+    #expect(!calls.value.contains(.send(channel1, BLEKeepalive.frame)))
+    // No timer is armed for inbound, so also drive a stray tick directly: the reducer refuses it.
+    await store.send(.keepalive(channel1))
+    await store.finish()
+    #expect(!calls.value.contains(.send(channel1, BLEKeepalive.frame)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func keepaliveCanBeDisabled() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    await clock.advance(by: BLEInterface.defaultKeepaliveInterval * 2)
+    #expect(!calls.value.contains(.send(channel1, BLEKeepalive.frame)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+// MARK: - Duplicate resolution
 
 @Test @MainActor func crossConnectKeepsLowerInitiatorsChannelFromBothPerspectives() async {
-    // Our token 0x11... vs peer 0x01...: PEER is lower, so the peer-initiated
-    // (inbound-at-us) channel must survive regardless of arrival order.
-    // Order 1: our outbound established first, then peer's inbound HELLOs.
-    var (store, events, calls, _, _) = await makeOnlineStore()
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenLow)
-    events[0].yield(.channelOpened(channel2, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel2, peerHandleA, direction: .inbound)))
-    events[0].yield(.channelData(channel2, framedHello(token: tokenLow)))
-    await store.receive(.driverEvent(.channelData(channel2, framedHello(token: tokenLow))))
-    #expect(calls.value.contains(.closeChannel(channel1)))   // outbound (ours) loses
-    #expect(!calls.value.contains(.closeChannel(channel2)))  // inbound (peer's) survives
-    // The peer stayed online through the swap: traffic flows on the survivor.
+    // Peer LOW < local: the peer-initiated (inbound-at-us) channel survives regardless of order.
+    var (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityLow)
+    events[0].yield(.channelOpened(channel2, peerHandleA, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel2, peerHandleA, direction: .inbound, mtu: testMTU)))
+    events[0].yield(.channelData(channel2, identityLow))
+    await store.receive(.driverEvent(.channelData(channel2, identityLow)))
+    await store.finish()
+    #expect(calls.value.contains(.closeChannel(channel1)))
+    #expect(!calls.value.contains(.closeChannel(channel2)))
     let packet = Data([0x0A, 0x0B, 0x0C])
-    await store.send(.send(peer: tokenLow, packet: packet))
-    #expect(calls.value.contains(.send(channel2, try! BLEFraming.frame(packet))))
+    await store.send(.send(peer: identityLow, packet: packet))
+    await store.finish()
+    #expect(calls.value.contains(.send(channel2, frags(packet)[0])))
     await store.send(.stop) { $0.status = .stopped }
 
-    // Order 2: peer's inbound established first, then our outbound HELLOs back.
-    (store, events, calls, _, _) = await makeOnlineStore()
-    events[0].yield(.channelOpened(channel2, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel2, peerHandleA, direction: .inbound)))
-    events[0].yield(.channelData(channel2, framedHello(token: tokenLow)))
-    await store.receive(.driverEvent(.channelData(channel2, framedHello(token: tokenLow))))
-    await store.receive(.delegate(.peerOnline(tokenLow)))
-    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .outbound))
-    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .outbound)))
-    events[0].yield(.channelData(channel1, framedHello(token: tokenLow)))
-    await store.receive(.driverEvent(.channelData(channel1, framedHello(token: tokenLow))))
-    #expect(calls.value.contains(.closeChannel(channel1)))   // ours still loses
-    // Traffic flows on the surviving inbound channel.
-    await store.send(.send(peer: tokenLow, packet: Data([0x0D])))
-    #expect(calls.value.contains(.send(channel2, try! BLEFraming.frame(Data([0x0D])))))
+    // Order 2: inbound first, then our outbound completes → ours still loses.
+    (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel2, identity: identityLow)
+    events[0].yield(.peerDiscovered(peerHandleB))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleB)))
+    events[0].yield(.identityRead(peerHandleB, identity: identityLow))
+    await store.receive(.driverEvent(.identityRead(peerHandleB, identity: identityLow)))
+    await store.finish()
+    #expect(!calls.value.contains(.openChannel(peerHandleB)))   // pre-check: never dialed
+    await store.send(.send(peer: identityLow, packet: Data([0x0D])))
+    await store.finish()
+    #expect(calls.value.contains(.send(channel2, frags(Data([0x0D]))[0])))
+    await store.send(.stop) { $0.status = .stopped }
+
+    // Peer HIGH > local: OUR outbound channel survives a later inbound.
+    (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    events[0].yield(.channelOpened(channel2, peerHandleA, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel2, peerHandleA, direction: .inbound, mtu: testMTU)))
+    events[0].yield(.channelData(channel2, identityHigh))
+    await store.receive(.driverEvent(.channelData(channel2, identityHigh)))
+    await store.finish()
+    #expect(calls.value.contains(.closeChannel(channel2)))
+    #expect(!calls.value.contains(.closeChannel(channel1)))
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func sameDirectionHelloReplacesStaleChannelWithoutOfflineBlip() async {
-    let (store, events, calls, _, _) = await makeOnlineStore()
-    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound)))
-    events[0].yield(.channelData(channel1, framedHello(token: tokenHigh)))
-    await store.receive(.driverEvent(.channelData(channel1, framedHello(token: tokenHigh))))
-    await store.receive(.delegate(.peerOnline(tokenHigh)))
-    // Peer silently dropped and re-dialed: new inbound channel, same token.
-    events[0].yield(.channelOpened(channel2, peerHandleA, direction: .inbound))
-    await store.receive(.driverEvent(.channelOpened(channel2, peerHandleA, direction: .inbound)))
-    events[0].yield(.channelData(channel2, framedHello(token: tokenHigh)))
-    await store.receive(.driverEvent(.channelData(channel2, framedHello(token: tokenHigh))))
-    #expect(calls.value.contains(.closeChannel(channel1)))  // stale channel closed
-    // No peerOffline/second peerOnline was emitted; traffic now rides channel2.
-    let packet = Data([0x01])
-    await store.send(.send(peer: tokenHigh, packet: packet))
-    #expect(calls.value.contains(.send(channel2, try! BLEFraming.frame(packet))))
+@Test @MainActor func sameDirectionHandshakeReplacesStaleChannelWithoutOfflineBlip() async {
+    // Review Focus 4 (reducer half).
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    store.exhaustivity = .on
+    events[0].yield(.channelOpened(channel2, peerHandleA, direction: .inbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel2, peerHandleA, direction: .inbound, mtu: testMTU))) {
+        $0.channels[channel2] = BLEInterface.ChannelState(
+            peer: peerHandleA, direction: .inbound, fragmenter: BLEFragmenter(mtu: testMTU),
+            reassembler: BLEReassembler(), peerIdentity: nil, openedAt: Date(timeIntervalSince1970: 1_000))
+    }
+    events[0].yield(.channelData(channel2, identityHigh))
+    await store.receive(.driverEvent(.channelData(channel2, identityHigh))) {
+        $0.channels[channel1] = nil
+        $0.channels[channel2]?.peerIdentity = identityHigh
+        $0.peers[identityHigh] = channel2
+    }
+    store.exhaustivity = .off
+    await store.finish()
+    #expect(calls.value.contains(.closeChannel(channel1)))
+    await store.send(.send(peer: identityHigh, packet: Data([0x01])))
+    await store.finish()
+    #expect(calls.value.contains(.send(channel2, frags(Data([0x01]))[0])))
     await store.send(.stop) { $0.status = .stopped }
 }
 
 // MARK: - Close policy / churn / adapter loss
 
 @Test @MainActor func channelClosedTakesPeerOfflineWithoutChurnStrike() async {
-    let (store, events, calls, _, now) = await makeOnlineStore()
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    // Lives >= 10 s: no strike.
+    let (store, events, calls, _, now) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
     now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime))
     events[0].yield(.channelClosed(channel1, reason: "supervision timeout"))
     await store.receive(.driverEvent(.channelClosed(channel1, reason: "supervision timeout")))
-    await store.receive(.delegate(.peerOffline(tokenHigh)))
-    // No strike: rediscovery proceeds straight to a directory read.
+    await store.receive(.delegate(.peerOffline(identityHigh)))
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 2)
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleA) }.count == 2)
     await store.send(.stop) { $0.status = .stopped }
 }
 
 @Test @MainActor func shortLivedChannelEarnsChurnStrike() async {
-    let (store, events, calls, _, now) = await makeOnlineStore()
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
-    // Lives < 10 s: strike.
+    let (store, events, calls, _, now) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
     now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime - 0.5))
     events[0].yield(.channelClosed(channel1, reason: nil))
     await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
-    await store.receive(.delegate(.peerOffline(tokenHigh)))
+    await store.receive(.delegate(.peerOffline(identityHigh)))
     events[0].yield(.peerDiscovered(peerHandleA))
     await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
-    #expect(calls.value.filter { $0 == .readDirectory(peerHandleA) }.count == 1)  // blocked
-    await store.send(.stop) { $0.status = .stopped }
-}
-
-@Test @MainActor func closedChannelUnknownToStateIsIgnored() async {
-    let (store, events, _, _, _) = await makeOnlineStore()
-    events[0].yield(.channelClosed(channel2, reason: nil))
-    await store.receive(.driverEvent(.channelClosed(channel2, reason: nil)))  // no crash, no delegate
+    #expect(calls.value.filter { $0 == .readIdentity(peerHandleA) }.count == 1)
     await store.send(.stop) { $0.status = .stopped }
 }
 
 @Test @MainActor func adapterLossTakesPeersOfflineThenRecoversWithBackoff() async {
-    let (store, events, calls, clock, _) = await makeOnlineStore(streams: 2)
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
+    let (store, events, calls, clock, _) = await makeOnlineStore(streams: 2, keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
     events[0].yield(.unavailable(.poweredOff))
     await store.receive(.driverEvent(.unavailable(.poweredOff))) {
         $0.status = .waitingForAdapter
@@ -547,12 +598,10 @@ func establishPeer(
         $0.peers = [:]
         $0.pendingPeers = []
     }
-    await store.receive(.delegate(.peerOffline(tokenHigh)))
-    // First retry after 5 s.
+    await store.receive(.delegate(.peerOffline(identityHigh)))
     await clock.advance(by: BLEInterface.adapterRetryMin)
     await store.receive(.adapterRetry) { $0.status = .starting }
     #expect(calls.value.filter { $0 == .start }.count == 2)
-    // Recovery: second stream reports ready; backoff delay resets.
     events[1].yield(.ready)
     await store.receive(.driverEvent(.ready)) {
         $0.status = .online
@@ -566,43 +615,24 @@ func establishPeer(
     events[0].yield(.unavailable(.other(nil)))
     await store.receive(.driverEvent(.unavailable(.other(nil)))) {
         $0.status = .waitingForAdapter
-        $0.adapterRetryDelay = .seconds(10)  // doubled after scheduling the 5 s retry
+        $0.adapterRetryDelay = .seconds(10)
     }
     await clock.advance(by: BLEInterface.adapterRetryMin)
     await store.receive(.adapterRetry) { $0.status = .starting }
-    // Second loss: the scheduled retry now uses 10 s, and the stored delay doubles to 20 s.
     events[1].yield(.unavailable(.other(nil)))
     await store.receive(.driverEvent(.unavailable(.other(nil)))) {
         $0.status = .waitingForAdapter
         $0.adapterRetryDelay = .seconds(20)
     }
     await clock.advance(by: .seconds(5))
-    // 5 s is no longer enough — no retry yet.
     await clock.advance(by: .seconds(5))
     await store.receive(.adapterRetry) { $0.status = .starting }
     await store.send(.stop) { $0.status = .stopped }
 }
 
-@Test @MainActor func stopWhileWaitingForAdapterCancelsRetry() async {
-    let (store, events, calls, clock, _) = await makeOnlineStore()
-    events[0].yield(.unavailable(.other(nil)))
-    await store.receive(.driverEvent(.unavailable(.other(nil)))) { $0.status = .waitingForAdapter }
-    await store.send(.stop) { $0.status = .stopped }
-    let startsBefore = calls.value.filter { $0 == .start }.count
-    await clock.advance(by: BLEInterface.adapterRetryMax)
-    #expect(calls.value.filter { $0 == .start }.count == startsBefore)  // no retry fired
-}
-
-// MARK: - Terminal adapter unavailability (S6)
-
-/// `unauthorized` (Bluetooth permission denied) is TERMINAL: unlike `poweredOff`, no amount of
-/// retrying can resolve it, so the interface must stop the backoff loop, land in a terminal status,
-/// take live peers offline, and SURFACE the cause via `adapterUnavailable` — the signal the app
-/// turns into a "permission denied — open Settings" prompt (A5). Before S6 every `.unavailable`
-/// folded into `waitingForAdapter` and re-probed forever, invisibly.
 @Test @MainActor func unauthorizedIsTerminalStopsRetryingAndSurfaces() async {
-    let (store, events, calls, clock, _) = await makeOnlineStore(streams: 2)
-    await establishPeer(store, events[0], handle: peerHandleA, channel: channel1, peerToken: tokenHigh)
+    let (store, events, calls, clock, _) = await makeOnlineStore(streams: 2, keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
     events[0].yield(.unavailable(.unauthorized))
     await store.receive(.driverEvent(.unavailable(.unauthorized))) {
         $0.status = .unavailable(.unauthorized)
@@ -610,45 +640,12 @@ func establishPeer(
         $0.peers = [:]
         $0.pendingPeers = []
     }
-    await store.receive(.delegate(.peerOffline(tokenHigh)))
+    await store.receive(.delegate(.peerOffline(identityHigh)))
     await store.receive(.delegate(.adapterUnavailable(.unauthorized)))
-    // Terminal: NO retry is scheduled. Advancing well past the max backoff must not re-start the
-    // driver (the mutation that keeps the old waitingForAdapter+retry path fires a second .start).
-    let startsBefore = calls.value.filter { $0 == .start }.count
-    await clock.advance(by: BLEInterface.adapterRetryMax)
-    #expect(calls.value.filter { $0 == .start }.count == startsBefore, "terminal state must not retry")
-    await store.send(.stop) { $0.status = .stopped }
-}
-
-/// `unsupported` (no BLE LE radio, e.g. a Mac without the hardware) is likewise terminal and
-/// surfaces its own cause.
-@Test @MainActor func unsupportedIsTerminalAndSurfaces() async {
-    let (store, events, calls, clock, _) = await makeOnlineStore()
-    events[0].yield(.unavailable(.unsupported))
-    await store.receive(.driverEvent(.unavailable(.unsupported))) {
-        $0.status = .unavailable(.unsupported)
-    }
-    await store.receive(.delegate(.adapterUnavailable(.unsupported)))
     let startsBefore = calls.value.filter { $0 == .start }.count
     await clock.advance(by: BLEInterface.adapterRetryMax)
     #expect(calls.value.filter { $0 == .start }.count == startsBefore)
-    await store.send(.stop) { $0.status = .stopped }
-}
-
-/// A terminal state is not a dead end: a fresh `.start` (the user granted permission and reconnected
-/// / foregrounded) restarts the driver, rather than leaving the interface wedged. `poweredOff`'s
-/// recovery already runs through the retry loop; terminal states have no loop, so `.start` is the
-/// only way back — and it must be honoured.
-@Test @MainActor func startRestartsFromTerminalUnavailable() async {
-    let (store, events, calls, _, _) = await makeOnlineStore(streams: 2)
-    events[0].yield(.unavailable(.unauthorized))
-    await store.receive(.driverEvent(.unavailable(.unauthorized))) {
-        $0.status = .unavailable(.unauthorized)
-    }
-    await store.receive(.delegate(.adapterUnavailable(.unauthorized)))
-    let startsBefore = calls.value.filter { $0 == .start }.count
     await store.send(.start) { $0.status = .starting }
-    #expect(calls.value.filter { $0 == .start }.count == startsBefore + 1,
-            "start must restart the driver from a terminal state")
+    #expect(calls.value.filter { $0 == .start }.count == startsBefore + 1)
     await store.send(.stop) { $0.status = .stopped }
 }

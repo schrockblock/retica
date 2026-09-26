@@ -6,11 +6,6 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
-// A framed HELLO carrying `token` (the wire form the peer sends first on a channel).
-private func framedHello(_ token: Data) -> Data {
-    try! BLEFraming.frame(BLEHello.pack(version: BLEInterface.protocolVersion, token: token))
-}
-
 // Build a raw HEADER_1 ANNOUNCE packet for a synthetic identity (copied from EndpointTests).
 private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [String],
                                 hops: UInt8, emitted: UInt64, appData: Data? = nil) -> (Data, Data) {
@@ -29,6 +24,9 @@ private let ownToken  = Data(repeating: 0x5A, count: 16)   // the node's own ses
 private let peerToken = Data(repeating: 0xC7, count: 16)   // the connected peer's token (≠ own)
 private let channel   = BLEChannelID(id: UUID(uuidString: "11111111-0000-0000-0000-000000000001")!)
 private let handle    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-0000-000000000002")!)
+private let bleMTU = 512
+/// One fragment (payload 507 ≥ any test packet) with the 5-byte v2.2 header.
+private func bleFrag(_ packet: Data) -> Data { try! BLEFragmenter(mtu: bleMTU).fragment(packet)[0] }
 
 /// A single BLEEndpoint store with a controllable mock driver.
 @MainActor
@@ -41,10 +39,9 @@ private func makeNode() -> (TestStore<TransportEndpoint.State, TransportEndpoint
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 0))
         $0.uuid = .incrementing
-        $0.bleRandomBytes = BLERandomBytesGenerator { _ in ownToken }
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
-            readDirectory: { _ in }, openChannel: { _, _ in },
+            readIdentity: { _ in }, openChannel: { _ in },
             send: { _, _ in }, closeChannel: { _ in }, stop: { }
         )
     }
@@ -64,8 +61,8 @@ private func bringPeerOnline(_ store: TestStore<TransportEndpoint.State, Transpo
                             _ events: AsyncStream<BLEDriverEvent>.Continuation) async {
     await store.send(.start)
     events.yield(.ready)
-    events.yield(.channelOpened(channel, handle, direction: .inbound))
-    events.yield(.channelData(channel, framedHello(peerToken)))
+    events.yield(.channelOpened(channel, handle, direction: .inbound, mtu: bleMTU))
+    events.yield(.channelData(channel, peerToken))
     await store.receive { if case .transport(.interfaceConnected) = $0 { return true }; return false }
     #expect(store.state.transport.interfaces[bleInterfaceID(peerToken)] == .ble)
 }
@@ -92,7 +89,7 @@ private func teardown(_ store: TestStore<TransportEndpoint.State, TransportEndpo
     await store.send(.registerLocalDestination(dest))
 
     // Deliver the crafted packet as framed channel data on the peer's channel.
-    events.yield(.channelData(channel, try! BLEFraming.frame(try! packet.packed())))
+    events.yield(.channelData(channel, bleFrag(try! packet.packed())))
     let got = LockIsolated<Data?>(nil)
     await store.receive { action in
         if case let .delegate(.messageReceived(_, p)) = action { got.setValue(p); return true }
@@ -111,7 +108,7 @@ private func teardown(_ store: TestStore<TransportEndpoint.State, TransportEndpo
     let remote = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
                                                      aspects: ["svc"], hops: 2, emitted: 1000)
-    events.yield(.channelData(channel, try! BLEFraming.frame(announceRaw)))
+    events.yield(.channelData(channel, bleFrag(announceRaw)))
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
     #expect(store.state.transport.learned[destHash]?.identity.hash == remote.hash)
     #expect(store.state.transport.learned[destHash]?.interfaceID == bleInterfaceID(peerToken))

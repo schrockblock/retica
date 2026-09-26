@@ -74,7 +74,7 @@ public struct Packet: Equatable {
         // The load-bearing caller is the primary inbound decode in Transport.received
         // (Transport.swift:339). The interface deframers admit far more than the protocol
         // MTU — HDLCDeframer defaults to 262144 (InterfaceProfile.tcp.hwMTU) and
-        // BLEFrameBuffer caps at 1196 — so without this guard a ~262 KB frame parses into a
+        // the BLE reassembler is bounded by the 500-byte HW_MTU — so without this guard a ~262 KB frame parses into a
         // Packet whose payload then feeds every downstream decoder and allocator.
         //
         // The remaining Packet(raw:) callers do not depend on this guard. Recorded so it is

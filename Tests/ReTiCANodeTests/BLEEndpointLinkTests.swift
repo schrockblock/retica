@@ -6,10 +6,6 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
-private func framedHello(_ token: Data) -> Data {
-    try! BLEFraming.frame(BLEHello.pack(version: BLEInterface.protocolVersion, token: token))
-}
-
 private let ownToken   = Data(repeating: 0x5A, count: 16)
 private let peerToken  = Data(repeating: 0xC7, count: 16)
 private let peerTokenB = Data(repeating: 0xD4, count: 16)   // second session token for peer-cycle test
@@ -23,6 +19,9 @@ private let handle2    = BLEPeerHandle(id: UUID(uuidString: "22222222-0000-0000-
 /// assertion can match by accident, so a mis-routed send fails loudly rather than silently
 /// reading as the default peer.
 private let tokenForChannel: [BLEChannelID: Data] = [channel: peerToken, channel2: peerTokenB]
+private let bleMTU = 512
+/// One fragment (payload 507 ≥ any test packet) with the 5-byte v2.2 header.
+private func bleFrag(_ packet: Data) -> Data { try! BLEFragmenter(mtu: bleMTU).fragment(packet)[0] }
 
 @MainActor
 private func makeNode() -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>,
@@ -36,10 +35,9 @@ private func makeNode() -> (TestStore<TransportEndpoint.State, TransportEndpoint
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 0))
         $0.uuid = .incrementing
-        $0.bleRandomBytes = BLERandomBytesGenerator { _ in ownToken }
         $0.bleDriver = BLEDriver(
             start: { _ in events.stream },
-            readDirectory: { _ in }, openChannel: { _, _ in },
+            readIdentity: { _ in }, openChannel: { _ in },
             send: { chan, data in
                 sent.withValue { $0.append((tokenForChannel[chan] ?? Data(), data)) }
             },
@@ -64,8 +62,8 @@ private func bringPeerOnline(_ store: TestStore<TransportEndpoint.State, Transpo
         await store.send(.start)
         events.yield(.ready)                   // BLEInterface gates channelOpened on .online
     }
-    events.yield(.channelOpened(channelID, peerHandle, direction: .inbound))
-    events.yield(.channelData(channelID, framedHello(token)))
+    events.yield(.channelOpened(channelID, peerHandle, direction: .inbound, mtu: bleMTU))
+    events.yield(.channelData(channelID, token))
     await store.receive { if case .transport(.interfaceConnected) = $0 { return true }; return false }
 }
 
@@ -104,7 +102,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
                          destinationType: .single, context: .none, contextFlag: false, hops: 0,
                          destinationHash: dest.hash, transportId: nil,
                          payload: initEph.publicKey + Link.signallingBytes)
-    events.yield(.channelData(channel, try! BLEFraming.frame(try! request.packed())))
+    events.yield(.channelData(channel, bleFrag(try! request.packed())))
 
     // A responder link is created on the arrival peer's interface, and the LRPROOF goes back to that peer.
     await store.receive { if case .ble(.ble(.send)) = $0 { return true }; return false }
@@ -113,7 +111,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let last = sent.value.last
     #expect(last?.0 == peerToken)
     // BLEInterface.send frames packets (2-byte big-endian length prefix); unframe before parsing.
-    let unframed = last.map { Data($0.1.dropFirst(BLEFraming.headerLength)) }
+    let unframed = last.map { Data($0.1.dropFirst(BLEFragmenter.headerLength)) }
     #expect(Packet(raw: unframed!)?.packetType == .proof)
 
     await teardown(store)
@@ -127,7 +125,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let remote = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
                                                      aspects: ["svc"], hops: 0, emitted: 1000)
-    events.yield(.channelData(channel, try! BLEFraming.frame(announceRaw)))
+    events.yield(.channelData(channel, bleFrag(announceRaw)))
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
 
     // openLink must pick the peer's BLE interface from the learned entry.
@@ -143,7 +141,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     // (c) the driver received a LINKREQUEST for this peer
     let lastSent = sent.value.last
     #expect(lastSent?.0 == peerToken)
-    let unframed = lastSent.map { Data($0.1.dropFirst(BLEFraming.headerLength)) }
+    let unframed = lastSent.map { Data($0.1.dropFirst(BLEFragmenter.headerLength)) }
     #expect(Packet(raw: unframed!)?.packetType == .linkRequest)
 
     await store.send(.closeLink(linkID: store.state.links[0].linkID))
@@ -181,7 +179,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let remote = Identity()
     let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
                                                      aspects: ["svc"], hops: 0, emitted: 1000)
-    events.yield(.channelData(channel, try! BLEFraming.frame(announceRaw)))
+    events.yield(.channelData(channel, bleFrag(announceRaw)))
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
 
     // Transport has learned[destHash] = … with interfaceID = bleInterfaceID(peerToken).
@@ -279,7 +277,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
                          context: .none, contextFlag: false, hops: 0,
                          destinationHash: dest.hash, transportId: nil,
                          payload: initEph.publicKey + Link.signallingBytes)
-    events.yield(.channelData(channel, try! BLEFraming.frame(try! request.packed())))
+    events.yield(.channelData(channel, bleFrag(try! request.packed())))
 
     // Responder creates a link and sends LRPROOF back to tokenA.
     await store.receive { if case .ble(.ble(.send)) = $0 { return true }; return false }
@@ -289,7 +287,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     // Extract the responder's X25519 pub from the LRPROOF (signature‖X25519pub‖signalling).
     // `sent` captures (peerToken, framedBytes); unframe to reach the Packet payload.
     let proofFramed   = sent.value.last!.1
-    let proofUnframed = Data(proofFramed.dropFirst(BLEFraming.headerLength))
+    let proofUnframed = Data(proofFramed.dropFirst(BLEFragmenter.headerLength))
     let proofPayload  = Packet(raw: proofUnframed)!.payload      // 99 bytes
     let responderX25519Pub = Data(proofPayload[64..<96])
 
@@ -304,7 +302,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let rttPkt = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                         destinationType: .link, context: .linkRequestRTT, contextFlag: false,
                         hops: 0, destinationHash: linkID, transportId: nil, payload: rttPayload)
-    events.yield(.channelData(channel, try! BLEFraming.frame(try! rttPkt.packed())))
+    events.yield(.channelData(channel, bleFrag(try! rttPkt.packed())))
     await store.receive { if case .delegate(.linkEstablished) = $0 { return true }; return false }
     #expect(store.state.links[0].interfaceID == bleInterfaceID(peerToken))
 
@@ -325,7 +323,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let pingPkt = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                          destinationType: .link, context: .none, contextFlag: false,
                          hops: 0, destinationHash: linkID, transportId: nil, payload: pingPayload)
-    events.yield(.channelData(channel2, try! BLEFraming.frame(try! pingPkt.packed())))
+    events.yield(.channelData(channel2, bleFrag(try! pingPkt.packed())))
     // linkDataReceived confirms both re-homing AND that tokenB's interface carried the packet.
     await store.receive { if case .delegate(.linkDataReceived) = $0 { return true }; return false }
 
@@ -374,7 +372,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
                          destinationType: .single, context: .none, contextFlag: false, hops: 0,
                          destinationHash: dest.hash, transportId: nil,
                          payload: initEph.publicKey + Link.signallingBytes)
-    events.yield(.channelData(channel, try! BLEFraming.frame(try! request.packed())))
+    events.yield(.channelData(channel, bleFrag(try! request.packed())))
     // Drain the LRPROOF so the link element is fully created before we read state.
     await store.receive { if case .ble(.ble(.send)) = $0 { return true }; return false }
 
