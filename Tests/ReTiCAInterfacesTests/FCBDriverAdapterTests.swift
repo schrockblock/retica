@@ -732,15 +732,18 @@ func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
     let p = peer(2)
     guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
     stubs.canSend.setValue(false)
-    stubs.canSendDelayNanos.setValue(200_000_000)       // the first check is in flight for 200 ms, then says false
+    stubs.canSendHeld.setValue(true)                    // the first check stays in flight (answer: false) until released
     let calls = stubs.calls
     let sending = Task { await adapter.send(cid, fragments: [Data([1])]) }
-    // Gate: the first check has started and already decided `false`, so the flips below can only
-    // affect LATER checks (a fixed sleep let a loaded machine flip them first: trivial pass).
+    // Gate: the first check has started and already decided `false`, so the flip below can only
+    // affect LATER checks (a fixed sleep let a loaded machine flip it first: trivial pass).
     #expect(await waitUntil(within: eventWait) { await calls.canSendStarted >= 1 })
     stubs.canSend.setValue(true)                        // every later check says true
-    stubs.canSendDelayNanos.setValue(0)
-    stubs.centralEvents.yield(readyToSend(p))           // consumed while the first check is still suspended
+    stubs.centralEvents.yield(readyToSend(p))           // consumed while the first check is still held
+    // The ready handler has no observable effect while the drain is running, so give it a turn on
+    // the (otherwise idle) actor before the check may resolve; the check cannot resolve earlier.
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    stubs.canSendHeld.setValue(false)
     await sending.value
     // No second ready event is ever sent: only the generation re-check can get [1] out.
     let written = await waitUntil(within: eventWait) { await calls.withoutResponseWrites.count >= 1 }
@@ -780,7 +783,10 @@ func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
     let sending = Task { await adapter.send(cid, fragments: [Data([1])]) }
     #expect(await waitUntil(within: eventWait) { await calls.canSendStarted >= 1 })
     stubs.centralEvents.yield(.didDisconnect(Peripheral(id: p.id, name: nil, state: .disconnected), nil))
-    guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed"); await adapter.stop(); return }
+    let closed = (await collect(events, count: 1)).first
+    var sawClose = false
+    if case .channelClosed(cid, _)? = closed { sawClose = true }
+    #expect(sawClose, "expected channelClosed, got \(String(describing: closed))")   // no early return: the gate must be released
     stubs.canSendHeld.setValue(false)                   // the check now returns `false` into a closed channel
     await sending.value
     stubs.canSend.setValue(true)
