@@ -235,7 +235,9 @@ public struct LXMFNode {
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
-            case messageReceived(message: LXMessage, signatureValidated: Bool)
+            /// `method` is how the message arrived: a single packet, a link, or a propagation node
+            /// download. With duplicates the first arrival wins (the router's dedup is unchanged).
+            case messageReceived(message: LXMessage, signatureValidated: Bool, method: LXMFRouter.DeliveryMethod)
             case deliveryFailed(messageHash: Data)
             case deliveryConfirmed(messageHash: Data)
             case propagationAccepted(messageHash: Data)
@@ -581,7 +583,7 @@ public struct LXMFNode {
                         // NOT strip again here (that double-strip hashed served[:-32] → purge never matched).
                         tids.append(LXMFPropagation.transientId(lxmfData: blob))
                         if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity) {
-                            effects.append(.send(.router(.received(method: .direct, destinationHash: Data(), data: packed))))
+                            effects.append(.send(.router(.received(method: .propagated, destinationHash: Data(), data: packed))))
                         }
                     }
                     effects.append(.send(.router(.messagesDownloaded(transientIds: tids))))
@@ -656,7 +658,7 @@ public struct LXMFNode {
                 }
                 return .merge(effects)
 
-            case let .router(.delegate(.messageDelivered(message, validated))):
+            case let .router(.delegate(.messageDelivered(message, validated, method))):
                 // Stamp validation mirrors `LXMRouter.lxmf_delivery` (LXMRouter.py:1861-1880, LXMF 1.1.0).
                 //
                 // Only validates when WE have configured a stamp cost (`State.deliveryStampCost != nil`).
@@ -698,7 +700,8 @@ public struct LXMFNode {
                         // fall through to deliver, flagged checked-and-invalid
                     }
                 }
-                return .send(.delegate(.messageReceived(message: delivered, signatureValidated: validated)))
+                return .send(.delegate(.messageReceived(message: delivered, signatureValidated: validated,
+                                                        method: method)))
 
             case let .router(.send(handedOn, _)):
                 // The search for this message is over — it is the router's problem now, so it can no

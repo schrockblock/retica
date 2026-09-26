@@ -131,7 +131,7 @@ private func teardown(_ store: TestStore<LXMFNode.State, LXMFNode.Action>) async
 
     let gotContent = LockIsolated<Data?>(nil)
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, _)) = action { gotContent.setValue(m.content); return true }
+        if case let .delegate(.messageReceived(m, _, _)) = action { gotContent.setValue(m.content); return true }
         return false
     }
     #expect(gotContent.value == Data("hello over ble".utf8))

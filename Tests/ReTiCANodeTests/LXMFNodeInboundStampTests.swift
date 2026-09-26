@@ -148,9 +148,9 @@ private func makeInboundStampStore(
     let store = makeInboundStampStore(deliveryStampCost: nil)
     let message = messageWithNoStamp()
     let got = LockIsolated<(hash: Data, checked: Bool, valid: Bool)?>(nil)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, _)) = action {
+        if case let .delegate(.messageReceived(m, _, _)) = action {
             got.setValue((m.hash, m.stampChecked, m.stampValid))
             return true
         }
@@ -168,9 +168,9 @@ private func makeInboundStampStore(
     let store = makeInboundStampStore(deliveryStampCost: nil)
     let message = await messageWithValidStamp(cost: 1)
     let got = LockIsolated<(hash: Data, checked: Bool, valid: Bool)?>(nil)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, _)) = action {
+        if case let .delegate(.messageReceived(m, _, _)) = action {
             got.setValue((m.hash, m.stampChecked, m.stampValid))
             return true
         }
@@ -195,9 +195,9 @@ private func makeInboundStampStore(
     let store = makeInboundStampStore(deliveryStampCost: cost, enforceDeliveryStamps: false)
     let message = await messageWithValidStamp(cost: cost)
     let got = LockIsolated<(hash: Data, sigValidated: Bool, checked: Bool, valid: Bool)?>(nil)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: true))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: true, method: .opportunistic))))
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, v)) = action {
+        if case let .delegate(.messageReceived(m, v, _)) = action {
             got.setValue((m.hash, v, m.stampChecked, m.stampValid))
             return true
         }
@@ -234,9 +234,9 @@ private func makeInboundStampStore(
     let store = makeInboundStampStore(deliveryStampCost: 8, enforceDeliveryStamps: false)
     let message = messageWithInvalidStamp(atCost: 8)
     let got = LockIsolated<(checked: Bool, valid: Bool)?>(nil)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, _)) = action {
+        if case let .delegate(.messageReceived(m, _, _)) = action {
             got.setValue((m.stampChecked, m.stampValid))
             return true
         }
@@ -256,9 +256,9 @@ private func makeInboundStampStore(
     let store = makeInboundStampStore(deliveryStampCost: 8, enforceDeliveryStamps: false)
     let message = messageWithNoStamp()
     let got = LockIsolated<(checked: Bool, valid: Bool)?>(nil)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, _)) = action {
+        if case let .delegate(.messageReceived(m, _, _)) = action {
             got.setValue((m.stampChecked, m.stampValid))
             return true
         }
@@ -284,7 +284,7 @@ private func makeInboundStampStore(
 @MainActor @Test func inboundStamp_costConfigured_invalidStamp_enforcementOn_messageIsDropped() async {
     let store = makeInboundStampStore(deliveryStampCost: 8, enforceDeliveryStamps: true)
     let message = messageWithInvalidStamp(atCost: 8)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))
 }
@@ -294,7 +294,7 @@ private func makeInboundStampStore(
 @MainActor @Test func inboundStamp_costConfigured_noStamp_enforcementOn_messageIsDropped() async {
     let store = makeInboundStampStore(deliveryStampCost: 8, enforceDeliveryStamps: true)
     let message = messageWithNoStamp()
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))
 }
@@ -311,9 +311,9 @@ private func makeInboundStampStore(
     let store = makeInboundStampStore(deliveryStampCost: cost, enforceDeliveryStamps: true)
     let message = await messageWithValidStamp(cost: cost)
     let got = LockIsolated<(hash: Data, checked: Bool, valid: Bool)?>(nil)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, _)) = action {
+        if case let .delegate(.messageReceived(m, _, _)) = action {
             got.setValue((m.hash, m.stampChecked, m.stampValid))
             return true
         }
@@ -347,9 +347,9 @@ private func makeInboundStampStore(
 
     let message = messageWithNoStamp()
     let got = LockIsolated<(hash: Data, checked: Bool)?>(nil)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, _)) = action {
+        if case let .delegate(.messageReceived(m, _, _)) = action {
             got.setValue((m.hash, m.stampChecked))
             return true
         }
@@ -378,9 +378,9 @@ private func makeInboundStampStore(
 
     let message = messageWithInvalidStamp(atCost: 8)
     let got = LockIsolated<(checked: Bool, valid: Bool)?>(nil)
-    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false))))
+    await store.send(.router(.delegate(.messageDelivered(message: message, signatureValidated: false, method: .opportunistic))))
     await store.receive { action in
-        if case let .delegate(.messageReceived(m, _)) = action {
+        if case let .delegate(.messageReceived(m, _, _)) = action {
             got.setValue((m.stampChecked, m.stampValid))
             return true
         }
@@ -402,7 +402,7 @@ private func makeInboundStampStore(
     #expect(store.state.deliveryStampCost == 8)
 
     await store.send(.router(.delegate(.messageDelivered(message: messageWithInvalidStamp(atCost: 8),
-                                                         signatureValidated: false))))
+                                                         signatureValidated: false, method: .opportunistic))))
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))
 }

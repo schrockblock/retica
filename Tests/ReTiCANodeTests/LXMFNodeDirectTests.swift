@@ -120,7 +120,7 @@ import ComposableArchitecture
             await b.receive(isInterfaceSend)               // RESOURCE_PRF out
             resourcePrfBytes.setValue(sentB.value.last!)   // capture RESOURCE_PRF before messageReceived
             await b.receive { action in
-                if case let .delegate(.messageReceived(m, v)) = action {
+                if case let .delegate(.messageReceived(m, v, _)) = action {
                     gotContent.setValue(m.content)
                     gotTitle.setValue(m.title)
                     gotSrcHash.setValue(m.sourceHash)

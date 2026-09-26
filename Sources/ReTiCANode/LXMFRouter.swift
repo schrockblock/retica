@@ -105,7 +105,11 @@ public struct LXMFRouter {
         public init() {}
     }
 
-    public enum DeliveryMethod: Equatable, Sendable { case opportunistic, direct }
+    /// How an LXMF message travels. Inbound it is the arrival path reported on `messageDelivered`:
+    /// a single packet (`opportunistic`), a link packet or Resource (`direct`), or a download from a
+    /// propagation node (`propagated`). Outbound, `.send` accepts `opportunistic` and `direct` only;
+    /// propagated sends go through `.sendViaPropagation`.
+    public enum DeliveryMethod: Equatable, Sendable { case opportunistic, direct, propagated }
     public enum LinkStatus: Equatable { case awaitingPath; case establishing; case active(linkID: Data) }
 
     /// Which copy of an outbound message a pending delivery tracks. `delivery` is the copy addressed
@@ -207,7 +211,7 @@ public struct LXMFRouter {
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
-            case messageDelivered(message: LXMessage, signatureValidated: Bool)
+            case messageDelivered(message: LXMessage, signatureValidated: Bool, method: DeliveryMethod)
             case duplicateDropped(hash: Data)
             /// `messageHash` becomes the packet's receipt token, so a proof for ANY attempt of this
             /// message comes back as `.opportunisticDelivered(messageHash:)`.
@@ -430,7 +434,9 @@ public struct LXMFRouter {
                 switch method {
                 case .opportunistic:
                     reconstructed = LXMessage.fromOpportunistic(destinationHash: destinationHash, payload: data)
-                case .direct:
+                case .direct, .propagated:
+                    // Both carry the full packed message, destination hash included: a link packet or
+                    // Resource for `.direct`, a decrypted propagation entry for `.propagated`.
                     reconstructed = LXMessage.unpack(data)
                 }
                 guard let message = reconstructed else { return .none }   // malformed → drop
@@ -439,7 +445,8 @@ public struct LXMFRouter {
                 }
                 let validated = state.knownIdentities[message.sourceHash]
                     .map { message.validateSignature(source: $0) } ?? false
-                return .send(.delegate(.messageDelivered(message: message, signatureValidated: validated)))
+                return .send(.delegate(.messageDelivered(message: message, signatureValidated: validated,
+                                                         method: method)))
 
             case let .send(message, desiredMethod):
                 let effective: DeliveryMethod =
@@ -471,6 +478,11 @@ public struct LXMFRouter {
                         return establish(&state, dest)
                     }
                     return .none   // a link/path request is already in flight
+                case .propagated:
+                    // A propagated copy needs a packed propagation container, which `.send` cannot
+                    // build; `.sendViaPropagation` is the entry point. Fail this copy rather than send
+                    // it some other way.
+                    return fail(&state, .delivery(message.hash))
                 }
 
             case let .setOutboundPropagationNode(pn):

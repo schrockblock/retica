@@ -230,7 +230,7 @@ import ComposableArchitecture
     eventsR.yield(.data(sentPN.value.last!))
     await r.receive { if case .endpoint(.delegate(.responseReceived)) = $0 { return true }; return false }
     await r.receive { action in
-        if case let .delegate(.messageReceived(m, v)) = action {
+        if case let .delegate(.messageReceived(m, v, _)) = action {
             gotContent.setValue(m.content)
             gotSrcHash.setValue(m.sourceHash)
             gotValidated.setValue(v)

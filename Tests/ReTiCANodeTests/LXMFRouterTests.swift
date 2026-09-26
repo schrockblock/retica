@@ -21,7 +21,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.send(.received(method: .opportunistic, destinationHash: msg.destinationHash,
                                data: msg.opportunisticPayload))
     await store.receive { action in
-        if case let .delegate(.messageDelivered(m, validated)) = action {
+        if case let .delegate(.messageDelivered(m, validated, _)) = action {
             #expect(m.hash == msg.hash)
             #expect(m.content == Data("hello router".utf8))
             #expect(validated == true)
@@ -39,7 +39,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.send(.learnedIdentity(destinationHash: msg.sourceHash, identity: sender))
     await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))
     await store.receive { action in
-        if case let .delegate(.messageDelivered(m, validated)) = action {
+        if case let .delegate(.messageDelivered(m, validated, _)) = action {
             #expect(m.hash == msg.hash); #expect(validated == true); return true
         }
         return false
@@ -53,7 +53,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // No .learnedIdentity for the sender.
     await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))
     await store.receive { action in
-        if case let .delegate(.messageDelivered(m, validated)) = action {
+        if case let .delegate(.messageDelivered(m, validated, _)) = action {
             #expect(m.hash == msg.hash); #expect(validated == false); return true
         }
         return false
@@ -93,7 +93,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.send(.received(method: .opportunistic, destinationHash: msg.destinationHash,
                                data: msg.opportunisticPayload))
     await store.receive { action in
-        if case let .delegate(.messageDelivered(m, _)) = action { #expect(m.hash == msg.hash); return true }
+        if case let .delegate(.messageDelivered(m, _, _)) = action { #expect(m.hash == msg.hash); return true }
         return false
     }
     await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))   // same msg, other path
@@ -115,7 +115,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.send(.learnedIdentity(destinationHash: msg.sourceHash, identity: sender))
     await store.send(.received(method: .direct, destinationHash: Data(), data: Data(bytes)))
     await store.receive { action in
-        if case let .delegate(.messageDelivered(_, validated)) = action { #expect(validated == false); return true }
+        if case let .delegate(.messageDelivered(_, validated, _)) = action { #expect(validated == false); return true }
         return false
     }
 }
@@ -258,13 +258,13 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.received(method: .direct, destinationHash: Data(), data: before.packed))
     await store.receive { action in
-        if case let .delegate(.messageDelivered(_, v)) = action { #expect(v == false); return true }; return false
+        if case let .delegate(.messageDelivered(_, v, _)) = action { #expect(v == false); return true }; return false
     }
     // Both messages are from `sender`, so before.sourceHash == after.sourceHash.
     await store.send(.learnedIdentity(destinationHash: after.sourceHash, identity: sender))
     await store.send(.received(method: .direct, destinationHash: Data(), data: after.packed))
     await store.receive { action in
-        if case let .delegate(.messageDelivered(_, v)) = action { #expect(v == true); return true }; return false
+        if case let .delegate(.messageDelivered(_, v, _)) = action { #expect(v == true); return true }; return false
     }
 }
 

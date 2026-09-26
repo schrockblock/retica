@@ -64,7 +64,7 @@ import ComposableArchitecture
     let gotSrcHash = LockIsolated<Data?>(nil)
     let gotValidated = LockIsolated<Bool>(false)
     await b.receive { action in
-        if case let .delegate(.messageReceived(m, v)) = action {
+        if case let .delegate(.messageReceived(m, v, _)) = action {
             gotContent.setValue(m.content)
             gotTitle.setValue(m.title)
             gotDestHash.setValue(m.destinationHash)
