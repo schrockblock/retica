@@ -18,6 +18,10 @@ public struct LXMFRouter {
         /// Dedup of already-delivered LXMF message IDs (`message.hash`). Bounded (RNS uses age-based
         /// expiry; a bounded ring is the LXMF-4a approximation).
         var seen = RingSet(capacity: 10_000)
+        /// Message hashes one of whose copies has succeeded. A copy that fails LATER — even one armed
+        /// after the success, as a propagated copy is once its stamp search finishes — is then not
+        /// reported as `deliveryFailed`. Bounded like `seen`; see `succeededMessageMemory`.
+        var succeededMessages = RingSet(capacity: LXMFRouter.succeededMessageMemory)
         /// sourceHash (sender's lxmf.delivery destination hash) → identity, for signature validation.
         public var knownIdentities: [Data: Identity] = [:]
         /// destinationHash → direct-link state (reuse an active link, or one being established).
@@ -88,7 +92,8 @@ public struct LXMFRouter {
         /// raise `pathRequestWaitSeconds` before `maxAttempts` — the budget is shared, so raising
         /// the count also lengthens every other saga that draws on it.
         ///
-        /// Queued messages are reported at the ceiling as `deliveryFailed`; a PN SYNC has no message
+        /// Queued copies are failed at the ceiling through `fail` (`deliveryFailed` unless the
+        /// message's other copy is outstanding or already succeeded); a PN SYNC has no message
         /// to fail, so it terminates silently — the flag is cleared but the app is not told. See the
         /// give-up branch.
         ///
@@ -223,6 +228,10 @@ public struct LXMFRouter {
 
     public init() {}
 
+    /// How many recently-succeeded message hashes `succeededMessages` remembers. A copy that fails
+    /// more than this many successes later could be reported failed; far beyond any retry saga.
+    static let succeededMessageMemory = 1024
+
     public var body: some ReducerOf<Self> {
         Reduce { [clock] state, action in
             func retryTimer(_ key: DeliveryKey, _ seconds: Int) -> Effect<Action> {
@@ -246,16 +255,43 @@ public struct LXMFRouter {
             func arm(_ state: inout State, _ key: DeliveryKey, _ resend: ResendInfo) {
                 state.pendingDeliveries[key] = PendingDelivery(resend: resend, attempts: 1)
             }
-            /// One copy of a message was confirmed: settle that copy only, stop its retries, and
-            /// report the outcome that copy stands for. A receipt for a copy no longer pending is
-            /// ignored.
+            /// One copy of a message was confirmed: settle that copy only, stop its retries, remember
+            /// the success, and report the outcome that copy stands for. A receipt for a copy no
+            /// longer pending is ignored.
             func succeed(_ state: inout State, _ key: DeliveryKey) -> Effect<Action> {
                 guard state.pendingDeliveries[key] != nil else { return .none }
                 state.pendingDeliveries[key] = nil
+                state.succeededMessages.insert(key.messageHash)
                 let outcome: Action.Delegate = key.leg == .propagated
                     ? .propagationAccepted(messageHash: key.messageHash)
                     : .deliveryConfirmed(messageHash: key.messageHash)
                 return .merge(.cancel(id: CancelID.retry(key)), .send(.delegate(outcome)))
+            }
+            /// Whether the `leg` copy of `hash` can still succeed: armed with a retry timer, or queued
+            /// behind its link (not yet armed, but it will be when the link comes up).
+            ///
+            /// Accepted gap: a delivery copy still in its stamp search (in `LXMFNode`, not yet handed
+            /// to this router) is invisible here, so it does not count as outstanding.
+            func isOutstanding(_ state: State, _ hash: Data, _ leg: Leg) -> Bool {
+                if state.pendingDeliveries[DeliveryKey(messageHash: hash, leg: leg)] != nil { return true }
+                switch leg {
+                case .delivery:
+                    return state.outboundQueue.values.contains { $0.contains { $0.hash == hash } }
+                case .propagated:
+                    return state.propagationQueue.values.contains { $0.contains { $0.messageHash == hash } }
+                }
+            }
+            /// One copy of a message has failed for good. `deliveryFailed` is reported only when no
+            /// other copy can still succeed and none already did (spec §3). Every router failure path
+            /// goes through here. (Accepted gap: `LXMFNode`'s `.cancelDeliveryStamps` emits
+            /// `deliveryFailed` itself and bypasses this helper.)
+            func fail(_ state: inout State, _ key: DeliveryKey) -> Effect<Action> {
+                state.pendingDeliveries[key] = nil
+                let other: Leg = key.leg == .delivery ? .propagated : .delivery
+                guard !isOutstanding(state, key.messageHash, other),
+                      !state.succeededMessages.contains(key.messageHash)
+                else { return .none }
+                return .send(.delegate(.deliveryFailed(messageHash: key.messageHash)))
             }
             // Tear down a direct link, reaping its in-flight Resource entry. `linkResourceInFlight`
             // is keyed on the linkID carried by `.active`, so it can only be reaped BEFORE
@@ -287,8 +323,8 @@ public struct LXMFRouter {
                 // Guarded on the PN: an unrelated destination giving up says nothing about the sync.
                 if dest == state.outboundPropagationNode { state.pendingDownloadFromPN = false }
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.pathRequest(dest))]
-                effects += queued.map { .send(.delegate(.deliveryFailed(messageHash: $0.hash))) }
-                effects += propQueued.map { .send(.delegate(.deliveryFailed(messageHash: $0.messageHash))) }
+                for message in queued { effects.append(fail(&state, .delivery(message.hash))) }
+                for item in propQueued { effects.append(fail(&state, .propagated(item.messageHash))) }
                 return .merge(effects)
             }
             func establish(_ state: inout State, _ dest: Data) -> Effect<Action> {
@@ -443,7 +479,7 @@ public struct LXMFRouter {
 
             case let .sendViaPropagation(message, propagationPacked):
                 guard let pn = state.outboundPropagationNode else {
-                    return .send(.delegate(.deliveryFailed(messageHash: message.hash)))
+                    return fail(&state, .propagated(message.hash))
                 }
                 if case let .active(linkID) = state.directLinks[pn] {
                     let key = DeliveryKey.propagated(message.hash)
@@ -601,8 +637,7 @@ public struct LXMFRouter {
                 guard var pending = state.pendingDeliveries[key] else { return .none }
                 pending.attempts += 1
                 if pending.attempts > LXMFDelivery.maxAttempts {
-                    state.pendingDeliveries[key] = nil
-                    return .send(.delegate(.deliveryFailed(messageHash: hash)))
+                    return fail(&state, key)
                 }
                 state.pendingDeliveries[key] = pending
                 switch pending.resend {
