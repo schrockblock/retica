@@ -134,6 +134,11 @@ private final class Pair {
     // The proof confirms the message on A and retires every retry.
     p.eventsA.yield(.data(proof))
     await p.a.receive(.delegate(.deliveryConfirmed(messageHash: msg.hash)))
+    // No-op-send probe: a stray action left queued (e.g. a spurious deliveryFailed emitted
+    // alongside the confirmation) makes this exhaustive send fail on unasserted received actions.
+    p.a.exhaustivity = .on
+    await p.a.send(.cancelPropagationStamps)
+    p.a.exhaustivity = .off
     #expect(p.a.state.router.pendingDeliveries.isEmpty)
     #expect(p.a.state.endpoint.transport.pendingReceipts.isEmpty)
     await p.expectANeverRetriesAgain()
@@ -215,14 +220,29 @@ private final class Pair {
     await p.a.send(.endpoint(.delegate(.packetDelivered(token: msg.hash))))
     await p.a.receive(.delegate(.propagationAccepted(messageHash: msg.hash)))
 
-    // Then the recipient's proof arrives: still reported as deliveryConfirmed.
+    // Then the recipient's proof arrives: still reported as deliveryConfirmed. Exhaustive from here
+    // through deliveryConfirmed, so a stray deliveryFailed alongside/before it fails the test.
+    p.a.exhaustivity = .on
     let bFrames = p.sentB.value.count
     p.eventsB.yield(.data(data))
     await p.b.receive { if case .endpoint(.proveSinglePacket) = $0 { return true }; return false }
     await p.b.receive(isTCPSend)
     let proof = await nextFrame(p.sentB, after: bFrames)
     p.eventsA.yield(.data(proof))
+    await p.a.receive(.endpoint(.tcpClient(.interface(.connectionEvent(.data(proof))))))
+    await p.a.receive { if case .endpoint(.tcpClient(.interface(.delegate(.packetReceived)))) = $0 { return true }; return false }
+    await p.a.receive({ if case .endpoint(.transport(.received)) = $0 { return true }; return false }) {
+        $0.endpoint.transport.pendingReceipts = [:]
+    }
+    await p.a.receive(.endpoint(.transport(.delegate(.singlePacketDelivered(token: msg.hash)))))
+    await p.a.receive(.endpoint(.delegate(.singlePacketDelivered(token: msg.hash))))
+    await p.a.receive(.router(.opportunisticDelivered(messageHash: msg.hash))) {
+        $0.router.pendingDeliveries[.delivery(msg.hash)] = nil
+        $0.router.succeededMessages.insert(msg.hash)
+    }
+    await p.a.receive(.router(.delegate(.deliveryConfirmed(messageHash: msg.hash))))
     await p.a.receive(.delegate(.deliveryConfirmed(messageHash: msg.hash)))
+    p.a.exhaustivity = .off
     #expect(p.a.state.router.pendingDeliveries.isEmpty)
     await p.expectANeverRetriesAgain()
     await p.stop()
