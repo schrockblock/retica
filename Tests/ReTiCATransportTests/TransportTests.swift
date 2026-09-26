@@ -146,7 +146,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     store.exhaustivity = .off
     await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
     await store.send(.received(InterfaceID("i1"), raw))
-    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext)))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext, packetHash: packet.packetHash, interfaceID: InterfaceID("i1"))))
 }
 
 @Test @MainActor func dropsDataForUnknownDestination() async {
@@ -301,7 +301,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
 
     // First delivery.
     await store.send(.received(InterfaceID("i1"), raw))
-    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext)))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext, packetHash: packet.packetHash, interfaceID: InterfaceID("i1"))))
 
     // Second copy of the same raw frame — must be dropped by dedup.
     // Switch exhaustivity ON so any spurious delegate action would be caught.
@@ -860,7 +860,7 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     await store.send(.setTransportIdentity(relay))
     await store.send(.registerLocalDestination(dest)) { $0.localDestinations = [dest.hash: dest] }
     await store.send(.received(InterfaceID("i1"), raw))
-    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext)))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext, packetHash: packet.packetHash, interfaceID: InterfaceID("i1"))))
 }
 
 // MARK: - Task 4b-2 tests (byte-fidelity + E2E)
@@ -1089,7 +1089,7 @@ private func makeHeader2LinkRequestPacket(transportId: Data, destHash: Data, hop
     // Step 6: Deliver R's HEADER_1 to B on "rb". B decrypts and surfaces the exact plaintext.
     // This proves the encrypted payload survived the full relay chain A→R→B.
     await storeB.send(.received(ifRB, rToBRaw.value!))
-    await storeB.receive(.delegate(.received(destinationHash: destB.hash, plaintext: plaintext)))
+    await storeB.receive(.delegate(.received(destinationHash: destB.hash, plaintext: plaintext, packetHash: rPacket.packetHash, interfaceID: ifRB)))
 }
 
 // MARK: - Task 4b-2b-t3 helpers
@@ -1409,7 +1409,7 @@ private func makeRelayStore(_ relay: Identity) async -> TestStore<Transport.Stat
                         destinationHash: dest.hash, transportId: nil, payload: ciphertext)
     let raw = try! packet.packed()
     await store.send(.received(InterfaceID("i"), raw))
-    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext)))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: plaintext, packetHash: packet.packetHash, interfaceID: InterfaceID("i"))))
     // Duplicate → deduped by packetHash: no second delivery.
     await store.send(.received(InterfaceID("i"), raw))
     store.exhaustivity = .on
@@ -4290,13 +4290,13 @@ private func distinctPayload(_ i: Int) -> Data {
     let packets = payloads.map { makePlainDataPacket(to: dest, payload: $0) }
     for (packet, payload) in zip(packets, payloads) {
         await store.send(.received(InterfaceID("i"), packet))
-        await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: payload)))
+        await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: payload, packetHash: Packet(raw: packet)!.packetHash, interfaceID: InterfaceID("i"))))
     }
     #expect(store.state.seenPacketHashes.count == 2)     // bounded at the injected capacity
 
     // #0 was evicted by #2, so replaying it is delivered a SECOND time.
     await store.send(.received(InterfaceID("i"), packets[0]))
-    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: payloads[0])))
+    await store.receive(.delegate(.received(destinationHash: dest.hash, plaintext: payloads[0], packetHash: Packet(raw: packets[0])!.packetHash, interfaceID: InterfaceID("i"))))
     // #2 is still remembered, so replaying it is suppressed. Flip exhaustivity LAST: teardown
     // catches a stray delivery.
     store.exhaustivity = .on

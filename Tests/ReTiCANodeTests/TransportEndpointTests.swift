@@ -110,18 +110,23 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
 
 @Test @MainActor func sharedMachineryDelegatesSurfaceAsUnifiedDelegates() async {
     let h = Data(repeating: 0x22, count: 16)
+    let ph = Data(repeating: 0x33, count: 32)
 
     let tcp = makeTCP()
-    await tcp.send(.transport(.delegate(.received(destinationHash: h, plaintext: Data([0x01])))))
-    await tcp.receive(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x01]))))
+    await tcp.send(.transport(.delegate(.received(destinationHash: h, plaintext: Data([0x01]),
+                                                  packetHash: ph, interfaceID: InterfaceID("tcp")))))
+    await tcp.receive(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x01]),
+                                                 packetHash: ph, interfaceID: InterfaceID("tcp"))))
     await tcp.send(.transport(.delegate(.pathLearned(destinationHash: h, hops: 2))))
     await tcp.receive(.delegate(.pathLearned(destinationHash: h, hops: 2)))
     await tcp.send(.linkPlane(.delegate(.linkEstablished(linkID: h, destinationHash: h))))
     await tcp.receive(.delegate(.linkEstablished(linkID: h, destinationHash: h)))
 
     let ble = makeBLE()
-    await ble.send(.transport(.delegate(.received(destinationHash: h, plaintext: Data([0x02])))))
-    await ble.receive(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x02]))))
+    await ble.send(.transport(.delegate(.received(destinationHash: h, plaintext: Data([0x02]),
+                                                  packetHash: ph, interfaceID: InterfaceID("ble")))))
+    await ble.receive(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x02]),
+                                                 packetHash: ph, interfaceID: InterfaceID("ble"))))
     await ble.send(.linkPlane(.delegate(.resourceConcluded(linkID: h, resourceHash: h))))
     await ble.receive(.delegate(.resourceConcluded(linkID: h, resourceHash: h)))
 }

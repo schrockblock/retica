@@ -65,3 +65,20 @@ private let proofIfID = InterfaceID("tcp-1")
     await store.send(.proveSingle(packetHash: f.dataPacketHashBytes, interfaceID: proofIfID,
                                   identity: f.identity))
 }
+
+/// A single DATA packet decrypted for a local destination surfaces its full 32-byte packet hash —
+/// the reference `packet_hash` a proof must sign — and the interface it arrived on.
+@Test @MainActor func inboundProvingReceivedCarriesReferencePacketHashAndArrivalInterface() async throws {
+    let f = try ProofVectorFixtures.load()
+    let local = try #require(Destination(kind: .single, direction: .in, appName: "lxmf",
+                                         aspects: ["delivery"], identity: f.identity))
+    #expect(local.hash == f.destinationHashBytes)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.registerLocalDestination(local))
+    await store.send(.received(proofIfID, f.dataPacketBytes))
+    await store.receive(.delegate(.received(destinationHash: f.destinationHashBytes,
+                                            plaintext: f.plaintextBytes,
+                                            packetHash: f.dataPacketHashBytes,
+                                            interfaceID: proofIfID)))
+}

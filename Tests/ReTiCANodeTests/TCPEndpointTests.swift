@@ -86,7 +86,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     events.yield(.data(HDLC.frame(try! packet.packed())))
     let captured = LockIsolated<Data?>(nil)
     await store.receive { action in
-        if case let .delegate(.messageReceived(_, p)) = action { captured.setValue(p); return true }
+        if case let .delegate(.messageReceived(_, p, _, _)) = action { captured.setValue(p); return true }
         return false
     }
     #expect(captured.value == plaintext)

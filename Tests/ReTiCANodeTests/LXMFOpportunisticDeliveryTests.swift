@@ -65,7 +65,7 @@ import ComposableArchitecture
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received)
     await b.receive { action in
-        if case let .delegate(.messageReceived(h, p)) = action { got.setValue((h, p)); return true }
+        if case let .delegate(.messageReceived(h, p, _, _)) = action { got.setValue((h, p)); return true }
         return false
     }
     let (deliveryHash, plaintext) = got.value!

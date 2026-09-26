@@ -268,8 +268,12 @@ private func makeStore() -> TestStore<TransportEndpoint.State, TransportEndpoint
     await store.send(.transport(.delegate(.pathLearned(destinationHash: h, hops: 3))))
     await store.receive(.delegate(.pathLearned(destinationHash: h, hops: 3)))
 
-    await store.send(.transport(.delegate(.received(destinationHash: h, plaintext: Data([0x09])))))
-    await store.receive(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x09]))))
+    await store.send(.transport(.delegate(.received(destinationHash: h, plaintext: Data([0x09]),
+                                                    packetHash: Data(repeating: 0x66, count: 32),
+                                                    interfaceID: InterfaceID("ble-peer")))))
+    await store.receive(.delegate(.messageReceived(destinationHash: h, plaintext: Data([0x09]),
+                                                   packetHash: Data(repeating: 0x66, count: 32),
+                                                   interfaceID: InterfaceID("ble-peer"))))
 
     await store.send(.transport(.delegate(.sendFailed(destinationHash: h, reason: .notLearned))))
     await store.receive(.delegate(.sendFailed(destinationHash: h, reason: .notLearned)))

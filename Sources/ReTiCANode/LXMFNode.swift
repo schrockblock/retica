@@ -597,8 +597,20 @@ public struct LXMFNode {
             case let .router(.delegate(.sendOpportunistic(dest, payload))):
                 return .send(.endpoint(.send(destinationHash: dest, plaintext: payload)))
 
-            case let .endpoint(.delegate(.messageReceived(destHash, plaintext))):
-                return .send(.router(.received(method: .opportunistic, destinationHash: destHash, data: plaintext)))
+            case let .endpoint(.delegate(.messageReceived(destHash, plaintext, packetHash, interfaceID))):
+                // Reference `LXMRouter.delivery_packet` (LXMRouter.py:1926-1927) calls `packet.prove()`
+                // as its FIRST statement, for opportunistic (non-link) packets too. The proof therefore
+                // goes out BEFORE the router's `seen` dedup, so a resend of an already-delivered message
+                // is proved again, and before unpacking, so LXMF-level malformation is proved too.
+                // Only packets for OUR delivery destination are proved: `Transport` surfaces a packet
+                // here only after decrypting it for a local destination, and link traffic and
+                // propagated downloads never arrive on this path.
+                let deliver = Effect<Action>.send(.router(.received(method: .opportunistic,
+                                                                    destinationHash: destHash, data: plaintext)))
+                guard let ours = state.deliveryDestinationHash, destHash == ours else { return deliver }
+                return .merge(.send(.endpoint(.proveSinglePacket(packetHash: packetHash, interfaceID: interfaceID,
+                                                                 identity: state.identity))),
+                              deliver)
 
             case let .endpoint(.delegate(.pathLearned(h, _))):
                 var effects: [Effect<Action>] = [.send(.router(.learnedPath(destinationHash: h)))]

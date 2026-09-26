@@ -92,7 +92,7 @@ private func teardown(_ store: TestStore<TransportEndpoint.State, TransportEndpo
     events.yield(.channelData(channel, bleFrag(try! packet.packed())))
     let got = LockIsolated<Data?>(nil)
     await store.receive { action in
-        if case let .delegate(.messageReceived(_, p)) = action { got.setValue(p); return true }
+        if case let .delegate(.messageReceived(_, p, _, _)) = action { got.setValue(p); return true }
         return false
     }
     #expect(got.value == plaintext)

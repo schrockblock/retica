@@ -262,7 +262,10 @@ public struct Transport {
         @CasePathable
         public enum Delegate: Equatable {
             case transmit(InterfaceID, Data)
-            case received(destinationHash: Data, plaintext: Data)
+            /// A single packet decrypted for a local destination. `packetHash` is the full 32-byte
+            /// `Packet.packetHash` (what a proof signs) and `interfaceID` is where it arrived (where
+            /// a proof must go back out).
+            case received(destinationHash: Data, plaintext: Data, packetHash: Data, interfaceID: InterfaceID)
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: SendFailure)
             case linkPacket(linkID: Data, arrivalInterface: InterfaceID, data: Data)
@@ -704,7 +707,9 @@ public struct Transport {
                           let plaintext = destination.decrypt(packet.payload)
                     else { return .none }
                     return .send(.delegate(.received(destinationHash: packet.destinationHash,
-                                                     plaintext: plaintext)))
+                                                     plaintext: plaintext,
+                                                     packetHash: packet.packetHash,
+                                                     interfaceID: interfaceID)))
                 case .linkRequest:
                     // Relay: a HEADER_2 LINKREQUEST naming us as next hop, for a REMOTE destination, is
                     // forwarded toward the dest and a link_table entry is recorded for reverse routing.

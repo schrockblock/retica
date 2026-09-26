@@ -101,6 +101,8 @@ public struct TransportEndpoint {
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
         case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
         case provePacketOverLink(linkID: Data, packetHash: Data)
+        /// Prove a single (non-link) packet we received — see `Transport.Action.proveSingle`.
+        case proveSinglePacket(packetHash: Data, interfaceID: InterfaceID, identity: Identity)
         case closeLink(linkID: Data)
         case registerRequestHandler(path: String, policy: RequestPolicy)
         case deregisterRequestHandler(path: String)
@@ -108,7 +110,7 @@ public struct TransportEndpoint {
         case delegate(Delegate)
         @CasePathable
         public enum Delegate: Equatable {
-            case messageReceived(destinationHash: Data, plaintext: Data)
+            case messageReceived(destinationHash: Data, plaintext: Data, packetHash: Data, interfaceID: InterfaceID)
             case pathLearned(destinationHash: Data, hops: UInt8)
             case sendFailed(destinationHash: Data, reason: Transport.SendFailure)
             case linkEstablished(linkID: Data, destinationHash: Data)
@@ -148,6 +150,8 @@ public struct TransportEndpoint {
             case let .send(h, p):                   return .send(.transport(.send(destinationHash: h, plaintext: p)))
             case let .enableRelay(identity):        return .send(.transport(.setTransportIdentity(identity)))
             case let .requestPath(h):               return .send(.transport(.requestPath(destinationHash: h)))
+            case let .proveSinglePacket(h, id, identity):
+                return .send(.transport(.proveSingle(packetHash: h, interfaceID: id, identity: identity)))
 
             case let .openLink(destinationHash):
                 // F8 stale-path gate, on the SHARED router. `learned` is deliberately
@@ -245,8 +249,9 @@ public struct TransportEndpoint {
                 // the inbound C4 replay path.
                 let masked = state.transport.interfaces[txID]?.ifac?.protect(raw) ?? raw
                 return transmit(state, to: txID, masked: masked, unmasked: raw)
-            case let .transport(.delegate(.received(h, p))):
-                return .send(.delegate(.messageReceived(destinationHash: h, plaintext: p)))
+            case let .transport(.delegate(.received(h, p, packetHash, interfaceID))):
+                return .send(.delegate(.messageReceived(destinationHash: h, plaintext: p,
+                                                        packetHash: packetHash, interfaceID: interfaceID)))
             case let .transport(.delegate(.pathLearned(h, hops))):
                 return .send(.delegate(.pathLearned(destinationHash: h, hops: hops)))
             case let .transport(.delegate(.sendFailed(h, r))):
