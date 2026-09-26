@@ -221,6 +221,13 @@ public struct Transport {
         case announce(destinationHash: Data, appData: Data?)
         case requestPath(destinationHash: Data)
         case send(destinationHash: Data, plaintext: Data)
+        /// Prove a single packet we received, reference-style (RNS `Identity.prove`,
+        /// Identity.py:942-953): an unencrypted HEADER_1 PROOF to the packet's `ProofDestination`
+        /// (hash = `packetHash[:16]`, type SINGLE, Packet.py:376-379), context NONE, carrying the
+        /// 64-byte IMPLICIT proof — `identity.sign(packetHash)`, the reference default
+        /// (Reticulum.py:259) — sent on the interface the packet arrived on. Does nothing when
+        /// `identity` has no private key or `interfaceID` is not connected.
+        case proveSingle(packetHash: Data, interfaceID: InterfaceID, identity: Identity)
         case announceRetransmitDue(destinationHash: Data)
         case announceQueueDrainDue(InterfaceID)
         case heldAnnounceReleaseDue(InterfaceID)
@@ -1007,6 +1014,15 @@ public struct Transport {
                 guard let raw = try? packet.packed() else { return .none }
                 let sends = state.interfaces.keys.map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
                 return sends.isEmpty ? .none : .merge(sends)
+
+            case let .proveSingle(packetHash, interfaceID, identity):
+                guard identity.privateKey != nil, state.interfaces[interfaceID] != nil else { return .none }
+                let proof = Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                                   destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                                   destinationHash: Data(packetHash.prefix(Packet.addressLength)),
+                                   transportId: nil, payload: identity.sign(packetHash))
+                guard let raw = try? proof.packed() else { return .none }
+                return .send(.delegate(.transmit(interfaceID, raw)))
 
             case .delegate:
                 return .none
