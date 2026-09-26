@@ -29,8 +29,10 @@ public struct BLEInterface {
     public struct ChannelState: Equatable, Sendable {
         public var peer: BLEPeerHandle
         public var direction: BLEChannelDirection
-        var fragmenter: BLEFragmenter
-        var reassembler: BLEReassembler
+        public var transport: BLEChannelTransport
+        var fragmenter: BLEFragmenter          // .gatt only
+        var reassembler: BLEReassembler        // .gatt only
+        var frameBuffer: BLEFrameBuffer        // .l2cap only
         /// Outbound: set at channelOpened (from identityRead). Inbound: nil until the handshake.
         var peerIdentity: Data?
         var openedAt: Date
@@ -48,16 +50,21 @@ public struct BLEInterface {
         var peers: [Data: BLEChannelID] = [:]            // established peers by identity
         var pendingPeers: Set<BLEPeerHandle> = []        // establishment in flight
         var pendingIdentities: [BLEPeerHandle: Data] = [:]  // identity read, channel not yet open
+        var pendingPaths: [BLEPeerHandle: BLEChannelTransport] = [:]   // which path the in-flight dial is on
         var greylist = BLEPeerGreylist<BLEPeerHandle>()
         var adapterRetryDelay: Duration = BLEInterface.adapterRetryMin
+        /// v3: dial L2CAP when the peer publishes a PSM. false forces the GATT path for every peer.
+        public var l2capEnabled: Bool
 
         public init(localIdentity: Data,
                     maxPeers: Int = BLEInterface.defaultMaxPeers,
-                    keepaliveInterval: Duration? = BLEInterface.defaultKeepaliveInterval) {
+                    keepaliveInterval: Duration? = BLEInterface.defaultKeepaliveInterval,
+                    l2capEnabled: Bool = true) {
             precondition(localIdentity.count == BLEProtocol.identityLength, "localIdentity must be 16 bytes")
             self.localIdentity = localIdentity
             self.maxPeers = maxPeers
             self.keepaliveInterval = keepaliveInterval
+            self.l2capEnabled = l2capEnabled
         }
     }
 
@@ -81,6 +88,8 @@ public struct BLEInterface {
         public enum SendFailedReason: Equatable {
             /// Empty packet or more than 65 535 fragments: a programmer error, not a lifecycle race.
             case unfragmentable
+            /// L2CAP path: the packet is empty or exceeds BLEFraming.maxFrameLength.
+            case unframable
         }
     }
 
@@ -113,6 +122,7 @@ public struct BLEInterface {
                 state.peers = [:]
                 state.pendingPeers = []
                 state.pendingIdentities = [:]
+                state.pendingPaths = [:]
                 state.adapterRetryDelay = Self.adapterRetryMin
                 state.status = .stopped
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.driver), .cancel(id: CancelID.retry)]
@@ -144,7 +154,7 @@ public struct BLEInterface {
                     .cancellable(id: CancelID.establish(handle), cancelInFlight: true)
                 )
 
-            case let .driverEvent(.identityRead(handle, identity, _)):
+            case let .driverEvent(.identityRead(handle, identity, psm)):
                 guard state.pendingPeers.contains(handle) else { return .none }
                 guard identity.count == BLEProtocol.identityLength, identity != state.localIdentity else {
                     state.pendingPeers.remove(handle)
@@ -162,33 +172,58 @@ public struct BLEInterface {
                                   .run { [bleDriver] _ in await bleDriver.disconnect(handle) })
                 }
                 state.pendingIdentities[handle] = identity
+                if state.l2capEnabled, let psm, psm != 0 {
+                    state.pendingPaths[handle] = .l2cap
+                    return .run { [bleDriver] _ in await bleDriver.openL2CAPChannel(handle, psm) }
+                }
+                state.pendingPaths[handle] = .gatt
                 return .run { [bleDriver] _ in await bleDriver.openChannel(handle) }
 
-            case let .driverEvent(.identityFailed(handle, _)),
-                 let .driverEvent(.channelFailed(handle, _)):
+            case let .driverEvent(.identityFailed(handle, _)):
                 guard state.pendingPeers.contains(handle) else { return .none }
                 state.pendingPeers.remove(handle)
                 state.pendingIdentities[handle] = nil
-                if !hasEstablishedChannel(state, handle) {
-                    state.greylist.recordFailure(handle, now: date())
+                state.pendingPaths[handle] = nil
+                if !hasEstablishedChannel(state, handle) { state.greylist.recordFailure(handle, now: date()) }
+                return .cancel(id: CancelID.establish(handle))
+
+            case let .driverEvent(.channelFailed(handle, _)):
+                guard state.pendingPeers.contains(handle) else { return .none }
+                if state.pendingPaths[handle] == .l2cap {
+                    // v3: an L2CAP miss is not a failure of the peer — fall back to GATT on the same
+                    // link, exactly once, with a fresh establishment window.
+                    state.pendingPaths[handle] = .gatt
+                    return .merge(
+                        .run { [bleDriver] _ in await bleDriver.openChannel(handle) },
+                        .run { [clock] send in
+                            try await clock.sleep(for: Self.establishTimeout)
+                            await send(.establishDeadline(handle))
+                        }
+                        .cancellable(id: CancelID.establish(handle), cancelInFlight: true))
                 }
+                state.pendingPeers.remove(handle)
+                state.pendingIdentities[handle] = nil
+                state.pendingPaths[handle] = nil
+                if !hasEstablishedChannel(state, handle) { state.greylist.recordFailure(handle, now: date()) }
                 return .cancel(id: CancelID.establish(handle))
 
             case let .establishDeadline(handle):
                 guard state.pendingPeers.contains(handle) else { return .none }
                 state.pendingPeers.remove(handle)
                 state.pendingIdentities[handle] = nil
+                state.pendingPaths[handle] = nil
                 // The peer came in the other way while we were dialing: leave its link alone.
                 if hasEstablishedChannel(state, handle) { return .none }
                 state.greylist.recordFailure(handle, now: date())
                 return .run { [bleDriver] _ in await bleDriver.disconnect(handle) }
 
-            case let .driverEvent(.channelOpened(channelID, handle, direction, mtu, _)):
+            case let .driverEvent(.channelOpened(channelID, handle, direction, mtu, transport)):
                 var effects: [Effect<Action>] = []
                 var pendingIdentity: Data? = nil
                 if direction == .outbound {
                     state.pendingPeers.remove(handle)
                     pendingIdentity = state.pendingIdentities.removeValue(forKey: handle)
+                    state.pendingPaths[handle] = nil
                     effects.append(.cancel(id: CancelID.establish(handle)))
                 }
                 let now = date()
@@ -203,9 +238,9 @@ public struct BLEInterface {
                     return .merge(effects)
                 }
                 state.channels[channelID] = ChannelState(
-                    peer: handle, direction: direction,
+                    peer: handle, direction: direction, transport: transport,
                     fragmenter: BLEFragmenter(mtu: mtu), reassembler: BLEReassembler(),
-                    peerIdentity: nil, openedAt: now)
+                    frameBuffer: BLEFrameBuffer(), peerIdentity: nil, openedAt: now)
                 switch direction {
                 case .outbound:
                     effects.append(establish(&state, channelID: channelID, identity: pendingIdentity!))
@@ -220,36 +255,74 @@ public struct BLEInterface {
 
             case let .driverEvent(.channelData(channelID, bytes)):
                 guard var channel = state.channels[channelID] else { return .none }
-                if BLEKeepalive.isKeepalive(bytes) { return .none }
-                guard channel.peerIdentity != nil else {
-                    // Inbound, pre-handshake: only a 16-byte write that is not our own identity counts.
-                    guard bytes.count == BLEProtocol.identityLength, bytes != state.localIdentity else { return .none }
-                    return .merge(.cancel(id: CancelID.handshake(channelID)),
-                                  establish(&state, channelID: channelID, identity: Data(bytes)))
+                switch channel.transport {
+                case .gatt:
+                    if BLEKeepalive.isKeepalive(bytes) { return .none }
+                    guard channel.peerIdentity != nil else {
+                        // Inbound, pre-handshake: only a 16-byte write that is not our own identity counts.
+                        guard bytes.count == BLEProtocol.identityLength, bytes != state.localIdentity else { return .none }
+                        return .merge(.cancel(id: CancelID.handshake(channelID)),
+                                      establish(&state, channelID: channelID, identity: Data(bytes)))
+                    }
+                    let packet: Data?
+                    do {
+                        packet = try channel.reassembler.receive(bytes, now: date())
+                    } catch {
+                        packet = nil   // malformed: that packet's buffer is gone, the channel stays up
+                    }
+                    state.channels[channelID] = channel
+                    guard let packet, let identity = channel.peerIdentity else { return .none }
+                    return .send(.delegate(.packetReceived(peer: identity, packet: packet)))
+                case .l2cap:
+                    let records: [Data]
+                    do {
+                        records = try channel.frameBuffer.append(bytes)
+                        state.channels[channelID] = channel
+                    } catch {
+                        // Wire spec: a bad length prefix closes the channel. No resynchronisation.
+                        state.channels[channelID] = channel
+                        return tearDown(&state, channelID: channelID, strike: true)
+                    }
+                    var effects: [Effect<Action>] = []
+                    for record in records {
+                        guard let current = state.channels[channelID] else { break }   // torn down or replaced
+                        if BLEKeepalive.isKeepalive(record) { continue }
+                        guard let identity = current.peerIdentity else {
+                            guard record.count == BLEProtocol.identityLength, record != state.localIdentity else {
+                                effects.append(tearDown(&state, channelID: channelID, strike: true))
+                                break
+                            }
+                            effects.append(.cancel(id: CancelID.handshake(channelID)))
+                            effects.append(establish(&state, channelID: channelID, identity: Data(record)))
+                            continue
+                        }
+                        effects.append(.send(.delegate(.packetReceived(peer: identity, packet: record))))
+                    }
+                    return .merge(effects)
                 }
-                let packet: Data?
-                do {
-                    packet = try channel.reassembler.receive(bytes, now: date())
-                } catch {
-                    packet = nil   // malformed: that packet's buffer is gone, the channel stays up
-                }
-                state.channels[channelID] = channel
-                guard let packet, let identity = channel.peerIdentity else { return .none }
-                return .send(.delegate(.packetReceived(peer: identity, packet: packet)))
 
             case let .send(peer, packet):
                 guard let channelID = state.peers[peer], let channel = state.channels[channelID] else { return .none }
-                guard let raw = try? channel.fragmenter.fragment(packet) else {
-                    return .send(.delegate(.sendFailed(peer: peer, reason: .unfragmentable)))
+                switch channel.transport {
+                case .gatt:
+                    guard let raw = try? channel.fragmenter.fragment(packet) else {
+                        return .send(.delegate(.sendFailed(peer: peer, reason: .unfragmentable)))
+                    }
+                    // Never put a 16-byte fragment on the wire: ble-reticulum reads it as a handshake.
+                    let fragments = BLEFragmentSanitizer.avoidHandshakeCollision(raw)
+                    return .run { [bleDriver] _ in await bleDriver.send(channelID, fragments) }
+                case .l2cap:
+                    guard let frame = try? BLEFraming.frame(packet) else {
+                        return .send(.delegate(.sendFailed(peer: peer, reason: .unframable)))
+                    }
+                    return .run { [bleDriver] _ in await bleDriver.send(channelID, [frame]) }
                 }
-                // Never put a 16-byte fragment on the wire: ble-reticulum reads it as a handshake.
-                let fragments = BLEFragmentSanitizer.avoidHandshakeCollision(raw)
-                return .run { [bleDriver] _ in await bleDriver.send(channelID, fragments) }
 
             case let .keepalive(channelID):
                 guard let channel = state.channels[channelID], channel.direction == .outbound,
                       channel.peerIdentity != nil else { return .none }
-                return .run { [bleDriver] _ in await bleDriver.send(channelID, [BLEKeepalive.frame]) }
+                let frame = channel.transport == .l2cap ? BLEFraming.keepaliveFrame : BLEKeepalive.frame
+                return .run { [bleDriver] _ in await bleDriver.send(channelID, [frame]) }
 
             case let .handshakeDeadline(channelID):
                 guard let channel = state.channels[channelID], channel.peerIdentity == nil else { return .none }
@@ -278,6 +351,7 @@ public struct BLEInterface {
                 state.peers = [:]
                 state.pendingPeers = []
                 state.pendingIdentities = [:]
+                state.pendingPaths = [:]
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.driver)]
                 effects += channelIDs.flatMap { [.cancel(id: CancelID.handshake($0)), .cancel(id: CancelID.keepalive($0))] }
                 effects += pending.map { .cancel(id: CancelID.establish($0)) }

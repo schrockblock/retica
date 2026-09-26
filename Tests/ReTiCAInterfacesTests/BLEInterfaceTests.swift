@@ -28,7 +28,8 @@ func frags(_ packet: Data, mtu: Int = testMTU) -> [Data] { try! BLEFragmenter(mt
 
 @MainActor
 func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1,
-               keepalive: Duration? = BLEInterface.defaultKeepaliveInterval)
+               keepalive: Duration? = BLEInterface.defaultKeepaliveInterval,
+               l2cap: Bool = true)
     -> (store: TestStore<BLEInterface.State, BLEInterface.Action>,
         events: [AsyncStream<BLEDriverEvent>.Continuation],
         calls: LockIsolated<[MockDriverCall]>,
@@ -41,7 +42,7 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1,
     let clock = TestClock()
     let now = LockIsolated(Date(timeIntervalSince1970: 1_000))
     let store = TestStore(initialState: BLEInterface.State(localIdentity: localIdentity, maxPeers: maxPeers,
-                                                           keepaliveInterval: keepalive)) {
+                                                           keepaliveInterval: keepalive, l2capEnabled: l2cap)) {
         BLEInterface()
     } withDependencies: {
         $0.bleDriver = BLEDriver(
@@ -67,14 +68,15 @@ func makeStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1,
 
 @MainActor
 func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int = 1,
-                     keepalive: Duration? = BLEInterface.defaultKeepaliveInterval)
+                     keepalive: Duration? = BLEInterface.defaultKeepaliveInterval,
+                     l2cap: Bool = true)
     async -> (store: TestStore<BLEInterface.State, BLEInterface.Action>,
               events: [AsyncStream<BLEDriverEvent>.Continuation],
               calls: LockIsolated<[MockDriverCall]>,
               clock: TestClock<Duration>,
               now: LockIsolated<Date>)
 {
-    let (store, events, calls, clock, now) = makeStore(maxPeers: maxPeers, streams: streams, keepalive: keepalive)
+    let (store, events, calls, clock, now) = makeStore(maxPeers: maxPeers, streams: streams, keepalive: keepalive, l2cap: l2cap)
     await store.send(.start) { $0.status = .starting }
     events[0].yield(.ready)
     await store.receive(.driverEvent(.ready)) { $0.status = .online }
@@ -108,6 +110,39 @@ func establishInbound(
     await store.receive(.driverEvent(.channelOpened(channel, handle, direction: .inbound, mtu: testMTU)))
     events.yield(.channelData(channel, identity))
     await store.receive(.driverEvent(.channelData(channel, identity)))
+    await store.receive(.delegate(.peerOnline(identity)))
+}
+
+let testPSM: UInt16 = 0x0081
+func l2capFrame(_ packet: Data) -> Data { try! BLEFraming.frame(packet) }
+
+/// Outbound over L2CAP: discovery → identityRead(psm) → openL2CAPChannel → channelOpened(.l2cap) → peerOnline.
+@MainActor
+func establishOutboundL2CAP(
+    _ store: TestStore<BLEInterface.State, BLEInterface.Action>,
+    _ events: AsyncStream<BLEDriverEvent>.Continuation,
+    handle: BLEPeerHandle, channel: BLEChannelID, identity: Data
+) async {
+    events.yield(.peerDiscovered(handle))
+    await store.receive(.driverEvent(.peerDiscovered(handle)))
+    events.yield(.identityRead(handle, identity: identity, psm: testPSM))
+    await store.receive(.driverEvent(.identityRead(handle, identity: identity, psm: testPSM)))
+    events.yield(.channelOpened(channel, handle, direction: .outbound, mtu: 0, transport: .l2cap))
+    await store.receive(.driverEvent(.channelOpened(channel, handle, direction: .outbound, mtu: 0, transport: .l2cap)))
+    await store.receive(.delegate(.peerOnline(identity)))
+}
+
+/// Inbound over L2CAP: channelOpened(.inbound, .l2cap) → framed 16-byte handshake → peerOnline.
+@MainActor
+func establishInboundL2CAP(
+    _ store: TestStore<BLEInterface.State, BLEInterface.Action>,
+    _ events: AsyncStream<BLEDriverEvent>.Continuation,
+    handle: BLEPeerHandle, channel: BLEChannelID, identity: Data
+) async {
+    events.yield(.channelOpened(channel, handle, direction: .inbound, mtu: 0, transport: .l2cap))
+    await store.receive(.driverEvent(.channelOpened(channel, handle, direction: .inbound, mtu: 0, transport: .l2cap)))
+    events.yield(.channelData(channel, l2capFrame(identity)))
+    await store.receive(.driverEvent(.channelData(channel, l2capFrame(identity))))
     await store.receive(.delegate(.peerOnline(identity)))
 }
 
@@ -605,8 +640,8 @@ func establishInbound(
     events[0].yield(.channelOpened(channel2, peerHandleA, direction: .inbound, mtu: testMTU))
     await store.receive(.driverEvent(.channelOpened(channel2, peerHandleA, direction: .inbound, mtu: testMTU))) {
         $0.channels[channel2] = BLEInterface.ChannelState(
-            peer: peerHandleA, direction: .inbound, fragmenter: BLEFragmenter(mtu: testMTU),
-            reassembler: BLEReassembler(), peerIdentity: nil, openedAt: Date(timeIntervalSince1970: 1_000))
+            peer: peerHandleA, direction: .inbound, transport: .gatt, fragmenter: BLEFragmenter(mtu: testMTU),
+            reassembler: BLEReassembler(), frameBuffer: BLEFrameBuffer(), peerIdentity: nil, openedAt: Date(timeIntervalSince1970: 1_000))
     }
     events[0].yield(.channelData(channel2, identityHigh))
     await store.receive(.driverEvent(.channelData(channel2, identityHigh))) {
@@ -663,10 +698,11 @@ func establishInbound(
     await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .outbound, mtu: testMTU))) {
         $0.pendingPeers = []
         $0.pendingIdentities = [:]
+        $0.pendingPaths = [:]
         $0.channels[channel2] = nil
         $0.channels[channel1] = BLEInterface.ChannelState(
-            peer: peerHandleA, direction: .outbound, fragmenter: BLEFragmenter(mtu: testMTU),
-            reassembler: BLEReassembler(), peerIdentity: identityHigh, openedAt: Date(timeIntervalSince1970: 1_000))
+            peer: peerHandleA, direction: .outbound, transport: .gatt, fragmenter: BLEFragmenter(mtu: testMTU),
+            reassembler: BLEReassembler(), frameBuffer: BLEFrameBuffer(), peerIdentity: identityHigh, openedAt: Date(timeIntervalSince1970: 1_000))
         $0.peers[identityHigh] = channel1
     }
     // Still exhaustive: a send emits no actions, so any queued peerOffline/peerOnline from the
@@ -799,5 +835,246 @@ func establishInbound(
     let startsBefore = calls.value.filter { $0 == .start }.count
     await clock.advance(by: BLEInterface.adapterRetryMax)
     #expect(calls.value.filter { $0 == .start }.count == startsBefore)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+// MARK: - v3 path selection and fallback
+
+@Test @MainActor func identityWithPSMOpensL2CAP() async {
+    let (store, events, calls, _, _) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM))) {
+        $0.pendingIdentities = [peerHandleA: identityHigh]
+        $0.pendingPaths = [peerHandleA: .l2cap]
+    }
+    await store.finish()
+    #expect(calls.value.contains(.openL2CAPChannel(peerHandleA, testPSM)))
+    #expect(!calls.value.contains(.openChannel(peerHandleA)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func identityWithoutPSMOpensGATT() async {
+    let (store, events, calls, _, _) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh))) {
+        $0.pendingIdentities = [peerHandleA: identityHigh]
+        $0.pendingPaths = [peerHandleA: .gatt]
+    }
+    await store.finish()
+    #expect(calls.value.contains(.openChannel(peerHandleA)))
+    #expect(!calls.value.contains { if case .openL2CAPChannel = $0 { return true } else { return false } })
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capDisabledIgnoresPSM() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(l2cap: false)
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM)))
+    await store.finish()
+    #expect(calls.value.contains(.openChannel(peerHandleA)))
+    #expect(!calls.value.contains(.openL2CAPChannel(peerHandleA, testPSM)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capOpenFailureFallsBackToGATTOnce() async {
+    let (store, events, calls, _, now) = await makeOnlineStore(keepalive: nil)
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM)))
+    events[0].yield(.channelFailed(peerHandleA, reason: "l2cap open failed"))
+    await store.receive(.driverEvent(.channelFailed(peerHandleA, reason: "l2cap open failed"))) {
+        $0.pendingPaths = [peerHandleA: .gatt]          // still pending, now on the GATT path
+    }
+    await store.finish()
+    #expect(store.state.pendingPeers == [peerHandleA])
+    #expect(calls.value.contains(.openChannel(peerHandleA)))
+    #expect(!store.state.greylist.isBlocked(peerHandleA, now: now.value), "an L2CAP miss is not a strike")
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .outbound, mtu: testMTU))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .outbound, mtu: testMTU)))
+    await store.receive(.delegate(.peerOnline(identityHigh)))
+    #expect(store.state.channels[channel1]?.transport == .gatt)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func gattFallbackFailureStrikesAndStopsRetrying() async {
+    // Review Focus 4.
+    let (store, events, calls, _, now) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM)))
+    events[0].yield(.channelFailed(peerHandleA, reason: "l2cap"))
+    await store.receive(.driverEvent(.channelFailed(peerHandleA, reason: "l2cap")))
+    events[0].yield(.channelFailed(peerHandleA, reason: "gatt"))
+    await store.receive(.driverEvent(.channelFailed(peerHandleA, reason: "gatt"))) {
+        $0.pendingPeers = []
+        $0.pendingIdentities = [:]
+        $0.pendingPaths = [:]
+    }
+    await store.finish()
+    #expect(store.state.greylist.isBlocked(peerHandleA, now: now.value))
+    #expect(calls.value.filter { $0 == .openChannel(peerHandleA) }.count == 1)
+    #expect(calls.value.filter { $0 == .openL2CAPChannel(peerHandleA, testPSM) }.count == 1)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func fallbackReArmsTheEstablishDeadline() async {
+    let (store, events, _, clock, _) = await makeOnlineStore()
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    await clock.advance(by: .seconds(10))                    // 10 s into the original 15 s window
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM)))
+    events[0].yield(.channelFailed(peerHandleA, reason: "l2cap"))
+    await store.receive(.driverEvent(.channelFailed(peerHandleA, reason: "l2cap")))
+    await clock.advance(by: .seconds(14))                    // 24 s after discovery, 14 s after fallback: no deadline yet
+    #expect(store.state.pendingPeers == [peerHandleA])
+    await clock.advance(by: .seconds(1))
+    await store.receive(.establishDeadline(peerHandleA)) { $0.pendingPeers = []; $0.pendingIdentities = [:]; $0.pendingPaths = [:] }
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+// MARK: - v3 L2CAP data plane
+
+@Test @MainActor func l2capOutboundEstablishmentReportsPeerOnline() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutboundL2CAP(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    #expect(store.state.channels[channel1]?.transport == .l2cap)
+    #expect(store.state.pendingPaths.isEmpty)
+    #expect(!calls.value.contains { if case .send = $0 { return true } else { return false } })   // adapter sent the handshake
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capInboundHandshakeReportsPeerOnline() async {
+    let (store, events, _, _, _) = await makeOnlineStore()
+    await establishInboundL2CAP(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    #expect(store.state.peers[identityHigh] == channel1)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capInboundBadFirstFrameTearsDownWithStrike() async {
+    let (store, events, calls, _, now) = await makeOnlineStore()
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: 0, transport: .l2cap))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: 0, transport: .l2cap)))
+    let bad = l2capFrame(Data([1, 2, 3, 4, 5]))
+    events[0].yield(.channelData(channel1, bad))
+    await store.receive(.driverEvent(.channelData(channel1, bad))) { $0.channels = [:] }
+    await store.finish()
+    #expect(calls.value.contains(.closeChannel(channel1)))
+    #expect(store.state.greylist.isBlocked(peerHandleA, now: now.value))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capInboundHandshakeDeadlineApplies() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore()
+    events[0].yield(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: 0, transport: .l2cap))
+    await store.receive(.driverEvent(.channelOpened(channel1, peerHandleA, direction: .inbound, mtu: 0, transport: .l2cap)))
+    await clock.advance(by: BLEInterface.handshakeTimeout)
+    await store.receive(.handshakeDeadline(channel1))
+    #expect(calls.value.contains(.closeChannel(channel1)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capPacketsFlowFramedBothWays() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutboundL2CAP(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    // Inbound: one record split across two deliveries, then two records coalesced in one.
+    let p1 = Data(repeating: 0xAB, count: 40)
+    let framed = l2capFrame(p1)
+    events[0].yield(.channelData(channel1, framed.prefix(7)))
+    await store.receive(.driverEvent(.channelData(channel1, framed.prefix(7))))
+    events[0].yield(.channelData(channel1, Data(framed.dropFirst(7))))
+    await store.receive(.driverEvent(.channelData(channel1, Data(framed.dropFirst(7)))))
+    await store.receive(.delegate(.packetReceived(peer: identityHigh, packet: p1)))
+    let p2 = Data([1]); let p3 = Data([2, 3])
+    events[0].yield(.channelData(channel1, l2capFrame(p2) + l2capFrame(p3)))
+    await store.receive(.driverEvent(.channelData(channel1, l2capFrame(p2) + l2capFrame(p3))))
+    await store.receive(.delegate(.packetReceived(peer: identityHigh, packet: p2)))
+    await store.receive(.delegate(.packetReceived(peer: identityHigh, packet: p3)))
+    // Outbound: one framed record per packet, no fragmentation header.
+    let out = Data(repeating: 0xCD, count: 500)
+    await store.send(.send(peer: identityHigh, packet: out))
+    await store.finish()
+    #expect(calls.value.contains(.send(channel1, [l2capFrame(out)])))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capFramingErrorTearsDownWithStrike() async {
+    // Review Focus 3.
+    let (store, events, calls, _, now) = await makeOnlineStore(keepalive: nil)
+    await establishOutboundL2CAP(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    events[0].yield(.channelData(channel1, Data([0x00, 0x00])))          // length 0: invalid on the wire
+    await store.receive(.driverEvent(.channelData(channel1, Data([0x00, 0x00])))) {
+        $0.channels = [:]
+        $0.peers = [:]
+    }
+    await store.receive(.delegate(.peerOffline(identityHigh)))
+    await store.finish()
+    #expect(calls.value.contains(.closeChannel(channel1)))
+    #expect(store.state.greylist.isBlocked(peerHandleA, now: now.value))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capKeepaliveFrameIgnoredOnReceiptAndSentOnTimer() async {
+    let (store, events, calls, clock, _) = await makeOnlineStore()
+    await establishOutboundL2CAP(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    store.exhaustivity = .on
+    events[0].yield(.channelData(channel1, BLEFraming.keepaliveFrame))
+    await store.receive(.driverEvent(.channelData(channel1, BLEFraming.keepaliveFrame)))   // no delegate
+    store.exhaustivity = .off
+    await clock.advance(by: BLEInterface.defaultKeepaliveInterval)
+    await store.receive(.keepalive(channel1))
+    await store.finish()
+    #expect(calls.value.contains(.send(channel1, [BLEFraming.keepaliveFrame])))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capOversizedPacketReportsUnframable() async {
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutboundL2CAP(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    let before = calls.value.count
+    await store.send(.send(peer: identityHigh, packet: Data(repeating: 1, count: 1197)))
+    await store.receive(.delegate(.sendFailed(peer: identityHigh, reason: .unframable)))
+    #expect(calls.value.count == before)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func l2capChurnStrikesButNextDialStillPrefersL2CAP() async {
+    // Review Focus 5.
+    let (store, events, calls, _, now) = await makeOnlineStore(keepalive: nil)
+    await establishOutboundL2CAP(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    now.setValue(now.value.addingTimeInterval(BLEInterface.churnMinLifetime - 0.5))
+    events[0].yield(.channelClosed(channel1, reason: nil))
+    await store.receive(.driverEvent(.channelClosed(channel1, reason: nil)))
+    await store.receive(.delegate(.peerOffline(identityHigh)))
+    #expect(store.state.greylist.isBlocked(peerHandleA, now: now.value))
+    now.setValue(now.value.addingTimeInterval(5.01))
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM))
+    await store.receive(.driverEvent(.identityRead(peerHandleA, identity: identityHigh, psm: testPSM)))
+    await store.finish()
+    #expect(calls.value.filter { $0 == .openL2CAPChannel(peerHandleA, testPSM) }.count == 2)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func mixedTransportCrossConnectKeepsOneChannel() async {
+    // Peer LOW is established inbound over GATT; our outbound L2CAP to the same identity loses.
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityLow)
+    events[0].yield(.peerDiscovered(peerHandleB))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleB)))
+    events[0].yield(.identityRead(peerHandleB, identity: identityLow, psm: testPSM))
+    await store.receive(.driverEvent(.identityRead(peerHandleB, identity: identityLow, psm: testPSM)))
+    await store.finish()
+    #expect(!calls.value.contains(.openL2CAPChannel(peerHandleB, testPSM)))   // pre-check abandons the dial
+    #expect(store.state.channels.count == 1)
     await store.send(.stop) { $0.status = .stopped }
 }
