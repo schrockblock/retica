@@ -77,6 +77,13 @@ actor FCBDriverAdapter {
     static let sendQueueCap = 256
     private var sendQueues: [BLEChannelID: [Data]] = [:]
     private var draining: Set<BLEChannelID> = []
+    // Peripheral role: inbound channels (one per subscribed central). Their send FIFOs are the
+    // shared `sendQueues` above.
+    static let heldWriteWindow: TimeInterval = 2
+    private var inbound: [BLEChannelID: Central] = [:]
+    private var inboundByCentral: [UUID: BLEChannelID] = [:]
+    private var notifyParked = false
+    private var heldWrites: [UUID: (data: Data, at: Date)] = [:]
 
     init(central: BluetoothCentralClient, peripheral: BluetoothPeripheralClient,
          now: @escaping @Sendable () -> Date = { Date() }) {
@@ -375,15 +382,108 @@ actor FCBDriverAdapter {
         await peripheral.removeAll()
     }
 
-    // MARK: - Peripheral role (Task 7 fills these in)
+    // MARK: - Peripheral role
 
-    private func subscribePeripheralStreams() {}
-    private func resetPeripheralSession() {}
-    private func isInbound(_ id: BLEChannelID) -> Bool { false }
-    /// One notify attempt for the drain loop: true = sent, dequeue; false = leave queued (parked or closed).
-    private func notifyInbound(_ channel: BLEChannelID, _ fragment: Data) async -> Bool { false }
-    private func inboundDidClose(_ channel: BLEChannelID, reason: String?) {}
-    private func closeInbound(_ channel: BLEChannelID) {}
+    private func subscribePeripheralStreams() {
+        tasks.append(Task { [peripheral] in
+            for await event in peripheral.subscriptions() { self.handleSubscription(event) }
+        })
+        tasks.append(Task { [peripheral] in
+            for await batch in peripheral.writeRequests() { await self.handleWrites(batch) }
+        })
+        tasks.append(Task { [peripheral] in
+            for await request in peripheral.readRequests() { await peripheral.respond(request.id, .success) }
+        })
+        tasks.append(Task { [peripheral] in
+            for await event in peripheral.events() {
+                if case .isReadyToUpdateSubscribers = event { await self.notifyReady() }
+            }
+        })
+    }
+
+    private func resetPeripheralSession() {
+        inbound = [:]
+        inboundByCentral = [:]
+        notifyParked = false
+        heldWrites = [:]
+    }
+
+    private func isInbound(_ id: BLEChannelID) -> Bool { inbound[id] != nil }
+
+    private func handleSubscription(_ event: SubscriptionEvent) {
+        switch event {
+        case let .subscribed(central, characteristic):
+            guard characteristic.id == bleV22TXCharUUID else { return }
+            if let old = inboundByCentral[central.id] { inboundDidClose(old, reason: "resubscribed") }
+            let channelID = BLEChannelID(id: UUID())
+            inbound[channelID] = central
+            inboundByCentral[central.id] = channelID
+            continuation?.yield(.channelOpened(channelID, BLEPeerHandle(id: central.id), direction: .inbound,
+                                               mtu: central.maximumUpdateValueLength))
+            if let held = heldWrites.removeValue(forKey: central.id),
+               now().timeIntervalSince(held.at) <= Self.heldWriteWindow {
+                continuation?.yield(.channelData(channelID, held.data))
+            }
+        case let .unsubscribed(central, characteristic):
+            guard characteristic.id == bleV22TXCharUUID, let cid = inboundByCentral[central.id] else { return }
+            inboundDidClose(cid, reason: "unsubscribed")
+        }
+    }
+
+    private func handleWrites(_ batch: [WriteRequest]) async {
+        // CoreBluetooth wants ONE respond per batch (the first request); a without-response
+        // write's respond is a harmless no-op.
+        let myEpoch = epoch
+        if let first = batch.first { await peripheral.respond(first.id, .success) }
+        guard epoch == myEpoch else { return }   // session ended mid-respond: drop, don't leak into the next
+        for request in batch where request.characteristic.id == bleV22RXCharUUID {
+            guard let value = request.value else { continue }
+            if let cid = inboundByCentral[request.central.id] {
+                continuation?.yield(.channelData(cid, Data(value)))
+            } else {
+                let t = now()
+                heldWrites = heldWrites.filter { t.timeIntervalSince($0.value.at) <= Self.heldWriteWindow }
+                heldWrites[request.central.id] = (Data(value), t)
+            }
+        }
+    }
+
+    /// One notify attempt for the drain loop. true = sent, dequeue it; false = leave it queued
+    /// (CoreBluetooth's queue is full → parked until isReadyToUpdateSubscribers) or the channel closed.
+    private func notifyInbound(_ channel: BLEChannelID, _ fragment: Data) async -> Bool {
+        guard !notifyParked, let central = inbound[channel] else { return false }
+        let myEpoch = epoch
+        do {
+            let ok = try await peripheral.updateValue(fragment, bleV22TXCharUUID, [central.id])
+            // A session reset mid-notify must not park the next session.
+            if !ok && epoch == myEpoch { notifyParked = true }
+            return ok
+        } catch {
+            inboundDidClose(channel, reason: "notify failed: \(error)")
+            return false
+        }
+    }
+
+    private func notifyReady() async {
+        notifyParked = false
+        for channel in inbound.keys.sorted(by: { $0.id.uuidString < $1.id.uuidString }) where sendQueues[channel] != nil {
+            await drain(channel)
+        }
+    }
+
+    private func closeInbound(_ channel: BLEChannelID) {
+        guard let central = inbound.removeValue(forKey: channel) else { return }
+        inboundByCentral[central.id] = nil
+        sendQueues[channel] = nil
+    }
+
+    private func inboundDidClose(_ channel: BLEChannelID, reason: String?) {
+        guard let central = inbound.removeValue(forKey: channel) else { return }
+        inboundByCentral[central.id] = nil
+        sendQueues[channel] = nil
+        // A reducer-initiated close removed the mapping in `closeInbound`, so it never reaches here.
+        continuation?.yield(.channelClosed(channel, reason: reason))
+    }
 }
 
 extension BLEDriver {

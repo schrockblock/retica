@@ -656,3 +656,189 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     let tail = await collect(events, count: 3)
     #expect(!tail.contains { if case .channelClosed = $0 { return true }; return false })
 }
+
+// MARK: - Peripheral role
+
+func centralValue(_ b: UInt8, mtu: Int = 185) -> Central {
+    Central(id: UUID(uuidString: "C000000\(b)-0000-0000-0000-000000000000")!, maximumUpdateValueLength: mtu)
+}
+func txChar() -> Characteristic {
+    Characteristic(id: txCharUUID, serviceID: serviceUUID, peripheralID: UUID(), properties: [.read, .notify], value: nil, isNotifying: true)
+}
+func rxWrite(_ c: Central, _ value: Data) -> WriteRequest {
+    WriteRequest(id: UUID(), central: c, characteristic:
+        Characteristic(id: rxCharUUID, serviceID: serviceUUID, peripheralID: UUID(), properties: [.write, .writeWithoutResponse], value: nil, isNotifying: false),
+        offset: 0, value: value)
+}
+
+/// Subscribes `c` to TX and returns the inbound channel id.
+@MainActor
+func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEvent>, _ c: Central) async -> BLEChannelID? {
+    stubs.subscriptions.yield(.subscribed(central: c, characteristic: txChar()))
+    let got = await collect(events, count: 1)
+    guard case let .channelOpened(cid, hp, dir, mtu)? = got.first else { Issue.record("no inbound channelOpened: \(got)"); return nil }
+    #expect(hp == BLEPeerHandle(id: c.id) && dir == .inbound && mtu == c.maximumUpdateValueLength)
+    return cid
+}
+
+@Test @MainActor func txSubscriptionOpensInboundChannelWithCentralsMTU() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(1, mtu: 244)
+    let cid = await subscribeInbound(stubs, events, c)
+    #expect(cid != nil)
+    await adapter.stop()
+}
+
+@Test @MainActor func rxWritesSurfaceAsChannelDataAndAreResponded() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(2)
+    guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    let req = rxWrite(c, adapterPeerIdentity)
+    stubs.writeRequests.yield([req])
+    #expect(await collect(events, count: 1) == [.channelData(cid, adapterPeerIdentity)])
+    let responded = await stubs.calls.responded
+    #expect(responded.contains { $0.0 == req.id && $0.1 == .success })
+    await adapter.stop()
+}
+
+@Test @MainActor func writeBatchEmitsEachValueInOrder() async {
+    // Review Focus 3.
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(3)
+    guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    stubs.writeRequests.yield([rxWrite(c, Data([1])), rxWrite(c, Data([2])), rxWrite(c, Data([3]))])
+    #expect(await collect(events, count: 3) == [.channelData(cid, Data([1])), .channelData(cid, Data([2])), .channelData(cid, Data([3]))])
+    await adapter.stop()
+}
+
+@Test @MainActor func unsubscribeClosesInboundChannel() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(4)
+    guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    stubs.subscriptions.yield(.unsubscribed(central: c, characteristic: txChar()))
+    guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed"); await adapter.stop(); return }
+    await adapter.stop()
+}
+
+@Test @MainActor func resubscribeMintsNewChannelAndClosesOld() async {
+    // Review Focus 4 (adapter half).
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(5)
+    guard let first = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    stubs.subscriptions.yield(.subscribed(central: c, characteristic: txChar()))
+    let got = await collect(events, count: 2)
+    #expect(got.contains { if case .channelClosed(first, _) = $0 { return true }; return false })
+    #expect(got.contains { if case let .channelOpened(cid, _, .inbound, _) = $0 { return cid != first }; return false })
+    await adapter.stop()
+}
+
+@Test @MainActor func sendOnInboundChannelNotifiesOnlyThatCentral() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(6)
+    guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    await adapter.send(cid, fragments: [Data([9, 9])])
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    let updates = await stubs.calls.updates
+    // Separate expectations: an `&&` chain captures the non-Sendable tuple array in a closure
+    // (Swift 6 region-isolation error).
+    let only = updates.count == 1 ? updates[0] : nil
+    #expect(updates.count == 1)
+    #expect(only?.0 == Data([9, 9]))
+    #expect(only?.1 == txCharUUID)
+    #expect(only?.2 == [c.id])
+    await adapter.stop()
+}
+
+@Test @MainActor func notifyQueueParksOnFalseAndResumesOnReady() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(7)
+    guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    stubs.updateResult.setValue(false)              // CoreBluetooth queue full
+    await adapter.send(cid, fragments: [Data([1])])
+    await adapter.send(cid, fragments: [Data([2])])
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    #expect(await stubs.calls.updates.count == 1)   // tried [1] once, parked; [2] never attempted
+    stubs.updateResult.setValue(true)
+    stubs.peripheralEvents.yield(.isReadyToUpdateSubscribers)
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let updates = await stubs.calls.updates
+    #expect(updates.map(\.0) == [Data([1]), Data([1]), Data([2])])   // [1] retried, then [2]
+    await adapter.stop()
+}
+
+@Test @MainActor func notifyQueueOverflowClosesChannel() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(8)
+    guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    stubs.updateResult.setValue(false)
+    for i in 0...FCBDriverAdapter.sendQueueCap { await adapter.send(cid, fragments: [Data([UInt8(i & 0xFF)])]) }
+    guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed on overflow"); await adapter.stop(); return }
+    await adapter.stop()
+}
+
+@Test @MainActor func heldHandshakeIsReplayedWhenSubscriptionArrivesLate() async {
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral, now: { now.value })
+    let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    _ = await collect(events, count: 1)
+    let c = centralValue(9)
+    stubs.writeRequests.yield([rxWrite(c, adapterPeerIdentity)])   // before any subscription
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    now.withValue { $0 = $0.addingTimeInterval(1) }
+    stubs.subscriptions.yield(.subscribed(central: c, characteristic: txChar()))
+    let got = await collect(events, count: 2)
+    guard got.count == 2, case let .channelOpened(cid, _, .inbound, _) = got[0] else { Issue.record("unexpected: \(got)"); await adapter.stop(); return }
+    #expect(got[1] == .channelData(cid, adapterPeerIdentity))
+    await adapter.stop()
+}
+
+@Test @MainActor func heldWriteExpiresAfterWindow() async {
+    let now = LockIsolated(Date(timeIntervalSince1970: 1000))
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral, now: { now.value })
+    let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    _ = await collect(events, count: 1)
+    let c = centralValue(1)
+    stubs.writeRequests.yield([rxWrite(c, adapterPeerIdentity)])
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    now.withValue { $0 = $0.addingTimeInterval(FCBDriverAdapter.heldWriteWindow + 0.5) }
+    stubs.subscriptions.yield(.subscribed(central: c, characteristic: txChar()))
+    let got = await collect(events, count: 2)   // times out after the single channelOpened
+    #expect(got.count == 1)
+    await adapter.stop()
+}
+
+@Test @MainActor func closeInboundChannelIsSilent() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let c = centralValue(2)
+    guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
+    await adapter.closeChannel(cid)
+    stubs.subscriptions.yield(.unsubscribed(central: c, characteristic: txChar()))
+    stubs.writeRequests.yield([rxWrite(c, Data([1]))])   // after close: dropped
+    await adapter.stop()
+    let tail = await collect(events, count: 5)
+    #expect(!tail.contains { if case .channelClosed(cid, _) = $0 { return true }; return false })
+    #expect(!tail.contains { if case .channelData(cid, _) = $0 { return true }; return false })
+}
+
+@Test @MainActor func readRequestsOnTXAreAnsweredSuccess() async {
+    let stubs = makeStubs()
+    let reads = AsyncStream<ReadRequest>.makeStream()
+    var p = stubs.peripheral
+    p.readRequests = { reads.stream }
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: p)
+    let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    _ = await collect(events, count: 1)
+    let req = ReadRequest(id: UUID(), central: centralValue(3), characteristic: txChar(), offset: 0)
+    reads.continuation.yield(req)
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    #expect(await stubs.calls.responded.contains { $0.0 == req.id && $0.1 == .success })
+    await adapter.stop()
+}
