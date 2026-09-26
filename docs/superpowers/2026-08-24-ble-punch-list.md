@@ -5,6 +5,7 @@
 > P1b, P1c, P2, P3, P4 (the Python-fork work) are obsolete — the Pi runs stock ble-reticulum.
 > S1, S2 and S6 are carried into the new adapter. A1–A4 and R1–R3 still apply. Live
 > verification now follows `docs/superpowers/plans/2026-09-26-ble-v22-hardware-checklist.md`.
+> v3 (L2CAP fast path) landed on the iOS side per `docs/superpowers/specs/2026-09-26-ble-v3-l2cap-ios-design.md`; the Pi gains it in a separate ble-reticulum contribution.
 
 **Date:** 2026-08-24. **ReTiCA HEAD:** `cd347e4`. **Python fork HEAD:** `112fef0b`
 (`~/development/python/Reticulum`, branch `master`, clean tree).

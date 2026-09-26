@@ -103,7 +103,9 @@ success the service gains the PSM characteristic (`…28e7`, read-only, 2 bytes 
 on failure (platform cannot listen) the service is published without it and a log-equivalent
 note is kept in the report — bring-up does not fail. `resetSession` unpublishes the PSM.
 Inbound channels arrive on `peripheral.l2capConnections()`: each is registered as an inbound
-channel (`l2cap[channelID] = conn`, `inboundL2CAP[channelID] = conn.peerID`), its `incoming()`
+channel (`l2cap[channelID] = conn`, `inboundL2CAP[channelID] = conn.peerID`) unless the session
+has been reset in the meantime, in which case the connection is closed instead of registered;
+a registered channel's `incoming()` is
 pumped to `channelData` (raw bytes; framing is the reducer's), stream end → `channelClosed`.
 `channelOpened(.inbound, mtu: 0, transport: .l2cap)`.
 
@@ -165,3 +167,31 @@ both directions, resource transfer), iPhone ↔ Pi unchanged over GATT.
 
 Per-peer HW_MTU 1196; the Python listener/connector; Android; L2CAP-level backpressure beyond
 FCB's pump buffer; measuring throughput for the bitrate guess.
+
+## 6. Deviations during implementation
+
+- The L2CAP open race is not implemented as a task group. The adapter races the open against
+  the ten-second limit with a first-finisher-wins continuation instead, because a task group
+  waits for its losing child to finish and FCB's open ignores cancellation, so a task-group
+  implementation could not honour the ten-second limit as specified. A connection that arrives
+  after the limit has expired is closed.
+
+- A central disconnect while an L2CAP open is in flight yields a channel-failed event with
+  reason peerDisconnected, without a disconnect call, matching the behavior of the GATT open
+  path, instead of returning silently.
+
+- The PSM is never leaked: a publish that completes after the session has already ended is
+  unpublished, and a repeated poweredOn event within one session unpublishes the previous PSM
+  before publishing again. A publish call that returns zero is treated as "cannot listen" and
+  no PSM characteristic is added.
+
+- Inbound L2CAP registration is epoch-guarded: a connection accepted while the session is
+  being reset is closed instead of being registered.
+
+- A PSM read of any length other than exactly two bytes reads as nil; the design's "anything
+  else leads to nil" rule is enforced strictly, including PSM values longer than two bytes.
+
+- The reducer's fallback at channel-failed does not repeat the duplicate pre-check: if an
+  inbound channel for the same identity was established while the L2CAP dial was still
+  outstanding, the GATT fallback opens a second link, which the duplicate rule then resolves.
+  This is recorded as a known inefficiency, not fixed in this slice.
