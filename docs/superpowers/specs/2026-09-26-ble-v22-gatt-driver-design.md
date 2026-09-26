@@ -322,6 +322,10 @@ Behaviour deltas from the current reducer:
 
 Peripheral role, on `poweredOn`:
 
+- First `stopAdvertising()` and `removeAll()`: a repeated `poweredOn` (Bluetooth toggled off
+  and on) must not publish a duplicate service or fail with alreadyAdvertising. Every session
+  reset (`stop()` and a restart without `stop()`) likewise stops scanning and advertising and
+  removes all services before finishing the event stream.
 - `add` one primary service with TX (read + notify, no static value), RX (write +
   writeWithoutResponse), Identity (read, static value = `localIdentity`). All `.readable` /
   `.writeable` permissions (no encryption).
@@ -371,6 +375,24 @@ Central role:
   the reducer (it still answers writes with `.success`, as CoreBluetooth requires) and lets the
   peer's own timers end the link. `disconnect(h)`, `stop`, discovery cooldown (S1), `forget`:
   unchanged.
+
+**Known limits until the FCB follow-up.** The adapter is only as robust as the live FCB
+client underneath it, which today has three gaps:
+
+- (a) Live FCB does not fail pending connect / discover / read / write / setNotify
+  continuations, nor finish notification streams, on `didDisconnect`. A disconnect in the
+  middle of `readIdentity` or `openChannel` therefore recovers only through the reducer's 15 s
+  establish deadline, and the suspended adapter task leaks.
+- (b) FCB's `disconnect` overwrites a pending disconnect continuation, so two overlapping
+  disconnects of the same peripheral strand the first caller.
+- (c) Write-without-response has no backpressure: `canSendWriteWithoutResponse` and its
+  `peripheralIsReady(toSendWriteWithoutResponse:)` event are not exposed, so the outbound
+  (central-role) drain writes blindly and a resource-transfer burst can drop fragments.
+
+Follow-up: an FCB branch that fails every pending continuation (and finishes notification
+streams) on disconnect, never overwrites `pendingDisconnect`, and exposes write-without-response
+readiness so the outbound drain parks on it the way the notify path parks on
+`isReadyToUpdateSubscribers`.
 
 Removed: L2CAP publish/open/unpublish, `L2CAPConnection` pump, `rbtpDirectoryService`, all
 RBTP UUIDs.

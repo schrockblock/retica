@@ -207,6 +207,7 @@ public struct BLEReassembler: Equatable, Sendable {
             if buffers[total] == nil {
                 buffers[total] = Buffer(fragments: [:], total: total, startedAt: now)
             }
+            // Unreachable under total-keyed buffers; kept for parity with the reference.
             guard buffers[total]!.total == total else {
                 let expected = buffers[total]!.total
                 buffers[total] = nil

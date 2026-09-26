@@ -84,7 +84,8 @@ import Foundation
 /// Reference RNS bounds this at the interface layer (`TCPInterface.check_frame_len`), not in
 /// `Packet.unpack`. The ReTiCA bound matters at the primary inbound decode in
 /// `Transport.received` (`Transport.swift:339`), because the interface deframers admit far more
-/// than the protocol MTU — `HDLCDeframer` defaults to 262144 and the BLE data plane is bounded by `HW_MTU` 500 —
+/// than the protocol MTU — `HDLCDeframer` defaults to 262144 and the BLE reassembler is bounded only by
+/// 8 in-flight packets × 65 535 fragments per peer —
 /// so an oversized frame would otherwise parse and feed every downstream decoder.
 ///
 /// The maximum legitimate packet is a HEADER_2 packed at exactly `Packet.mtu` (500 bytes):
