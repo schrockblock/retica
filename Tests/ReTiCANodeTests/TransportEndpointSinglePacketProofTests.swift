@@ -41,3 +41,12 @@ private func makeEndpoint() -> TestStore<TransportEndpoint.State, TransportEndpo
     await store.receive(.delegate(.messageReceived(destinationHash: dest, plaintext: Data([7]),
                                                    packetHash: packetHash, interfaceID: InterfaceID("x"))))
 }
+
+@Test @MainActor func receiptTableEndpointPassesTheTokenToTransport() async {
+    let store = makeEndpoint()
+    let dest = Data(repeating: 0x11, count: 16)
+    let plaintext = Data("hi".utf8)
+    let token = Data([0xAB])
+    await store.send(.send(destinationHash: dest, plaintext: plaintext, receiptToken: token))
+    await store.receive(.transport(.send(destinationHash: dest, plaintext: plaintext, receiptToken: token)))
+}

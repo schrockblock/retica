@@ -90,7 +90,7 @@ public struct TransportEndpoint {
         case stop
         case registerLocalDestination(Destination)
         case announce(destinationHash: Data, appData: Data?)
-        case send(destinationHash: Data, plaintext: Data)
+        case send(destinationHash: Data, plaintext: Data, receiptToken: Data? = nil)
         case enableRelay(Identity)
         case requestPath(destinationHash: Data)
         case openLink(destinationHash: Data)
@@ -147,7 +147,8 @@ public struct TransportEndpoint {
                               state.ble != nil ? .send(.ble(.stop)) : .none)
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
             case let .announce(h, a):               return .send(.transport(.announce(destinationHash: h, appData: a)))
-            case let .send(h, p):                   return .send(.transport(.send(destinationHash: h, plaintext: p)))
+            case let .send(h, p, token):            return .send(.transport(.send(destinationHash: h, plaintext: p,
+                                                                                  receiptToken: token)))
             case let .enableRelay(identity):        return .send(.transport(.setTransportIdentity(identity)))
             case let .requestPath(h):               return .send(.transport(.requestPath(destinationHash: h)))
             case let .proveSinglePacket(h, id, identity):

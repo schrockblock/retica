@@ -149,6 +149,27 @@ public struct Transport {
         /// When each interface connected — drives the young/established burst threshold (RNS age()).
         public var interfaceConnectedAt: [InterfaceID: Date] = [:]
 
+        /// An outbound single packet awaiting its delivery proof (RNS `PacketReceipt`,
+        /// Packet.py:402-419), recorded by `.send(..., receiptToken:)`.
+        public struct PendingReceipt: Equatable, Sendable {
+            /// Full 32-byte packet hash: what the proof signs, and (first 16 bytes) its address.
+            public var packetHash: Data
+            /// Opaque to Transport. LXMF passes `message.hash`, so every resend shares one token.
+            public var token: Data
+            /// The recipient identity from `learned[dest]` at send time; the proof must verify with it.
+            public var identity: Identity
+            public var expiresAt: Date
+            public init(packetHash: Data, token: Data, identity: Identity, expiresAt: Date) {
+                self.packetHash = packetHash
+                self.token = token
+                self.identity = identity
+                self.expiresAt = expiresAt
+            }
+        }
+        /// `packetHash.prefix(16)` → receipt. The key is the proof's destination hash (the packet's
+        /// `ProofDestination`), so an inbound proof finds its receipt with one lookup.
+        public var pendingReceipts: [Data: PendingReceipt] = [:]
+
         public init() {}
 
         /// The learned path to `destinationHash`, but only when its interface is currently connected.
@@ -220,7 +241,10 @@ public struct Transport {
         case received(InterfaceID, Data)
         case announce(destinationHash: Data, appData: Data?)
         case requestPath(destinationHash: Data)
-        case send(destinationHash: Data, plaintext: Data)
+        /// Encrypt `plaintext` to a learned destination and send it as one packet. With a non-nil
+        /// `receiptToken`, also record a `PendingReceipt` so a valid proof for this packet emits
+        /// `.delegate(.singlePacketDelivered(token:))`. The token is opaque to Transport.
+        case send(destinationHash: Data, plaintext: Data, receiptToken: Data? = nil)
         /// Prove a single packet we received, reference-style (RNS `Identity.prove`,
         /// Identity.py:942-953): an unencrypted HEADER_1 PROOF to the packet's `ProofDestination`
         /// (hash = `packetHash[:16]`, type SINGLE, Packet.py:376-379), context NONE, carrying the
@@ -773,6 +797,9 @@ public struct Transport {
                     let live = queue.filter { now.timeIntervalSince($0.queuedAt) <= Transport.queuedAnnounceLife }
                     state.announceQueues[id] = live.isEmpty ? nil : live
                 }
+                // Expired receipts go silently: the LXMF retry timer is the only failure authority,
+                // so reporting expiry here would double the retries (spec §2).
+                state.pendingReceipts = state.pendingReceipts.filter { $0.value.expiresAt > now }
                 return .none
 
             case let .announceRetransmitDue(destinationHash):
@@ -926,7 +953,7 @@ public struct Transport {
                 }
                 return .merge(effects)
 
-            case let .send(destinationHash, plaintext):
+            case let .send(destinationHash, plaintext, receiptToken):
                 guard let entry = state.learned[destinationHash] else {
                     return .send(.delegate(.sendFailed(destinationHash: destinationHash,
                                                        reason: .notLearned)))
@@ -951,6 +978,13 @@ public struct Transport {
                 guard let raw = try? packet.packed() else {
                     return .send(.delegate(.sendFailed(destinationHash: destinationHash,
                                                        reason: .tooLarge)))
+                }
+                if let receiptToken {
+                    let hopTimeout = Transport.receiptTimeoutPerHop * Double(max(1, entry.hops))
+                    Transport.recordReceipt(State.PendingReceipt(
+                        packetHash: packet.packetHash, token: receiptToken, identity: entry.identity,
+                        expiresAt: date.now.addingTimeInterval(Transport.receiptTimeoutBase + hopTimeout)),
+                                            in: &state)
                 }
                 return .send(.delegate(.transmit(entry.interfaceID, raw)))
 
@@ -1181,6 +1215,32 @@ public struct Transport {
     /// of now + this * max(1, hops-to-dest); if no proof flows through by then it is reaped, so junk
     /// LINKREQUESTs cannot accumulate.
     static let establishmentTimeoutPerHop: TimeInterval = 6
+    /// Single-packet receipt lifetime: `receiptTimeoutBase + receiptTimeoutPerHop * max(1, hops)`.
+    /// Reference: `PacketReceipt.timeout = first_hop_timeout + TIMEOUT_PER_HOP * hops_to(dest)`
+    /// (Packet.py:417-418), where `first_hop_timeout` is `DEFAULT_PER_HOP_TIMEOUT` (6 s) plus a
+    /// link-latency term ReTiCA does not track (Transport.py:2788-2791) and `TIMEOUT_PER_HOP` is
+    /// also `DEFAULT_PER_HOP_TIMEOUT` (Reticulum.py:142). ReTiCA's learned `hops` is the announce's
+    /// on-wire count (reference increments it on receipt), so `max(1, hops)` matches reference for a
+    /// directly-heard peer and is one hop short for a relayed one. Harmless: an expired receipt emits
+    /// nothing, because the LXMF retry timer is the only failure authority.
+    static let receiptTimeoutBase: TimeInterval = 6
+    static let receiptTimeoutPerHop: TimeInterval = 6
+    /// RNS `MAX_RECEIPTS` (Transport.py:96). Reference culls the OLDEST receipt past the cap
+    /// (Transport.py:570-575); ReTiCA evicts the one expiring soonest, which is the one least
+    /// likely to still be proved.
+    static let maxPendingReceipts = 1024
+
+    /// Record `receipt` under `packetHash.prefix(16)`, evicting the soonest-expiring entry when a
+    /// NEW key would exceed `maxPendingReceipts`.
+    static func recordReceipt(_ receipt: State.PendingReceipt, in state: inout State) {
+        let key = Data(receipt.packetHash.prefix(Packet.addressLength))
+        if state.pendingReceipts[key] == nil,
+           state.pendingReceipts.count >= maxPendingReceipts,
+           let soonest = state.pendingReceipts.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
+            state.pendingReceipts[soonest] = nil
+        }
+        state.pendingReceipts[key] = receipt
+    }
     /// RNS PATH_REQUEST_TIMEOUT (Transport.py:79): in-flight recursive path searches expire, seconds.
     /// Governs discoveryPathRequests (relay-only). Do NOT use this for pathRequests.
     static let pathRequestTimeout: TimeInterval = 15
