@@ -630,14 +630,16 @@ for mtu in mtus:
         fragmentation.append({"mtu": mtu, "packet": p.hex(),
                               "fragments": [x.hex() for x in f.fragment_packet(p)]})
 
-# Reassembly scenario: a 500-byte packet at MTU 23 delivered in a shuffled order, with one
-# benign duplicate; the reference reassembler must return the packet on the last fragment.
+# Reassembly scenario: a 500-byte packet at MTU 23 with sequence 0 first and the REST shuffled,
+# plus one benign duplicate; the reference reassembler must return the packet on the last
+# fragment. Sequence 0 must lead: the reference restarts the buffer on sequence 0, discarding
+# anything received before it (so a fully shuffled order can never complete).
 rng = random.Random(2026)
 big = pattern(500, 19)
 frags = frag.BLEFragmenter(mtu=23).fragment_packet(big)
-order = list(range(len(frags)))
-rng.shuffle(order)
-delivery = [frags[i] for i in order]
+rest = list(range(1, len(frags)))
+rng.shuffle(rest)
+delivery = [frags[0]] + [frags[i] for i in rest]
 delivery.insert(5, delivery[2])            # duplicate of an earlier fragment
 r = frag.BLEReassembler()
 result = None
