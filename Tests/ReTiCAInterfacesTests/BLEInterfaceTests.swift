@@ -333,6 +333,22 @@ func establishInbound(
     await store.send(.stop) { $0.status = .stopped }
 }
 
+@Test @MainActor func inboundChannelIsNotRefusedForAGreylistedHandle() async {
+    // The greylist throttles OUR dials. An inbound channel is the peer dialing us; the adapter
+    // cannot evict a central, so refusing it would only black-hole the peer's link.
+    let (store, events, calls, _, now) = await makeOnlineStore(keepalive: nil)
+    events[0].yield(.peerDiscovered(peerHandleA))
+    await store.receive(.driverEvent(.peerDiscovered(peerHandleA)))
+    events[0].yield(.identityFailed(peerHandleA, reason: "no identity characteristic"))
+    await store.receive(.driverEvent(.identityFailed(peerHandleA, reason: "no identity characteristic"))) { $0.pendingPeers = [] }
+    #expect(store.state.greylist.isBlocked(peerHandleA, now: now.value))   // precondition: struck
+    await establishInbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh)
+    await store.finish()
+    #expect(!calls.value.contains(.closeChannel(channel1)))
+    #expect(store.state.peers[identityHigh] == channel1)
+    await store.send(.stop) { $0.status = .stopped }
+}
+
 @Test @MainActor func inboundOpenLeavesPendingOutboundAliveAndLateFailureDoesNotStrike() async {
     let (store, events, calls, _, now) = await makeOnlineStore()
     events[0].yield(.peerDiscovered(peerHandleA))

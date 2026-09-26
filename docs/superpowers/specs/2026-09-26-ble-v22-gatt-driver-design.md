@@ -293,7 +293,10 @@ Behaviour deltas from the current reducer:
   establish, `disconnect(h)`, no strike (this is the cheap pre-check ble-reticulum also does
   before dialing). Otherwise record `pendingIdentities[h] = id` and `openChannel(h)`.
 - **`identityFailed` / `channelFailed`:** strike, remove pending (unchanged shape).
-- **`channelOpened(c, h, dir, mtu)`:** cap/greylist/online guards unchanged. Only an OUTBOUND
+- **`channelOpened(c, h, dir, mtu)`:** cap and online guards apply to both directions; the
+  greylist guard is OUTBOUND-only. The greylist throttles our own dials; an inbound channel is
+  the peer dialing us, and the adapter has no API to evict a central, so refusing it would only
+  black-hole the peer's link until its own timers give up. Only an OUTBOUND
   open touches the pending bookkeeping (`pendingPeers`, `pendingIdentities`, the establish
   timer): `peerIdentity = pendingIdentities.removeValue(h)` (missing → close, no strike), run
   the duplicate rule against `peers[id]`, then establish (`peers[id] = c`, `peerOnline`) and

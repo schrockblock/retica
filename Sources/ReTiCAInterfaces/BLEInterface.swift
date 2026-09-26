@@ -192,9 +192,11 @@ public struct BLEInterface {
                     effects.append(.cancel(id: CancelID.establish(handle)))
                 }
                 let now = date()
+                // The greylist throttles OUR dials only. An inbound channel is the peer dialing us;
+                // the adapter cannot evict a central, so refusing it would just black-hole the peer.
                 guard state.status == .online,
                       state.peers.count < state.maxPeers,
-                      !state.greylist.isBlocked(handle, now: now),
+                      direction == .inbound || !state.greylist.isBlocked(handle, now: now),
                       direction == .inbound || pendingIdentity != nil
                 else {
                     effects.append(.run { [bleDriver] _ in await bleDriver.closeChannel(channelID) })
