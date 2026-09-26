@@ -2094,6 +2094,33 @@ Commit: `feat: BLE reducer and driver seam speak ble-reticulum v2.2`.
 ---
 ### Task 6: FCB adapter — bring-up and central role (identity read, subscribe + handshake, writes)
 
+> **Controller addendum (2026-09-26, after the Task 5 review) — supersedes any conflicting line below.**
+> The driver seam changed in Task 5's fix round: `BLEDriver.send` is now
+> `@Sendable (BLEChannelID, [Data]) async -> Void` — one packet's fragments (or a single
+> keepalive) that must be delivered in order and never interleaved with another call's fragments
+> on the same channel. The adapter therefore owns per-channel ordering in BOTH roles with one
+> FIFO per channel and a single drain loop per channel:
+>
+> - Actor state (add next to `reducerClosed`): `static let sendQueueCap = 256`,
+>   `private var sendQueues: [BLEChannelID: [Data]] = [:]`, `private var draining: Set<BLEChannelID> = []`.
+> - `func send(_ channel: BLEChannelID, fragments: [Data]) async` replaces `send(_:data:)` — see the
+>   code block in Step 3 (already rewritten below). `outboundDidClose` and `resetSession` also
+>   clear `sendQueues` (and `resetSession` clears `draining`).
+> - Peripheral hooks for Task 7 become: `private func isInbound(_ id: BLEChannelID) -> Bool { false }`,
+>   `private func notifyInbound(_ channel: BLEChannelID, _ fragment: Data) async -> Bool { false }`,
+>   `private func inboundDidClose(_ channel: BLEChannelID, reason: String?) {}`,
+>   `private func closeInbound(_ channel: BLEChannelID) {}`, `subscribePeripheralStreams()`,
+>   `resetPeripheralSession()` — six no-ops, complete for this task's scope.
+> - `BLEDriver.fcb`: `send: { channel, fragments in await adapter.send(channel, fragments: fragments) }`.
+> - Tests call `adapter.send(cid, fragments: [...])` (already rewritten below); add one test,
+>   `sendKeepsFragmentOrderAcrossConcurrentCalls`: open an outbound channel, then fire
+>   `async let a = adapter.send(cid, fragments: [Data([1]), Data([2]), Data([3])])` and
+>   `async let b = adapter.send(cid, fragments: [Data([9]), Data([8])])`, await both, and assert the
+>   recorded write payloads are either `[1,2,3,9,8]` or `[9,8,1,2,3]` — never interleaved.
+> - Mutation batch gains (e): in `drain`, drop the `guard !draining.contains(channel)` line —
+>   `sendKeepsFragmentOrderAcrossConcurrentCalls` must fail (the stub's `writeValue` awaits an actor
+>   hop, which is enough of a suspension point for two drains to interleave).
+
 **Files:**
 - Create: `Sources/ReTiCAInterfaces/FCBDriverAdapter.swift`
 - Modify: `Sources/ReTiCAInterfaces/BLEDriver.swift` (`liveValue` → FCB-backed)
@@ -2478,9 +2505,10 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     let (adapter, stubs, events) = await onlineAdapter()
     let p = peer(9)
     guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
-    await adapter.send(cid, data: Data([1, 2, 3]))
+    await adapter.send(cid, fragments: [Data([1, 2, 3]), Data([4])])
     let writes = await stubs.calls.writes
-    #expect(writes.last?.0 == Data([1, 2, 3]) && writes.last?.2 == rxCharUUID && writes.last?.3 == .withoutResponse)
+    #expect(writes.suffix(2).map(\.0) == [Data([1, 2, 3]), Data([4])])
+    #expect(writes.last?.2 == rxCharUUID && writes.last?.3 == .withoutResponse)
     await adapter.stop()
 }
 
@@ -2489,7 +2517,7 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     let p = peer(1)
     guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
     stubs.writeShouldThrow.setValue(true)
-    await adapter.send(cid, data: Data([1]))
+    await adapter.send(cid, fragments: [Data([1])])
     guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed"); await adapter.stop(); return }
     await adapter.stop()
 }
@@ -2526,7 +2554,7 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
 
 @Test @MainActor func sendToUnknownChannelIsDropped() async {
     let (adapter, _, _) = await onlineAdapter()
-    await adapter.send(BLEChannelID(id: UUID()), data: Data([1]))
+    await adapter.send(BLEChannelID(id: UUID()), fragments: [Data([1])])
     await adapter.stop()
 }
 ```
@@ -2594,6 +2622,10 @@ actor FCBDriverAdapter {
     private var outbound: [BLEChannelID: UUID] = [:]      // channel → peripheral id
     private var outboundByPeer: [UUID: BLEChannelID] = [:]
     private var reducerClosed: Set<BLEChannelID> = []
+    // Per-channel send FIFOs (both roles) and the set of channels a drain loop is emptying.
+    static let sendQueueCap = 256
+    private var sendQueues: [BLEChannelID: [Data]] = [:]
+    private var draining: Set<BLEChannelID> = []
 
     init(central: BluetoothCentralClient, peripheral: BluetoothPeripheralClient,
          now: @escaping @Sendable () -> Date = { Date() }) {
@@ -2694,6 +2726,8 @@ actor FCBDriverAdapter {
         outbound = [:]
         outboundByPeer = [:]
         reducerClosed = []
+        sendQueues = [:]
+        draining = []
         resetPeripheralSession()
         continuation?.finish()
         continuation = nil
@@ -2777,6 +2811,7 @@ actor FCBDriverAdapter {
     private func outboundDidClose(_ id: BLEChannelID, reason: String?) {
         guard let peerID = outbound.removeValue(forKey: id) else { return }
         outboundByPeer[peerID] = nil
+        sendQueues[id] = nil
         if reducerClosed.remove(id) == nil {
             continuation?.yield(.channelClosed(id, reason: reason))
         }
@@ -2784,13 +2819,38 @@ actor FCBDriverAdapter {
 
     // MARK: - BLEDriver verbs
 
-    func send(_ channel: BLEChannelID, data: Data) async {
-        if let peerID = outbound[channel] {
-            do { try await central.writeValue(data, peerID, bleV22RXCharUUID, .withoutResponse) }
-            catch { outboundDidClose(channel, reason: "write failed: \(error)") }
+    /// One packet's fragments (or one keepalive): appended atomically to the channel's FIFO and
+    /// drained by a single per-channel loop, so fragments of different packets never interleave.
+    func send(_ channel: BLEChannelID, fragments: [Data]) async {
+        guard outbound[channel] != nil || isInbound(channel) else { return }
+        sendQueues[channel, default: []].append(contentsOf: fragments)
+        if sendQueues[channel]!.count > Self.sendQueueCap {
+            if outbound[channel] != nil { outboundDidClose(channel, reason: "send backlog") }
+            else { inboundDidClose(channel, reason: "notify backlog") }
             return
         }
-        await sendInbound(channel, data: data)
+        await drain(channel)
+    }
+
+    /// Empties one channel's FIFO in order. Re-entrant calls return at once: the loop that is
+    /// already running will pick up anything appended meanwhile.
+    private func drain(_ channel: BLEChannelID) async {
+        guard !draining.contains(channel) else { return }
+        draining.insert(channel)
+        defer { draining.remove(channel) }
+        while let next = sendQueues[channel]?.first {
+            if let peerID = outbound[channel] {
+                do { try await central.writeValue(next, peerID, bleV22RXCharUUID, .withoutResponse) }
+                catch { outboundDidClose(channel, reason: "write failed: \(error)"); return }
+            } else if isInbound(channel) {
+                guard await notifyInbound(channel, next) else { return }   // parked or closed
+            } else {
+                sendQueues[channel] = nil
+                return
+            }
+            sendQueues[channel]?.removeFirst()
+        }
+        sendQueues[channel] = nil
     }
 
     func closeChannel(_ channel: BLEChannelID) async {
@@ -2820,7 +2880,9 @@ actor FCBDriverAdapter {
     private func subscribePeripheralStreams() {}
     private func resetPeripheralSession() {}
     private func isInbound(_ id: BLEChannelID) -> Bool { false }
-    private func sendInbound(_ channel: BLEChannelID, data: Data) async {}
+    /// One notify attempt for the drain loop: true = sent, dequeue; false = leave queued (parked or closed).
+    private func notifyInbound(_ channel: BLEChannelID, _ fragment: Data) async -> Bool { false }
+    private func inboundDidClose(_ channel: BLEChannelID, reason: String?) {}
     private func closeInbound(_ channel: BLEChannelID) {}
 }
 
@@ -2832,7 +2894,7 @@ extension BLEDriver {
             start: { config in adapter.start(config) },
             readIdentity: { peer in await adapter.readIdentity(peer) },
             openChannel: { peer in await adapter.openChannel(peer) },
-            send: { channel, data in await adapter.send(channel, data: data) },
+            send: { channel, fragments in await adapter.send(channel, fragments: fragments) },
             closeChannel: { channel in await adapter.closeChannel(channel) },
             disconnect: { peer in await adapter.disconnect(peer) },
             stop: { await adapter.stop() }
@@ -2841,7 +2903,7 @@ extension BLEDriver {
 }
 ```
 
-The five one-line peripheral hooks at the bottom are the seam Task 7 replaces; they are complete no-ops for this task's scope (inbound channels do not exist yet), not placeholders.
+The six one-line peripheral hooks at the bottom are the seam Task 7 replaces; they are complete no-ops for this task's scope (inbound channels do not exist yet), not placeholders.
 
 In `BLEDriver.swift` restore the live value:
 ```swift
@@ -2869,6 +2931,20 @@ Batch: (a) in `readIdentity` drop the `chars.contains(...)` guard; (b) in `openC
 
 ---
 ### Task 7: FCB adapter — peripheral role (subscriptions, RX writes, notify FIFO, held handshake)
+
+> **Controller addendum (2026-09-26, after the Task 5 review) — supersedes any conflicting line below.**
+> Task 6 now owns ONE per-channel FIFO (`sendQueues`, `draining`, `sendQueueCap = 256`, `send(_:fragments:)`,
+> `drain(_:)`) for both roles. This task therefore does NOT add `notifyQueues`, `notifyQueueCap`,
+> `sendInbound` or `drainNotifyQueues`. Instead:
+>
+> - Step 3's code below is already rewritten for this: the peripheral role implements
+>   `notifyInbound(_:_:) async -> Bool` (one notify attempt for Task 6's `drain`) and `notifyReady()`
+>   (unparks and drains every inbound channel with a queue); `closeInbound`/`inboundDidClose` clear
+>   `sendQueues[channel]`. Replace Task 6's six no-op hooks with the Step 3 functions of the same names.
+> - Tests: every `adapter.send(cid, data: X)` in this task is `adapter.send(cid, fragments: [X])`
+>   (already rewritten below); `FCBDriverAdapter.notifyQueueCap` is `FCBDriverAdapter.sendQueueCap`.
+> - Mutation (b) becomes: in `notifyInbound` return `true` even when `ok` is false; mutation (c)
+>   becomes: in Task 6's `send`, remove the cap check.
 
 **Files:**
 - Modify: `Sources/ReTiCAInterfaces/FCBDriverAdapter.swift` (replace the five peripheral hooks; add state)
@@ -2962,7 +3038,7 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     let (adapter, stubs, events) = await onlineAdapter()
     let c = centralValue(6)
     guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
-    await adapter.send(cid, data: Data([9, 9]))
+    await adapter.send(cid, fragments: [Data([9, 9])])
     try? await Task.sleep(nanoseconds: 100_000_000)
     let updates = await stubs.calls.updates
     #expect(updates.count == 1 && updates[0].0 == Data([9, 9]) && updates[0].1 == txCharUUID && updates[0].2 == [c.id])
@@ -2974,8 +3050,8 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     let c = centralValue(7)
     guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
     stubs.updateResult.setValue(false)              // CoreBluetooth queue full
-    await adapter.send(cid, data: Data([1]))
-    await adapter.send(cid, data: Data([2]))
+    await adapter.send(cid, fragments: [Data([1])])
+    await adapter.send(cid, fragments: [Data([2])])
     try? await Task.sleep(nanoseconds: 100_000_000)
     #expect(await stubs.calls.updates.count == 1)   // tried [1] once, parked; [2] never attempted
     stubs.updateResult.setValue(true)
@@ -2991,7 +3067,7 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     let c = centralValue(8)
     guard let cid = await subscribeInbound(stubs, events, c) else { await adapter.stop(); return }
     stubs.updateResult.setValue(false)
-    for i in 0...FCBDriverAdapter.notifyQueueCap { await adapter.send(cid, data: Data([UInt8(i & 0xFF)])) }
+    for i in 0...FCBDriverAdapter.sendQueueCap { await adapter.send(cid, fragments: [Data([UInt8(i & 0xFF)])]) }
     guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed on overflow"); await adapter.stop(); return }
     await adapter.stop()
 }
@@ -3073,12 +3149,11 @@ Run: `swift test --filter FCBDriverAdapterTests` — expected: compile errors (`
 In `FCBDriverAdapter.swift` add state after `reducerClosed`:
 
 ```swift
-    // Peripheral role: inbound channels (one per subscribed central).
-    static let notifyQueueCap = 256
+    // Peripheral role: inbound channels (one per subscribed central). Their send FIFOs are the
+    // shared `sendQueues` from Task 6.
     static let heldWriteWindow: TimeInterval = 2
     private var inbound: [BLEChannelID: Central] = [:]
     private var inboundByCentral: [UUID: BLEChannelID] = [:]
-    private var notifyQueues: [BLEChannelID: [Data]] = [:]
     private var notifyParked = false
     private var heldWrites: [UUID: (data: Data, at: Date)] = [:]
 ```
@@ -3108,7 +3183,6 @@ Replace the five hooks with:
     private func resetPeripheralSession() {
         inbound = [:]
         inboundByCentral = [:]
-        notifyQueues = [:]
         notifyParked = false
         heldWrites = [:]
     }
@@ -3151,47 +3225,37 @@ Replace the five hooks with:
         }
     }
 
-    private func sendInbound(_ channel: BLEChannelID, data: Data) async {
-        guard inbound[channel] != nil else { return }
-        notifyQueues[channel, default: []].append(data)
-        if notifyQueues[channel]!.count > Self.notifyQueueCap {
-            inboundDidClose(channel, reason: "notify backlog")
-            return
-        }
-        await drainNotifyQueues()
-    }
-
-    private func drainNotifyQueues() async {
-        guard !notifyParked else { return }
-        for channel in notifyQueues.keys.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-            guard let central = inbound[channel] else { notifyQueues[channel] = nil; continue }
-            while let next = notifyQueues[channel]?.first {
-                let ok: Bool
-                do { ok = try await peripheral.updateValue(next, bleV22TXCharUUID, [central.id]) }
-                catch { inboundDidClose(channel, reason: "notify failed: \(error)"); break }
-                if !ok { notifyParked = true; return }   // leave `next` queued; retry on ready
-                notifyQueues[channel]?.removeFirst()
-            }
-            if notifyQueues[channel]?.isEmpty == true { notifyQueues[channel] = nil }
+    /// One notify attempt for Task 6's drain loop. true = sent, dequeue it; false = leave it queued
+    /// (CoreBluetooth's queue is full → parked until isReadyToUpdateSubscribers) or the channel closed.
+    private func notifyInbound(_ channel: BLEChannelID, _ fragment: Data) async -> Bool {
+        guard !notifyParked, let central = inbound[channel] else { return false }
+        do {
+            let ok = try await peripheral.updateValue(fragment, bleV22TXCharUUID, [central.id])
+            if !ok { notifyParked = true }
+            return ok
+        } catch {
+            inboundDidClose(channel, reason: "notify failed: \(error)")
+            return false
         }
     }
 
     private func notifyReady() async {
         notifyParked = false
-        await drainNotifyQueues()
+        for channel in inbound.keys.sorted(by: { $0.id.uuidString < $1.id.uuidString }) where sendQueues[channel] != nil {
+            await drain(channel)
+        }
     }
 
     private func closeInbound(_ channel: BLEChannelID) {
         guard let central = inbound.removeValue(forKey: channel) else { return }
         inboundByCentral[central.id] = nil
-        notifyQueues[channel] = nil
-        reducerClosed.insert(channel)
+        sendQueues[channel] = nil
     }
 
     private func inboundDidClose(_ channel: BLEChannelID, reason: String?) {
         guard let central = inbound.removeValue(forKey: channel) else { return }
         inboundByCentral[central.id] = nil
-        notifyQueues[channel] = nil
+        sendQueues[channel] = nil
         if reducerClosed.remove(channel) == nil {
             continuation?.yield(.channelClosed(channel, reason: reason))
         }
