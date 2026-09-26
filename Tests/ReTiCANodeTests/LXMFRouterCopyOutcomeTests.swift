@@ -71,7 +71,10 @@ private func advanceToTheFinalRetry(_ store: TestStore<LXMFRouter.State, LXMFRou
     await store.receive(.retryDue(messageHash: msg.hash, leg: .delivery)) {
         $0.pendingDeliveries[.delivery(msg.hash)] = nil
     }
-    await store.skipInFlightEffects(strict: false)   // the PN link's idle timer
+    // Exhaustive no-op: both copies are settled, so this does nothing — but it fails if a stray
+    // deliveryFailed is still unhandled.
+    await store.send(.retryDue(messageHash: msg.hash, leg: .delivery))
+    store.exhaustivity = .off   // the PN link's idle timer (and any settled retry timer) run on by design
 }
 
 @Test @MainActor func copyOutcomeNoFailureAfterTheDeliveryCopySucceeded() async {
@@ -86,7 +89,10 @@ private func advanceToTheFinalRetry(_ store: TestStore<LXMFRouter.State, LXMFRou
     await store.receive(.retryDue(messageHash: msg.hash, leg: .propagated)) {
         $0.pendingDeliveries[.propagated(msg.hash)] = nil
     }
-    await store.skipInFlightEffects(strict: false)
+    // Exhaustive no-op: both copies are settled, so this does nothing — but it fails if a stray
+    // deliveryFailed is still unhandled.
+    await store.send(.retryDue(messageHash: msg.hash, leg: .propagated))
+    store.exhaustivity = .off   // the PN link's idle timer (and any settled retry timer) run on by design
 }
 
 /// The propagated copy is armed only after its propagation stamp is found — possibly after the
@@ -103,7 +109,10 @@ private func advanceToTheFinalRetry(_ store: TestStore<LXMFRouter.State, LXMFRou
     await store.receive(.retryDue(messageHash: msg.hash, leg: .propagated)) {
         $0.pendingDeliveries[.propagated(msg.hash)] = nil
     }
-    await store.skipInFlightEffects(strict: false)
+    // Exhaustive no-op: both copies are settled, so this does nothing — but it fails if a stray
+    // deliveryFailed is still unhandled.
+    await store.send(.retryDue(messageHash: msg.hash, leg: .propagated))
+    store.exhaustivity = .off   // the PN link's idle timer (and any settled retry timer) run on by design
 }
 
 /// A propagated copy QUEUED behind a link request has no timer yet, but it is outstanding: the
@@ -144,6 +153,29 @@ private func advanceToTheFinalRetry(_ store: TestStore<LXMFRouter.State, LXMFRou
         $0.directLinks[pn] = nil
         $0.establishAttempts[pn] = nil
         $0.propagationQueue[pn] = nil
+    }
+}
+
+/// Mirror of the above for `giveUp`'s DELIVERY half: a direct delivery copy queued behind the
+/// recipient gives up (budget spent) while the propagated copy is armed — nothing is reported.
+@Test @MainActor func copyOutcomeGiveUpOnAQueuedDeliveryCopyWaitsForThePropagatedCopy() async {
+    let msg = makeMessage()
+    let dest = msg.destinationHash
+    var state = LXMFRouter.State()
+    state.outboundPropagationNode = pn
+    state.directLinks[dest] = .awaitingPath
+    state.establishAttempts[dest] = LXMFDelivery.maxAttempts
+    state.outboundQueue[dest] = [msg]
+    state.pendingDeliveries[.propagated(msg.hash)] = LXMFRouter.PendingDelivery(
+        resend: .propagated(destinationHash: pn, data: small), attempts: 1)
+    let store = TestStore(initialState: state) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    // Exhaustive: the park deadline gives up on the recipient; a deliveryFailed would be unexpected.
+    await store.send(.pathRequestDeadline(destinationHash: dest)) {
+        $0.directLinks[dest] = nil
+        $0.establishAttempts[dest] = nil
+        $0.outboundQueue[dest] = nil
     }
 }
 
