@@ -233,8 +233,12 @@ public struct BLEDriver: Sendable {
     public var readIdentity: @Sendable (BLEPeerHandle) async -> Void
     /// Subscribe to TX and write the handshake. Result arrives as channelOpened/channelFailed.
     public var openChannel: @Sendable (BLEPeerHandle) async -> Void
-    /// One fragment (or keepalive). Central: RX write without response. Peripheral: TX notify.
-    public var send: @Sendable (BLEChannelID, Data) async -> Void
+    /// One packet's fragments — or a single keepalive — delivered in order and never interleaved
+    /// with another call's fragments on the same channel. Central: sequential RX writes without
+    /// response. Peripheral: TX notifies. (Changed from per-fragment during implementation: two
+    /// concurrent per-fragment sends could interleave packets, which the total-keyed reassembler
+    /// cannot survive.)
+    public var send: @Sendable (BLEChannelID, [Data]) async -> Void
     public var closeChannel: @Sendable (BLEChannelID) async -> Void
     public var disconnect: @Sendable (BLEPeerHandle) async -> Void   // peer with no channel (S2)
     public var stop: @Sendable () async -> Void
@@ -280,18 +284,23 @@ Behaviour deltas from the current reducer:
   establish, `disconnect(h)`, no strike (this is the cheap pre-check ble-reticulum also does
   before dialing). Otherwise record `pendingIdentities[h] = id` and `openChannel(h)`.
 - **`identityFailed` / `channelFailed`:** strike, remove pending (unchanged shape).
-- **`channelOpened(c, h, dir, mtu)`:** cap/greylist/online guards unchanged. Outbound:
-  `peerIdentity = pendingIdentities.removeValue(h)` (missing → close, no strike), run the
-  duplicate rule against `peers[id]`, then establish (`peers[id] = c`, `peerOnline`) and arm
-  the keepalive timer. Inbound: `peerIdentity = nil`, arm `handshakeDeadline(c)` at 10 s.
+- **`channelOpened(c, h, dir, mtu)`:** cap/greylist/online guards unchanged. Only an OUTBOUND
+  open touches the pending bookkeeping (`pendingPeers`, `pendingIdentities`, the establish
+  timer): `peerIdentity = pendingIdentities.removeValue(h)` (missing → close, no strike), run
+  the duplicate rule against `peers[id]`, then establish (`peers[id] = c`, `peerOnline`) and
+  arm the keepalive timer. Inbound: `peerIdentity = nil`, arm `handshakeDeadline(c)` at 10 s,
+  and leave any in-flight outbound dial to the same handle alive so a simultaneous
+  cross-connect resolves through the duplicate rule to exactly one surviving channel. A late
+  `identityFailed`/`channelFailed`/`establishDeadline` for a handle that already has an
+  established channel clears pending without a strike and without `disconnect`.
 - **`channelData(c, bytes)`:** keepalive → ignore. If `peerIdentity == nil` (inbound,
   pre-handshake): exactly 16 bytes and ≠ `localIdentity` → handshake: cancel deadline, run
   the duplicate rule, establish, emit `peerOnline`. Any other pre-handshake write → drop
   (no strike; ble-reticulum drops too). Established: `reassembler.receive(bytes, now:)`;
   packet → `packetReceived`; throw → log-equivalent no-op (buffer already discarded), channel
   stays up.
-- **`.send(peer, packet)`:** `fragmenter.fragment(packet)`; one `bleDriver.send` per
-  fragment, in order, sequenced inside a single `.run` so ordering is preserved.
+- **`.send(peer, packet)`:** `fragmenter.fragment(packet)`; ONE `bleDriver.send(channelID,
+  fragments)` per packet. Per-channel ordering and non-interleaving are the adapter's job.
 - **`keepalive(c)`:** channel still established and outbound → `send(c, [0x00])`, re-arm.
 - **`handshakeDeadline(c)`:** `peerIdentity == nil` → close + strike.
 - **`channelClosed` / teardown / `unavailable` / `.stop`:** unchanged, plus cancel that
@@ -313,12 +322,14 @@ Peripheral role, on `poweredOn`:
   channel for `request.central.id`. Writes from a central with no TX subscription are
   answered `.success` and dropped (ble-reticulum peripherals never see these; CoreBluetooth
   may deliver a handshake before the subscription event lands — see ordering note below).
-- Notify path: `updateValue(data, TX, [centralID])`. **FCB gap:** the live client discards
-  CoreBluetooth's `Bool` (`_ = manager.updateValue(...)`); a `false` means "queue full, wait
-  for `isReadyToUpdateSubscribers`". FCB's `updateValue` must return that `Bool`. The
-  adapter keeps a per-channel FIFO, sends one fragment at a time, and on `false` parks until
-  `.isReadyToUpdateSubscribers` then resumes. FIFO cap 256 fragments; overflow closes the
-  channel (`channelClosed(reason: "notify backlog")`).
+- Notify path: `updateValue(data, TX, [centralID])`. **FCB gap (fixed in Task 1):** the live
+  client discarded CoreBluetooth's `Bool`; a `false` means "queue full, wait for
+  `isReadyToUpdateSubscribers`". FCB's `updateValue` now returns that `Bool`. The adapter
+  keeps ONE per-channel FIFO for both roles (`sendQueues`, cap 256, drained by a single loop
+  per channel so packets never interleave). For inbound channels a `false` parks the notify
+  path until `.isReadyToUpdateSubscribers`; a ready event that lands while an attempt is still
+  in flight bumps a generation counter so the attempt retries instead of parking forever.
+  Overflow closes the channel (`channelClosed(reason: "notify backlog")`).
 - Ordering note: iOS may deliver the RX handshake write before, or without, a TX
   subscription. To be robust, the adapter holds the **last** RX write per unsubscribed central
   for 2 s and replays it as `channelData` when the subscription arrives. If no subscription
@@ -330,16 +341,24 @@ Central role:
   `discoverCharacteristics(service, [TX, RX, Identity])` → `readValue(Identity)`. Any throw,
   or a missing characteristic, or value ≠ 16 bytes → `disconnect`, `forget`,
   `identityFailed`. Success → `identityRead`.
-- `openChannel(h)`: `setNotify(true, TX)` → subscribe the `notifications(h, TX)` stream →
-  `writeValue(localIdentity, RX, .withResponse)` → `mtu = maximumWriteValueLength(h,
-  .withoutResponse)` → mint channel, emit `channelOpened(.outbound, mtu)`. Throw → `forget`,
-  `channelFailed`. Notification stream elements → `channelData`; stream end or
-  `didDisconnect` → `channelClosed`.
+- `openChannel(h)`: create the `notifications(h, TX)` stream and its pump → `setNotify(true,
+  TX)` → `mtu = maximumWriteValueLength(h, .withoutResponse)` → `writeValue(localIdentity,
+  RX, .withResponse)` → register the channel and emit `channelOpened(.outbound, mtu)` with no
+  suspension after the write returns. Notifications that arrive while the channel is still
+  opening are buffered and flushed right after `channelOpened`. A `didDisconnect` during the
+  window → `channelFailed`. Throw → `forget`, `channelFailed`. Notification stream elements
+  → `channelData`; stream end or `didDisconnect` → `channelClosed`; the pump task is
+  cancelled on every close. Every await in `readIdentity`/`openChannel` re-checks a session
+  epoch that `stop()`/restart bumps, so a stale operation never emits into the next session.
 - `send` on an outbound channel: `writeValue(data, h, RX, .withoutResponse)`. Throw →
   `channelClosed(reason:)` (the connection is gone).
-- `closeChannel`: outbound → `disconnect(h)`; inbound → there is no API to evict a central;
-  the adapter drops its channel mapping, stops replying, and lets the peer's own timers end
-  the link. `disconnect(h)`, `stop`, discovery cooldown (S1), `forget`: unchanged.
+- `closeChannel`: outbound → cancel the pump, clear the maps, `disconnect(h)`; every
+  adapter-initiated outbound close (write failure, overflow, stream end) also disconnects,
+  while the `didDisconnect` path does not (the link is already down). Inbound → there is no
+  API to evict a central; the adapter drops its channel mapping and stops delivering data to
+  the reducer (it still answers writes with `.success`, as CoreBluetooth requires) and lets the
+  peer's own timers end the link. `disconnect(h)`, `stop`, discovery cooldown (S1), `forget`:
+  unchanged.
 
 Removed: L2CAP publish/open/unpublish, `L2CAPConnection` pump, `rbtpDirectoryService`, all
 RBTP UUIDs.
