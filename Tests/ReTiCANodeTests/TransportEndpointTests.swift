@@ -188,6 +188,14 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
     #expect(ble.interfaces == [InterfaceID("ble-1"): .ble])
 }
 
+// The L2CAP kill switch is reachable from the node layer: passed straight through to the BLE interface.
+@Test func bleEndpointPassesL2CAPEnabledThroughToTheInterface() {
+    let off = BLEEndpoint.State(localIdentity: Data(repeating: 0x5A, count: 16), l2capEnabled: false)
+    #expect(off.ble.l2capEnabled == false)
+    let byDefault = BLEEndpoint.State(localIdentity: Data(repeating: 0x5A, count: 16))
+    #expect(byDefault.ble.l2capEnabled == true)
+}
+
 // `PendingDelivery` gained an explicit `public init` because the synthesised memberwise init
 // on a `public struct` is INTERNAL — the type was public in name only. This test asserts the
 // init ASSIGNS ITS PARAMETERS; it deliberately does NOT claim to prove accessibility.

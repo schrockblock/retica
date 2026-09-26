@@ -37,8 +37,10 @@ public struct BLEEndpoint {
 
         public init(localIdentity: Data,
                     maxPeers: Int = BLEInterface.defaultMaxPeers,
-                    profile: InterfaceProfile = .ble) {
-            self.ble = BLEInterface.State(localIdentity: localIdentity, maxPeers: maxPeers)
+                    profile: InterfaceProfile = .ble,
+                    l2capEnabled: Bool = true) {
+            self.ble = BLEInterface.State(localIdentity: localIdentity, maxPeers: maxPeers,
+                                          l2capEnabled: l2capEnabled)
             self.profile = profile
         }
     }

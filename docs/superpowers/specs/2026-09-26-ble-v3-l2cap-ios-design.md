@@ -35,6 +35,10 @@ case channelOpened(BLEChannelID, BLEPeerHandle, direction: BLEChannelDirection, 
 /// handshake frame, then emit channelOpened(.outbound, transport: .l2cap). Failure emits
 /// channelFailed WITHOUT disconnecting: the reducer falls back to the GATT path on the same link.
 public var openL2CAPChannel: @Sendable (BLEPeerHandle, UInt16) async -> Void = { _, _ in }
+
+// BLEDriverConfig gains a defaulted flag (the reducer passes State.l2capEnabled at start):
+/// false: do not publish an L2CAP listener or PSM; GATT only.
+public var l2capEnabled: Bool   // init(localIdentity:l2capEnabled: Bool = true)
 ```
 
 Default associated values keep every existing `.identityRead(h, identity:)` and
@@ -65,8 +69,10 @@ The v2.2 fragmenter, reassembler, sanitizer and greylist are untouched.
 ### 2.3 Reducer (`BLEInterface.swift`)
 
 State:
-- `State.l2capEnabled: Bool` (init parameter, default `true`) — set `false` to force GATT for
-  hardware bring-up or A/B tests.
+- `State.l2capEnabled: Bool` (init parameter, default `true`) — set `false` on a node to make it
+  GATT-only: it neither publishes a PSM nor dials L2CAP. A peer with the flag on still dials the
+  other peer's PSM, so to force a pair onto GATT set it on both nodes, or on the node that would
+  otherwise be dialled.
 - `ChannelState.transport: BLEChannelTransport`; `ChannelState.frameBuffer: BLEFrameBuffer`
   (used only on `.l2cap`).
 - `State.pendingPaths: [BLEPeerHandle: BLEChannelTransport]` — which path the in-flight dial
@@ -74,7 +80,9 @@ State:
 
 Path selection at `identityRead(h, identity, psm)`:
 - existing guards and the duplicate pre-check unchanged;
-- if `l2capEnabled && psm != nil` → `pendingPaths[h] = .l2cap`, `bleDriver.openL2CAPChannel(h, psm)`;
+- if `l2capEnabled && psm != nil` → `pendingPaths[h] = .l2cap`, re-arm the establish deadline (a
+  fresh 15 s, so the adapter's 10 s open limit is never pre-empted by the window started at
+  discovery), `bleDriver.openL2CAPChannel(h, psm)`;
 - else → `pendingPaths[h] = .gatt`, `bleDriver.openChannel(h)`.
 
 Fallback at `channelFailed(h)`: if `pendingPaths[h] == .l2cap` and the handle is still pending,
@@ -98,7 +106,8 @@ Handshake and data on `.l2cap` channels:
 
 ### 2.4 Adapter (`FCBDriverAdapter.swift`)
 
-Peripheral bring-up: after `removeAll`, `try await peripheral.publishL2CAPChannel(false)`; on
+Peripheral bring-up: after `removeAll`, and only when `config.l2capEnabled` (otherwise no
+listener and no PSM characteristic: a GATT-only peripheral), `try await peripheral.publishL2CAPChannel(false)`; on
 success the service gains the PSM characteristic (`…28e7`, read-only, 2 bytes little-endian);
 on failure (platform cannot listen) the service is published without it and a log-equivalent
 note is kept in the report — bring-up does not fail. `resetSession` unpublishes the PSM.
@@ -112,8 +121,9 @@ pumped to `channelData` (raw bytes; framing is the reducer's), stream end → `c
 Central: `readIdentity` also discovers `…28e7` and, if present, reads it (2 bytes LE; anything
 else → `psm: nil`). `openL2CAPChannel(peer, psm)`: `central.openL2CAPChannel(peer.id, psm)`
 raced against a 10 s clock; on success `conn.send(handshakeFrame)` where the frame is
-`[0x00, 0x10] + localIdentity`, register (`l2cap`, `outboundByPeer`, pump), emit
-`channelOpened(.outbound, mtu: 0, transport: .l2cap)`; on failure or timeout close any
+`[0x00, 0x10] + localIdentity`, register (`l2cap`, `outboundByPeer`), emit
+`channelOpened(.outbound, mtu: 0, transport: .l2cap)`, then start the pump (FCB buffers incoming
+chunks and a stream end until a consumer attaches, so nothing is lost); on failure or timeout close any
 half-open connection and emit `channelFailed(peer, reason:)` **without** `disconnect` or
 `forget` (the reducer falls back on the same GATT link). Epoch guards after every await, as
 in `openChannel`.
@@ -129,7 +139,8 @@ channel with `disconnect: false`. `resetSession` closes every connection before 
 
 ### 2.5 Node layer
 
-No change. `bleInterfaceID` and `peerOnline`/`peerOffline` carry identities as before; every
+One additive, defaulted `l2capEnabled` init parameter on `BLEEndpoint.State`, passed through; no
+other node change. `bleInterfaceID` and `peerOnline`/`peerOffline` carry identities as before; every
 BLE peer keeps `InterfaceProfile.ble` (HW_MTU 500). Raising L2CAP peers to 1196 is a later
 slice that would need `peerOnline` to carry the transport.
 
@@ -195,3 +206,9 @@ FCB's pump buffer; measuring throughput for the bitrate guess.
   inbound channel for the same identity was established while the L2CAP dial was still
   outstanding, the GATT fallback opens a second link, which the duplicate rule then resolves.
   This is recorded as a known inefficiency, not fixed in this slice.
+
+- The wire spec's Path Selection says the L2CAP channel wins when one central delivers both an
+  L2CAP and a GATT handshake; ReTiCA applies the transport-blind v2.2 duplicate rule
+  (same-direction: newest wins). This differs only against a non-conforming central that opens
+  both; the wire spec's Peer Keying section says v2.2 rules are unchanged, so the two specs
+  disagree with each other here. Left as-is; to be reconciled in the wire spec.

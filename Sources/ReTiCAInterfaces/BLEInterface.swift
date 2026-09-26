@@ -53,7 +53,8 @@ public struct BLEInterface {
         var pendingPaths: [BLEPeerHandle: BLEChannelTransport] = [:]   // which path the in-flight dial is on
         var greylist = BLEPeerGreylist<BLEPeerHandle>()
         var adapterRetryDelay: Duration = BLEInterface.adapterRetryMin
-        /// v3: dial L2CAP when the peer publishes a PSM. false forces the GATT path for every peer.
+        /// v3: dial L2CAP when the peer publishes a PSM, and publish our own. false makes this node
+        /// GATT-only: it neither dials L2CAP nor publishes a PSM (passed to the driver at start).
         public var l2capEnabled: Bool
 
         public init(localIdentity: Data,
@@ -174,7 +175,15 @@ public struct BLEInterface {
                 state.pendingIdentities[handle] = identity
                 if state.l2capEnabled, let psm, psm != 0 {
                     state.pendingPaths[handle] = .l2cap
-                    return .run { [bleDriver] _ in await bleDriver.openL2CAPChannel(handle, psm) }
+                    // A fresh establishment window for the dial, so the adapter's 10 s open limit
+                    // cannot be pre-empted by what is left of the window started at discovery.
+                    return .merge(
+                        .run { [bleDriver] _ in await bleDriver.openL2CAPChannel(handle, psm) },
+                        .run { [clock] send in
+                            try await clock.sleep(for: Self.establishTimeout)
+                            await send(.establishDeadline(handle))
+                        }
+                        .cancellable(id: CancelID.establish(handle), cancelInFlight: true))
                 }
                 state.pendingPaths[handle] = .gatt
                 return .run { [bleDriver] _ in await bleDriver.openChannel(handle) }
@@ -388,7 +397,7 @@ public struct BLEInterface {
     }
 
     private func startDriver(state: inout State) -> Effect<Action> {
-        let config = BLEDriverConfig(localIdentity: state.localIdentity)
+        let config = BLEDriverConfig(localIdentity: state.localIdentity, l2capEnabled: state.l2capEnabled)
         return .run { [bleDriver] send in
             for await event in bleDriver.start(config) {
                 await send(.driverEvent(event))

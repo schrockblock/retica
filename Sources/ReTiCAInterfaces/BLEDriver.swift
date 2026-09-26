@@ -17,7 +17,12 @@ public struct BLEChannelID: Hashable, Sendable {
 public struct BLEDriverConfig: Equatable, Sendable {
     /// 16 bytes: served on the Identity characteristic and written as the handshake.
     public var localIdentity: Data
-    public init(localIdentity: Data) { self.localIdentity = localIdentity }
+    /// false: do not publish an L2CAP listener or PSM; GATT only.
+    public var l2capEnabled: Bool
+    public init(localIdentity: Data, l2capEnabled: Bool = true) {
+        self.localIdentity = localIdentity
+        self.l2capEnabled = l2capEnabled
+    }
 }
 
 /// Why the BLE adapter is unavailable. `isTerminal` separates causes retrying cannot fix

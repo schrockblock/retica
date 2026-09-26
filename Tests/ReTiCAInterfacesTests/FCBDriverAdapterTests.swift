@@ -148,6 +148,8 @@ struct AdapterStubs {
     let psmResult: LockIsolated<Data?>                 // readValue result for the PSM characteristic (nil → throws)
     let l2capInbound: AsyncStream<L2CAPConnection>.Continuation
     let publishHeld: LockIsolated<Bool>                // while true, publishL2CAPChannel stays in flight
+    let publishEncryption: LockIsolated<[Bool]>        // withEncryption argument of every publishL2CAPChannel call
+    let openL2CAPHeld: LockIsolated<Bool>              // while true, openL2CAPChannel stays in flight (after being counted started)
 }
 
 @MainActor
@@ -177,6 +179,8 @@ func makeStubs() -> AdapterStubs {
     let canSendHeld = LockIsolated(false)
     let publishPSM = LockIsolated<UInt16?>(0x0081)
     let publishHeld = LockIsolated(false)
+    let publishEncryption = LockIsolated<[Bool]>([])
+    let openL2CAPHeld = LockIsolated(false)
     let unpublished = LockIsolated<[UInt16]>([])
     let openL2CAPResult = LockIsolated<L2CAPConnection?>(nil)
     let openL2CAPDelayNanos = LockIsolated<UInt64>(0)
@@ -250,6 +254,7 @@ func makeStubs() -> AdapterStubs {
         openL2CAPChannel: { _, _ in
             await calls.startL2CAPOpen()
             if openL2CAPDelayNanos.value > 0 { try? await Task.sleep(nanoseconds: openL2CAPDelayNanos.value) }
+            while openL2CAPHeld.value { try? await Task.sleep(nanoseconds: 2_000_000) }
             guard let c = openL2CAPResult.value else { throw BluetoothError.l2capNotSupported }
             return c
         },
@@ -290,7 +295,8 @@ func makeStubs() -> AdapterStubs {
             if updateDelayNanos.value > 0 { try? await Task.sleep(nanoseconds: updateDelayNanos.value) }
             return result
         },
-        publishL2CAPChannel: { _ in
+        publishL2CAPChannel: { withEncryption in
+            publishEncryption.withValue { $0.append(withEncryption) }
             await calls.startPublish()
             while publishHeld.value { try? await Task.sleep(nanoseconds: 2_000_000) }
             guard let p = publishPSM.value else { throw BluetoothError.l2capNotSupported }
@@ -320,7 +326,7 @@ func makeStubs() -> AdapterStubs {
         canSendHeld: canSendHeld,
         publishPSM: publishPSM, unpublished: unpublished, openL2CAPResult: openL2CAPResult,
         openL2CAPDelayNanos: openL2CAPDelayNanos, psmResult: psmResult, l2capInbound: inbound.continuation,
-        publishHeld: publishHeld)
+        publishHeld: publishHeld, publishEncryption: publishEncryption, openL2CAPHeld: openL2CAPHeld)
 }
 
 /// A scripted L2CAP connection. Nonisolated on purpose: tests build it inside
@@ -1178,8 +1184,27 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     let (adapter, stubs, _) = await onlineAdapter()
     let svc = await stubs.calls.addedServices.last
     #expect(svc?.characteristics.contains { $0.id == psmCharUUID && $0.properties == .read && $0.value == Data([0x81, 0x00]) } == true)
+    // The wire spec's listener is unencrypted: one publish, withEncryption == false.
+    #expect(stubs.publishEncryption.value == [false])
     await adapter.stop()
     #expect(stubs.unpublished.value == [0x0081])
+}
+
+@Test @MainActor func l2capDisabledPublishesNoPSMAndNoListener() async {
+    let stubs = makeStubs()
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
+    let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity, l2capEnabled: false))
+    stubs.peripheralState.yield(.poweredOn)
+    stubs.centralState.yield(.poweredOn)
+    #expect(await collect(events, count: 1) == [.ready])                      // GATT-only bring-up still succeeds
+    #expect(await stubs.calls.publishesStarted == 0, "the kill switch must not publish an L2CAP listener")
+    #expect(stubs.publishEncryption.value.isEmpty)
+    let added = await stubs.calls.addedServices
+    #expect(added.count == 1)
+    #expect(added.last?.characteristics.contains { $0.id == identityCharUUID } == true)
+    #expect(added.last?.characteristics.contains { $0.id == psmCharUUID } == false, "no PSM characteristic when disabled")
+    await adapter.stop()
+    #expect(stubs.unpublished.value.isEmpty, "nothing was published, so stop() unpublishes nothing")
 }
 
 @Test @MainActor func bringUpWithoutL2CAPSupportOmitsPSMCharacteristic() async {
@@ -1424,16 +1449,37 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
 @Test @MainActor func disconnectDuringL2CAPOpenFailsWithoutDisconnecting() async {
     let (adapter, stubs, events) = await onlineAdapter()
     let p = peer(6)
+    // One consumer for the whole test: a timed-out `collect` would finish the event stream.
+    let recorded = LockIsolated<[BLEDriverEvent]>([])
+    let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
+    let discoveries: @Sendable () -> Int = { recorded.value.filter { $0 == .peerDiscovered(p) }.count }
+    // Seen once: until a disconnect forgets it, a re-scan inside the cooldown is not offered again.
+    let scan = stubs.scanCont
+    scan.yield(disc(p))
+    #expect(await waitUntil(within: eventWait) { discoveries() == 1 })
     let closed = LockIsolated(false)
     stubs.openL2CAPResult.setValue(fakeConnection(peerID: p.id, psm: 0x0081, closed: closed))
-    stubs.openL2CAPDelayNanos.setValue(300_000_000)
+    stubs.openL2CAPHeld.setValue(true)                   // the open stays in flight until released below
     let calls = stubs.calls
     let opening = Task { await adapter.openL2CAPChannel(p, psm: 0x0081) }
     #expect(await waitUntil(within: eventWait) { await calls.l2capOpensStarted >= 1 })
     stubs.centralEvents.yield(.didDisconnect(Peripheral(id: p.id, name: nil, state: .disconnected), nil))
+    // Gate on the didDisconnect handler having run (it forgets the peer, so a re-scan is offered
+    // again) before the open is released — no reliance on a fixed open delay.
+    let handled = await waitUntil(within: eventWait) {
+        scan.yield(disc(p))
+        return discoveries() >= 2
+    }
+    #expect(handled, "the didDisconnect handler must have run before the open is released")
+    stubs.openL2CAPHeld.setValue(false)
     await opening.value
-    let got = await collect(events, count: 1)
-    guard case let .channelFailed(failed, reason)? = got.first else { Issue.record("expected channelFailed, got \(got)"); await adapter.stop(); return }
+    let failedEvent: @Sendable () -> BLEDriverEvent? = {
+        recorded.value.first { if case .channelFailed = $0 { return true }; return false }
+    }
+    #expect(await waitUntil(within: eventWait) { failedEvent() != nil })
+    drain.cancel()
+    guard case let .channelFailed(failed, reason)? = failedEvent() else { Issue.record("expected channelFailed, got \(recorded.value)"); await adapter.stop(); return }
+    #expect(!recorded.value.contains { if case .channelOpened = $0 { return true }; return false })
     #expect(failed == p)
     #expect(reason == "\(FCBAdapterError.peerDisconnected)")
     #expect(closed.value, "a connection that opened onto a dropped link must be closed")

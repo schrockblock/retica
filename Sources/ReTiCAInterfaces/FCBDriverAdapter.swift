@@ -186,14 +186,18 @@ actor FCBDriverAdapter {
             guard epoch == myEpoch else { return }
         }
         do {
-            // nil (throw) or 0: this platform cannot listen → publish the v2.2 service only.
-            let published = try? await peripheral.publishL2CAPChannel(false)
-            guard epoch == myEpoch else {
-                // The session ended mid-publish, after its resetSession ran: nobody else will unpublish this one.
-                if let published, published != 0 { await peripheral.unpublishL2CAPChannel(published) }
-                return
+            var psm: UInt16? = nil
+            if config.l2capEnabled {
+                // nil (throw) or 0: this platform cannot listen → publish the v2.2 service only.
+                let published = try? await peripheral.publishL2CAPChannel(false)
+                guard epoch == myEpoch else {
+                    // The session ended mid-publish, after its resetSession ran: nobody else will unpublish this one.
+                    if let published, published != 0 { await peripheral.unpublishL2CAPChannel(published) }
+                    return
+                }
+                psm = (published ?? 0) == 0 ? nil : published
             }
-            let psm: UInt16? = (published ?? 0) == 0 ? nil : published
+            // l2capEnabled == false: no listener and no PSM characteristic — a GATT-only node.
             publishedPSM = psm
             _ = try await peripheral.add(bleV22Service(localIdentity: config.localIdentity, psm: psm))
             guard epoch == myEpoch else { return }
@@ -532,8 +536,8 @@ actor FCBDriverAdapter {
     func openL2CAPChannel(_ peer: BLEPeerHandle, psm: UInt16) async {
         let myEpoch = epoch
         let channelID = BLEChannelID(id: UUID())
-        opening.insert(channelID)
-        defer { opening.remove(channelID) }
+        // No `opening`/`earlyChunks` bookkeeping here (unlike openChannel): this channel's pump is
+        // only created after registration, so no chunk can arrive for it before the maps exist.
         pendingOpens.insert(peer.id)
         abortedOpens.remove(peer.id)
         defer { pendingOpens.remove(peer.id) }
@@ -584,10 +588,6 @@ actor FCBDriverAdapter {
             if epoch == myEpoch { continuation?.yield(.channelFailed(peer, reason: "\(FCBAdapterError.peerDisconnected)")) }
             return
         }
-        let pump = Task { [conn] in
-            for await chunk in conn.incoming() { self.emitChannelData(channelID, chunk) }
-            await self.l2capDidClose(channelID, reason: "channel ended", disconnect: true)
-        }
         do {
             try await conn.send(Self.handshakeFrame(for: config.localIdentity))
             guard epoch == myEpoch else { throw FCBAdapterError.sessionEnded }
@@ -596,15 +596,16 @@ actor FCBDriverAdapter {
             outbound[channelID] = peer.id
             outboundByPeer[peer.id] = channelID
             l2cap[channelID] = conn
-            pumps[channelID] = pump
             continuation?.yield(.channelOpened(channelID, peer, direction: .outbound, mtu: 0, transport: .l2cap))
-            for chunk in earlyChunks.removeValue(forKey: channelID) ?? [] {
-                continuation?.yield(.channelData(channelID, chunk))
+            // The pump starts only once the channel is registered and announced: FCB buffers
+            // incoming chunks (and a stream end) until a consumer attaches, so nothing is lost,
+            // and every chunk it delivers finds the channel already live.
+            pumps[channelID] = Task { [conn] in
+                for await chunk in conn.incoming() { self.emitChannelData(channelID, chunk) }
+                await self.l2capDidClose(channelID, reason: "channel ended", disconnect: true)
             }
         } catch {
-            pump.cancel()
             await conn.close()
-            earlyChunks[channelID] = nil
             abortedOpens.remove(peer.id)
             // No disconnect and no forget: the reducer falls back to GATT on this same link.
             if epoch == myEpoch { continuation?.yield(.channelFailed(peer, reason: "\(error)")) }

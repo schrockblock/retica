@@ -68,6 +68,6 @@ Record MTU, throughput and latency here for the spec's §2.8 bitrate revision.
 - [ ] The lower identity's outbound L2CAP channel is the one surviving channel; logs on both sides show `transport: .l2cap`.
 - [ ] Small and > 391 B LXMF messages both ways over the channel; no fragmentation headers on the wire (packet capture or driver log).
 - [ ] Kill one app mid-transfer: the survivor gets `channelClosed` within the supervision timeout and re-establishes over L2CAP on relaunch.
-- [ ] Force the fallback: run one side with `l2capEnabled = false` — the pair establishes over GATT; then with both enabled but one side's PSM characteristic removed — GATT again; then with a PSM published but the listener unpublished — the 10 s open limit fires and the pair falls back to GATT on the same link without a reconnect.
-- [ ] iPhone ↔ Pi (v2.2): unchanged behaviour over GATT; the Pi never sees the PSM characteristic.
+- [ ] Force the fallback: run both sides with `l2capEnabled = false` — the pair establishes over GATT; then with both enabled but one side's PSM characteristic removed — GATT again; then with a PSM published but the listener unpublished — the open is refused (or the 10 s limit fires) and the pair falls back to GATT on the same link without a reconnect.
+- [ ] iPhone ↔ Pi (v2.2): unchanged behaviour over GATT; the Pi enumerates the PSM characteristic but ignores it.
 - [ ] Record throughput on L2CAP vs GATT for the spec's bitrate revision.
