@@ -77,6 +77,11 @@ actor FCBDriverAdapter {
     static let sendQueueCap = 256
     private var sendQueues: [BLEChannelID: [Data]] = [:]
     private var draining: Set<BLEChannelID> = []
+    // Central role backpressure: peripheral ids whose write-without-response queue is full
+    // (parked until isReadyToSendWriteWithoutResponse), and a per-peer count of those ready
+    // events so a check that sees one land while in flight re-checks instead of parking.
+    private var writeParked: Set<UUID> = []
+    private var writeReadyGeneration: [UUID: Int] = [:]
     // Peripheral role: inbound channels (one per subscribed central). Their send FIFOs are the
     // shared `sendQueues` above.
     static let heldWriteWindow: TimeInterval = 2
@@ -196,6 +201,8 @@ actor FCBDriverAdapter {
         outboundByPeer = [:]
         sendQueues = [:]
         draining = []
+        writeParked = []
+        writeReadyGeneration = [:]
         pendingOpens = []
         abortedOpens = []
         opening = []
@@ -222,11 +229,21 @@ actor FCBDriverAdapter {
     }
 
     private func handleCentralEvent(_ event: CentralEvent) async {
-        if case let .didDisconnect(p, _) = event {
+        switch event {
+        case let .didDisconnect(p, _):
             forget(p.id)
+            // A park belongs to the link that just dropped; a reconnect starts with an empty queue.
+            writeParked.remove(p.id)
+            writeReadyGeneration[p.id] = nil
             if pendingOpens.contains(p.id) { abortedOpens.insert(p.id) }
             // The link is already down — no redundant disconnect (would await on the only event loop).
             if let cid = outboundByPeer[p.id] { await outboundDidClose(cid, reason: "disconnected", disconnect: false) }
+        case let .isReadyToSendWriteWithoutResponse(p):
+            writeReadyGeneration[p.id, default: 0] += 1
+            writeParked.remove(p.id)
+            if let channel = outboundByPeer[p.id], sendQueues[channel] != nil { await drain(channel) }
+        default:
+            break
         }
     }
 
@@ -358,8 +375,7 @@ actor FCBDriverAdapter {
         defer { draining.remove(channel) }
         while let next = sendQueues[channel]?.first {
             if let peerID = outbound[channel] {
-                do { try await central.writeValue(next, peerID, bleV22RXCharUUID, .withoutResponse) }
-                catch { await outboundDidClose(channel, reason: "write failed: \(error)", disconnect: true); return }
+                guard await writeOutbound(channel, peerID, next) else { return }   // parked or closed
             } else if isInbound(channel) {
                 guard await notifyInbound(channel, next) else { return }   // parked or closed
             } else {
@@ -369,6 +385,31 @@ actor FCBDriverAdapter {
             sendQueues[channel]?.removeFirst()
         }
         sendQueues[channel] = nil
+    }
+
+    /// One write-without-response attempt for the drain loop (mirrors `notifyInbound`). true =
+    /// written, dequeue it; false = leave it queued (the peripheral's queue is full → parked until
+    /// isReadyToSendWriteWithoutResponse) or the channel closed.
+    private func writeOutbound(_ channel: BLEChannelID, _ peerID: UUID, _ fragment: Data) async -> Bool {
+        while true {
+            guard !writeParked.contains(peerID), outbound[channel] != nil else { return false }
+            let generation = writeReadyGeneration[peerID, default: 0]
+            let myEpoch = epoch
+            guard await central.canSendWriteWithoutResponse(peerID) else {
+                guard epoch == myEpoch else { return false }   // a session reset mid-check must not touch the next session
+                // A ready event landed while this check was in flight: it was meant for us, re-check now.
+                if generation != writeReadyGeneration[peerID, default: 0] { continue }
+                writeParked.insert(peerID)
+                return false
+            }
+            do {
+                try await central.writeValue(fragment, peerID, bleV22RXCharUUID, .withoutResponse)
+                return true
+            } catch {
+                await outboundDidClose(channel, reason: "write failed: \(error)", disconnect: true)
+                return false
+            }
+        }
     }
 
     func closeChannel(_ channel: BLEChannelID) async {

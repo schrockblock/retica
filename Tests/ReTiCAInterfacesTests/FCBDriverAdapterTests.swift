@@ -92,6 +92,8 @@ actor AdapterCalls {
     func write(_ d: Data, _ id: UUID, _ c: CBUUID, _ t: CBCharacteristicWriteType) { writes.append((d, id, c, t)) }
     func respond(_ id: UUID, _ code: CBATTError.Code) { responded.append((id, code)) }
     func update(_ d: Data, _ c: CBUUID, _ ids: [UUID]?) { updates.append((d, c, ids)) }
+    /// Payloads of the write-without-response calls only (the channel sends, not the handshake).
+    var withoutResponseWrites: [Data] { writes.filter { $0.3 == .withoutResponse }.map(\.0) }
 }
 
 @MainActor
@@ -122,6 +124,8 @@ struct AdapterStubs {
     let disconnectDuringHandshake: LockIsolated<Bool>  // fire .didDisconnect mid-handshake-write
     let readDelay: LockIsolated<UInt64>                // extra nanoseconds readValue sleeps before returning
     let updateDelayNanos: LockIsolated<UInt64>         // nanoseconds updateValue stays in flight before returning
+    let canSend: LockIsolated<Bool>                    // central.canSendWriteWithoutResponse return
+    let canSendDelayNanos: LockIsolated<UInt64>        // nanoseconds canSendWriteWithoutResponse stays in flight before returning
 }
 
 @MainActor
@@ -145,6 +149,8 @@ func makeStubs() -> AdapterStubs {
     let disconnectDuringHandshake = LockIsolated(false)
     let readDelay = LockIsolated<UInt64>(0)
     let updateDelayNanos = LockIsolated<UInt64>(0)
+    let canSend = LockIsolated(true)
+    let canSendDelayNanos = LockIsolated<UInt64>(0)
 
     let central = BluetoothCentralClient(
         state: { cState.makeStream() },
@@ -210,7 +216,14 @@ func makeStubs() -> AdapterStubs {
             }
         },
         openL2CAPChannel: { _, _ in throw BluetoothError.l2capNotSupported },
-        events: { cEvents.stream }
+        events: { cEvents.stream },
+        canSendWriteWithoutResponse: { _ in
+            // Like updateValue: the answer is decided when the check is made; the opt-in delay
+            // only keeps the check in flight before that answer is returned.
+            let result = canSend.value
+            if canSendDelayNanos.value > 0 { try? await Task.sleep(nanoseconds: canSendDelayNanos.value) }
+            return result
+        }
     )
 
     let peripheral = BluetoothPeripheralClient(
@@ -251,7 +264,8 @@ func makeStubs() -> AdapterStubs {
         identityResult: identityResult, charsResult: charsResult, writeShouldThrow: writeShouldThrow,
         mtu: mtu, updateResult: updateResult, notifications: notifications, terminated: terminated,
         notifyOnHandshake: notifyOnHandshake, disconnectDuringHandshake: disconnectDuringHandshake,
-        readDelay: readDelay, updateDelayNanos: updateDelayNanos)
+        readDelay: readDelay, updateDelayNanos: updateDelayNanos,
+        canSend: canSend, canSendDelayNanos: canSendDelayNanos)
 }
 
 /// Collect up to `count` events (or until the stream ends, or ~2s elapses) with a bounded wait.
@@ -274,6 +288,16 @@ func collect(_ stream: AsyncStream<BLEDriverEvent>, count: Int) async -> [BLEDri
         group.cancelAll()
     }
     return acc.value
+}
+
+/// Polls `condition` every 10 ms until it holds or `nanos` elapse; returns whether it held.
+func waitUntil(within nanos: UInt64, _ condition: @Sendable () async -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now + .nanoseconds(Int64(nanos))
+    while true {
+        if await condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
 }
 
 func peer(_ b: UInt8) -> BLEPeerHandle { BLEPeerHandle(id: UUID(uuidString: "0000000\(b)-0000-0000-0000-000000000000")!) }
@@ -593,6 +617,67 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     #expect(payload.count == 5)
     #expect(payload == [Data([1]), Data([2]), Data([3]), Data([9]), Data([8])]
             || payload == [Data([9]), Data([8]), Data([1]), Data([2]), Data([3])])
+    await adapter.stop()
+}
+
+// MARK: - Outbound write-without-response backpressure
+
+func readyToSend(_ h: BLEPeerHandle) -> CentralEvent {
+    .isReadyToSendWriteWithoutResponse(Peripheral(id: h.id, name: nil, state: .connected))
+}
+
+@Test @MainActor func outboundWriteParksWhenPeripheralCannotSendAndResumesOnReady() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(1)
+    guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
+    stubs.canSend.setValue(false)                       // CoreBluetooth's write-without-response queue is full
+    await adapter.send(cid, fragments: [Data([1]), Data([2])])
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    #expect(await stubs.calls.withoutResponseWrites == [], "no write-without-response while canSend is false")
+    stubs.canSend.setValue(true)
+    stubs.centralEvents.yield(readyToSend(p))
+    let calls = stubs.calls
+    let resumed = await waitUntil(within: 500_000_000) { await calls.withoutResponseWrites.count >= 2 }
+    #expect(resumed)
+    #expect(await calls.withoutResponseWrites == [Data([1]), Data([2])])
+    await adapter.stop()
+}
+
+@Test @MainActor func readyArrivingDuringTheCanSendCheckDoesNotParkForever() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(2)
+    guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
+    stubs.canSend.setValue(false)
+    stubs.canSendDelayNanos.setValue(200_000_000)       // the first check is in flight for 200 ms, then says false
+    let sending = Task { await adapter.send(cid, fragments: [Data([1])]) }
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    stubs.canSend.setValue(true)                        // every later check says true
+    stubs.canSendDelayNanos.setValue(0)
+    stubs.centralEvents.yield(readyToSend(p))           // consumed while the first check is still suspended
+    await sending.value
+    let calls = stubs.calls
+    // No second ready event is ever sent: only the generation re-check can get [1] out.
+    let written = await waitUntil(within: 500_000_000) { await calls.withoutResponseWrites.count >= 1 }
+    #expect(written, "false after a consumed ready must re-check, not park")
+    #expect(await calls.withoutResponseWrites == [Data([1])])
+    // Still unparked: a later send goes straight out with no further ready event.
+    await adapter.send(cid, fragments: [Data([2])])
+    #expect(await calls.withoutResponseWrites == [Data([1]), Data([2])])
+    await adapter.stop()
+}
+
+@Test @MainActor func writeParkIsClearedOnDisconnect() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(3)
+    guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
+    stubs.canSend.setValue(false)
+    await adapter.send(cid, fragments: [Data([1])])     // parks the peer (parking itself is covered above)
+    stubs.centralEvents.yield(.didDisconnect(Peripheral(id: p.id, name: nil, state: .disconnected), nil))
+    guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed"); await adapter.stop(); return }
+    stubs.canSend.setValue(true)
+    guard let cid2 = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
+    await adapter.send(cid2, fragments: [Data([2])])
+    #expect(await stubs.calls.withoutResponseWrites.contains(Data([2])), "a park must not outlive the link it was for")
     await adapter.stop()
 }
 
