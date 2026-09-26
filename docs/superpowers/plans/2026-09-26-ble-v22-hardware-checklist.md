@@ -45,3 +45,19 @@ Spec: `docs/superpowers/specs/2026-09-26-ble-v22-gatt-driver-design.md`.
 
 ## Results
 Record MTU, throughput and latency here for the spec's §2.8 bitrate revision.
+
+## Added after the whole-branch review
+- [ ] Packet sizes where length mod (mtu − 5) = 11 (e.g. 188 B at MTU 182) reach the Pi intact:
+      no 16-byte fragment on the wire, and no `consuming as handshake` warning in the Pi log.
+- [ ] A resource-transfer burst (> 391 B message) does not lose fragments. **BLOCKER until the
+      FCB write-without-response backpressure lands** (spec §3.4 known limit (c)).
+- [ ] Bluetooth toggled off and on while `waitingForAdapter` recovers with exactly one service
+      and one advertisement (no duplicate service, no alreadyAdvertising retry loop).
+- [ ] Disconnect mid-`openChannel` on live hardware recovers within the 15 s establish deadline.
+- [ ] Two centrals subscribed to one Pi: the Pi's notifications are broadcast to all
+      subscribers, so foreign fragments enter our reassembler. Confirm our packets still
+      reassemble and nothing wedges.
+- [ ] Closing an outbound channel while an inbound channel from the same device is live on the
+      same ACL link: does the inbound channel survive?
+- [ ] An idle GATT link left after a cross-connect deadline is released by the peer's
+      supervision timeout.
