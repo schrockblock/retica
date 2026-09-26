@@ -14,7 +14,11 @@ final class V22SpecDelegate: CBMPeripheralSpecDelegate, @unchecked Sendable {
 
     func peripheral(_ peripheral: CBMPeripheralSpec,
                     didReceiveReadRequestFor characteristic: CBMCharacteristicMock) -> Result<Data, any Error> {
-        characteristic.uuid == identityCharUUID ? .success(identity) : .failure(CBATTError(.attributeNotFound))
+        switch characteristic.uuid {
+        case identityCharUUID: return .success(identity)
+        case psmCharUUID:      return .success(Data([0x81, 0x00]))     // 0x0081 little-endian
+        default:               return .failure(CBATTError(.attributeNotFound))
+        }
     }
     func peripheral(_ peripheral: CBMPeripheralSpec,
                     didReceiveWriteRequestFor characteristic: CBMCharacteristicMock, data: Data) -> Result<Void, any Error> {
@@ -104,6 +108,54 @@ struct FCBDriverAdapterCBMTests {
         let data = await waitFor { if case .channelData = $0 { return true }; return false }
         #expect(data == .channelData(cid, Data([0x01, 0x00, 0x00, 0x00, 0x01, 0x42])))
 
+        await driver.stop()
+    }
+
+    @Test func realCentralFallsBackToGattWhenL2CAPOpenIsUnsupported() async throws {
+        CBMCentralManagerMock.tearDownSimulation()
+        CBMCentralManagerMock.simulateInitialState(.poweredOn)
+        let id = UUID()
+        let tx = CBMCharacteristicMock(type: txCharUUID, properties: [.read, .notify])
+        let rx = CBMCharacteristicMock(type: rxCharUUID, properties: [.write, .writeWithoutResponse])
+        let ident = CBMCharacteristicMock(type: identityCharUUID, properties: [.read])
+        let psm = CBMCharacteristicMock(type: psmCharUUID, properties: [.read])
+        let service = CBMServiceMock(type: serviceUUID, primary: true, characteristics: tx, rx, ident, psm)
+        let delegate = V22SpecDelegate()
+        let spec = CBMPeripheralSpec
+            .simulatePeripheral(identifier: id, proximity: .near)
+            .advertising(advertisementData: [CBMAdvertisementDataServiceUUIDsKey: [serviceUUID],
+                                             CBMAdvertisementDataIsConnectable: true as NSNumber], withInterval: 0.05)
+            .connectable(name: "v3-node", services: [service], delegate: delegate, connectionInterval: 0.01)
+            .build()
+        CBMCentralManagerMock.simulatePeripherals([spec])
+
+        let driver = BLEDriver.fcb(central: .mocked(), peripheral: noopPeripheralClient())
+        let events = driver.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+        let buffer = LockIsolated<[BLEDriverEvent]>([])
+        let pump = Task { for await e in events { buffer.withValue { $0.append(e) } } }
+        defer { pump.cancel() }
+        func waitFor(_ match: @Sendable @escaping (BLEDriverEvent) -> Bool) async -> BLEDriverEvent? {
+            for _ in 0..<300 {
+                if let hit = buffer.withValue({ $0.first(where: match) }) { return hit }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            return nil
+        }
+
+        guard case let .peerDiscovered(handle)? = await waitFor({ if case .peerDiscovered = $0 { return true }; return false })
+        else { Issue.record("no peerDiscovered"); await driver.stop(); return }
+        await driver.readIdentity(handle)
+        let read = await waitFor { if case .identityRead = $0 { return true }; if case .identityFailed = $0 { return true }; return false }
+        #expect(read == .identityRead(handle, identity: delegate.identity, psm: 0x0081))
+
+        await driver.openL2CAPChannel(handle, 0x0081)          // CBM cannot open L2CAP → channelFailed, link kept
+        let failed = await waitFor { if case .channelFailed = $0 { return true }; return false }
+        #expect(failed != nil)
+        await driver.openChannel(handle)                        // the reducer's fallback, driven by hand here
+        let opened = await waitFor { if case .channelOpened = $0 { return true }; return false }
+        guard case let .channelOpened(_, h, dir, _, transport)? = opened else { Issue.record("expected channelOpened after fallback, got \(String(describing: opened))"); await driver.stop(); return }
+        #expect(h == handle && dir == .outbound && transport == .gatt)
+        #expect(delegate.writes.value.first == adapterLocalIdentity)   // the GATT handshake reached the peripheral
         await driver.stop()
     }
 }
