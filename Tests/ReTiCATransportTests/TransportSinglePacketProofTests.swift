@@ -125,3 +125,96 @@ private func sendAndCapture(_ store: TestStore<Transport.State, Transport.Action
     #expect(store.state.pendingReceipts[soonestKey] == nil)
     #expect(store.state.pendingReceipts[newKey]?.token == Data([0x77]))
 }
+
+/// Transport state holding one receipt for a packet with hash `packetHash`, sent to `recipient`.
+private func stateAwaitingProof(of packetHash: Data, from recipient: Identity, token: Data) -> Transport.State {
+    var state = Transport.State()
+    state.interfaces[ifID] = .default
+    state.pendingReceipts[Data(packetHash.prefix(16))] = Transport.State.PendingReceipt(
+        packetHash: packetHash, token: token, identity: Identity(publicKey: recipient.publicKey)!,
+        expiresAt: now.addingTimeInterval(60))
+    return state
+}
+
+/// A raw PROOF packet addressed to `packetHash`'s proof destination.
+private func proofPacket(for packetHash: Data, payload: Data) -> Data {
+    try! Packet(headerType: .header1, packetType: .proof, transportType: .broadcast,
+                destinationType: .single, context: .none, contextFlag: false, hops: 1,
+                destinationHash: Data(packetHash.prefix(16)), transportId: nil, payload: payload).packed()
+}
+
+private let provedHash = Data(repeating: 0x5A, count: 32)
+private let otherHash = Data(repeating: 0x5B, count: 32)
+
+@Test @MainActor func proofValidationImplicitProofDeliversOnceAndClearsTheReceipt() async {
+    let recipient = Identity()
+    let token = Data("msg".utf8)
+    let raw = proofPacket(for: provedHash, payload: recipient.sign(provedHash))
+    let store = TestStore(initialState: stateAwaitingProof(of: provedHash, from: recipient, token: token)) {
+        Transport()
+    }
+    await store.send(.received(ifID, raw)) { $0.pendingReceipts = [:] }
+    await store.receive(.delegate(.singlePacketDelivered(token: token)))
+    await store.send(.received(ifID, raw))   // a duplicate proof misses the lookup: nothing
+}
+
+@Test @MainActor func proofValidationExplicitProofDelivers() async {
+    let recipient = Identity()
+    let token = Data("msg".utf8)
+    let raw = proofPacket(for: provedHash, payload: provedHash + recipient.sign(provedHash))
+    let store = TestStore(initialState: stateAwaitingProof(of: provedHash, from: recipient, token: token)) {
+        Transport()
+    }
+    await store.send(.received(ifID, raw)) { $0.pendingReceipts = [:] }
+    await store.receive(.delegate(.singlePacketDelivered(token: token)))
+}
+
+@Test @MainActor func proofValidationWrongSignerIsIgnoredAndKeepsTheReceipt() async {
+    let raw = proofPacket(for: provedHash, payload: Identity().sign(provedHash))
+    let store = TestStore(initialState: stateAwaitingProof(of: provedHash, from: Identity(), token: Data([1]))) {
+        Transport()
+    }
+    await store.send(.received(ifID, raw))   // exhaustive: no state change, no delegate
+}
+
+@Test @MainActor func proofValidationUnknownHashIsIgnored() async {
+    let recipient = Identity()
+    let raw = proofPacket(for: otherHash, payload: recipient.sign(otherHash))
+    let store = TestStore(initialState: stateAwaitingProof(of: provedHash, from: recipient, token: Data([1]))) {
+        Transport()
+    }
+    await store.send(.received(ifID, raw))
+}
+
+@Test @MainActor func proofValidationWrongLengthIsIgnored() async {
+    let recipient = Identity()
+    let raw = proofPacket(for: provedHash, payload: recipient.sign(provedHash) + Data([0x00]))   // 65 bytes
+    let store = TestStore(initialState: stateAwaitingProof(of: provedHash, from: recipient, token: Data([1]))) {
+        Transport()
+    }
+    await store.send(.received(ifID, raw))
+}
+
+/// An explicit proof whose signature is valid but whose embedded hash is not the receipt's must be
+/// rejected (reference: `proof_hash == self.hash`, Packet.py:486).
+@Test @MainActor func proofValidationExplicitProofWithAMismatchedHashIsIgnored() async {
+    let recipient = Identity()
+    let raw = proofPacket(for: provedHash, payload: otherHash + recipient.sign(provedHash))
+    let store = TestStore(initialState: stateAwaitingProof(of: provedHash, from: recipient, token: Data([1]))) {
+        Transport()
+    }
+    await store.send(.received(ifID, raw))
+}
+
+/// Proofs bypass the packet-hash dedup ring.
+@Test @MainActor func proofValidationProofIsNotRecordedInTheDedupRing() async throws {
+    let recipient = Identity()
+    let raw = proofPacket(for: provedHash, payload: provedHash + recipient.sign(provedHash))
+    let store = TestStore(initialState: stateAwaitingProof(of: provedHash, from: recipient, token: Data([1]))) {
+        Transport()
+    }
+    store.exhaustivity = .off
+    await store.send(.received(ifID, raw))
+    await store.receive { if case .delegate(.singlePacketDelivered) = $0 { return true }; return false }
+    #expect(!store.state.seenPacketHashes.contains(try #require(Packet(raw: raw)).packetHash))
+}

@@ -294,6 +294,8 @@ public struct Transport {
             case sendFailed(destinationHash: Data, reason: SendFailure)
             case linkPacket(linkID: Data, arrivalInterface: InterfaceID, data: Data)
             case linkRequest(destinationHash: Data, arrivalInterface: InterfaceID, data: Data)
+            /// A valid proof arrived for a packet sent with `receiptToken`; the receipt is gone.
+            case singlePacketDelivered(token: Data)
         }
     }
 
@@ -479,7 +481,9 @@ public struct Transport {
                 // prevents replays that mutate non-blob bytes (appData/signature/hops/transport_id)
                 // from bypassing dedup, and matches RNS (Transport.py:1807/1824). Non-announce
                 // packets keep packetHash dedup for loop protection.
-                if packet.packetType != .announce {
+                // Proofs are not deduped either: a proof is matched against `pendingReceipts`, and a
+                // duplicate proof for a receipt already removed simply misses that lookup.
+                if packet.packetType != .announce, packet.packetType != .proof {
                     guard state.seenPacketHashes.insert(packet.packetHash) else { return .none }
                 }
 
@@ -755,8 +759,30 @@ public struct Transport {
                         return .send(.delegate(.transmit(entry.interfaceID, raw)))
                     }
                     return .none
-                default:
-                    return .none
+                case .proof:
+                    // A delivery proof for a single packet we sent with a receipt token (RNS
+                    // Transport.py:2334-2360 → PacketReceipt.validate_proof, Packet.py:480-515). It is
+                    // addressed to our packet's ProofDestination, `packetHash[:16]`, which is exactly
+                    // the `pendingReceipts` key — so where reference tries an implicit proof against
+                    // every outstanding receipt, one lookup finds the only candidate.
+                    guard packet.destinationType == .single,
+                          let receipt = state.pendingReceipts[packet.destinationHash]
+                    else { return .none }
+                    let valid: Bool
+                    switch packet.payload.count {
+                    case Transport.implicitProofLength:
+                        valid = receipt.identity.validate(signature: packet.payload, message: receipt.packetHash)
+                    case Transport.explicitProofLength:
+                        valid = packet.payload.prefix(32) == receipt.packetHash
+                            && receipt.identity.validate(signature: Data(packet.payload.suffix(64)),
+                                                         message: receipt.packetHash)
+                    default:
+                        valid = false
+                    }
+                    // A bad proof leaves the receipt in place, so a later genuine proof still confirms.
+                    guard valid else { return .none }
+                    state.pendingReceipts[packet.destinationHash] = nil
+                    return .send(.delegate(.singlePacketDelivered(token: receipt.token)))
                 }
 
             case .startMaintenance:
@@ -1229,6 +1255,10 @@ public struct Transport {
     /// (Transport.py:570-575); ReTiCA evicts the one expiring soonest, which is the one least
     /// likely to still be proved.
     static let maxPendingReceipts = 1024
+    /// RNS `PacketReceipt.IMPL_LENGTH` (Packet.py:399): an implicit proof is the bare signature.
+    static let implicitProofLength = 64
+    /// RNS `PacketReceipt.EXPL_LENGTH` (Packet.py:398): packet hash (32) ‖ signature (64).
+    static let explicitProofLength = 96
 
     /// Record `receipt` under `packetHash.prefix(16)`, evicting the soonest-expiring entry when a
     /// NEW key would exceed `maxPendingReceipts`.

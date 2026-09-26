@@ -50,3 +50,10 @@ private func makeEndpoint() -> TestStore<TransportEndpoint.State, TransportEndpo
     await store.send(.send(destinationHash: dest, plaintext: plaintext, receiptToken: token))
     await store.receive(.transport(.send(destinationHash: dest, plaintext: plaintext, receiptToken: token)))
 }
+
+@Test @MainActor func proofValidationEndpointForwardsSinglePacketDelivered() async {
+    let store = makeEndpoint()
+    let token = Data([0xCD])
+    await store.send(.transport(.delegate(.singlePacketDelivered(token: token))))
+    await store.receive(.delegate(.singlePacketDelivered(token: token)))
+}

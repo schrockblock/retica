@@ -82,3 +82,26 @@ private let proofIfID = InterfaceID("tcp-1")
                                             packetHash: f.dataPacketHashBytes,
                                             interfaceID: proofIfID)))
 }
+
+/// Genuine RNS proofs — both forms — confirm a ReTiCA receipt for the proved packet.
+@MainActor
+private func assertReferenceProofConfirms(_ proofPacket: Data, _ f: ProofVectorFixtures) async {
+    let token = Data("lxmf message hash".utf8)
+    var initial = Transport.State()
+    initial.interfaces[proofIfID] = .default
+    initial.pendingReceipts[Data(f.dataPacketHashBytes.prefix(16))] = Transport.State.PendingReceipt(
+        packetHash: f.dataPacketHashBytes, token: token, identity: f.publicIdentity, expiresAt: .distantFuture)
+    let store = TestStore(initialState: initial) { Transport() }
+    await store.send(.received(proofIfID, proofPacket)) { $0.pendingReceipts = [:] }
+    await store.receive(.delegate(.singlePacketDelivered(token: token)))
+}
+
+@Test @MainActor func proofValidationAcceptsReferenceImplicitProof() async throws {
+    let f = try ProofVectorFixtures.load()
+    await assertReferenceProofConfirms(f.implicitProofPacketBytes, f)
+}
+
+@Test @MainActor func proofValidationAcceptsReferenceExplicitProof() async throws {
+    let f = try ProofVectorFixtures.load()
+    await assertReferenceProofConfirms(f.explicitProofPacketBytes, f)
+}

@@ -126,6 +126,9 @@ public struct TransportEndpoint {
             case requestFailed(linkID: Data, requestID: Data)
             case packetDelivered(token: Data)
             case packetDeliveryFailed(token: Data)
+            /// A single (non-link) packet sent with a receipt token was proved. Distinct from
+            /// `packetDelivered(token:)`, which stays link-only.
+            case singlePacketDelivered(token: Data)
         }
     }
 
@@ -253,6 +256,8 @@ public struct TransportEndpoint {
             case let .transport(.delegate(.received(h, p, packetHash, interfaceID))):
                 return .send(.delegate(.messageReceived(destinationHash: h, plaintext: p,
                                                         packetHash: packetHash, interfaceID: interfaceID)))
+            case let .transport(.delegate(.singlePacketDelivered(token))):
+                return .send(.delegate(.singlePacketDelivered(token: token)))
             case let .transport(.delegate(.pathLearned(h, hops))):
                 return .send(.delegate(.pathLearned(destinationHash: h, hops: hops)))
             case let .transport(.delegate(.sendFailed(h, r))):
