@@ -86,10 +86,13 @@ public struct BLEDriver: Sendable {
 }
 
 extension BLEDriver: DependencyKey {
-    // Task 6 replaces this with the FCB-backed adapter.
     public static var liveValue: BLEDriver {
-        BLEDriver(start: { _ in .finished }, readIdentity: { _ in }, openChannel: { _ in },
-                  send: { _, _ in }, closeChannel: { _ in }, stop: {})
+        #if canImport(CoreBluetooth) && (os(iOS) || os(macOS))
+        return .fcb(central: .liveValue, peripheral: .liveValue)
+        #else
+        return BLEDriver(start: { _ in .finished }, readIdentity: { _ in }, openChannel: { _ in },
+                         send: { _, _ in }, closeChannel: { _ in }, stop: {})
+        #endif
     }
 
     public static let testValue = BLEDriver(
