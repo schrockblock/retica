@@ -200,3 +200,104 @@ public struct BLEFragmenter: Equatable, Sendable {
         return out
     }
 }
+
+public enum BLEReassemblyError: Error, Equatable {
+    case tooShort(Int)
+    case badType(UInt8)
+    case badSequence(UInt16, total: UInt16)
+    case zeroTotal
+    case totalMismatch(expected: UInt16, got: UInt16)
+    case conflictingDuplicate(UInt16)
+}
+
+/// Port of ble_reticulum.BLEFragmentation.BLEReassembler for ONE peer. Buffers are keyed by
+/// `total` exactly as the reference does (its packet_key collapses to (sender, 0, total)):
+/// sequence 0 starts or restarts the buffer for that total; other sequences join it.
+/// Bounded: at most `maxInFlight` buffers (oldest evicted) and a stale purge on completion.
+public struct BLEReassembler: Equatable, Sendable {
+    public static let staleAge: TimeInterval = 30
+    public static let maxInFlight = 8
+
+    private struct Buffer: Equatable, Sendable {
+        var fragments: [UInt16: Data] = [:]
+        var total: UInt16
+        var startedAt: Date
+    }
+    private var buffers: [UInt16: Buffer] = [:]
+
+    public init() {}
+
+    public var inFlightCount: Int { buffers.count }
+
+    public mutating func receive(_ fragment: Data, now: Date) throws -> Data? {
+        let f = Data(fragment)
+        guard f.count >= BLEFragmenter.headerLength else { throw BLEReassemblyError.tooShort(f.count) }
+        guard BLEFragmentType(rawValue: f[0]) != nil else { throw BLEReassemblyError.badType(f[0]) }
+        let sequence = UInt16(f[1]) << 8 | UInt16(f[2])
+        let total = UInt16(f[3]) << 8 | UInt16(f[4])
+        guard total != 0 else { throw BLEReassemblyError.zeroTotal }
+        guard sequence < total else { throw BLEReassemblyError.badSequence(sequence, total: total) }
+        let payload = Data(f[BLEFragmenter.headerLength...])
+
+        if sequence == 0 {
+            if let existing = buffers[total]?.fragments[0] {
+                if existing == payload { return nil }          // benign retransmit
+                // Conflicting sequence 0: different payload
+                // If we only have fragment 0, it's a conflict/corruption
+                if buffers[total]!.fragments.count == 1 {
+                    buffers[total] = nil
+                    throw BLEReassemblyError.conflictingDuplicate(0)
+                }
+                // If we have multiple fragments, this is a fresh start for same total, restart the buffer
+                buffers[total] = Buffer(fragments: [0: payload], total: total, startedAt: buffers[total]!.startedAt)
+            } else if buffers[total] == nil {
+                buffers[total] = Buffer(fragments: [0: payload], total: total, startedAt: now)
+            } else {
+                buffers[total]!.fragments[0] = payload
+            }
+        } else {
+            if buffers[total] == nil {
+                buffers[total] = Buffer(fragments: [:], total: total, startedAt: now)
+            }
+            guard buffers[total]!.total == total else {
+                let expected = buffers[total]!.total
+                buffers[total] = nil
+                throw BLEReassemblyError.totalMismatch(expected: expected, got: total)
+            }
+            if let existing = buffers[total]!.fragments[sequence] {
+                if existing == payload { return nil }          // benign retransmit
+                buffers[total] = nil
+                throw BLEReassemblyError.conflictingDuplicate(sequence)
+            }
+            buffers[total]!.fragments[sequence] = payload
+        }
+        evictIfOverCapacity()
+
+        guard let buffer = buffers[total], buffer.fragments.count == Int(total) else { return nil }
+        var packet = Data()
+        for i in 0..<total {
+            guard let part = buffer.fragments[i] else { return nil }
+            packet.append(part)
+        }
+        buffers[total] = nil
+        purgeStale(now: now)
+        return packet
+    }
+
+    private mutating func evictIfOverCapacity() {
+        while buffers.count > Self.maxInFlight {
+            guard let oldest = buffers.min(by: { $0.value.startedAt < $1.value.startedAt }) else { return }
+            buffers[oldest.key] = nil
+        }
+    }
+
+    private mutating func purgeStale(now: Date) {
+        buffers = buffers.filter { now.timeIntervalSince($0.value.startedAt) <= Self.staleAge }
+    }
+}
+
+/// Columba's 1-byte keepalive; every ble-reticulum peer filters it before reassembly.
+public enum BLEKeepalive {
+    public static let frame = Data([0x00])
+    public static func isKeepalive(_ data: Data) -> Bool { data.count == 1 && data[data.startIndex] == 0x00 }
+}
