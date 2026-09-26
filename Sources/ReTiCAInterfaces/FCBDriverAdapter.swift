@@ -137,6 +137,10 @@ actor FCBDriverAdapter {
     }
 
     private func bringUpPeripheral() async {
+        // A repeat poweredOn (Bluetooth toggled off→on) must not publish a second copy of the
+        // service or hit alreadyAdvertising: tear down whatever an earlier bring-up left behind.
+        await peripheral.stopAdvertising()
+        await peripheral.removeAll()
         do {
             _ = try await peripheral.add(bleV22Service(localIdentity: config.localIdentity))
             try await peripheral.startAdvertising(AdvertisementData(serviceUUIDs: [bleV22ServiceUUID]))
@@ -200,6 +204,11 @@ actor FCBDriverAdapter {
         scanning = false
         resetPeripheralSession()
         for peerID in peers { try? await central.disconnect(peerID) }
+        // A restart without stop() (the reducer's adapter retry) must leave the managers clean
+        // for the next bring-up: no scan, no advertisement, no published service.
+        await central.stopScan()
+        await peripheral.stopAdvertising()
+        await peripheral.removeAll()
         continuation?.finish()
         continuation = nil
     }
@@ -379,10 +388,7 @@ actor FCBDriverAdapter {
     }
 
     func stop() async {
-        await resetSession()
-        await central.stopScan()
-        await peripheral.stopAdvertising()
-        await peripheral.removeAll()
+        await resetSession()   // also stops scanning/advertising and removes the service
     }
 
     // MARK: - Peripheral role

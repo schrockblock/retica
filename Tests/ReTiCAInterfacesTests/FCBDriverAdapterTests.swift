@@ -74,13 +74,15 @@ actor AdapterCalls {
     var writes: [(Data, UUID, CBUUID, CBCharacteristicWriteType)] = []
     var responded: [(UUID, CBATTError.Code)] = []
     var updates: [(Data, CBUUID, [UUID]?)] = []
+    /// Relative order of the peripheral-manager bring-up/tear-down commands.
+    var peripheralOrder: [String] = []
 
-    func addService(_ s: MutableService) { addedServices.append(s) }
-    func advertise(_ d: AdvertisementData?) { advertised.append(d) }
+    func addService(_ s: MutableService) { addedServices.append(s); peripheralOrder.append("add") }
+    func advertise(_ d: AdvertisementData?) { advertised.append(d); peripheralOrder.append("startAdvertising") }
     func scan() { scanned += 1 }
     func stopScan() { stopScanned += 1 }
-    func stopAdvertising() { stoppedAdvertising += 1 }
-    func removeAll() { removedAll += 1 }
+    func stopAdvertising() { stoppedAdvertising += 1; peripheralOrder.append("stopAdvertising") }
+    func removeAll() { removedAll += 1; peripheralOrder.append("removeAll") }
     func connect(_ id: UUID) { connected.append(id) }
     func disconnect(_ id: UUID) { disconnected.append(id) }
     func discoverServices(_ id: UUID) { discoveredServices.append(id) }
@@ -362,6 +364,41 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     #expect(await collect(events1, count: 1) == [.ready])
     _ = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
     #expect(await collect(events1, count: 1) == [])   // finished, not hung
+    await adapter.stop()
+}
+
+@Test @MainActor func restartRemovesServicesAndStopsAdvertisingBeforeReAdding() async {
+    // Bluetooth off→on: the reducer restarts the driver without stop(). The old service and
+    // advertisement must be torn down, or the re-add duplicates the service and startAdvertising
+    // fails with alreadyAdvertising (an unavailable → retry loop).
+    let (adapter, stubs, _) = await onlineAdapter()
+    let events2 = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    // The new session's state streams read both managers as poweredOn again (the Broadcaster
+    // replays the current state to each new subscriber, as CoreBluetooth's `.state()` does).
+    #expect(await collect(events2, count: 1) == [.ready])
+    #expect(await stubs.calls.removedAll >= 2)
+    #expect(await stubs.calls.stoppedAdvertising >= 2)
+    #expect(await stubs.calls.stopScanned >= 1)
+    #expect(await stubs.calls.addedServices.count == 2)
+    await adapter.stop()
+}
+
+@Test @MainActor func secondPoweredOnCleansUpBeforeReAdding() async throws {
+    // A second poweredOn on the same session (no restart) re-runs the peripheral bring-up; it must
+    // remove the published service and stop advertising before adding the service again.
+    let (adapter, stubs, _) = await onlineAdapter()
+    stubs.peripheralState.yield(.poweredOn)
+    var waited = 0
+    while await stubs.calls.addedServices.count < 2, waited < 200 {
+        try? await Task.sleep(nanoseconds: 10_000_000)
+        waited += 1
+    }
+    let order = await stubs.calls.peripheralOrder
+    let adds = order.indices.filter { order[$0] == "add" }
+    try #require(adds.count == 2, "order: \(order)")
+    let between = order[(adds[0] + 1)..<adds[1]]   // after the first bring-up's add
+    #expect(between.contains("removeAll"), "order: \(order)")
+    #expect(between.contains("stopAdvertising"), "order: \(order)")
     await adapter.stop()
 }
 
