@@ -69,9 +69,12 @@ Steps 1–5 are time-boxed by the existing 15 s establishment deadline.
 1. A central subscribing to TX opens an inbound channel. Its fragment size is that central's
    `maximumUpdateValueLength`.
 2. The first RX write of **exactly 16 bytes** from a central with no known identity is its
-   handshake. This is ble-reticulum's detection rule verbatim; a genuine 16-byte fragment
-   cannot be misread because every data write carries a 5-byte header and is only accepted
-   after an identity is known.
+   handshake. The reference's rule is broader than ours: ble-reticulum
+   (`_handle_identity_handshake`) consumes ANY exactly-16-byte write or notification as a
+   handshake even once the peer's identity is known, so a genuine 16-byte data fragment
+   (5-byte header + 11-byte payload) would be silently dropped by every Pi and Columba. ReTiCA
+   therefore never emits a 16-byte fragment (§2.5). On receipt ReTiCA treats a 16-byte write
+   after the handshake as data.
 3. Established on handshake. RX writes before the handshake are dropped.
 4. No handshake within 10 s of the subscription → close + strike (replaces the HELLO
    deadline).
@@ -93,6 +96,12 @@ packet is type START with total = 1.
 
 - Payload size per fragment = `mtu − 5`, where `mtu` is the role-specific size from §2.3/§2.4,
   floored at 20 (so payload ≥ 15).
+- No fragment on the wire is ever 16 bytes (§2.4). `BLEFragmentSanitizer` post-processes the
+  pure fragmenter's output on send: an 11-byte packet is split 10 + 1 as START/END (total 2);
+  otherwise one payload byte moves from the penultimate fragment onto the 16-byte END, making
+  it 17. The reference reassembler concatenates payloads by sequence without checking their
+  sizes, so the uneven last pair is wire-legal. `BLEFragmenter` itself stays byte-identical to
+  the reference (the fixtures pin it).
 - Centrals send fragments as RX writes **without response**. Peripherals send fragments as
   TX notifications targeted at the one subscribed central.
 - Reassembly is per peer. A packet completes when all `total` sequences 0…total−1 are held.

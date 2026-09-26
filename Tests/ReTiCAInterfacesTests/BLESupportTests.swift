@@ -253,6 +253,84 @@ private let t0 = Date(timeIntervalSince1970: 10_000)
     #expect(r.inFlightCount == BLEReassembler.maxInFlight)              // nothing else evicted
 }
 
+// MARK: - Fragment sanitizer (no 16-byte fragment on the wire)
+
+/// Feeds `fragments` through a fresh reassembler; returns the packet only if it completes on the
+/// last fragment and on no earlier one.
+private func reassembleExactlyAtEnd(_ fragments: [Data]) throws -> Data? {
+    var r = BLEReassembler()
+    var result: Data? = nil
+    for (i, f) in fragments.enumerated() {
+        let got = try r.receive(f, now: t0)
+        if i < fragments.count - 1 { guard got == nil else { return nil } } else { result = got }
+    }
+    return result
+}
+
+@Test func sanitizerLeavesCleanOutputUntouched() throws {
+    let raw = try BLEFragmenter(mtu: 23).fragment(Data((0..<40).map { UInt8($0) }))   // 23, 23, 9
+    #expect(BLEFragmentSanitizer.avoidHandshakeCollision(raw) == raw)
+}
+
+@Test func sanitizerSplitsAnElevenBytePacket() throws {
+    let packet = Data((1...11).map { UInt8($0) })
+    let raw = try BLEFragmenter(mtu: 185).fragment(packet)
+    #expect(raw.map(\.count) == [16])
+    let out = BLEFragmentSanitizer.avoidHandshakeCollision(raw)
+    try #require(out.map(\.count) == [15, 6])
+    #expect(out[0].prefix(5) == Data([0x01, 0x00, 0x00, 0x00, 0x02]))   // START, seq 0, total 2
+    #expect(out[1].prefix(5) == Data([0x03, 0x00, 0x01, 0x00, 0x02]))   // END, seq 1, total 2
+    #expect(out[0].dropFirst(5) == packet.prefix(10))
+    #expect(out[1].dropFirst(5) == packet.suffix(1))
+    #expect(try reassembleExactlyAtEnd(out) == packet)
+}
+
+@Test func sanitizerRecutsTheLastPair() throws {
+    // 188 B at MTU 182 (payload 177): 177 + 11 → the raw END fragment is 16 bytes.
+    let packet = Data((0..<188).map { UInt8(truncatingIfNeeded: $0) })
+    let raw = try BLEFragmenter(mtu: 182).fragment(packet)
+    #expect(raw.map(\.count) == [182, 16])
+    let out = BLEFragmentSanitizer.avoidHandshakeCollision(raw)
+    try #require(out.map(\.count) == [181, 17])
+    #expect(out[0].prefix(5) == Data([0x01, 0x00, 0x00, 0x00, 0x02]))
+    #expect(out[1].prefix(5) == Data([0x03, 0x00, 0x01, 0x00, 0x02]))
+    #expect(out[0].dropFirst(5) == packet[0..<176])
+    #expect(out[1].dropFirst(5) == packet[176..<188])
+    #expect(try reassembleExactlyAtEnd(out) == packet)
+
+    // Three fragments: the penultimate is a CONTINUE and keeps its type; the START is untouched.
+    let longer = Data((0..<365).map { UInt8(truncatingIfNeeded: $0 &* 7) })   // 177 + 177 + 11
+    let raw3 = try BLEFragmenter(mtu: 182).fragment(longer)
+    #expect(raw3.map(\.count) == [182, 182, 16])
+    let out3 = BLEFragmentSanitizer.avoidHandshakeCollision(raw3)
+    try #require(out3.map(\.count) == [182, 181, 17])
+    #expect(out3[0] == raw3[0])
+    #expect(out3[1].prefix(5) == Data([0x02, 0x00, 0x01, 0x00, 0x03]))
+    #expect(out3[2].prefix(5) == Data([0x03, 0x00, 0x02, 0x00, 0x03]))
+    #expect(try reassembleExactlyAtEnd(out3) == longer)
+}
+
+@Test func noFragmentIsEverSixteenBytesAndAllRoundTrip() throws {
+    var sixteen: [String] = []
+    var oversize: [String] = []
+    var broken: [String] = []
+    for mtu in [20, 23, 182, 185, 517] {
+        let fragmenter = BLEFragmenter(mtu: mtu)
+        for length in 1...1500 {
+            let packet = Data((0..<length).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ length) })
+            let out = BLEFragmentSanitizer.avoidHandshakeCollision(try fragmenter.fragment(packet))
+            if out.contains(where: { $0.count == BLEFragmentSanitizer.forbiddenLength }) {
+                sixteen.append("mtu \(mtu) length \(length)")
+            }
+            if out.contains(where: { $0.count > mtu }) { oversize.append("mtu \(mtu) length \(length)") }
+            if try reassembleExactlyAtEnd(out) != packet { broken.append("mtu \(mtu) length \(length)") }
+        }
+    }
+    #expect(sixteen.count == 0, "16-byte fragments, first: \(sixteen.prefix(5))")
+    #expect(oversize.count == 0, "fragments over MTU, first: \(oversize.prefix(5))")
+    #expect(broken.count == 0, "failed round trips, first: \(broken.prefix(5))")
+}
+
 @Test func keepalivePredicateMatchesOnlyASingleZeroByte() {
     #expect(BLEKeepalive.isKeepalive(Data([0x00])))
     #expect(BLEKeepalive.frame == Data([0x00]))

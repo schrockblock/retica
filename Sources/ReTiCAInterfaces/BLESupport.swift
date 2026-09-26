@@ -129,6 +129,40 @@ public struct BLEFragmenter: Equatable, Sendable {
     }
 }
 
+/// ble-reticulum receivers treat ANY exactly-16-byte write/notification as an identity handshake
+/// once the peer is known (BLEInterface.py `_handle_identity_handshake`), so a fragment whose
+/// payload is 11 bytes would be swallowed. This post-pass re-cuts the LAST fragment so no fragment
+/// on the wire is 16 bytes: the reference reassembler concatenates payloads by sequence and never
+/// checks their sizes, so an uneven last pair is wire-legal.
+public enum BLEFragmentSanitizer {
+    public static let forbiddenLength = BLEProtocol.identityLength   // 16
+    /// `fragments` must be a complete, in-order output of `BLEFragmenter.fragment` with total ≥ 1.
+    public static func avoidHandshakeCollision(_ fragments: [Data]) -> [Data] {
+        guard let last = fragments.last, last.count == forbiddenLength else { return fragments }
+        let header = BLEFragmenter.headerLength
+        let total = UInt16(fragments.count)
+        func fragment(type: BLEFragmentType, sequence: Int, total: UInt16, payload: Data) -> Data {
+            var d = Data([type.rawValue, UInt8(sequence >> 8), UInt8(sequence & 0xFF), UInt8(total >> 8), UInt8(total & 0xFF)])
+            d.append(payload); return d
+        }
+        if fragments.count == 1 {
+            // An 11-byte packet: split it 10 + 1 as START/END, total 2.
+            let payload = Data(last.dropFirst(header))
+            return [fragment(type: .start, sequence: 0, total: 2, payload: payload.prefix(10)),
+                    fragment(type: .end, sequence: 1, total: 2, payload: payload.suffix(1))]
+        }
+        // Move one payload byte from the second-to-last fragment onto the last one (17 bytes).
+        var out = fragments
+        let prevIndex = fragments.count - 2
+        let prevPayload = Data(fragments[prevIndex].dropFirst(header))
+        let lastPayload = Data(last.dropFirst(header))
+        let prevType: BLEFragmentType = prevIndex == 0 ? .start : .cont
+        out[prevIndex] = fragment(type: prevType, sequence: prevIndex, total: total, payload: prevPayload.dropLast(1))
+        out[fragments.count - 1] = fragment(type: .end, sequence: fragments.count - 1, total: total, payload: prevPayload.suffix(1) + lastPayload)
+        return out
+    }
+}
+
 public enum BLEReassemblyError: Error, Equatable {
     case tooShort(Int)
     case badType(UInt8)

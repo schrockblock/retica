@@ -237,9 +237,11 @@ public struct BLEInterface {
 
             case let .send(peer, packet):
                 guard let channelID = state.peers[peer], let channel = state.channels[channelID] else { return .none }
-                guard let fragments = try? channel.fragmenter.fragment(packet) else {
+                guard let raw = try? channel.fragmenter.fragment(packet) else {
                     return .send(.delegate(.sendFailed(peer: peer, reason: .unfragmentable)))
                 }
+                // Never put a 16-byte fragment on the wire: ble-reticulum reads it as a handshake.
+                let fragments = BLEFragmentSanitizer.avoidHandshakeCollision(raw)
                 return .run { [bleDriver] _ in await bleDriver.send(channelID, fragments) }
 
             case let .keepalive(channelID):

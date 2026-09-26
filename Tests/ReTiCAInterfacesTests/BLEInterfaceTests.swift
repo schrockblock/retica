@@ -84,14 +84,14 @@ func makeOnlineStore(maxPeers: Int = BLEInterface.defaultMaxPeers, streams: Int 
 func establishOutbound(
     _ store: TestStore<BLEInterface.State, BLEInterface.Action>,
     _ events: AsyncStream<BLEDriverEvent>.Continuation,
-    handle: BLEPeerHandle, channel: BLEChannelID, identity: Data
+    handle: BLEPeerHandle, channel: BLEChannelID, identity: Data, mtu: Int = testMTU
 ) async {
     events.yield(.peerDiscovered(handle))
     await store.receive(.driverEvent(.peerDiscovered(handle)))
     events.yield(.identityRead(handle, identity: identity))
     await store.receive(.driverEvent(.identityRead(handle, identity: identity)))
-    events.yield(.channelOpened(channel, handle, direction: .outbound, mtu: testMTU))
-    await store.receive(.driverEvent(.channelOpened(channel, handle, direction: .outbound, mtu: testMTU)))
+    events.yield(.channelOpened(channel, handle, direction: .outbound, mtu: mtu))
+    await store.receive(.driverEvent(.channelOpened(channel, handle, direction: .outbound, mtu: mtu)))
     await store.receive(.delegate(.peerOnline(identity)))
 }
 
@@ -461,6 +461,26 @@ func establishInbound(
     await store.send(.send(peer: identityHigh, packet: Data()))
     #expect(calls.value.count == before)
     await store.receive(.delegate(.sendFailed(peer: identityHigh, reason: .unfragmentable)))
+    await store.send(.stop) { $0.status = .stopped }
+}
+
+@Test @MainActor func sendNeverEmitsASixteenByteFragment() async {
+    // ble-reticulum reads ANY 16-byte write from a known peer as a handshake. 188 B at MTU 182
+    // (payload 177) would leave an 11-byte tail — a 16-byte END fragment — without the sanitizer.
+    let (store, events, calls, _, _) = await makeOnlineStore(keepalive: nil)
+    await establishOutbound(store, events[0], handle: peerHandleA, channel: channel1, identity: identityHigh, mtu: 182)
+    let packet = Data((0..<188).map { UInt8(truncatingIfNeeded: $0) })
+    await store.send(.send(peer: identityHigh, packet: packet))
+    await store.finish()
+    let sends = calls.value.compactMap { if case let .send(c, d) = $0, c == channel1 { return d } else { return nil } }
+    #expect(sends.count == 1)
+    let fragments = sends.first ?? []
+    #expect(!fragments.isEmpty)
+    #expect(fragments.allSatisfy { $0.count != BLEProtocol.identityLength }, "sizes: \(fragments.map(\.count))")
+    var reassembler = BLEReassembler()
+    var reassembled: Data? = nil
+    for f in fragments { reassembled = (try? reassembler.receive(f, now: Date(timeIntervalSince1970: 0))) ?? nil }
+    #expect(reassembled == packet)
     await store.send(.stop) { $0.status = .stopped }
 }
 
