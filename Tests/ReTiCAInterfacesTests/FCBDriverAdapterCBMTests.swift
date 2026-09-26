@@ -44,6 +44,9 @@ func noopPeripheralClient() -> BluetoothPeripheralClient {
     client.writeRequests = { .finished }
     client.readRequests = { .finished }
     client.events = { .finished }
+    client.publishL2CAPChannel = { _ in throw BluetoothError.l2capNotSupported }
+    client.unpublishL2CAPChannel = { _ in }
+    client.l2capConnections = { .finished }
     return client
 }
 

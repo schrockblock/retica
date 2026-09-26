@@ -7,14 +7,22 @@ let bleV22ServiceUUID = CBUUID(string: BLEProtocol.serviceUUID)
 let bleV22TXCharUUID = CBUUID(string: BLEProtocol.txCharUUID)
 let bleV22RXCharUUID = CBUUID(string: BLEProtocol.rxCharUUID)
 let bleV22IdentityCharUUID = CBUUID(string: BLEProtocol.identityCharUUID)
+let bleV3PSMCharUUID = CBUUID(string: BLEProtocol.psmCharUUID)
 
-/// The ble-reticulum v2.2 GATT service: TX (read+notify), RX (write+WWR), Identity (read, static).
-func bleV22Service(localIdentity: Data) -> MutableService {
-    MutableService(id: bleV22ServiceUUID, isPrimary: true, characteristics: [
+/// The ble-reticulum v2.2 GATT service: TX (read+notify), RX (write+WWR), Identity (read, static),
+/// plus the v3 PSM characteristic (read, static, 2 bytes little-endian) when this node can accept
+/// L2CAP channels.
+func bleV22Service(localIdentity: Data, psm: UInt16? = nil) -> MutableService {
+    var chars = [
         MutableCharacteristic(id: bleV22TXCharUUID, properties: [.read, .notify], permissions: .readable, value: nil),
         MutableCharacteristic(id: bleV22RXCharUUID, properties: [.write, .writeWithoutResponse], permissions: .writeable, value: nil),
         MutableCharacteristic(id: bleV22IdentityCharUUID, properties: .read, permissions: .readable, value: localIdentity),
-    ])
+    ]
+    if let psm {
+        chars.append(MutableCharacteristic(id: bleV3PSMCharUUID, properties: .read, permissions: .readable,
+                                           value: Data([UInt8(psm & 0xFF), UInt8(psm >> 8)])))
+    }
+    return MutableService(id: bleV22ServiceUUID, isPrimary: true, characteristics: chars)
 }
 
 enum FCBAdapterError: Error, CustomStringConvertible {
@@ -26,12 +34,15 @@ enum FCBAdapterError: Error, CustomStringConvertible {
     /// The peer disconnected while `openChannel` was mid-handshake; the link is already down, so
     /// no further disconnect is issued, but this is reported as a real failure (not silent).
     case peerDisconnected
+    /// The L2CAP open did not complete within the adapter's limit.
+    case l2capOpenTimeout
     var description: String {
         switch self {
         case let .missingCharacteristic(name): return "peer lacks \(name) characteristic"
         case let .shortIdentity(n): return "identity read returned \(n) bytes"
         case .sessionEnded: return "session ended"
         case .peerDisconnected: return "peer disconnected during open"
+        case .l2capOpenTimeout: return "L2CAP open exceeded the limit"
         }
     }
 }
@@ -42,6 +53,8 @@ actor FCBDriverAdapter {
     private let central: BluetoothCentralClient
     private let peripheral: BluetoothPeripheralClient
     private let now: @Sendable () -> Date
+    /// How long openL2CAPChannel waits for the CoC to open before reporting channelFailed.
+    private let l2capOpenLimit: Duration
 
     /// Re-offer a seen peer after this long (discovery is a heartbeat the reducer re-evaluates).
     static let discoveryCooldown: TimeInterval = 5
@@ -92,12 +105,24 @@ actor FCBDriverAdapter {
     // flight retries instead of parking: the ready that would have unparked it is already consumed.
     private var readyGeneration = 0
     private var heldWrites: [UUID: (data: Data, at: Date)] = [:]
+    // v3 L2CAP: the PSM this session published (nil when the platform cannot listen), every live
+    // L2CAP channel (both roles), and which of those are inbound (→ the central's id).
+    private var publishedPSM: UInt16?
+    private var l2cap: [BLEChannelID: L2CAPConnection] = [:]
+    private var inboundL2CAP: [BLEChannelID: UUID] = [:]
+
+    /// The v3 handshake record written first on an outbound L2CAP channel: a 2-byte big-endian
+    /// length (16) followed by this node's identity.
+    static func handshakeFrame(for identity: Data) -> Data {
+        Data([0x00, UInt8(BLEProtocol.identityLength)]) + identity
+    }
 
     init(central: BluetoothCentralClient, peripheral: BluetoothPeripheralClient,
-         now: @escaping @Sendable () -> Date = { Date() }) {
+         now: @escaping @Sendable () -> Date = { Date() }, l2capOpenLimit: Duration = .seconds(10)) {
         self.central = central
         self.peripheral = peripheral
         self.now = now
+        self.l2capOpenLimit = l2capOpenLimit
     }
 
     nonisolated func start(_ config: BLEDriverConfig) -> AsyncStream<BLEDriverEvent> {
@@ -155,8 +180,22 @@ actor FCBDriverAdapter {
         guard epoch == myEpoch else { return }
         await peripheral.removeAll()
         guard epoch == myEpoch else { return }
+        if let old = publishedPSM {
+            publishedPSM = nil
+            await peripheral.unpublishL2CAPChannel(old)
+            guard epoch == myEpoch else { return }
+        }
         do {
-            _ = try await peripheral.add(bleV22Service(localIdentity: config.localIdentity))
+            // nil (throw) or 0: this platform cannot listen → publish the v2.2 service only.
+            let published = try? await peripheral.publishL2CAPChannel(false)
+            guard epoch == myEpoch else {
+                // The session ended mid-publish, after its resetSession ran: nobody else will unpublish this one.
+                if let published, published != 0 { await peripheral.unpublishL2CAPChannel(published) }
+                return
+            }
+            let psm: UInt16? = (published ?? 0) == 0 ? nil : published
+            publishedPSM = psm
+            _ = try await peripheral.add(bleV22Service(localIdentity: config.localIdentity, psm: psm))
             guard epoch == myEpoch else { return }
             try await peripheral.startAdvertising(AdvertisementData(serviceUUIDs: [bleV22ServiceUUID]))
             guard epoch == myEpoch else { return }
@@ -222,12 +261,21 @@ actor FCBDriverAdapter {
         advertising = false
         scanning = false
         resetPeripheralSession()
+        // L2CAP channels (both roles): cleared before any await for the same reason as `outbound`.
+        let conns = Array(l2cap.values)
+        l2cap = [:]
+        inboundL2CAP = [:]
+        for c in conns { await c.close() }
         for peerID in peers { try? await central.disconnect(peerID) }
         // A restart without stop() (the reducer's adapter retry) must leave the managers clean
-        // for the next bring-up: no scan, no advertisement, no published service.
+        // for the next bring-up: no scan, no advertisement, no published service or PSM.
         await central.stopScan()
         await peripheral.stopAdvertising()
         await peripheral.removeAll()
+        if let psm = publishedPSM {
+            publishedPSM = nil
+            await peripheral.unpublishL2CAPChannel(psm)
+        }
         continuation?.finish()
         continuation = nil
     }
@@ -249,7 +297,10 @@ actor FCBDriverAdapter {
             writeReadyGeneration[p.id] = nil
             if pendingOpens.contains(p.id) { abortedOpens.insert(p.id) }
             // The link is already down — no redundant disconnect (would await on the only event loop).
-            if let cid = outboundByPeer[p.id] { await outboundDidClose(cid, reason: "disconnected", disconnect: false) }
+            if let cid = outboundByPeer[p.id] {
+                if l2cap[cid] != nil { await l2capDidClose(cid, reason: "disconnected", disconnect: false) }
+                else { await outboundDidClose(cid, reason: "disconnected", disconnect: false) }
+            }
         case let .isReadyToSendWriteWithoutResponse(p):
             writeReadyGeneration[p.id, default: 0] += 1
             writeParked.remove(p.id)
@@ -279,7 +330,7 @@ actor FCBDriverAdapter {
             _ = try await central.discoverServices(peer.id, [bleV22ServiceUUID])
             guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
             let chars = try await central.discoverCharacteristics(
-                peer.id, bleV22ServiceUUID, [bleV22TXCharUUID, bleV22RXCharUUID, bleV22IdentityCharUUID])
+                peer.id, bleV22ServiceUUID, [bleV22TXCharUUID, bleV22RXCharUUID, bleV22IdentityCharUUID, bleV3PSMCharUUID])
             guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
             guard chars.contains(where: { $0.id == bleV22IdentityCharUUID }) else {
                 throw FCBAdapterError.missingCharacteristic("Identity")
@@ -287,7 +338,17 @@ actor FCBDriverAdapter {
             let identity = try await central.readValue(peer.id, bleV22IdentityCharUUID)
             guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
             guard identity.count == BLEProtocol.identityLength else { throw FCBAdapterError.shortIdentity(identity.count) }
-            continuation?.yield(.identityRead(peer, identity: Data(identity)))
+            // v3: optional. A v2.2 peer has no PSM characteristic; a failed, short or zero read
+            // means "not listening" (nil), never an identity failure.
+            var psm: UInt16? = nil
+            if chars.contains(where: { $0.id == bleV3PSMCharUUID }) {
+                if let raw = try? await central.readValue(peer.id, bleV3PSMCharUUID), raw.count >= 2 {
+                    let value = UInt16(raw[raw.startIndex]) | (UInt16(raw[raw.startIndex + 1]) << 8)
+                    psm = value == 0 ? nil : value
+                }
+                guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
+            }
+            continuation?.yield(.identityRead(peer, identity: Data(identity), psm: psm))
         } catch {
             forget(peer.id)
             try? await central.disconnect(peer.id)
@@ -343,7 +404,7 @@ actor FCBDriverAdapter {
     }
 
     private func emitChannelData(_ id: BLEChannelID, _ data: Data) {
-        if outbound[id] != nil || isInbound(id) {
+        if outbound[id] != nil || isInbound(id) || l2cap[id] != nil {
             continuation?.yield(.channelData(id, data))
         } else if opening.contains(id) {
             // Arrived before openChannel finished registering the channel: hold it, openChannel
@@ -372,7 +433,8 @@ actor FCBDriverAdapter {
         guard outbound[channel] != nil || isInbound(channel) else { return }
         sendQueues[channel, default: []].append(contentsOf: fragments)
         if sendQueues[channel]!.count > Self.sendQueueCap {
-            if outbound[channel] != nil { await outboundDidClose(channel, reason: "send backlog", disconnect: true) }
+            if l2cap[channel] != nil { await l2capDidClose(channel, reason: "send backlog", disconnect: outbound[channel] != nil) }
+            else if outbound[channel] != nil { await outboundDidClose(channel, reason: "send backlog", disconnect: true) }
             else { inboundDidClose(channel, reason: "notify backlog") }
             return
         }
@@ -386,7 +448,13 @@ actor FCBDriverAdapter {
         draining.insert(channel)
         defer { draining.remove(channel) }
         while let next = sendQueues[channel]?.first {
-            if let peerID = outbound[channel] {
+            if let conn = l2cap[channel] {
+                // v3: each queued element is one already-framed record; the stream has no MTU park.
+                do { try await conn.send(next) } catch {
+                    await l2capDidClose(channel, reason: "write failed: \(error)", disconnect: outbound[channel] != nil)
+                    return
+                }
+            } else if let peerID = outbound[channel] {
                 guard await writeOutbound(channel, peerID, next) else { return }   // parked or closed
             } else if isInbound(channel) {
                 guard await notifyInbound(channel, next) else { return }   // parked or closed
@@ -432,6 +500,17 @@ actor FCBDriverAdapter {
     }
 
     func closeChannel(_ channel: BLEChannelID) async {
+        if let conn = l2cap.removeValue(forKey: channel) {
+            // Reducer-initiated: silent. Only an outbound channel owns (and drops) its GATT link.
+            pumps.removeValue(forKey: channel)?.cancel()
+            inboundL2CAP[channel] = nil
+            let peerID = outbound.removeValue(forKey: channel)
+            if let peerID { outboundByPeer[peerID] = nil }
+            sendQueues[channel] = nil
+            await conn.close()
+            if let peerID { try? await central.disconnect(peerID) }
+            return
+        }
         if let peerID = outbound[channel] {
             pumps.removeValue(forKey: channel)?.cancel()
             outbound[channel] = nil
@@ -447,9 +526,103 @@ actor FCBDriverAdapter {
         try? await central.disconnect(peer.id)
     }
 
-    // TODO(Task 4): replace with a real L2CAP CoC open + handshake write.
+    /// v3: open an L2CAP CoC to `peer` on `psm`, write the handshake record, then report the
+    /// channel. Every failure is a `channelFailed` WITHOUT a disconnect: the reducer falls back to
+    /// GATT on this same link.
     func openL2CAPChannel(_ peer: BLEPeerHandle, psm: UInt16) async {
-        continuation?.yield(.channelFailed(peer, reason: "L2CAP not implemented yet"))
+        let myEpoch = epoch
+        let channelID = BLEChannelID(id: UUID())
+        opening.insert(channelID)
+        defer { opening.remove(channelID) }
+        pendingOpens.insert(peer.id)
+        abortedOpens.remove(peer.id)
+        defer { pendingOpens.remove(peer.id) }
+        // Race the open against the limit. FCB cannot cancel a pending open, so a late arrival is
+        // closed by the trailing task rather than leaked.
+        enum OpenOutcome: Sendable { case opened(L2CAPConnection), failed(String), timedOut }
+        let open = Task { [central] () -> OpenOutcome in
+            do { return .opened(try await central.openL2CAPChannel(peer.id, psm)) }
+            catch { return .failed("\(error)") }
+        }
+        let limit = l2capOpenLimit
+        // Not a task group: a group waits for its losing child, and awaiting `open.value` ignores
+        // cancellation, so a hung open would hold this call past the limit. First to resume wins.
+        let outcome: OpenOutcome = await withCheckedContinuation { cont in
+            let pending = LockIsolated<CheckedContinuation<OpenOutcome, Never>?>(cont)
+            let finish: @Sendable (OpenOutcome) -> Void = { result in
+                pending.withValue { c in
+                    c?.resume(returning: result)
+                    c = nil
+                }
+            }
+            let timer = Task {
+                do { try await Task.sleep(for: limit) } catch { return }
+                finish(.timedOut)
+            }
+            Task {
+                finish(await open.value)
+                timer.cancel()
+            }
+        }
+        let conn: L2CAPConnection
+        switch outcome {
+        case let .opened(c):
+            conn = c
+        case let .failed(reason):
+            if epoch == myEpoch { continuation?.yield(.channelFailed(peer, reason: reason)) }
+            return
+        case .timedOut:
+            Task { if case let .opened(late) = await open.value { await late.close() } }
+            if epoch == myEpoch { continuation?.yield(.channelFailed(peer, reason: "\(FCBAdapterError.l2capOpenTimeout)")) }
+            return
+        }
+        guard epoch == myEpoch else { await conn.close(); return }
+        guard !abortedOpens.contains(peer.id) else {
+            // The peer disconnected while the open was in flight: report it (as openChannel does).
+            await conn.close()
+            abortedOpens.remove(peer.id)
+            if epoch == myEpoch { continuation?.yield(.channelFailed(peer, reason: "\(FCBAdapterError.peerDisconnected)")) }
+            return
+        }
+        let pump = Task { [conn] in
+            for await chunk in conn.incoming() { self.emitChannelData(channelID, chunk) }
+            await self.l2capDidClose(channelID, reason: "channel ended", disconnect: true)
+        }
+        do {
+            try await conn.send(Self.handshakeFrame(for: config.localIdentity))
+            guard epoch == myEpoch else { throw FCBAdapterError.sessionEnded }
+            guard !abortedOpens.contains(peer.id) else { throw FCBAdapterError.peerDisconnected }
+            // No suspension from here to the yield: the maps are live before any event can race them.
+            outbound[channelID] = peer.id
+            outboundByPeer[peer.id] = channelID
+            l2cap[channelID] = conn
+            pumps[channelID] = pump
+            continuation?.yield(.channelOpened(channelID, peer, direction: .outbound, mtu: 0, transport: .l2cap))
+            for chunk in earlyChunks.removeValue(forKey: channelID) ?? [] {
+                continuation?.yield(.channelData(channelID, chunk))
+            }
+        } catch {
+            pump.cancel()
+            await conn.close()
+            earlyChunks[channelID] = nil
+            abortedOpens.remove(peer.id)
+            // No disconnect and no forget: the reducer falls back to GATT on this same link.
+            if epoch == myEpoch { continuation?.yield(.channelFailed(peer, reason: "\(error)")) }
+        }
+    }
+
+    /// Adapter-initiated close of an L2CAP channel (either role): reported as `channelClosed`.
+    /// An outbound channel also drops its GATT link unless the caller knows it is already down.
+    private func l2capDidClose(_ id: BLEChannelID, reason: String?, disconnect: Bool) async {
+        guard let conn = l2cap.removeValue(forKey: id) else { return }
+        let peerID = outbound.removeValue(forKey: id)
+        if let peerID { outboundByPeer[peerID] = nil }
+        inboundL2CAP[id] = nil
+        sendQueues[id] = nil
+        pumps.removeValue(forKey: id)?.cancel()
+        continuation?.yield(.channelClosed(id, reason: reason))
+        await conn.close()
+        if disconnect, let peerID { try? await central.disconnect(peerID) }
     }
 
     func stop() async {
@@ -473,6 +646,9 @@ actor FCBDriverAdapter {
                 if case .isReadyToUpdateSubscribers = event { await self.notifyReady() }
             }
         })
+        tasks.append(Task { [peripheral] in
+            for await conn in peripheral.l2capConnections() { self.registerInboundL2CAP(conn) }
+        })
     }
 
     private func resetPeripheralSession() {
@@ -483,7 +659,20 @@ actor FCBDriverAdapter {
         heldWrites = [:]
     }
 
-    private func isInbound(_ id: BLEChannelID) -> Bool { inbound[id] != nil }
+    private func isInbound(_ id: BLEChannelID) -> Bool { inbound[id] != nil || inboundL2CAP[id] != nil }
+
+    /// v3: a central opened an L2CAP channel to our published PSM. Its handshake arrives as the
+    /// first channelData record (framing is the reducer's).
+    private func registerInboundL2CAP(_ conn: L2CAPConnection) {
+        let channelID = BLEChannelID(id: UUID())
+        l2cap[channelID] = conn
+        inboundL2CAP[channelID] = conn.peerID
+        pumps[channelID] = Task { [conn] in
+            for await chunk in conn.incoming() { self.emitChannelData(channelID, chunk) }
+            await self.l2capDidClose(channelID, reason: "channel ended", disconnect: false)
+        }
+        continuation?.yield(.channelOpened(channelID, BLEPeerHandle(id: conn.peerID), direction: .inbound, mtu: 0, transport: .l2cap))
+    }
 
     private func handleSubscription(_ event: SubscriptionEvent) {
         switch event {

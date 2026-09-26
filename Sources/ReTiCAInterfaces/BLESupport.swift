@@ -83,6 +83,8 @@ public enum BLEProtocol {
     public static let txCharUUID       = "37145b00-442d-4a94-917f-8f42c5da28e4"
     public static let rxCharUUID       = "37145b00-442d-4a94-917f-8f42c5da28e5"
     public static let identityCharUUID = "37145b00-442d-4a94-917f-8f42c5da28e6"
+    /// v3: read-only, 2 bytes little-endian; the peer's L2CAP PSM, absent or 0 when not listening.
+    public static let psmCharUUID      = "37145b00-442d-4a94-917f-8f42c5da28e7"
     public static let identityLength   = 16
 }
 
