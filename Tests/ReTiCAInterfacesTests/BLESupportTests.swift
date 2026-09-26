@@ -159,3 +159,55 @@ import Foundation
     #expect(bleResolveDuplicate(localToken: a, peerToken: b,
                                 existingDirection: .inbound, newDirection: .inbound) == .keepNew)
 }
+
+// MARK: - Fragmenter (ble-reticulum v2.2)
+
+@Test func singleFragmentPacketIsStartWithTotalOne() throws {
+    let f = BLEFragmenter(mtu: 185)
+    let packet = Data([0xAA, 0xBB, 0xCC])
+    let frags = try f.fragment(packet)
+    #expect(frags == [Data([0x01, 0x00, 0x00, 0x00, 0x01, 0xAA, 0xBB, 0xCC])])
+}
+
+@Test func multiFragmentPacketHasStartContinueEndHeaders() throws {
+    let f = BLEFragmenter(mtu: 23)                 // payload 18
+    #expect(f.payloadSize == 18)
+    let packet = Data((0..<40).map { UInt8($0) })  // 18 + 18 + 4 → 3 fragments
+    let frags = try f.fragment(packet)
+    #expect(frags.count == 3)
+    #expect(frags[0].prefix(5) == Data([0x01, 0x00, 0x00, 0x00, 0x03]))
+    #expect(frags[1].prefix(5) == Data([0x02, 0x00, 0x01, 0x00, 0x03]))
+    #expect(frags[2].prefix(5) == Data([0x03, 0x00, 0x02, 0x00, 0x03]))
+    #expect(frags[0].dropFirst(5) == packet[0..<18])
+    #expect(frags[1].dropFirst(5) == packet[18..<36])
+    #expect(frags[2].dropFirst(5) == packet[36..<40])
+}
+
+@Test func exactMultipleOfPayloadNeedsNoExtraFragment() throws {
+    let f = BLEFragmenter(mtu: 23)
+    let frags = try f.fragment(Data(repeating: 0x5A, count: 36))
+    #expect(frags.count == 2)
+    #expect(frags[1][frags[1].startIndex] == 0x03)   // END, not CONTINUE
+}
+
+@Test func mtuIsFlooredAtTwenty() {
+    #expect(BLEFragmenter(mtu: 3).mtu == 20)
+    #expect(BLEFragmenter(mtu: 3).payloadSize == 15)
+    #expect(BLEFragmenter(mtu: 517).payloadSize == 512)
+}
+
+@Test func fragmentRejectsEmptyPacket() {
+    #expect(throws: BLEFragmentError.emptyPacket) { try BLEFragmenter(mtu: 185).fragment(Data()) }
+}
+
+@Test func fragmentRejectsMoreThan65535Fragments() {
+    // mtu 20 → payload 15; 65 536 × 15 bytes needs 65 536 fragments.
+    let packet = Data(repeating: 0, count: 65_536 * 15)
+    #expect(throws: BLEFragmentError.tooManyFragments(65_536)) { try BLEFragmenter(mtu: 20).fragment(packet) }
+}
+
+@Test func sequenceAndTotalAreBigEndianUInt16() throws {
+    // 300 fragments of 15 bytes: sequence 299 = 0x012B, total 300 = 0x012C.
+    let frags = try BLEFragmenter(mtu: 20).fragment(Data(repeating: 1, count: 300 * 15))
+    #expect(frags[299].prefix(5) == Data([0x03, 0x01, 0x2B, 0x01, 0x2C]))
+}

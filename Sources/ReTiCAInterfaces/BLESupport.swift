@@ -145,3 +145,58 @@ public func bleResolveDuplicate(
     let existingInitiatedLocally = existingDirection == .outbound
     return existingInitiatedLocally == localInitiatorWins ? .keepExisting : .keepNew
 }
+
+// MARK: - ble-reticulum protocol v2.2
+
+/// Wire constants for ble-reticulum protocol v2.2 (BLE_PROTOCOL_v2.2.md §UUID Reference).
+/// Strings, not CBUUIDs, so this file stays free of CoreBluetooth.
+public enum BLEProtocol {
+    public static let serviceUUID      = "37145b00-442d-4a94-917f-8f42c5da28e3"
+    public static let txCharUUID       = "37145b00-442d-4a94-917f-8f42c5da28e4"
+    public static let rxCharUUID       = "37145b00-442d-4a94-917f-8f42c5da28e5"
+    public static let identityCharUUID = "37145b00-442d-4a94-917f-8f42c5da28e6"
+    public static let identityLength   = 16
+}
+
+public enum BLEFragmentType: UInt8, Sendable {
+    case start = 0x01, cont = 0x02, end = 0x03
+}
+
+public enum BLEFragmentError: Error, Equatable {
+    case emptyPacket
+    case tooManyFragments(Int)
+}
+
+/// Port of ble_reticulum.BLEFragmentation.BLEFragmenter. Every packet — even one that fits in a
+/// single fragment — is sent with the 5-byte header `!BHH` (type, sequence, total).
+public struct BLEFragmenter: Equatable, Sendable {
+    public static let headerLength = 5
+    public static let minimumMTU = 20
+    public static let maxFragments = 65_535
+
+    public let mtu: Int
+    public var payloadSize: Int { mtu - Self.headerLength }
+
+    public init(mtu: Int) {
+        self.mtu = max(mtu, Self.minimumMTU)
+    }
+
+    public func fragment(_ packet: Data) throws -> [Data] {
+        guard !packet.isEmpty else { throw BLEFragmentError.emptyPacket }
+        let count = (packet.count + payloadSize - 1) / payloadSize
+        guard count <= Self.maxFragments else { throw BLEFragmentError.tooManyFragments(count) }
+        let bytes = Data(packet)   // rebase indices to 0
+        var out: [Data] = []
+        out.reserveCapacity(count)
+        for i in 0..<count {
+            let type: BLEFragmentType = (i == 0) ? .start : (i == count - 1 ? .end : .cont)
+            var frag = Data([type.rawValue,
+                             UInt8(i >> 8), UInt8(i & 0xFF),
+                             UInt8(count >> 8), UInt8(count & 0xFF)])
+            let start = i * payloadSize
+            frag.append(bytes[start ..< min(start + payloadSize, bytes.count)])
+            out.append(frag)
+        }
+        return out
+    }
+}
