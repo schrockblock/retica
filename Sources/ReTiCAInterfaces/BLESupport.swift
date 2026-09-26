@@ -240,21 +240,7 @@ public struct BLEReassembler: Equatable, Sendable {
         let payload = Data(f[BLEFragmenter.headerLength...])
 
         if sequence == 0 {
-            if let existing = buffers[total]?.fragments[0] {
-                if existing == payload { return nil }          // benign retransmit
-                // Conflicting sequence 0: different payload
-                // If we only have fragment 0, it's a conflict/corruption
-                if buffers[total]!.fragments.count == 1 {
-                    buffers[total] = nil
-                    throw BLEReassemblyError.conflictingDuplicate(0)
-                }
-                // If we have multiple fragments, this is a fresh start for same total, restart the buffer
-                buffers[total] = Buffer(fragments: [0: payload], total: total, startedAt: buffers[total]!.startedAt)
-            } else if buffers[total] == nil {
-                buffers[total] = Buffer(fragments: [0: payload], total: total, startedAt: now)
-            } else {
-                buffers[total]!.fragments[0] = payload
-            }
+            buffers[total] = Buffer(fragments: [0: payload], total: total, startedAt: now)
         } else {
             if buffers[total] == nil {
                 buffers[total] = Buffer(fragments: [:], total: total, startedAt: now)
@@ -271,16 +257,19 @@ public struct BLEReassembler: Equatable, Sendable {
             }
             buffers[total]!.fragments[sequence] = payload
         }
-        evictIfOverCapacity()
 
-        guard let buffer = buffers[total], buffer.fragments.count == Int(total) else { return nil }
+        guard let buffer = buffers[total], buffer.fragments.count == Int(total) else {
+            evictIfOverCapacity()
+            return nil
+        }
         var packet = Data()
         for i in 0..<total {
-            guard let part = buffer.fragments[i] else { return nil }
+            guard let part = buffer.fragments[i] else { evictIfOverCapacity(); return nil }
             packet.append(part)
         }
         buffers[total] = nil
         purgeStale(now: now)
+        evictIfOverCapacity()
         return packet
     }
 

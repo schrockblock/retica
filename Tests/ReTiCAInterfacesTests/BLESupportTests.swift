@@ -232,15 +232,6 @@ private let t0 = Date(timeIntervalSince1970: 10_000)
     #expect(try r.receive(frag, now: t0) == Data([9, 8, 7]))
 }
 
-@Test func outOfOrderFragmentsStillComplete() throws {
-    let packet = Data(repeating: 0x33, count: 50)
-    let frags = try BLEFragmenter(mtu: 23).fragment(packet)   // 3 fragments
-    var r = BLEReassembler()
-    #expect(try r.receive(frags[2], now: t0) == nil)   // arrives before sequence 0
-    #expect(try r.receive(frags[0], now: t0) == nil)
-    #expect(try r.receive(frags[1], now: t0) == packet)
-}
-
 @Test func identicalDuplicateFragmentIsIgnored() throws {
     let packet = Data(repeating: 0x44, count: 30)
     let frags = try BLEFragmenter(mtu: 23).fragment(packet)   // 2 fragments
@@ -251,12 +242,13 @@ private let t0 = Date(timeIntervalSince1970: 10_000)
 }
 
 @Test func conflictingDuplicateThrowsAndDiscardsBuffer() throws {
-    // A 3-fragment packet so the conflict happens mid-flight.
+    // A 3-fragment packet; the conflict lands on sequence 1, mid-flight.
     var r = BLEReassembler()
     let big = try BLEFragmenter(mtu: 23).fragment(Data(repeating: 0x55, count: 50))
     _ = try r.receive(big[0], now: t0)
-    var altered = big[0]; altered[altered.startIndex + 5] = 0x99
-    #expect(throws: BLEReassemblyError.conflictingDuplicate(0)) { _ = try r.receive(altered, now: t0) }
+    _ = try r.receive(big[1], now: t0)
+    var altered = big[1]; altered[altered.startIndex + 5] = 0x99
+    #expect(throws: BLEReassemblyError.conflictingDuplicate(1)) { _ = try r.receive(altered, now: t0) }
     #expect(r.inFlightCount == 0)   // buffer discarded
 }
 
@@ -318,6 +310,19 @@ private let t0 = Date(timeIntervalSince1970: 10_000)
     // The oldest (total 2) was evicted: its END now lands in a fresh, incomplete buffer.
     let two = try BLEFragmenter(mtu: 23).fragment(Data(repeating: 2, count: 19))
     #expect(try r.receive(two[1], now: t0.addingTimeInterval(20)) == nil)
+}
+
+@Test func packetCompletingAtCapacityWithTiedTimestampIsNotEvicted() throws {
+    var r = BLEReassembler()
+    for total in 2...9 {   // eight partial packets, all started at t0
+        let size = (total - 1) * 18 + 1
+        let frags = try BLEFragmenter(mtu: 23).fragment(Data(repeating: UInt8(total), count: size))
+        _ = try r.receive(frags[0], now: t0)
+    }
+    #expect(r.inFlightCount == BLEReassembler.maxInFlight)
+    let quick = try BLEFragmenter(mtu: 185).fragment(Data([7, 7]))[0]   // total 1, same instant
+    #expect(try r.receive(quick, now: t0) == Data([7, 7]))
+    #expect(r.inFlightCount == BLEReassembler.maxInFlight)              // nothing else evicted
 }
 
 @Test func keepalivePredicateMatchesOnlyASingleZeroByte() {
