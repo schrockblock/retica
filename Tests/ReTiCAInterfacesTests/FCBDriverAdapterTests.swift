@@ -112,6 +112,9 @@ struct AdapterStubs {
     let updateResult: LockIsolated<Bool>               // peripheral.updateValue return
     /// Notification continuations per peripheral id, minted when the adapter subscribes.
     let notifications: LockIsolated<[UUID: AsyncThrowingStream<Data, any Error>.Continuation]>
+    /// Peripheral ids whose notification stream's `onTermination` has fired — proof the pump
+    /// actually stopped consuming (cancellation), not just that the adapter forgot the channel.
+    let terminated: LockIsolated<Set<UUID>>
     /// Opt-in race hooks, off by default so they don't perturb unrelated tests.
     let notifyOnHandshake: LockIsolated<Data?>         // yielded on the peer's notify stream once the handshake write lands
     let disconnectDuringHandshake: LockIsolated<Bool>  // fire .didDisconnect mid-handshake-write
@@ -134,6 +137,7 @@ func makeStubs() -> AdapterStubs {
     let mtu = LockIsolated(512)
     let updateResult = LockIsolated(true)
     let notifications = LockIsolated<[UUID: AsyncThrowingStream<Data, any Error>.Continuation]>([:])
+    let terminated = LockIsolated<Set<UUID>>([])
     let notifyOnHandshake = LockIsolated<Data?>(nil)
     let disconnectDuringHandshake = LockIsolated(false)
     let readDelay = LockIsolated<UInt64>(0)
@@ -144,7 +148,14 @@ func makeStubs() -> AdapterStubs {
         scan: { _, _ in Task { await calls.scan() }; return scan.stream },
         stopScan: { await calls.stopScan() },
         connect: { id, _ in await calls.connect(id); return Peripheral(id: id, name: nil, state: .connected) },
-        disconnect: { id in await calls.disconnect(id) },
+        disconnect: { id in
+            // A real suspension point so a pump task already cancelled (e.g. by resetSession, or
+            // by an unrelated closeChannel/outboundDidClose) gets a genuine scheduling turn to run
+            // its trailing cleanup call while this disconnect is in flight — a bare actor-hop
+            // resolves too fast to force that interleaving reliably.
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            await calls.disconnect(id)
+        },
         retrievePeripherals: { _ in [] },
         retrieveConnected: { _ in [] },
         discoverServices: { id, _ in await calls.discoverServices(id); return [Service(id: serviceUUID, peripheralID: id, isPrimary: true)] },
@@ -168,6 +179,9 @@ func makeStubs() -> AdapterStubs {
             if t == .withResponse {
                 if let payload = notifyOnHandshake.value, let cont = notifications.value[id] {
                     cont.yield(payload)
+                    // Guarantee the pump actually runs and consumes this chunk before writeValue
+                    // (and therefore openChannel) proceeds — a bare actor-hop resolves too fast.
+                    try? await Task.sleep(nanoseconds: 50_000_000)
                 }
                 if disconnectDuringHandshake.value {
                     cEvents.continuation.yield(.didDisconnect(Peripheral(id: id, name: nil, state: .disconnected), nil))
@@ -186,7 +200,10 @@ func makeStubs() -> AdapterStubs {
             return mtu.value
         },
         notifications: { id, _ in
-            AsyncThrowingStream { cont in notifications.withValue { $0[id] = cont } }
+            AsyncThrowingStream { cont in
+                notifications.withValue { $0[id] = cont }
+                cont.onTermination = { _ in _ = terminated.withValue { $0.insert(id) } }
+            }
         },
         openL2CAPChannel: { _, _ in throw BluetoothError.l2capNotSupported },
         events: { cEvents.stream }
@@ -221,7 +238,7 @@ func makeStubs() -> AdapterStubs {
         writeRequests: writes.continuation, subscriptions: subs.continuation,
         peripheralEvents: pEvents.continuation,
         identityResult: identityResult, charsResult: charsResult, writeShouldThrow: writeShouldThrow,
-        mtu: mtu, updateResult: updateResult, notifications: notifications,
+        mtu: mtu, updateResult: updateResult, notifications: notifications, terminated: terminated,
         notifyOnHandshake: notifyOnHandshake, disconnectDuringHandshake: disconnectDuringHandshake,
         readDelay: readDelay)
 }
@@ -491,6 +508,11 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
     stubs.centralEvents.yield(.didDisconnect(Peripheral(id: p.id, name: nil, state: .disconnected), nil))
     guard case .channelClosed(cid, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelClosed"); await adapter.stop(); return }
+    // The link is already down — no redundant disconnect call for a peer that just disconnected.
+    // Bounded wait (well past the stub's own artificial disconnect delay) so a wrongly-issued
+    // disconnect has time to actually land before we check for its absence.
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    #expect(!(await stubs.calls.disconnected.contains(p.id)))
     stubs.scanCont.yield(disc(p))
     #expect(await collect(events, count: 1) == [.peerDiscovered(p)])
     await adapter.stop()
@@ -612,12 +634,25 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     guard let cid = await openOutbound(adapter, stubs, events, p) else { await adapter.stop(); return }
     await adapter.closeChannel(cid)
 
-    let recorded = LockIsolated<[BLEDriverEvent]>([])
-    let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
-    stubs.notifications.value[p.id]?.yield(Data([0x01]))
+    // Direct proof the pump actually stopped consuming (not just that the adapter forgot the
+    // channel, which `emitChannelData`'s own outbound-membership guard would mask either way):
+    // a stream whose only consumer was cancelled reports itself terminated to a later yield.
+    let cont = stubs.notifications.value[p.id]
+    let result = cont?.yield(Data([0x01]))
+    let isTerminated: Bool
+    if case .terminated? = result { isTerminated = true } else { isTerminated = false }
+    #expect(isTerminated)
     try? await Task.sleep(nanoseconds: 200_000_000)
-    let gotChannelData = recorded.value.contains { if case .channelData = $0 { return true }; return false }
-    #expect(!gotChannelData)
-    drain.cancel()
+    #expect(stubs.terminated.value.contains(p.id))
     await adapter.stop()
+}
+
+@Test @MainActor func stopWithOpenChannelDisconnectsOnceAndEmitsNoClose() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(7)
+    guard (await openOutbound(adapter, stubs, events, p)) != nil else { await adapter.stop(); return }
+    await adapter.stop()
+    #expect(await stubs.calls.disconnected.filter { $0 == p.id }.count == 1)
+    let tail = await collect(events, count: 3)
+    #expect(!tail.contains { if case .channelClosed = $0 { return true }; return false })
 }
