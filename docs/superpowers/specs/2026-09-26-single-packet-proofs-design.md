@@ -229,6 +229,52 @@ mutate → red → revert → green.
   ("until opportunistic delivery gains a receipt") gets a pointer to this spec. Rediscovery itself
   stays out of scope.
 
+## Amendments at planning time (2026-09-26)
+
+Writing the plan against the real code surfaced these corrections. They override the text above
+where they conflict.
+
+1. **Proof vectors can't be byte-identical.** `Identity.sign` uses CryptoKit, whose Ed25519
+   signatures are randomised; RNS signs deterministically. The vector test therefore:
+   - byte-compares the proof packet's header, destination and context bytes;
+   - checks that ReTiCA's signature validates;
+   - requires that genuine reference proofs, in both implicit and explicit form, confirm a ReTiCA
+     receipt.
+
+   Switching to the IFAC-only `DeterministicSigner` is rejected.
+2. **"Link DATA proofs resolve the delivery copy" matches no code.** Direct link packets go out via
+   `sendOverLink` without a receipt. The only receipted link send is the propagated small container
+   (`sendPropagatedPacket`). So:
+   - `.delivered` takes an explicit `leg:` with no default;
+   - `LXMFNode` maps `packetDelivered` and `packetDeliveryFailed` to `.propagated`;
+   - `linkResourceInFlight` stores the owning `DeliveryKey`, so `.resourceDeliveredOnLink` resolves
+     the copy that sent the Resource.
+
+   `.delivered(messageHash:leg:)` and `.retryDue(messageHash:leg:)` join the list of breaking public
+   shapes.
+3. **What counts as "every armed copy has failed":**
+   - A copy still queued behind its link counts as outstanding.
+   - A success is remembered in a bounded ring (`succeededMessageMemory = 1024`) after its pending
+     entry is gone, so a propagated copy armed late (after its stamp search) that then fails still
+     cannot produce `deliveryFailed`.
+   - The no-node `sendViaPropagation` case fails only its own copy, through the same failure helper.
+   - `.send(desiredMethod: .propagated)` fails the delivery copy.
+   - Accepted gap: if one copy fails, and another copy is armed later and also fails,
+     `deliveryFailed` can fire twice.
+4. **Chosen constants:** `receiptTimeoutBase = 6` s and `receiptTimeoutPerHop = 6` s (reference
+   `DEFAULT_PER_HOP_TIMEOUT`), and `maxPendingReceipts = 1024` (reference `MAX_RECEIPTS`).
+5. **The app compile fix is larger than stated.** Besides the `messageReceived` pattern, it also
+   updates:
+   - `DiagnosticsSnapshot.swift`, where `pendingDeliveries` is now keyed by `DeliveryKey`;
+   - `DiagnosticsSnapshotTests`;
+   - one `.sendOpportunistic` match in `AppFeatureTests`.
+
+   It is done in an app worktree on branch `feat/retica-proofs-compat`, and is verified with a
+   temporary, uncommitted path override. **Merge order:** ReTiCA's `feat/single-packet-proofs` must
+   land in the ReTiCA checkout the app builds against before, or together with, the app branch.
+6. The path-request spec's wording at :100 is "Revisit if/when opportunistic delivery gains a
+   receipt". The docs update targets that line.
+
 ## Out of scope
 
 - ReTiCA-as-relay routing proofs for third parties (reverse table, Transport.py:1690, 2340-2348).
