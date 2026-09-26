@@ -90,6 +90,11 @@ actor AdapterCalls {
     /// canSendWriteWithoutResponse calls that have STARTED — and already decided their answer.
     var canSendStarted = 0
     func startCanSend() { canSendStarted += 1 }
+    /// central.openL2CAPChannel / peripheral.publishL2CAPChannel calls that have STARTED.
+    var l2capOpensStarted = 0
+    func startL2CAPOpen() { l2capOpensStarted += 1 }
+    var publishesStarted = 0
+    func startPublish() { publishesStarted += 1 }
     func connect(_ id: UUID) { connected.append(id) }
     func disconnect(_ id: UUID) { disconnected.append(id) }
     func discoverServices(_ id: UUID) { discoveredServices.append(id) }
@@ -142,6 +147,7 @@ struct AdapterStubs {
     let openL2CAPDelayNanos: LockIsolated<UInt64>      // nanoseconds openL2CAPChannel stays in flight before returning
     let psmResult: LockIsolated<Data?>                 // readValue result for the PSM characteristic (nil → throws)
     let l2capInbound: AsyncStream<L2CAPConnection>.Continuation
+    let publishHeld: LockIsolated<Bool>                // while true, publishL2CAPChannel stays in flight
 }
 
 @MainActor
@@ -170,6 +176,7 @@ func makeStubs() -> AdapterStubs {
     let removeAllHeld = LockIsolated(false)
     let canSendHeld = LockIsolated(false)
     let publishPSM = LockIsolated<UInt16?>(0x0081)
+    let publishHeld = LockIsolated(false)
     let unpublished = LockIsolated<[UInt16]>([])
     let openL2CAPResult = LockIsolated<L2CAPConnection?>(nil)
     let openL2CAPDelayNanos = LockIsolated<UInt64>(0)
@@ -241,6 +248,7 @@ func makeStubs() -> AdapterStubs {
             }
         },
         openL2CAPChannel: { _, _ in
+            await calls.startL2CAPOpen()
             if openL2CAPDelayNanos.value > 0 { try? await Task.sleep(nanoseconds: openL2CAPDelayNanos.value) }
             guard let c = openL2CAPResult.value else { throw BluetoothError.l2capNotSupported }
             return c
@@ -283,6 +291,8 @@ func makeStubs() -> AdapterStubs {
             return result
         },
         publishL2CAPChannel: { _ in
+            await calls.startPublish()
+            while publishHeld.value { try? await Task.sleep(nanoseconds: 2_000_000) }
             guard let p = publishPSM.value else { throw BluetoothError.l2capNotSupported }
             return p
         },
@@ -309,7 +319,8 @@ func makeStubs() -> AdapterStubs {
         canSend: canSend, canSendDelayNanos: canSendDelayNanos, removeAllHeld: removeAllHeld,
         canSendHeld: canSendHeld,
         publishPSM: publishPSM, unpublished: unpublished, openL2CAPResult: openL2CAPResult,
-        openL2CAPDelayNanos: openL2CAPDelayNanos, psmResult: psmResult, l2capInbound: inbound.continuation)
+        openL2CAPDelayNanos: openL2CAPDelayNanos, psmResult: psmResult, l2capInbound: inbound.continuation,
+        publishHeld: publishHeld)
 }
 
 /// A scripted L2CAP connection. Nonisolated on purpose: tests build it inside
@@ -1201,6 +1212,9 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     stubs.psmResult.setValue(Data([0x00, 0x00]))
     await adapter.readIdentity(peer(3))
     #expect(await collect(events, count: 1) == [.identityRead(peer(3), identity: adapterPeerIdentity, psm: nil)])
+    stubs.psmResult.setValue(Data([0x81, 0x00, 0x00]))                      // over-long: not a 2-byte PSM
+    await adapter.readIdentity(peer(5))
+    #expect(await collect(events, count: 1) == [.identityRead(peer(5), identity: adapterPeerIdentity, psm: nil)])
     stubs.charsResult.setValue([txCharUUID, rxCharUUID, identityCharUUID])   // v2.2 peer: no PSM characteristic
     await adapter.readIdentity(peer(4))
     #expect(await collect(events, count: 1) == [.identityRead(peer(4), identity: adapterPeerIdentity, psm: nil)])
@@ -1350,4 +1364,113 @@ func subscribeInbound(_ stubs: AdapterStubs, _ events: AsyncStream<BLEDriverEven
     #expect(elapsed < .seconds(3), "openL2CAPChannel took \(elapsed) against a 200 ms limit")
     guard case .channelFailed(p, _)? = (await collect(events, count: 1)).first else { Issue.record("expected channelFailed on timeout"); await adapter.stop(); return }
     await adapter.stop()
+}
+
+@Test @MainActor func inboundL2CAPAcceptedDuringStopIsClosedNotRegistered() async {
+    // A connection the accept loop has already dequeued when stop() begins must be closed, not
+    // registered into the session being torn down. `AsyncStream(unfolding:)` models that hand-off:
+    // its produce call is already in flight when the loop task is cancelled, and still returns.
+    let stubs = makeStubs()
+    let closed = LockIsolated(false)
+    let conn = fakeConnection(peerID: UUID(), psm: 0x0081, closed: closed)
+    let release = LockIsolated(false)
+    let delivered = LockIsolated(false)
+    var p = stubs.peripheral
+    p.l2capConnections = {
+        AsyncStream(unfolding: {
+            guard !delivered.value else { return nil }
+            // An unstructured task's value ignores cancellation: the hand-off completes regardless.
+            await Task { while !release.value { try? await Task.sleep(nanoseconds: 2_000_000) } }.value
+            delivered.setValue(true)
+            return conn
+        })
+    }
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: p)
+    let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    stubs.peripheralState.yield(.poweredOn); stubs.centralState.yield(.poweredOn)
+    #expect(await collect(events, count: 1) == [.ready])
+    let recorded = LockIsolated<[BLEDriverEvent]>([])
+    let drain = Task { for await e in events { recorded.withValue { $0.append(e) } } }
+    let calls = stubs.calls
+    let removeAllsBefore = await calls.removeAllStarted
+    stubs.removeAllHeld.setValue(true)
+    let stopping = Task { await adapter.stop() }
+    // stop()'s resetSession (epoch bumped, accept loop cancelled) is now suspended in removeAll.
+    #expect(await waitUntil(within: eventWait) { await calls.removeAllStarted > removeAllsBefore })
+    release.setValue(true)                               // the in-flight accept now returns the connection
+    #expect(await waitUntil(within: eventWait) { closed.value }, "a connection accepted during stop() must be closed")
+    stubs.removeAllHeld.setValue(false)
+    await stopping.value
+    #expect(!recorded.value.contains { if case .channelOpened = $0 { return true }; return false },
+            "no channelOpened for a connection accepted after the session ended: \(recorded.value)")
+    drain.cancel()
+}
+
+@Test @MainActor func stopClosesOpenL2CAPConnectionsInBothRoles() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(4)
+    let closedOut = LockIsolated(false)
+    let closedIn = LockIsolated(false)
+    stubs.openL2CAPResult.setValue(fakeConnection(peerID: p.id, psm: 0x0081, closed: closedOut))
+    await adapter.openL2CAPChannel(p, psm: 0x0081)
+    guard case .channelOpened? = (await collect(events, count: 1)).first else { Issue.record("no outbound open"); await adapter.stop(); return }
+    stubs.l2capInbound.yield(fakeConnection(peerID: UUID(), psm: 0x0081, closed: closedIn))
+    guard case .channelOpened? = (await collect(events, count: 1)).first else { Issue.record("no inbound open"); await adapter.stop(); return }
+    await adapter.stop()
+    #expect(closedOut.value, "stop() must close an outbound L2CAP connection")
+    #expect(closedIn.value, "stop() must close an inbound L2CAP connection")
+}
+
+@Test @MainActor func disconnectDuringL2CAPOpenFailsWithoutDisconnecting() async {
+    let (adapter, stubs, events) = await onlineAdapter()
+    let p = peer(6)
+    let closed = LockIsolated(false)
+    stubs.openL2CAPResult.setValue(fakeConnection(peerID: p.id, psm: 0x0081, closed: closed))
+    stubs.openL2CAPDelayNanos.setValue(300_000_000)
+    let calls = stubs.calls
+    let opening = Task { await adapter.openL2CAPChannel(p, psm: 0x0081) }
+    #expect(await waitUntil(within: eventWait) { await calls.l2capOpensStarted >= 1 })
+    stubs.centralEvents.yield(.didDisconnect(Peripheral(id: p.id, name: nil, state: .disconnected), nil))
+    await opening.value
+    let got = await collect(events, count: 1)
+    guard case let .channelFailed(failed, reason)? = got.first else { Issue.record("expected channelFailed, got \(got)"); await adapter.stop(); return }
+    #expect(failed == p)
+    #expect(reason == "\(FCBAdapterError.peerDisconnected)")
+    #expect(closed.value, "a connection that opened onto a dropped link must be closed")
+    // Well past the stub's own disconnect delay, so a wrongly-issued disconnect would have landed.
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    #expect(!(await stubs.calls.disconnected).contains(p.id), "the link is already down: no redundant disconnect")
+    await adapter.stop()
+}
+
+@Test @MainActor func psmPublishedAfterTheSessionEndedIsUnpublished() async {
+    let stubs = makeStubs()
+    stubs.publishHeld.setValue(true)                     // the bring-up's publish stays in flight
+    let adapter = FCBDriverAdapter(central: stubs.central, peripheral: stubs.peripheral)
+    let events = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    let drain = Task { for await _ in events {} }
+    stubs.peripheralState.yield(.poweredOn); stubs.centralState.yield(.poweredOn)
+    let calls = stubs.calls
+    let unpublished = stubs.unpublished
+    #expect(await waitUntil(within: eventWait) { await calls.publishesStarted >= 1 })
+    await adapter.stop()                                 // nothing recorded yet, so nothing for stop() to unpublish
+    #expect(unpublished.value.isEmpty)
+    stubs.publishHeld.setValue(false)                    // the publish returns into a session that already ended
+    #expect(await waitUntil(within: eventWait) { unpublished.value == [0x0081] },
+            "a PSM published after its session ended must be unpublished, got \(unpublished.value)")
+    #expect(await calls.addedServices.isEmpty)
+    drain.cancel()
+}
+
+@Test @MainActor func repeatPoweredOnUnpublishesThePreviousPSM() async {
+    let (adapter, stubs, _) = await onlineAdapter()
+    stubs.publishPSM.setValue(0x0083)
+    stubs.peripheralState.yield(.poweredOn)              // second bring-up in the same session
+    let calls = stubs.calls
+    #expect(await waitUntil(within: eventWait) { await calls.addedServices.count >= 2 })
+    #expect(stubs.unpublished.value == [0x0081], "the first bring-up's PSM must be unpublished before republishing")
+    let svc = await calls.addedServices.last
+    #expect(svc?.characteristics.contains { $0.id == psmCharUUID && $0.value == Data([0x83, 0x00]) } == true)
+    await adapter.stop()
+    #expect(stubs.unpublished.value == [0x0081, 0x0083])
 }

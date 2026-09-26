@@ -338,11 +338,11 @@ actor FCBDriverAdapter {
             let identity = try await central.readValue(peer.id, bleV22IdentityCharUUID)
             guard epoch == myEpoch else { try? await central.disconnect(peer.id); return }
             guard identity.count == BLEProtocol.identityLength else { throw FCBAdapterError.shortIdentity(identity.count) }
-            // v3: optional. A v2.2 peer has no PSM characteristic; a failed, short or zero read
+            // v3: optional. A v2.2 peer has no PSM characteristic; a failed, wrong-length or zero read
             // means "not listening" (nil), never an identity failure.
             var psm: UInt16? = nil
             if chars.contains(where: { $0.id == bleV3PSMCharUUID }) {
-                if let raw = try? await central.readValue(peer.id, bleV3PSMCharUUID), raw.count >= 2 {
+                if let raw = try? await central.readValue(peer.id, bleV3PSMCharUUID), raw.count == 2 {
                     let value = UInt16(raw[raw.startIndex]) | (UInt16(raw[raw.startIndex + 1]) << 8)
                     psm = value == 0 ? nil : value
                 }
@@ -646,8 +646,11 @@ actor FCBDriverAdapter {
                 if case .isReadyToUpdateSubscribers = event { await self.notifyReady() }
             }
         })
+        // A connection already dequeued when resetSession cancels this loop still reaches the body:
+        // the session epoch (bumped first thing in resetSession) decides whether it is accepted.
+        let myEpoch = epoch
         tasks.append(Task { [peripheral] in
-            for await conn in peripheral.l2capConnections() { self.registerInboundL2CAP(conn) }
+            for await conn in peripheral.l2capConnections() { await self.registerInboundL2CAP(conn, epoch: myEpoch) }
         })
     }
 
@@ -663,7 +666,10 @@ actor FCBDriverAdapter {
 
     /// v3: a central opened an L2CAP channel to our published PSM. Its handshake arrives as the
     /// first channelData record (framing is the reducer's).
-    private func registerInboundL2CAP(_ conn: L2CAPConnection) {
+    private func registerInboundL2CAP(_ conn: L2CAPConnection, epoch sessionEpoch: Int) async {
+        // Accepted for a session that has since ended (stop()/restart mid-hand-off): never register
+        // it into the maps resetSession just cleared, and never announce it; just close it.
+        guard epoch == sessionEpoch else { await conn.close(); return }
         let channelID = BLEChannelID(id: UUID())
         l2cap[channelID] = conn
         inboundL2CAP[channelID] = conn.peerID
