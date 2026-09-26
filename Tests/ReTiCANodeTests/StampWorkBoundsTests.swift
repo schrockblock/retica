@@ -96,7 +96,7 @@ private func makePropagationClient(advertisedStampCost: Int) -> TestStore<LXMFNo
     // either. What distinguishes the two is whether a stamp effect was *started*, so cancel the
     // opportunistic side (its retry timer is a legitimate long-lived effect) and require that nothing
     // is left running.
-    await store.send(.router(.delivered(messageHash: msg.hash)))   // retires the opportunistic retry timer
+    await store.send(.router(.delivered(messageHash: msg.hash, leg: .delivery)))   // retires the opportunistic retry timer
     await store.skipReceivedActions(strict: false)
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))

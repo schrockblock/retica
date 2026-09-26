@@ -734,13 +734,15 @@ public struct LXMFNode {
                 return .send(.endpoint(.sendWithReceiptOverLink(linkID: linkID, data: propagationPacked, token: messageHash)))
 
             case let .endpoint(.delegate(.packetDelivered(token))):
-                // token == message.hash (set when sendPropagatedPacket was dispatched)
-                // → feeds the router's existing delivered→propagationAccepted path
-                return .send(.router(.delivered(messageHash: token)))
+                // token == message.hash, set when `sendPropagatedPacket` was dispatched. That is the
+                // ONLY link send that requests a receipt (direct link packets go out via
+                // `sendOverLink`, unreceipted), so a link receipt always belongs to the PROPAGATED copy.
+                return .send(.router(.delivered(messageHash: token, leg: .propagated)))
 
             case let .endpoint(.delegate(.packetDeliveryFailed(token))):
                 // Treat a lost packet the same as a retry-due so the message isn't silently dropped.
-                return .send(.router(.retryDue(messageHash: token)))
+                // Same reasoning as above: a link receipt is always the propagated copy's.
+                return .send(.router(.retryDue(messageHash: token, leg: .propagated)))
 
             case let .router(.delegate(.closeLink(dest))):
                 guard let linkID = state.directLinks[dest] else { return .none }

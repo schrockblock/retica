@@ -469,8 +469,8 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .opportunistic))
     await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
-    await store.send(.delivered(messageHash: msg.hash))   // clean up the pending timer before teardown
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)]?.attempts == 1)
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))   // clean up the pending timer before teardown
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
 }
 
@@ -483,12 +483,12 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .opportunistic))
     await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }
-    await store.send(.delivered(messageHash: msg.hash))
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))
     await store.receive { action in
         if case let .delegate(.deliveryConfirmed(h)) = action { #expect(h == msg.hash); return true }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash] == nil)
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)] == nil)
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))   // retry timer was cancelled → no retryDue
     store.exhaustivity = .on
 }
@@ -514,7 +514,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash] == nil)
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)] == nil)
 }
 
 // MARK: - LXMF-4c-2 opportunistic pathless-retry
@@ -528,19 +528,19 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .opportunistic))
     await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }   // best-effort try #1
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)]?.attempts == 1)
     // No known path → the first retry requests a path instead of resending.
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
     await store.receive { action in
         if case let .delegate(.requestPath(dest)) = action { #expect(dest == msg.destinationHash); return true }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 2)
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)]?.attempts == 2)
     // The post-request wait is pathRequestWaitSeconds (7): advancing it fires the next retry (another requestPath).
     await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
     await store.receive { if case .delegate(.requestPath) = $0 { return true }; return false }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 3)
-    await store.send(.delivered(messageHash: msg.hash))   // cancel the pending timer before teardown
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)]?.attempts == 3)
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))   // cancel the pending timer before teardown
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
     store.exhaustivity = .on
 }
@@ -564,7 +564,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         if case let .delegate(.sendOpportunistic(dest, _)) = action { #expect(dest == msg.destinationHash); return true }
         return false
     }
-    await store.send(.delivered(messageHash: msg.hash))
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
     store.exhaustivity = .on
 }
@@ -583,8 +583,8 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
     await store.receive { if case .delegate(.sendOpportunistic) = $0 { return true }; return false }   // resend, not requestPath
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 2)
-    await store.send(.delivered(messageHash: msg.hash))
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)]?.attempts == 2)
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
     store.exhaustivity = .on
 }
@@ -603,14 +603,14 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .direct))
     await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)]?.attempts == 1)
     // Direct retry resends over the link despite no known path (would be requestPath if pathless-retry leaked in).
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
     await store.receive { action in
         if case let .delegate(.sendDirect(lid, _, _)) = action { #expect(lid == linkID); return true }
         return false
     }
-    await store.send(.delivered(messageHash: msg.hash))
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
 }
 
@@ -632,7 +632,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         if case let .delegate(.sendDirect(_, _, asResource)) = action { #expect(asResource == true); return true }
         return false
     }
-    #expect(store.state.pendingDeliveries[big.hash]?.attempts == 1)   // drained send armed a retry
+    #expect(store.state.pendingDeliveries[.delivery(big.hash)]?.attempts == 1)   // drained send armed a retry
     // A retry re-emits sendDirect with asResource preserved.
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
     await store.receive { action in
@@ -641,7 +641,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    await store.send(.delivered(messageHash: big.hash))
+    await store.send(.delivered(messageHash: big.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
 }
 
@@ -672,7 +672,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    await store.send(.delivered(messageHash: msg.hash))
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
 }
 
@@ -690,15 +690,15 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     store.exhaustivity = .off
     await store.send(.send(message: msg, desiredMethod: .direct))
     await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)]?.attempts == 1)
     await store.send(.linkClosed(destinationHash: msg.destinationHash))
     await store.receive { action in
         if case let .delegate(.requestLink(dest)) = action { #expect(dest == msg.destinationHash); return true }
         return false
     }
     #expect(store.state.directLinks[msg.destinationHash] == .establishing)
-    #expect(store.state.pendingDeliveries[msg.hash] != nil)   // pending retained across the close
-    await store.send(.delivered(messageHash: msg.hash))       // cancel the pending timer before teardown
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)] != nil)   // pending retained across the close
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))       // cancel the pending timer before teardown
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
 }
 
@@ -728,7 +728,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         if case let .delegate(.deliveryFailed(h)) = action { #expect(h == msg.hash); return true }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash] == nil)
+    #expect(store.state.pendingDeliveries[.delivery(msg.hash)] == nil)
 }
 
 /// A finished establishment saga must not leave its budget behind to truncate the NEXT delivery.
@@ -891,7 +891,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // Link establishes — must reset the counter.
     await store.send(.linkEstablished(destinationHash: dest, linkID: linkID))
     await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
-    await store.send(.delivered(messageHash: msg.hash))
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
     #expect(store.state.establishAttempts[dest] == nil)   // reset confirmed
 
@@ -1102,7 +1102,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
     await store.send(.linkEstablished(destinationHash: msg.destinationHash, linkID: linkID))
     await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }   // drain arms idle timer
-    await store.send(.delivered(messageHash: msg.hash))   // clear pending + its retry timer; idle timer remains
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))   // clear pending + its retry timer; idle timer remains
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
     #expect(store.state.directLinks[msg.destinationHash] == .active(linkID: linkID))
     // No further activity for the inactivity window → the link is torn down.
@@ -1133,7 +1133,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // First send arms the idle timer.
     await store.send(.send(message: msg, desiredMethod: .direct))
     await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
-    await store.send(.delivered(messageHash: msg.hash))
+    await store.send(.delivered(messageHash: msg.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
     // Almost to the deadline — not torn down yet.
     await clock.advance(by: .seconds(LXMFDelivery.linkMaxInactivitySeconds - 1))
@@ -1141,7 +1141,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // A second send restarts the idle timer.
     await store.send(.send(message: msg2, desiredMethod: .direct))
     await store.receive { if case .delegate(.sendDirect) = $0 { return true }; return false }
-    await store.send(.delivered(messageHash: msg2.hash))
+    await store.send(.delivered(messageHash: msg2.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
     // Past the ORIGINAL deadline but before the restarted one → still active (proves the restart).
     await clock.advance(by: .seconds(LXMFDelivery.linkMaxInactivitySeconds - 1))
@@ -1179,13 +1179,13 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    #expect(store.state.linkResourceInFlight[linkID] == bigMsg.hash)
+    #expect(store.state.linkResourceInFlight[linkID] == LXMFRouter.DeliveryKey.delivery(bigMsg.hash))
 
     // Resolve the delivery so its retry timer is cancelled; the idle timer and the in-flight entry
     // both remain (the Resource is still notionally in flight for eviction purposes).
-    await store.send(.delivered(messageHash: bigMsg.hash))
+    await store.send(.delivered(messageHash: bigMsg.hash, leg: .delivery))
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
-    #expect(store.state.linkResourceInFlight[linkID] == bigMsg.hash, "still in-flight before idle")
+    #expect(store.state.linkResourceInFlight[linkID] == LXMFRouter.DeliveryKey.delivery(bigMsg.hash), "still in-flight before idle")
     #expect(store.state.directLinks[bigMsg.destinationHash] == .active(linkID: linkID))
 
     // Idle window elapses → the link is torn down. The in-flight entry MUST be reaped.
@@ -1253,7 +1253,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    #expect(store.state.pendingDeliveries[.propagated(msg.hash)]?.attempts == 1)
 }
 
 @Test @MainActor func routerPropagationSendsImmediatelyWithActiveLink() async {
@@ -1276,7 +1276,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    #expect(store.state.pendingDeliveries[.propagated(msg.hash)]?.attempts == 1)
 }
 
 @Test @MainActor func routerPropagationRetryResendsSameBytes() async {
@@ -1302,14 +1302,14 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 2)
+    #expect(store.state.pendingDeliveries[.propagated(msg.hash)]?.attempts == 2)
 }
 
 // MARK: - Task-2: propagation small-packet + genuine propagationAccepted
 
 /// With an active PN link, a small propagation container (<= Link.mdu = 431 bytes) is sent as a
 /// proof-requesting link packet (sendPropagatedPacket), and a matching packetDelivered via
-/// .delivered(messageHash:) resolves to propagationAccepted for that message.hash.
+/// .delivered(messageHash:leg: .propagated) resolves to propagationAccepted for that message.hash.
 @Test @MainActor func propagationSmallSendsPacketAndAcceptsOnProof() async {
     let msg = makeMessage(source: Identity(), content: "small prop")
     // Small container: <= 431 bytes (Link.mdu) → should take the packet route.
@@ -1336,13 +1336,13 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash]?.attempts == 1)
+    #expect(store.state.pendingDeliveries[.propagated(msg.hash)]?.attempts == 1)
     // linkResourceInFlight is NOT set for the packet route (no Resource in flight).
     #expect(store.state.linkResourceInFlight[linkID] == nil)
 
     // packetDelivered (token = message.hash) → .delivered(messageHash:) → propagationAccepted.
-    // (In production, LXMFNode maps TCPEndpoint.delegate(.packetDelivered(token)) → router(.delivered(messageHash: token)).)
-    await store.send(.delivered(messageHash: msg.hash))
+    // (In production, LXMFNode maps TCPEndpoint.delegate(.packetDelivered(token)) → router(.delivered(messageHash: token, leg: .propagated)).)
+    await store.send(.delivered(messageHash: msg.hash, leg: .propagated))
     await store.receive { action in
         if case let .delegate(.propagationAccepted(hash)) = action {
             #expect(hash == msg.hash)
@@ -1350,7 +1350,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash] == nil)   // pending cleared
+    #expect(store.state.pendingDeliveries[.propagated(msg.hash)] == nil)   // pending cleared
 }
 
 // MARK: - LXMF-4d-4 client inbound sync
@@ -1539,15 +1539,15 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         }
         return false
     }
-    #expect(store.state.linkResourceInFlight[linkID] == bigMsg.hash)     // recorded on send
-    #expect(store.state.pendingDeliveries[bigMsg.hash] != nil)           // awaiting outcome
+    #expect(store.state.linkResourceInFlight[linkID] == LXMFRouter.DeliveryKey.delivery(bigMsg.hash))     // recorded on send
+    #expect(store.state.pendingDeliveries[.delivery(bigMsg.hash)] != nil)           // awaiting outcome
 
     await store.send(.resourceDeliveredOnLink(linkID: linkID))
     await store.receive { action in
         if case let .delegate(.deliveryConfirmed(hash)) = action { #expect(hash == bigMsg.hash); return true }
         return false
     }
-    #expect(store.state.pendingDeliveries[bigMsg.hash] == nil)           // resolved → retry can't resend
+    #expect(store.state.pendingDeliveries[.delivery(bigMsg.hash)] == nil)           // resolved → retry can't resend
     #expect(store.state.linkResourceInFlight[linkID] == nil)            // in-flight entry cleared
 }
 
@@ -1642,15 +1642,15 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         if case let .delegate(.sendPropagated(lid, _)) = action { #expect(lid == linkID); return true }
         return false
     }
-    #expect(store.state.linkResourceInFlight[linkID] == msg.hash)      // recorded on propagation send
-    #expect(store.state.pendingDeliveries[msg.hash] != nil)
+    #expect(store.state.linkResourceInFlight[linkID] == LXMFRouter.DeliveryKey.propagated(msg.hash))      // recorded on propagation send
+    #expect(store.state.pendingDeliveries[.propagated(msg.hash)] != nil)
 
     await store.send(.resourceDeliveredOnLink(linkID: linkID))
     await store.receive { action in
         if case let .delegate(.propagationAccepted(hash)) = action { #expect(hash == msg.hash); return true }
         return false
     }
-    #expect(store.state.pendingDeliveries[msg.hash] == nil)           // resolved → retry cancelled
+    #expect(store.state.pendingDeliveries[.propagated(msg.hash)] == nil)           // resolved → retry cancelled
     #expect(store.state.linkResourceInFlight[linkID] == nil)
 }
 

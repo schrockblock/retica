@@ -11,7 +11,7 @@ import ReTiCATransport
 @Reducer
 public struct LXMFRouter {
     @Dependency(\.continuousClock) var clock
-    private enum CancelID: Hashable { case retry(Data); case idle(Data); case pathRequest(Data) }
+    private enum CancelID: Hashable { case retry(DeliveryKey); case idle(Data); case pathRequest(Data) }
 
     @ObservableState
     public struct State: Equatable {
@@ -27,11 +27,14 @@ public struct LXMFRouter {
         public var knownPaths: Set<Data> = []
         /// destinationHash → messages queued until a direct link to it becomes active.
         var outboundQueue: [Data: [LXMessage]] = [:]
-        /// message.hash → in-flight send awaiting a delivery outcome (with its resend info + attempts).
-        public var pendingDeliveries: [Data: PendingDelivery] = [:]
-        /// linkID → message.hash of the Resource-direct send currently in flight on that link.
-        /// Single-in-flight per link (last write wins); resolves resourceDeliveredOnLink → deliveryConfirmed.
-        public var linkResourceInFlight: [Data: Data] = [:]
+        /// (message.hash, copy) → in-flight send awaiting a delivery outcome (with its resend info +
+        /// attempts). Keyed per COPY because `LXMFNode.sendMessage(alsoViaPropagation:)` arms a
+        /// delivery copy and a propagated copy of one message; under one key the second overwrote
+        /// the first and its outcome was reported as the other's.
+        public var pendingDeliveries: [DeliveryKey: PendingDelivery] = [:]
+        /// linkID → the copy whose Resource is currently in flight on that link. Single-in-flight per
+        /// link (last write wins); `resourceDeliveredOnLink` resolves exactly that copy.
+        public var linkResourceInFlight: [Data: DeliveryKey] = [:]
         /// The configured store-and-forward propagation node (all PROPAGATED sends link to it).
         public var outboundPropagationNode: Data? = nil
         /// PN hash → propagated messages queued until a link to the PN becomes active.
@@ -99,6 +102,24 @@ public struct LXMFRouter {
 
     public enum DeliveryMethod: Equatable, Sendable { case opportunistic, direct }
     public enum LinkStatus: Equatable { case awaitingPath; case establishing; case active(linkID: Data) }
+
+    /// Which copy of an outbound message a pending delivery tracks. `delivery` is the copy addressed
+    /// to the recipient — opportunistic, or direct over a link, including an opportunistic send
+    /// promoted to direct because it does not fit one packet. `propagated` is the copy handed to the
+    /// outbound propagation node.
+    public enum Leg: Hashable, Sendable { case delivery, propagated }
+
+    /// Key of `pendingDeliveries` and of each copy's retry timer.
+    public struct DeliveryKey: Hashable, Sendable {
+        public var messageHash: Data
+        public var leg: Leg
+        public init(messageHash: Data, leg: Leg) {
+            self.messageHash = messageHash
+            self.leg = leg
+        }
+        public static func delivery(_ messageHash: Data) -> DeliveryKey { DeliveryKey(messageHash: messageHash, leg: .delivery) }
+        public static func propagated(_ messageHash: Data) -> DeliveryKey { DeliveryKey(messageHash: messageHash, leg: .propagated) }
+    }
 
     public enum ResendInfo: Equatable {
         case opportunistic(destinationHash: Data, payload: Data)
@@ -168,9 +189,11 @@ public struct LXMFRouter {
         /// via `establishAttempts == nil`, and it remains the mutation catcher for this action:
         /// drop the `knownPaths.remove` below and it fails.
         case pathLostAndClosed(destinationHash: Data)
-        case delivered(messageHash: Data)
+        /// A receipt for one copy of a message. The copy is named by the path that produced the
+        /// receipt, never inferred from which copy was armed last.
+        case delivered(messageHash: Data, leg: Leg)
         case resourceDeliveredOnLink(linkID: Data)
-        case retryDue(messageHash: Data)
+        case retryDue(messageHash: Data, leg: Leg)
         case idleDeadline(destinationHash: Data, linkID: Data)
         case pathRequestDeadline(destinationHash: Data)
         case delegate(Delegate)
@@ -197,11 +220,11 @@ public struct LXMFRouter {
 
     public var body: some ReducerOf<Self> {
         Reduce { [clock] state, action in
-            func retryTimer(_ hash: Data, _ seconds: Int) -> Effect<Action> {
+            func retryTimer(_ key: DeliveryKey, _ seconds: Int) -> Effect<Action> {
                 .run { send in
                     try await clock.sleep(for: .seconds(seconds))
-                    await send(.retryDue(messageHash: hash))
-                }.cancellable(id: CancelID.retry(hash), cancelInFlight: true)
+                    await send(.retryDue(messageHash: key.messageHash, leg: key.leg))
+                }.cancellable(id: CancelID.retry(key), cancelInFlight: true)
             }
             func idleTimer(_ dest: Data, _ linkID: Data) -> Effect<Action> {
                 .run { send in
@@ -215,8 +238,19 @@ public struct LXMFRouter {
                     await send(.pathRequestDeadline(destinationHash: dest))
                 }.cancellable(id: CancelID.pathRequest(dest), cancelInFlight: true)
             }
-            func arm(_ state: inout State, _ hash: Data, _ resend: ResendInfo) {
-                state.pendingDeliveries[hash] = PendingDelivery(resend: resend, attempts: 1)
+            func arm(_ state: inout State, _ key: DeliveryKey, _ resend: ResendInfo) {
+                state.pendingDeliveries[key] = PendingDelivery(resend: resend, attempts: 1)
+            }
+            /// One copy of a message was confirmed: settle that copy only, stop its retries, and
+            /// report the outcome that copy stands for. A receipt for a copy no longer pending is
+            /// ignored.
+            func succeed(_ state: inout State, _ key: DeliveryKey) -> Effect<Action> {
+                guard state.pendingDeliveries[key] != nil else { return .none }
+                state.pendingDeliveries[key] = nil
+                let outcome: Action.Delegate = key.leg == .propagated
+                    ? .propagationAccepted(messageHash: key.messageHash)
+                    : .deliveryConfirmed(messageHash: key.messageHash)
+                return .merge(.cancel(id: CancelID.retry(key)), .send(.delegate(outcome)))
             }
             // Tear down a direct link, reaping its in-flight Resource entry. `linkResourceInFlight`
             // is keyed on the linkID carried by `.active`, so it can only be reaped BEFORE
@@ -371,21 +405,23 @@ public struct LXMFRouter {
                     (desiredMethod == .opportunistic && !message.opportunisticFits) ? .direct : desiredMethod
                 switch effective {
                 case .opportunistic:
+                    let key = DeliveryKey.delivery(message.hash)
                     let resend = ResendInfo.opportunistic(destinationHash: message.destinationHash,
                                                           payload: message.opportunisticPayload)
-                    arm(&state, message.hash, resend)
+                    arm(&state, key, resend)
                     return .merge(.send(.delegate(.sendOpportunistic(destinationHash: message.destinationHash,
                                                                      payload: message.opportunisticPayload))),
-                                  retryTimer(message.hash, LXMFDelivery.retryWaitSeconds))
+                                  retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 case .direct:
                     let dest = message.destinationHash
                     if case let .active(linkID) = state.directLinks[dest] {
+                        let key = DeliveryKey.delivery(message.hash)
                         let asResource = message.directRepresentation == .resource
-                        arm(&state, message.hash, .direct(destinationHash: dest, data: message.packed, asResource: asResource))
-                        if asResource { state.linkResourceInFlight[linkID] = message.hash }
+                        arm(&state, key, .direct(destinationHash: dest, data: message.packed, asResource: asResource))
+                        if asResource { state.linkResourceInFlight[linkID] = key }
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: message.packed,
                                                                   asResource: asResource))),
-                                      retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
+                                      retryTimer(key, LXMFDelivery.retryWaitSeconds),
                                       idleTimer(dest, linkID))
                     }
                     state.outboundQueue[dest, default: []].append(message)
@@ -404,20 +440,21 @@ public struct LXMFRouter {
                     return .send(.delegate(.deliveryFailed(messageHash: message.hash)))
                 }
                 if case let .active(linkID) = state.directLinks[pn] {
-                    arm(&state, message.hash, .propagated(destinationHash: pn, data: propagationPacked))
+                    let key = DeliveryKey.propagated(message.hash)
+                    arm(&state, key, .propagated(destinationHash: pn, data: propagationPacked))
                     if propagationPacked.count <= Link.mdu {
-                        // Small container: send as a proof-requesting link packet.
-                        // token = message.hash so packetDelivered maps back to this pending delivery.
+                        // Small container: send as a proof-requesting link packet. token = message.hash,
+                        // and LXMFNode maps its packetDelivered back to THIS copy (leg .propagated).
                         return .merge(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
                                                                             propagationPacked: propagationPacked,
                                                                             messageHash: message.hash))),
-                                      retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
+                                      retryTimer(key, LXMFDelivery.retryWaitSeconds),
                                       idleTimer(pn, linkID))
                     } else {
-                        // Large container: send as Resource; receipt via resourceDeliveredOnLink (unchanged).
-                        state.linkResourceInFlight[linkID] = message.hash
+                        // Large container: send as Resource; receipt via resourceDeliveredOnLink.
+                        state.linkResourceInFlight[linkID] = key
                         return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: propagationPacked))),
-                                      retryTimer(message.hash, LXMFDelivery.retryWaitSeconds),
+                                      retryTimer(key, LXMFDelivery.retryWaitSeconds),
                                       idleTimer(pn, linkID))
                     }
                 }
@@ -463,23 +500,25 @@ public struct LXMFRouter {
                 state.propagationQueue[dest] = nil
                 var effects: [Effect<Action>] = []
                 for m in queued {
+                    let key = DeliveryKey.delivery(m.hash)
                     let asResource = m.directRepresentation == .resource
-                    arm(&state, m.hash, .direct(destinationHash: dest, data: m.packed, asResource: asResource))
-                    if asResource { state.linkResourceInFlight[linkID] = m.hash }
+                    arm(&state, key, .direct(destinationHash: dest, data: m.packed, asResource: asResource))
+                    if asResource { state.linkResourceInFlight[linkID] = key }
                     effects.append(.send(.delegate(.sendDirect(linkID: linkID, data: m.packed, asResource: asResource))))
-                    effects.append(retryTimer(m.hash, LXMFDelivery.retryWaitSeconds))
+                    effects.append(retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 }
                 for item in propQueued {
-                    arm(&state, item.messageHash, .propagated(destinationHash: dest, data: item.propagationPacked))
+                    let key = DeliveryKey.propagated(item.messageHash)
+                    arm(&state, key, .propagated(destinationHash: dest, data: item.propagationPacked))
                     if item.propagationPacked.count <= Link.mdu {
                         effects.append(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
                                                                               propagationPacked: item.propagationPacked,
                                                                               messageHash: item.messageHash))))
                     } else {
-                        state.linkResourceInFlight[linkID] = item.messageHash
+                        state.linkResourceInFlight[linkID] = key
                         effects.append(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: item.propagationPacked))))
                     }
-                    effects.append(retryTimer(item.messageHash, LXMFDelivery.retryWaitSeconds))
+                    effects.append(retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 }
                 // Always arm — not only when a queue was drained. A link re-established for a
                 // still-pending delivery or a PN sync drains no queue, so the old "only if queued"
@@ -540,61 +579,56 @@ public struct LXMFRouter {
                 }
                 return .none
 
-            case let .delivered(hash):
-                guard let pending = state.pendingDeliveries[hash] else { return .none }
-                state.pendingDeliveries[hash] = nil
-                let outcome: Action.Delegate = {
-                    if case .propagated = pending.resend { return .propagationAccepted(messageHash: hash) }
-                    return .deliveryConfirmed(messageHash: hash)
-                }()
-                return .merge(.cancel(id: CancelID.retry(hash)), .send(.delegate(outcome)))
+            case let .delivered(hash, leg):
+                return succeed(&state, DeliveryKey(messageHash: hash, leg: leg))
 
             case let .resourceDeliveredOnLink(linkID):
-                guard let hash = state.linkResourceInFlight[linkID] else { return .none }
+                guard let key = state.linkResourceInFlight[linkID] else { return .none }
                 state.linkResourceInFlight[linkID] = nil
-                return .send(.delivered(messageHash: hash))
+                return .send(.delivered(messageHash: key.messageHash, leg: key.leg))
 
-            case let .retryDue(hash):
-                guard var pending = state.pendingDeliveries[hash] else { return .none }
+            case let .retryDue(hash, leg):
+                let key = DeliveryKey(messageHash: hash, leg: leg)
+                guard var pending = state.pendingDeliveries[key] else { return .none }
                 pending.attempts += 1
                 if pending.attempts > LXMFDelivery.maxAttempts {
-                    state.pendingDeliveries[hash] = nil
+                    state.pendingDeliveries[key] = nil
                     return .send(.delegate(.deliveryFailed(messageHash: hash)))
                 }
-                state.pendingDeliveries[hash] = pending
+                state.pendingDeliveries[key] = pending
                 switch pending.resend {
                 case let .opportunistic(destinationHash, payload):
                     if !state.knownPaths.contains(destinationHash) {
                         // Pathless opportunistic retry: request a path instead of resending, and wait longer.
                         return .merge(.send(.delegate(.requestPath(destinationHash: destinationHash))),
-                                      retryTimer(hash, LXMFDelivery.pathRequestWaitSeconds))
+                                      retryTimer(key, LXMFDelivery.pathRequestWaitSeconds))
                     }
                     return .merge(.send(.delegate(.sendOpportunistic(destinationHash: destinationHash, payload: payload))),
-                                  retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                                  retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 case let .direct(destinationHash, data, asResource):
                     if case let .active(linkID) = state.directLinks[destinationHash] {
-                        if asResource { state.linkResourceInFlight[linkID] = hash }
+                        if asResource { state.linkResourceInFlight[linkID] = key }
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: asResource))),
-                                      retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                                      retryTimer(key, LXMFDelivery.retryWaitSeconds))
                     }
                     // Link is down or re-establishing: no live link to send on. Wait and re-check; the
                     // attempt was already counted, so the saga stays bounded by maxAttempts.
-                    return retryTimer(hash, LXMFDelivery.retryWaitSeconds)
+                    return retryTimer(key, LXMFDelivery.retryWaitSeconds)
                 case let .propagated(destinationHash, data):
                     if case let .active(linkID) = state.directLinks[destinationHash] {
                         if data.count <= Link.mdu {
                             return .merge(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
                                                                                 propagationPacked: data,
                                                                                 messageHash: hash))),
-                                          retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                                          retryTimer(key, LXMFDelivery.retryWaitSeconds))
                         } else {
-                            state.linkResourceInFlight[linkID] = hash
+                            state.linkResourceInFlight[linkID] = key
                             return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: data))),
-                                          retryTimer(hash, LXMFDelivery.retryWaitSeconds))
+                                          retryTimer(key, LXMFDelivery.retryWaitSeconds))
                         }
                     }
                     // Link down/re-establishing: no live link; wait and re-check (bounded by maxAttempts).
-                    return retryTimer(hash, LXMFDelivery.retryWaitSeconds)
+                    return retryTimer(key, LXMFDelivery.retryWaitSeconds)
                 }
 
             case let .idleDeadline(dest, linkID):

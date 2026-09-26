@@ -197,7 +197,7 @@ private func makeDeliveryStampStore(
     let msg = try #require(capturedMessage.value)
     #expect(msg.stamp == nil)
     // Retire the router's retry timer so the effect set drains cleanly.
-    await store.send(.router(.delivered(messageHash: msg.hash)))
+    await store.send(.router(.delivered(messageHash: msg.hash, leg: .delivery)))
     await store.skipReceivedActions(strict: false)
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))
@@ -223,7 +223,7 @@ private func makeDeliveryStampStore(
     let msg = try #require(capturedMessage.value)
     #expect(msg.stamp == nil)
     // Retire the router's retry timer so the effect set drains cleanly.
-    await store.send(.router(.delivered(messageHash: msg.hash)))
+    await store.send(.router(.delivered(messageHash: msg.hash, leg: .delivery)))
     await store.skipReceivedActions(strict: false)
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))
@@ -304,7 +304,7 @@ private func makeDeliveryStampStore(
     // `.on` is judging. It must change no state and emit no `.deliveryFailed`. Ordering matters:
     // an earlier draft cancelled once under `.off` first, which cleared the list and left the
     // exhaustive cancel with nothing to get wrong.
-    await store.send(.router(.delivered(messageHash: sent.hash)))
+    await store.send(.router(.delivered(messageHash: sent.hash, leg: .delivery)))
     await store.skipReceivedActions(strict: false)
     store.exhaustivity = .on
     await store.send(.cancelDeliveryStamps)                  // exhaustive: must be a complete no-op
@@ -366,7 +366,7 @@ private func makeDeliveryStampStore(
     let sent = try #require(captured.value)
     #expect(sent.stamp == sentinel)    // byte-exact: not re-searched, not dropped
     // Nothing may be left running — a re-stamp would still be searching here.
-    await store.send(.router(.delivered(messageHash: msg.hash)))
+    await store.send(.router(.delivered(messageHash: msg.hash, leg: .delivery)))
     await store.skipReceivedActions(strict: false)
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))
