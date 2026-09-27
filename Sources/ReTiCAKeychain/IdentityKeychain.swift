@@ -9,6 +9,9 @@ import ReTiCA
 /// 2. At launch, synchronously:
 ///    `IdentityKeychain.loadOrCreate(shared: Location(service: "reticulum.identity",
 ///    accessGroup: "HK6WSAR793.co.lithobyte.reticulum.identity"), legacy: [<your old item, if any>])`.
+///    Every location MUST name its access group. An unentitled legacy item written without a
+///    group physically lives in the app-ID group, e.g.
+///    `Location(service: "nbhd.identity", accessGroup: "HK6WSAR793.co.lithobyte.Nbhd")`.
 /// 3. Treat `.failed` as "identity unavailable right now" (e.g. prewarm before first unlock) —
 ///    NEVER mint a replacement yourself.
 ///
@@ -18,7 +21,8 @@ import ReTiCA
 /// deleted; items are device-local (never `kSecAttrSynchronizable`).
 public struct IdentityKeychain {
     /// A generic-password item address. `accessGroup == nil` puts no `kSecAttrAccessGroup` in
-    /// the query: reads and deletes then match the service in EVERY group the app can access.
+    /// the query: reads and deletes then match the service in EVERY group the app can access —
+    /// which is why `loadOrCreate` rejects such locations (`Failure.invalidLocation`).
     /// Items are addressed by class + service (+ access group) only — no `kSecAttrAccount` — and
     /// are never `kSecAttrSynchronizable`; any adopting app must write the shared item the same
     /// way, or its copy won't collide/dedupe with the one other apps already wrote.
@@ -56,9 +60,15 @@ public struct IdentityKeychain {
         case corrupt(location: Location)
         /// Adding the shared item failed (e.g. -34018 errSecMissingEntitlement).
         case addFailed(status: Int32)
-        /// An add reported success but the shared item couldn't be read back as expected.
-        case verifyFailed
+        /// The shared item couldn't be read back as expected after an add. `status` is the
+        /// OSStatus when the re-read itself failed; nil when the item was absent or differed.
+        case verifyFailed(status: Int32?)
         case mintFailed
+        /// A location has no access group. Rejected before any Keychain access: a group-less
+        /// delete matches the service in EVERY accessible group (unbounded — it could destroy an
+        /// item never verified), a group-less read picks one of them arbitrarily, and a
+        /// group-less add lands in the app's default group instead of the shared one.
+        case invalidLocation(Location)
     }
 
     /// Rules, in order (spec 2026-09-26-shared-identity-design §5.1):
@@ -71,17 +81,21 @@ public struct IdentityKeychain {
     /// 3. Nothing anywhere → mint, add-only → `.created`; a duplicate → re-read, the stored
     ///    identity wins (`.loaded`).
     /// 4. Any read/add error → `.failed`; never mint on error.
+    ///
+    /// Every location (shared and legacy) must name its access group; otherwise
+    /// `.failed(.invalidLocation)` is returned without touching the Keychain.
+    /// Legacy locations with the shared item's service are ignored, whatever their group.
     public static func loadOrCreate(
         shared: Location,
         legacy: [Location] = [],
         ops: KeychainOps = .live
     ) -> Outcome {
-        // A legacy location that would match the shared item itself must never be read as
-        // "legacy" — the leftover cleanup would delete the shared item.
-        let legacy = legacy.filter { location in
-            !(location.service == shared.service
-              && (location.accessGroup == nil || location.accessGroup == shared.accessGroup))
+        if let unscoped = ([shared] + legacy).first(where: { $0.accessGroup == nil }) {
+            return .failed(.invalidLocation(unscoped))
         }
+        // A legacy location with the shared service is never treated as legacy: it is the shared
+        // item itself, or another group's copy of it, and the leftover cleanup must not delete it.
+        let legacy = legacy.filter { $0.service != shared.service }
 
         // Rule 1
         switch ops.read(shared) {
@@ -136,7 +150,7 @@ public struct IdentityKeychain {
             case let .failed(status):
                 return .failed(.readFailed(location: shared, status: status))
             case .notFound:
-                return .failed(.verifyFailed)
+                return .failed(.verifyFailed(status: nil))
             case let .found(data):
                 guard let winner = Identity(privateKey: data) else {
                     return .failed(.corrupt(location: shared))
@@ -150,11 +164,19 @@ public struct IdentityKeychain {
             }
 
         case .added:
-            guard case let .found(stored) = ops.read(shared), stored == seed,
-                  let identity = Identity(privateKey: stored) else {
-                // Legacy item kept; the next load resolves (rule 1 loads a good copy and
-                // removes the identical leftover).
-                return .failed(.verifyFailed)
+            // On any verify failure the legacy item is kept; the next load resolves (rule 1
+            // loads a good copy and removes the identical leftover).
+            let stored: Data
+            switch ops.read(shared) {
+            case let .failed(status):
+                return .failed(.verifyFailed(status: status))
+            case .notFound:
+                return .failed(.verifyFailed(status: nil))
+            case let .found(data):
+                stored = data
+            }
+            guard stored == seed, let identity = Identity(privateKey: stored) else {
+                return .failed(.verifyFailed(status: nil))
             }
             // A failed delete is harmless: the identity is safe in the shared item and the next
             // load removes the identical leftover.
@@ -171,7 +193,7 @@ public struct IdentityKeychain {
             }
             return .loaded(winner)
         case .notFound:
-            return .failed(.verifyFailed)
+            return .failed(.verifyFailed(status: nil))
         case let .failed(status):
             return .failed(.readFailed(location: shared, status: status))
         }

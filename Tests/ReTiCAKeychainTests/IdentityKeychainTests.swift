@@ -4,13 +4,29 @@ import ReTiCA
 @testable import ReTiCAKeychain
 
 private let shared = IdentityKeychain.Location(service: "reticulum.identity", accessGroup: "TEAMID.co.example.reticulum.identity")
-private let legacy = IdentityKeychain.Location(service: "app.identity", accessGroup: nil)
-private let olderLegacy = IdentityKeychain.Location(service: "app.identity.v0", accessGroup: nil)
+/// Legacy items live in the old app's app-ID group (an unentitled, group-less write lands there).
+private let appGroup = "TEAMID.co.example.app"
+private let legacy = IdentityKeychain.Location(service: "app.identity", accessGroup: appGroup)
+private let olderLegacy = IdentityKeychain.Location(service: "app.identity.v0", accessGroup: appGroup)
 private let garbage = Data(repeating: 0xAB, count: 63)
 
 private func makeSeed() -> (Identity, Data) {
     let identity = Identity()
     return (identity, identity.privateKey!)
+}
+
+/// Wraps `base` so `afterAdd` runs once an add has returned (outside the keychain's lock) —
+/// e.g. to make the shared item vanish or become unreadable before the caller's re-read.
+private func ops(_ base: KeychainOps, afterAdd: @escaping @Sendable (KeychainOps.AddResult) -> Void) -> KeychainOps {
+    KeychainOps(
+        read: base.read,
+        add: { location, data in
+            let result = base.add(location, data)
+            afterAdd(result)
+            return result
+        },
+        delete: base.delete
+    )
 }
 
 private func isCreated(_ outcome: IdentityKeychain.Outcome) -> Bool {
@@ -123,7 +139,7 @@ struct IdentityKeychainTests {
         let (_, data) = makeSeed()
         let keychain = InMemoryKeychain([legacy: data])
         keychain.dropAdds(at: shared)
-        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .failed(.verifyFailed))
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .failed(.verifyFailed(status: nil)))
         #expect(keychain.item(at: legacy) == data)
     }
 
@@ -214,9 +230,148 @@ struct IdentityKeychainTests {
 
     @Test func legacyLocationAliasingTheSharedItemIsIgnored() {
         let (identity, data) = makeSeed()
-        let alias = IdentityKeychain.Location(service: shared.service, accessGroup: nil)
+        let alias = IdentityKeychain.Location(service: shared.service, accessGroup: shared.accessGroup)
         let keychain = InMemoryKeychain([shared: data])
         #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [alias], ops: keychain.ops) == .loaded(identity))
         #expect(keychain.item(at: shared) == data)
+    }
+
+    // MARK: Location validation (fix round 1)
+
+    /// A group-less shared read would pick an arbitrary group's item; nothing may be touched.
+    @Test func nilGroupSharedLocationIsRejectedAndTouchesNothing() {
+        let (_, data) = makeSeed()
+        let unscoped = IdentityKeychain.Location(service: shared.service, accessGroup: nil)
+        let keychain = InMemoryKeychain([shared: data, legacy: data])
+        #expect(IdentityKeychain.loadOrCreate(shared: unscoped, legacy: [legacy], ops: keychain.ops)
+                == .failed(.invalidLocation(unscoped)))
+        #expect(keychain.item(at: shared) == data)
+        #expect(keychain.item(at: legacy) == data)
+        #expect(keychain.addCount == 0)
+    }
+
+    /// A group-less legacy delete would remove the service in EVERY group, including items never verified.
+    @Test func nilGroupLegacyLocationIsRejectedAndTouchesNothing() {
+        let (_, data) = makeSeed()
+        let unscoped = IdentityKeychain.Location(service: legacy.service, accessGroup: nil)
+        let keychain = InMemoryKeychain([legacy: data])
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [unscoped], ops: keychain.ops)
+                == .failed(.invalidLocation(unscoped)))
+        #expect(keychain.item(at: legacy) == data)
+        #expect(keychain.item(at: shared) == nil)
+        #expect(keychain.addCount == 0)
+    }
+
+    @Test func legacyWithSharedServiceInAnotherGroupIsIgnored() {
+        let (identity, data) = makeSeed()
+        let otherGroupCopy = IdentityKeychain.Location(service: shared.service, accessGroup: appGroup)
+        let keychain = InMemoryKeychain([shared: data, otherGroupCopy: data])
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [otherGroupCopy], ops: keychain.ops) == .loaded(identity))
+        #expect(keychain.item(at: otherGroupCopy) == data)
+        #expect(keychain.item(at: shared) == data)
+    }
+
+    /// The same legacy service in two groups: only the verified one is ever deleted.
+    @Test func migratingOneGroupNeverDeletesTheSameServiceInAnotherGroup() {
+        let (x, xData) = makeSeed()
+        let (_, yData) = makeSeed()
+        let g1 = IdentityKeychain.Location(service: "app.identity", accessGroup: "TEAMID.co.example.g1")
+        let g2 = IdentityKeychain.Location(service: "app.identity", accessGroup: "TEAMID.co.example.g2")
+        let keychain = InMemoryKeychain([g1: xData, g2: yData])
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [g1], ops: keychain.ops) == .migrated(x))
+        #expect(keychain.item(at: shared) == xData)
+        #expect(keychain.item(at: g1) == nil)
+        #expect(keychain.item(at: g2) == yData)
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [g1], ops: keychain.ops) == .loaded(x))
+        #expect(keychain.item(at: g2) == yData)
+    }
+
+    // MARK: Fail-closed branches (fix round 1)
+
+    @Test func migrationDuplicateWhoseRereadFailsKeepsLegacyAndNeverMints() {
+        let (_, legacyData) = makeSeed()
+        let (_, otherData) = makeSeed()
+        let keychain = InMemoryKeychain([legacy: legacyData])
+        keychain.onBeforeAdd { location in
+            keychain.set(otherData, at: location)
+            keychain.failRead(at: location, status: -25308)
+        }
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.readFailed(location: shared, status: -25308)))
+        #expect(keychain.item(at: legacy) == legacyData)
+        #expect(keychain.item(at: shared) == otherData)
+        #expect(keychain.addCount == 1)
+    }
+
+    @Test func migrationDuplicateWhoseRereadFindsNothingKeepsLegacyAndNeverMints() {
+        let (_, legacyData) = makeSeed()
+        let (_, otherData) = makeSeed()
+        let keychain = InMemoryKeychain([legacy: legacyData])
+        keychain.onBeforeAdd { location in keychain.set(otherData, at: location) }
+        let vanishing = ops(keychain.ops) { result in
+            if result == .duplicate { keychain.set(nil, at: shared) }
+        }
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: vanishing)
+                == .failed(.verifyFailed(status: nil)))
+        #expect(keychain.item(at: legacy) == legacyData)
+        #expect(keychain.item(at: shared) == nil)
+        #expect(keychain.addCount == 1)
+    }
+
+    @Test func migrationDuplicateWithCorruptSharedKeepsLegacyAndNeverMints() {
+        let (_, legacyData) = makeSeed()
+        let keychain = InMemoryKeychain([legacy: legacyData])
+        keychain.onBeforeAdd { location in keychain.set(garbage, at: location) }
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.corrupt(location: shared)))
+        #expect(keychain.item(at: legacy) == legacyData)
+        #expect(keychain.item(at: shared) == garbage)
+        #expect(keychain.addCount == 1)
+    }
+
+    @Test func mintDuplicateWhoseRereadFindsNothingFailsAndNeverMintsAgain() {
+        let (_, otherData) = makeSeed()
+        let keychain = InMemoryKeychain()
+        keychain.onBeforeAdd { location in keychain.set(otherData, at: location) }
+        let vanishing = ops(keychain.ops) { result in
+            if result == .duplicate { keychain.set(nil, at: shared) }
+        }
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, ops: vanishing) == .failed(.verifyFailed(status: nil)))
+        #expect(keychain.item(at: shared) == nil)
+        #expect(keychain.addCount == 1)
+    }
+
+    @Test func mintDuplicateWhoseRereadFailsFailsAndNeverMintsAgain() {
+        let (_, otherData) = makeSeed()
+        let keychain = InMemoryKeychain()
+        keychain.onBeforeAdd { location in
+            keychain.set(otherData, at: location)
+            keychain.failRead(at: location, status: -25308)
+        }
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, ops: keychain.ops)
+                == .failed(.readFailed(location: shared, status: -25308)))
+        #expect(keychain.item(at: shared) == otherData)
+        #expect(keychain.addCount == 1)
+    }
+
+    @Test func leftoverCleanupReadErrorStillLoadsAndDeletesNothing() {
+        let (identity, data) = makeSeed()
+        let keychain = InMemoryKeychain([shared: data, legacy: data])
+        keychain.failRead(at: legacy, status: -25308)
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .loaded(identity))
+        #expect(keychain.item(at: legacy) == data)
+        #expect(keychain.item(at: shared) == data)
+    }
+
+    @Test func migrationVerifyReadErrorCarriesStatusAndKeepsLegacy() {
+        let (_, data) = makeSeed()
+        let keychain = InMemoryKeychain([legacy: data])
+        let unreadable = ops(keychain.ops) { result in
+            if result == .added { keychain.failRead(at: shared, status: -25308) }
+        }
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: unreadable)
+                == .failed(.verifyFailed(status: -25308)))
+        #expect(keychain.item(at: legacy) == data)
+        #expect(keychain.addCount == 1)
     }
 }
