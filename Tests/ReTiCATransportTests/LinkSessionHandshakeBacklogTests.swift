@@ -176,3 +176,24 @@ private func authenticatedData(_ linkID: Data, _ key: Data, _ body: UInt8) -> Da
     store.exhaustivity = .on
     await clock.advance(by: .seconds(3_600))
 }
+
+/// A late action for a transfer this session has already removed is a quiet no-op AT THE SESSION
+/// (not only when `LinkPlane` wraps it): the session's own `.forEach(\.transfers)` must never
+/// `reportIssue` for it. Driven directly into a standalone session, so the plane-level filter
+/// cannot be what absorbs it.
+@Test @MainActor func lateActionForARemovedTransferIsIgnoredBySessionItself() async {
+    let clock = TestClock<Duration>()
+    let (store, linkID, key) = await handshakingResponder(clock: clock)
+    let rtt = linkData(linkID, .linkRequestRTT, Link.encrypt(MsgPack.encode(0.0), sessionKey: key))
+    await store.send(.received(rtt))
+    await store.send(.sendResource(Data(repeating: 0xAB, count: 64)))
+    let transferID = store.state.transfers[0].id
+    await store.send(.close)
+    await store.receive { if case .delegate(.closed) = $0 { return true }; return false }
+    #expect(store.state.transfers[id: transferID] == nil)
+
+    // What a watchdog that fired just before the removal would deliver.
+    store.exhaustivity = .on
+    await store.send(.transfer(.element(id: transferID, action: .senderDeadline)))
+    await store.send(.transfer(.element(id: transferID, action: .delegate(.concluded))))
+}

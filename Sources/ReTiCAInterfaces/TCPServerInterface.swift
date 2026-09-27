@@ -75,7 +75,9 @@ public struct TCPServerInterface {
             // Same single-writer FIFO as `TCPClientInterface` — see its `.send` for why outbound
             // order must be fixed at reduce time rather than by one `.run` Task per frame — and
             // its CANCELLATION note for why a writer is reset (generation bump) rather than trusted
-            // to report back. Here the reset points are the listener starting and stopping.
+            // to report back, and why the writer checks for cancellation before EVERY frame (the
+            // send itself ignores cancellation). Here the reset points are the listener starting
+            // and stopping.
             func startWriter(_ state: inout State) -> Effect<Action> {
                 guard !state.isWriting, !state.outbox.isEmpty else { return .none }
                 let batch = state.outbox
@@ -83,7 +85,10 @@ public struct TCPServerInterface {
                 state.outbox = []
                 state.isWriting = true
                 return .run { send in
-                    for item in batch { await tcpListener.send(item.conn, item.framed) }
+                    for item in batch {
+                        guard !Task.isCancelled else { return }
+                        await tcpListener.send(item.conn, item.framed)
+                    }
                     await send(.writerFinished(generation: generation))
                 }
                 .cancellable(id: CancelID.writer, cancelInFlight: true)

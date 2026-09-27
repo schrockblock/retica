@@ -72,8 +72,15 @@ public struct TCPClientInterface {
             // cancels whatever writer is running, clears `isWriting`, and bumps
             // `writerGeneration`. Each batch carries its generation, and a `.writerFinished` from
             // a superseded generation is ignored, so a late report can never start a second
-            // writer. `cancelInFlight` on the one shared cancel ID is the backstop: starting a
-            // writer cancels any other still running, so there is never more than one.
+            // writer. `cancelInFlight` on the one shared cancel ID cancels any other writer when
+            // one starts.
+            //
+            // Cancelling is not enough on its own: `tcpConnection.send` ignores cancellation (the
+            // live `NWConnectionActor.send` just writes), so a cancelled writer would carry on
+            // through its batch while the next generation's writer starts on the outbox — two
+            // writers hopping the actor at once, frames interleaving. Hence the check before EACH
+            // frame: a superseded writer stops after at most the one send it had already issued,
+            // and the rest of its batch (meant for the superseded connection) is dropped.
             func startWriter(_ state: inout State) -> Effect<Action> {
                 guard !state.isWriting, !state.outbox.isEmpty else { return .none }
                 let batch = state.outbox
@@ -81,7 +88,10 @@ public struct TCPClientInterface {
                 state.outbox = []
                 state.isWriting = true
                 return .run { send in
-                    for frame in batch { await tcpConnection.send(frame) }
+                    for frame in batch {
+                        guard !Task.isCancelled else { return }
+                        await tcpConnection.send(frame)
+                    }
                     await send(.writerFinished(generation: generation))
                 }
                 .cancellable(id: CancelID.writer, cancelInFlight: true)
