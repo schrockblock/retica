@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "ReTiCAInterfaces", targets: ["ReTiCAInterfaces"]),
         .library(name: "ReTiCATransport", targets: ["ReTiCATransport"]),
         .library(name: "ReTiCANode", targets: ["ReTiCANode"]),
+        .library(name: "ReTiCAKeychain", targets: ["ReTiCAKeychain"]),
     ],
     dependencies: [
         .package(url: "https://github.com/pointfreeco/swift-composable-architecture", from: "1.15.0"),
@@ -77,6 +78,16 @@ let package = Package(
                 "ReTiCANode",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
             ]
+        ),
+        // Shared per-device identity storage (Keychain access group). Depends only on the
+        // dependency-free core so any app can adopt it without pulling in TCA or transports.
+        .target(
+            name: "ReTiCAKeychain",
+            dependencies: ["ReTiCA"]
+        ),
+        .testTarget(
+            name: "ReTiCAKeychainTests",
+            dependencies: ["ReTiCAKeychain", "ReTiCA"]
         ),
     ],
     swiftLanguageModes: [.v6]
