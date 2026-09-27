@@ -80,3 +80,99 @@ private func linkData(_ linkID: Data, _ context: PacketContext, _ payload: Data)
 
     await store.send(.close)
 }
+
+// MARK: - Backlog bounds and lifetime (Task 9 follow-up)
+
+/// A responder driven to `.handshake` (proof sent, no LRRTT yet), plus what a test needs to forge
+/// authenticated traffic for it.
+@MainActor
+private func handshakingResponder(clock: TestClock<Duration>) async
+    -> (store: TestStore<LinkSession.State, LinkSession.Action>, linkID: Data, key: Data)
+{
+    let initEph = Identity()
+    let destHash = Data(repeating: 0x67, count: 16)
+    let linkRequest = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                             destinationType: .single, context: .none, contextFlag: false, hops: 0,
+                             destinationHash: destHash, transportId: nil,
+                             payload: initEph.publicKey + Link.signallingBytes)
+    let store = TestStore(
+        initialState: LinkSession.State(responderFor: Identity(), destinationHash: destHash,
+                                        interfaceID: InterfaceID("i"))
+    ) { LinkSession() } withDependencies: {
+        $0.date = .constant(epoch); $0.continuousClock = clock; $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.acceptRequest(try! linkRequest.packed()))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }   // LRPROOF
+    return (store, store.state.linkID, store.state.sessionKey)
+}
+
+private func authenticatedData(_ linkID: Data, _ key: Data, _ body: UInt8) -> Data {
+    linkData(linkID, .none, Link.encrypt(Data([body]), sessionKey: key))
+}
+
+/// The backlog is bounded: a session-key holder cannot grow it without limit during the
+/// establishment window. The ninth and tenth packets are dropped, the first eight kept in order.
+@Test @MainActor func handshakeBacklogIsCappedAtEight() async {
+    let clock = TestClock<Duration>()
+    let (store, linkID, key) = await handshakingResponder(clock: clock)
+    let packets = (0..<10).map { authenticatedData(linkID, key, UInt8($0)) }
+    for p in packets { await store.send(.received(p)) }
+    #expect(store.state.handshakeBacklog.map(\.data) == Array(packets.prefix(8)))
+    await clock.advance(by: .seconds(15))   // let the establishment deadline reap it
+}
+
+/// A handshake that never gets its LRRTT is reaped by the establishment deadline, and what it
+/// was holding goes with it — nothing is replayed, nothing lingers in state.
+@Test @MainActor func establishmentDeadlineClearsTheHandshakeBacklog() async {
+    let clock = TestClock<Duration>()
+    let (store, linkID, key) = await handshakingResponder(clock: clock)
+    await store.send(.received(authenticatedData(linkID, key, 1)))
+    #expect(store.state.handshakeBacklog.count == 1)
+
+    await clock.advance(by: .seconds(15))
+    await store.receive(\.establishmentDeadline)
+    #expect(store.state.status == .closed)
+    #expect(store.state.handshakeBacklog.isEmpty)
+    await store.receive(.delegate(.closed(.timedOut)))
+}
+
+/// `.close` during `.handshake` drops the held traffic (the link itself is still left for the
+/// establishment deadline to reap, as before).
+@Test @MainActor func closeDuringHandshakeClearsTheHandshakeBacklog() async {
+    let clock = TestClock<Duration>()
+    let (store, linkID, key) = await handshakingResponder(clock: clock)
+    await store.send(.received(authenticatedData(linkID, key, 1)))
+    #expect(store.state.handshakeBacklog.count == 1)
+
+    await store.send(.close)
+    #expect(store.state.handshakeBacklog.isEmpty)
+    #expect(store.state.status == .handshake)
+    await clock.advance(by: .seconds(15))
+}
+
+// MARK: - Close reaps transfers (Task 9 follow-up)
+
+/// Closing a session removes its transfers, which cancels their watchdogs in the same turn. Before,
+/// an advertised sender's watchdog outlived the close and re-advertised the resource on the closed
+/// link (and, under `LinkPlane`, its late actions reached a removed element).
+@Test @MainActor func closingASessionCancelsItsTransferWatchdogs() async {
+    let clock = TestClock<Duration>()
+    let (store, linkID, key) = await handshakingResponder(clock: clock)
+    let rtt = linkData(linkID, .linkRequestRTT, Link.encrypt(MsgPack.encode(0.0), sessionKey: key))
+    await store.send(.received(rtt))
+    #expect(store.state.status == .active)
+
+    await store.send(.sendResource(Data(repeating: 0xAB, count: 64)))
+    await store.receive { if case .delegate(.transmit) = $0 { return true }; return false }   // advertisement
+    #expect(store.state.transfers.count == 1)
+
+    await store.send(.close)
+    await store.receive { if case .delegate(.closed) = $0 { return true }; return false }
+    #expect(store.state.transfers.isEmpty)
+
+    // From here on every action must be accounted for: a surviving watchdog would fire
+    // `senderDeadline` and re-transmit the advertisement on the closed link.
+    store.exhaustivity = .on
+    await clock.advance(by: .seconds(3_600))
+}

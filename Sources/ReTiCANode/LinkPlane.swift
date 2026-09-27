@@ -137,6 +137,22 @@ public struct LinkPlane {
     @Dependency(\.requestResponder) var requestResponder
 
     public var body: some ReducerOf<Self> {
+        // LATE ACTIONS FOR A REMOVED LINK are dropped quietly. A link element is removed on its
+        // `.delegate(.closed)` / `.establishmentFailed`, and TCA drains effect actions
+        // breadth-first, so a sibling chain's action for that link can already be queued — e.g. a
+        // resource proof and a LINKCLOSE delivered in one TCP read: the close removes the element
+        // one level before the proof's transfer `.concluded` arrives. `.forEach` reported that as
+        // "received an action for a missing element" (this file's `.forEach`, seen in Nbhd's live
+        // suite once Nbhd started closing request links promptly). The element's effects are
+        // cancelled on removal (and `LinkSession` now reaps its transfers when it closes); this
+        // catches only what was emitted before that.
+        IgnoringActionsForRemovedElements(core) { (state: State, action: Action) -> Bool in
+            guard case let .link(.element(id, _)) = action else { return false }
+            return state.links[id: id] == nil
+        }
+    }
+
+    private var core: some ReducerOf<Self> {
         Reduce { state, action in
             switch action {
             case let .openLink(identity, destinationHash, interfaceID, relayNextHop):

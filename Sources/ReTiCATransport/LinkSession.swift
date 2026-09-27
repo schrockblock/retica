@@ -41,9 +41,9 @@ public struct LinkSession {
     /// from growing the buffer without bound during the establishment window.
     static let handshakeBacklogLimit = 8
     /// One inbound packet held in `State.handshakeBacklog`, with the interface it arrived on.
-    public struct BufferedPacket: Equatable, Sendable {
-        public var data: Data
-        public var arrivalInterface: InterfaceID?
+    struct BufferedPacket: Equatable, Sendable {
+        var data: Data
+        var arrivalInterface: InterfaceID?
     }
     static let resourceSDU = 464
     static let requestMDU = 431
@@ -124,7 +124,7 @@ public struct LinkSession {
         /// arrived while still in `.handshake`, i.e. BEFORE the LRRTT that activates the link.
         /// Replayed in arrival order, right after `.established`, when the LRRTT lands. Bounded by
         /// `LinkSession.handshakeBacklogLimit`; dropped if the handshake times out.
-        public var handshakeBacklog: [BufferedPacket] = []
+        var handshakeBacklog: [BufferedPacket] = []
         /// Initiator: link to a known destination identity.
         public init(id: UUID = UUID(), initiatorTo destinationIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
@@ -248,6 +248,27 @@ public struct LinkSession {
     public init() {}
 
     public var body: some ReducerOf<Self> {
+        // LATE CHILD ACTIONS. A transfer can be removed (GC on `.received`/`.concluded`/`.failed`,
+        // or reaped on close below) while actions for it are still queued: TCA drains effect
+        // actions breadth-first, so a sibling packet's chain (e.g. a LINKCLOSE that arrived in
+        // the same TCP read as a resource proof) can remove the element one level before the
+        // transfer's own delegate lands. `.forEach` would `reportIssue` for such an action —
+        // which is a test failure, and was the "missing element" at this file's `.forEach` in
+        // Nbhd's live suite. Nothing can be done with an action for an element that no longer
+        // exists, so drop it quietly. Removal itself still cancels the element's running effects
+        // (the watchdog timers), so this only catches actions already emitted.
+        IgnoringActionsForRemovedElements(withTransfers) { (state: State, action: Action) -> Bool in
+            guard case let .transfer(.element(id, _)) = action else { return false }
+            return state.transfers[id: id] == nil
+        }
+    }
+
+    private var withTransfers: some ReducerOf<Self> {
+        sessionAndReaper.forEach(\.transfers, action: \.transfer) { ResourceTransfer() }
+    }
+
+    @ReducerBuilder<State, Action>
+    private var sessionAndReaper: some ReducerOf<Self> {
         Reduce { [date, clock, uuid, randomBytes] state, action in
             func establishmentTimer(_ t: TimeInterval) -> Effect<Action> {
                 .run { send in try await clock.sleep(for: .seconds(t)); await send(.establishmentDeadline) }
@@ -919,6 +940,11 @@ public struct LinkSession {
                 return .send(.delegate(.transmit(id, raw)))
 
             case .close:
+                // A close during `.handshake` still does not tear the link down (only an active
+                // link has a session to close on the wire; the establishment deadline reaps it),
+                // but it does drop anything held for replay — the owner no longer wants this
+                // link's traffic, same as when the establishment deadline fires.
+                if state.status == .handshake { state.handshakeBacklog = [] }
                 guard state.status == .active else { return .none }
                 let cipher = Link.encrypt(state.linkID, sessionKey: state.sessionKey)
                 state.status = .closed
@@ -1119,7 +1145,18 @@ public struct LinkSession {
                 return .none
             }
         }
-        .forEach(\.transfers, action: \.transfer) { ResourceTransfer() }
+        // CLOSE REAPS TRANSFERS, at the source. Whatever closed the session (`.close`, an inbound
+        // LINKCLOSE, the inactivity or establishment deadline), its transfers are dead with it.
+        // Removing them HERE — inside the reducer that `.forEach(\.transfers)` wraps — makes
+        // `.forEach` cancel their effects in the same turn, so a closed session's watchdogs can
+        // no longer fire `receiverDeadline`/`senderDeadline` and retransmit on a closed link.
+        // Before this, they ran until `LinkPlane` removed the whole element, and a session used
+        // standalone kept transmitting resource traffic after it closed.
+        Reduce { state, _ in
+            guard state.status == .closed, !state.transfers.isEmpty else { return .none }
+            state.transfers.removeAll()
+            return .none
+        }
     }
 }
 
