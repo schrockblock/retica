@@ -76,6 +76,9 @@ public struct IdentityKeychain {
         /// Nothing was found at the named locations, but an item exists under this service in
         /// some other access group (e.g. a mistyped legacy group). Minting would rotate the
         /// identity, so nothing is written or deleted.
+        /// It can also surface from a race: another process adds the shared item between rule
+        /// 1's read and the probe. Callers should treat it as retryable ("not now"), like
+        /// `readFailed`; the next load then finds the shared item. Never mint in response.
         case unexpectedItem(service: String)
     }
 

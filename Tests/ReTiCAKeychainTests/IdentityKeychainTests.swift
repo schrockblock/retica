@@ -298,6 +298,17 @@ struct IdentityKeychainTests {
         #expect(keychain.item(at: actual) == data)
     }
 
+    /// On device: a locked item in an unexpected group (errSecInteractionNotAllowed) during the probe.
+    @Test func probeReadFailureNeverMints() {
+        let anyGroup = IdentityKeychain.Location(service: legacy.service, accessGroup: nil)
+        let keychain = InMemoryKeychain()
+        keychain.failRead(at: anyGroup, status: -25308)
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.readFailed(location: anyGroup, status: -25308)))
+        #expect(keychain.addCount == 0)
+        #expect(keychain.item(at: shared) == nil)
+    }
+
     @Test func emptyStringGroupIsRejectedAndTouchesNothing() {
         let (_, data) = makeSeed()
         let emptyShared = IdentityKeychain.Location(service: shared.service, accessGroup: "")
