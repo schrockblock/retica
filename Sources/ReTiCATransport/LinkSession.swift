@@ -36,6 +36,15 @@ public struct LinkSession {
     static let keepaliveMaxRTTRatio = 360.0 / 1.75   // KEEPALIVE_MAX / KEEPALIVE_MAX_RTT
     static let keepaliveMin: TimeInterval = 5        // KEEPALIVE_MIN
     static let keepaliveMax: TimeInterval = 360      // KEEPALIVE_MAX
+    /// Most packets a responder holds while waiting for the LRRTT. The initiator's legitimate
+    /// pre-RTT burst is an identify plus a request or two; the cap stops a session-key holder
+    /// from growing the buffer without bound during the establishment window.
+    static let handshakeBacklogLimit = 8
+    /// One inbound packet held in `State.handshakeBacklog`, with the interface it arrived on.
+    public struct BufferedPacket: Equatable, Sendable {
+        public var data: Data
+        public var arrivalInterface: InterfaceID?
+    }
     static let resourceSDU = 464
     static let requestMDU = 431
     public static let maxEfficientSize = 1_048_575
@@ -111,6 +120,11 @@ public struct LinkSession {
         /// on a slow link where the derived cadence is far longer than 30 s.
         var staleTime: TimeInterval { max(keepaliveInterval, effectiveKeepalive) * 2 }
         public var relayNextHop: Data? = nil
+        /// Responder only: authenticated link traffic (DATA/NONE, LINKIDENTIFY, REQUEST) that
+        /// arrived while still in `.handshake`, i.e. BEFORE the LRRTT that activates the link.
+        /// Replayed in arrival order, right after `.established`, when the LRRTT lands. Bounded by
+        /// `LinkSession.handshakeBacklogLimit`; dropped if the handshake times out.
+        public var handshakeBacklog: [BufferedPacket] = []
         /// Initiator: link to a known destination identity.
         public init(id: UUID = UUID(), initiatorTo destinationIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
@@ -515,8 +529,46 @@ public struct LinkSession {
                     state.status = .active
                     state.activatedAt = now
                     state.lastInbound = now
-                    return .merge(.send(.delegate(.established(linkID: state.linkID, sessionKey: state.sessionKey))),
+                    // Replay anything that beat the LRRTT here (see the `.handshake` buffering
+                    // branch below), AFTER `.established` and in arrival order, now that the
+                    // `.active` branches will accept it.
+                    let replays = state.handshakeBacklog.map {
+                        Effect<Action>.send(.received($0.data, arrivalInterface: $0.arrivalInterface))
+                    }
+                    state.handshakeBacklog = []
+                    let established = Effect<Action>.send(
+                        .delegate(.established(linkID: state.linkID, sessionKey: state.sessionKey)))
+                    return .merge(.concatenate([established] + replays),
                                   .cancel(id: CancelID.establishment), inactivityTimer(state.staleTime))
+
+                case (.responder, .handshake, .data, .none),
+                     (.responder, .handshake, .data, .linkIdentify),
+                     (.responder, .handshake, .data, .request):
+                    // Authenticated traffic that overtook the LRRTT. The initiator goes `.active`
+                    // on the proof and may send DATA/identify/request immediately after the RTT;
+                    // nothing guarantees they arrive after it (TCPClientInterface once reordered
+                    // its own frames; a multi-path mesh still can). These used to fall to
+                    // `default: .none` — the request was silently lost and the initiator's
+                    // request timed out ~11 s later.
+                    //
+                    // Reference RNS (RNS/Link.py `__receive`) gates only on `status != CLOSED`:
+                    // it processes LINKIDENTIFY and DATA during HANDSHAKE, but `handle_request`
+                    // requires `status == ACTIVE`, so a pre-RTT REQUEST is dropped there too. RNS
+                    // does NOT promote a link to ACTIVE on data — only `rtt_packet` (or
+                    // `validate_proof` on the initiator) does. So we do not promote either: we
+                    // BUFFER, and replay once the LRRTT activates the link, which also keeps the
+                    // RTT/keepalive derivation fed by the real RTT.
+                    //
+                    // Only packets that decrypt under the session key are held (injected junk is
+                    // still ignored, as in the RTT branch above), and at most
+                    // `handshakeBacklogLimit` of them. The establishment timer stays armed, so a
+                    // link that never receives its RTT is still reaped and the buffer with it.
+                    guard state.handshakeBacklog.count < LinkSession.handshakeBacklogLimit,
+                          authDecrypt(packet.payload, state.sessionKey) != nil
+                    else { return .none }
+                    state.handshakeBacklog.append(
+                        BufferedPacket(data: data, arrivalInterface: arrivalInterface))
+                    return .none
 
                 case (_, .active, .data, .none):
                     guard let plain = authDecrypt(packet.payload, state.sessionKey)
@@ -881,6 +933,7 @@ public struct LinkSession {
             case .establishmentDeadline:
                 guard state.status == .pending || state.status == .handshake else { return .none }
                 state.status = .closed
+                state.handshakeBacklog = []
                 // An INITIATOR's establishment timeout is an establishment FAILURE, and must be
                 // delivered keyed by DESTINATION. Emitting .closed here instead surfaces as
                 // linkClosed(linkID:), which LXMFNode cannot reverse-map — directLinks is written
