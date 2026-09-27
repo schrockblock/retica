@@ -25,7 +25,8 @@ private func ops(_ base: KeychainOps, afterAdd: @escaping @Sendable (KeychainOps
             afterAdd(result)
             return result
         },
-        delete: base.delete
+        delete: base.delete,
+        deleteItem: base.deleteItem
     )
 }
 
@@ -262,13 +263,88 @@ struct IdentityKeychainTests {
         #expect(keychain.addCount == 0)
     }
 
-    @Test func legacyWithSharedServiceInAnotherGroupIsIgnored() {
+    // MARK: Fix round 2
+
+    /// Groups are mandatory, so only an exact alias is the shared item: a same-service item in
+    /// another named group is a real legacy identity and must migrate, never be skipped (→ mint).
+    @Test func sameServiceLegacyInAnotherNamedGroupMigrates() {
         let (identity, data) = makeSeed()
-        let otherGroupCopy = IdentityKeychain.Location(service: shared.service, accessGroup: appGroup)
-        let keychain = InMemoryKeychain([shared: data, otherGroupCopy: data])
-        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [otherGroupCopy], ops: keychain.ops) == .loaded(identity))
-        #expect(keychain.item(at: otherGroupCopy) == data)
+        let oldApp = IdentityKeychain.Location(service: shared.service, accessGroup: "TEAMID.oldApp")
+        let keychain = InMemoryKeychain([oldApp: data])
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [oldApp], ops: keychain.ops) == .migrated(identity))
         #expect(keychain.item(at: shared) == data)
+        #expect(keychain.item(at: oldApp) == nil)
+    }
+
+    /// E.g. a legacy group string with the wrong prefix: the item exists, just not where named.
+    @Test func legacyItemOnlyInAnUnexpectedGroupFailsClosed() {
+        let (_, data) = makeSeed()
+        let actual = IdentityKeychain.Location(service: legacy.service, accessGroup: "TEAMID.co.example.wrong")
+        let keychain = InMemoryKeychain([actual: data])
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.unexpectedItem(service: legacy.service)))
+        #expect(keychain.addCount == 0)
+        #expect(keychain.item(at: actual) == data)
+        #expect(keychain.item(at: shared) == nil)
+    }
+
+    @Test func sharedServiceItemInAnUnexpectedGroupFailsClosed() {
+        let (_, data) = makeSeed()
+        let actual = IdentityKeychain.Location(service: shared.service, accessGroup: "TEAMID.co.example.other")
+        let keychain = InMemoryKeychain([actual: data])
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.unexpectedItem(service: shared.service)))
+        #expect(keychain.addCount == 0)
+        #expect(keychain.item(at: actual) == data)
+    }
+
+    @Test func emptyStringGroupIsRejectedAndTouchesNothing() {
+        let (_, data) = makeSeed()
+        let emptyShared = IdentityKeychain.Location(service: shared.service, accessGroup: "")
+        let emptyLegacy = IdentityKeychain.Location(service: legacy.service, accessGroup: "")
+        let keychain = InMemoryKeychain([legacy: data])
+        #expect(IdentityKeychain.loadOrCreate(shared: emptyShared, ops: keychain.ops) == .failed(.invalidLocation(emptyShared)))
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [emptyLegacy], ops: keychain.ops)
+                == .failed(.invalidLocation(emptyLegacy)))
+        #expect(keychain.addCount == 0)
+        #expect(keychain.item(at: legacy) == data)
+    }
+
+    /// Two items differ only by account; the location query matches both. Only the one whose
+    /// bytes were copied and verified may be deleted.
+    @Test func migrationDeletesOnlyTheVerifiedItemNotAnAccountSibling() {
+        let (x, xData) = makeSeed()
+        let (_, yData) = makeSeed()
+        let keychain = InMemoryKeychain()
+        keychain.set(xData, at: legacy)
+        keychain.set(yData, at: legacy, account: "other")
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .migrated(x))
+        #expect(keychain.item(at: shared) == xData)
+        #expect(keychain.item(at: legacy) == nil)
+        #expect(keychain.item(at: legacy, account: "other") == yData)
+    }
+
+    @Test func migrationRaceWithTheSameSeedDeletesOnlyTheVerifiedItem() {
+        let (x, xData) = makeSeed()
+        let (_, yData) = makeSeed()
+        let keychain = InMemoryKeychain()
+        keychain.set(xData, at: legacy)
+        keychain.set(yData, at: legacy, account: "other")
+        keychain.onBeforeAdd { location in keychain.set(xData, at: location) }
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .migrated(x))
+        #expect(keychain.item(at: legacy) == nil)
+        #expect(keychain.item(at: legacy, account: "other") == yData)
+    }
+
+    @Test func leftoverCleanupDeletesOnlyTheVerifiedItem() {
+        let (x, xData) = makeSeed()
+        let (_, yData) = makeSeed()
+        let keychain = InMemoryKeychain([shared: xData])
+        keychain.set(xData, at: legacy)
+        keychain.set(yData, at: legacy, account: "other")
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .loaded(x))
+        #expect(keychain.item(at: legacy) == nil)
+        #expect(keychain.item(at: legacy, account: "other") == yData)
     }
 
     /// The same legacy service in two groups: only the verified one is ever deleted.
