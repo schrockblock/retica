@@ -30,6 +30,9 @@ extension KeychainOps {
     /// accessibility is `kSecAttrAccessibleAfterFirstUnlock` (readable by background launches
     /// after the first unlock; iOS prewarm BEFORE first unlock fails with
     /// errSecInteractionNotAllowed, which callers must treat as "not now", never "absent").
+    /// Queries address items by class + service (+ access group) only — no `kSecAttrAccount` is
+    /// ever set — and never set `kSecAttrSynchronizable`; every adopting app must write the
+    /// shared item with these exact same attributes, or the copies won't collide/dedupe.
     public static let live = KeychainOps(
         read: { location in
             var result: AnyObject?

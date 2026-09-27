@@ -74,7 +74,10 @@ public final class InMemoryKeychain: @unchecked Sendable {
         }
     }
 
+    /// Group-less adds are unsupported: on device, a group-less `SecItemAdd` lands in the app's
+    /// default (first entitled) access group, which this in-memory double has no way to model.
     private func add(_ location: Location, _ data: Data) -> KeychainOps.AddResult {
+        precondition(location.accessGroup != nil, "InMemoryKeychain.add requires a location with an access group")
         let hook = locked { beforeAdd }
         hook?(location)
         return locked {
