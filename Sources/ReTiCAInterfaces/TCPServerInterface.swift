@@ -27,6 +27,9 @@ public struct TCPServerInterface {
         var outbox: [OutboundFrame]
         /// True while the one writer effect is draining a batch.
         var isWriting: Bool
+        /// Tags each writer batch; bumped when the writer is reset (listener (re)started or
+        /// stopped), so a `.writerFinished` from a superseded writer is ignored.
+        var writerGeneration: UInt64
 
         public init(port: UInt16) {
             self.port = port
@@ -34,6 +37,7 @@ public struct TCPServerInterface {
             self.deframers = [:]
             self.outbox = []
             self.isWriting = false
+            self.writerGeneration = 0
         }
     }
 
@@ -49,8 +53,8 @@ public struct TCPServerInterface {
         case stop
         case listenerEvent(TCPListenerEvent)
         case send(conn: TCPConnID, Data)
-        /// The writer finished the batch it took from `outbox`. Internal bookkeeping.
-        case writerFinished
+        /// The writer of `generation` finished the batch it took from `outbox`. Internal bookkeeping.
+        case writerFinished(generation: UInt64)
         case delegate(Delegate)
         @CasePathable
         public enum Delegate: Equatable {
@@ -62,23 +66,32 @@ public struct TCPServerInterface {
 
     @Dependency(\.tcpListener) var tcpListener
 
-    private enum CancelID { case listener }
+    private enum CancelID { case listener, writer }
 
     public init() {}
 
     public var body: some ReducerOf<Self> {
         Reduce { [tcpListener] state, action in
             // Same single-writer FIFO as `TCPClientInterface` — see its `.send` for why outbound
-            // order must be fixed at reduce time rather than by one `.run` Task per frame.
+            // order must be fixed at reduce time rather than by one `.run` Task per frame — and
+            // its CANCELLATION note for why a writer is reset (generation bump) rather than trusted
+            // to report back. Here the reset points are the listener starting and stopping.
             func startWriter(_ state: inout State) -> Effect<Action> {
                 guard !state.isWriting, !state.outbox.isEmpty else { return .none }
                 let batch = state.outbox
+                let generation = state.writerGeneration
                 state.outbox = []
                 state.isWriting = true
                 return .run { send in
                     for item in batch { await tcpListener.send(item.conn, item.framed) }
-                    await send(.writerFinished)
+                    await send(.writerFinished(generation: generation))
                 }
+                .cancellable(id: CancelID.writer, cancelInFlight: true)
+            }
+            func resetWriter(_ state: inout State) -> Effect<Action> {
+                state.writerGeneration &+= 1
+                state.isWriting = false
+                return .concatenate(.cancel(id: CancelID.writer), startWriter(&state))
             }
 
             switch action {
@@ -95,14 +108,16 @@ public struct TCPServerInterface {
             case .stop:
                 state.status = .stopped
                 state.deframers.removeAll()
+                state.outbox = []   // every connection goes with the listener
                 return .merge(
                     .cancel(id: CancelID.listener),
+                    resetWriter(&state),
                     .run { _ in await tcpListener.stop() }
                 )
 
             case .listenerEvent(.started):
                 state.status = .listening
-                return .none
+                return resetWriter(&state)
 
             case .listenerEvent(.failed):
                 state.status = .stopped
@@ -130,7 +145,8 @@ public struct TCPServerInterface {
                 state.outbox.append(OutboundFrame(conn: conn, framed: HDLC.frame(raw)))
                 return startWriter(&state)
 
-            case .writerFinished:
+            case let .writerFinished(generation):
+                guard generation == state.writerGeneration else { return .none }   // superseded
                 state.isWriting = false
                 return startWriter(&state)
 

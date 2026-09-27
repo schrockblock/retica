@@ -22,6 +22,9 @@ public struct TCPClientInterface {
         var outbox: [Data]
         /// True while the one writer effect is draining a batch. At most one is ever in flight.
         var isWriting: Bool
+        /// Tags each writer batch. Bumped whenever the writer is reset (a fresh connection, an
+        /// explicit disconnect), so a `.writerFinished` from a superseded writer is ignored.
+        var writerGeneration: UInt64
 
         public init(host: String, port: UInt16, reconnectOnDrop: Bool = true) {
             self.host = host
@@ -31,6 +34,7 @@ public struct TCPClientInterface {
             self.deframer = HDLCDeframer()
             self.outbox = []
             self.isWriting = false
+            self.writerGeneration = 0
         }
     }
 
@@ -41,8 +45,8 @@ public struct TCPClientInterface {
         case disconnect
         case connectionEvent(TCPEvent)
         case send(Data)
-        /// The writer finished the batch it took from `outbox`. Internal bookkeeping.
-        case writerFinished
+        /// The writer of `generation` finished the batch it took from `outbox`. Internal bookkeeping.
+        case writerFinished(generation: UInt64)
         case delegate(Delegate)
         public enum Delegate: Equatable { case packetReceived(Data) }
     }
@@ -50,7 +54,7 @@ public struct TCPClientInterface {
     @Dependency(\.tcpConnection) var tcpConnection
     @Dependency(\.continuousClock) var clock
 
-    private enum CancelID { case connection, reconnect }
+    private enum CancelID { case connection, reconnect, writer }
 
     public init() {}
 
@@ -61,20 +65,31 @@ public struct TCPClientInterface {
             // next, so frames reach the connection in exactly outbox order. Frames reduced while a
             // batch is in flight wait in `outbox` for the next batch (started by `.writerFinished`).
             //
-            // Not cancellable, deliberately: a cancelled writer would never report
-            // `.writerFinished`, leaving `isWriting` stuck and every later frame queued for ever.
-            // The live `send` returns as soon as `NWConnection.send` has queued the bytes, so a
-            // batch always finishes promptly; on a dropped connection its frames are discarded by
-            // the connection layer exactly as a lone send's were.
+            // CANCELLATION. A writer that is cancelled (or that simply never reports back) never
+            // delivers its `.writerFinished`, which would leave `isWriting` true for ever and
+            // silently queue every later frame — total TX loss. So the writer is not trusted to
+            // report back: `resetWriter` (on a fresh connection and on an explicit disconnect)
+            // cancels whatever writer is running, clears `isWriting`, and bumps
+            // `writerGeneration`. Each batch carries its generation, and a `.writerFinished` from
+            // a superseded generation is ignored, so a late report can never start a second
+            // writer. `cancelInFlight` on the one shared cancel ID is the backstop: starting a
+            // writer cancels any other still running, so there is never more than one.
             func startWriter(_ state: inout State) -> Effect<Action> {
                 guard !state.isWriting, !state.outbox.isEmpty else { return .none }
                 let batch = state.outbox
+                let generation = state.writerGeneration
                 state.outbox = []
                 state.isWriting = true
                 return .run { send in
                     for frame in batch { await tcpConnection.send(frame) }
-                    await send(.writerFinished)
+                    await send(.writerFinished(generation: generation))
                 }
+                .cancellable(id: CancelID.writer, cancelInFlight: true)
+            }
+            func resetWriter(_ state: inout State) -> Effect<Action> {
+                state.writerGeneration &+= 1
+                state.isWriting = false
+                return .concatenate(.cancel(id: CancelID.writer), startWriter(&state))
             }
 
             switch action {
@@ -105,17 +120,22 @@ public struct TCPClientInterface {
 
             case .disconnect:
                 state.status = .disconnected
+                // Frames still queued were for the connection being closed; drop them with it.
+                state.outbox = []
                 return .merge(
                     .cancel(id: CancelID.connection),
                     // An explicit disconnect must also disarm a pending reconnect, or the interface
                     // silently re-dials 5s after the user asked it to stop.
                     .cancel(id: CancelID.reconnect),
+                    resetWriter(&state),
                     .run { _ in await tcpConnection.close() }
                 )
 
             case .connectionEvent(.connected):
                 state.status = .online
-                return .none
+                // A fresh connection starts from a known-good writer, whatever happened to the
+                // last one; anything queued meanwhile is written now, in order.
+                return resetWriter(&state)
 
             case let .connectionEvent(.data(bytes)):
                 let frames = state.deframer.ingest(bytes)
@@ -151,7 +171,8 @@ public struct TCPClientInterface {
                 state.outbox.append(HDLC.frame(raw))
                 return startWriter(&state)
 
-            case .writerFinished:
+            case let .writerFinished(generation):
+                guard generation == state.writerGeneration else { return .none }   // superseded
                 state.isWriting = false
                 return startWriter(&state)
 
