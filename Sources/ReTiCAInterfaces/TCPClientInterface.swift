@@ -17,6 +17,11 @@ public struct TCPClientInterface {
         public var status: Status
         public var reconnectOnDrop: Bool
         var deframer: HDLCDeframer
+        /// Framed bytes waiting for the single writer, in the order their `.send`s were REDUCED.
+        /// See `.send` for why outbound order has to be fixed here rather than in the socket layer.
+        var outbox: [Data]
+        /// True while the one writer effect is draining a batch. At most one is ever in flight.
+        var isWriting: Bool
 
         public init(host: String, port: UInt16, reconnectOnDrop: Bool = true) {
             self.host = host
@@ -24,6 +29,8 @@ public struct TCPClientInterface {
             self.status = .disconnected
             self.reconnectOnDrop = reconnectOnDrop
             self.deframer = HDLCDeframer()
+            self.outbox = []
+            self.isWriting = false
         }
     }
 
@@ -34,6 +41,8 @@ public struct TCPClientInterface {
         case disconnect
         case connectionEvent(TCPEvent)
         case send(Data)
+        /// The writer finished the batch it took from `outbox`. Internal bookkeeping.
+        case writerFinished
         case delegate(Delegate)
         public enum Delegate: Equatable { case packetReceived(Data) }
     }
@@ -47,6 +56,27 @@ public struct TCPClientInterface {
 
     public var body: some ReducerOf<Self> {
         Reduce { [tcpConnection, clock] state, action in
+            // Start the single writer if it is idle and there is anything to write. It takes the
+            // WHOLE outbox as one batch and awaits each `tcpConnection.send` before starting the
+            // next, so frames reach the connection in exactly outbox order. Frames reduced while a
+            // batch is in flight wait in `outbox` for the next batch (started by `.writerFinished`).
+            //
+            // Not cancellable, deliberately: a cancelled writer would never report
+            // `.writerFinished`, leaving `isWriting` stuck and every later frame queued for ever.
+            // The live `send` returns as soon as `NWConnection.send` has queued the bytes, so a
+            // batch always finishes promptly; on a dropped connection its frames are discarded by
+            // the connection layer exactly as a lone send's were.
+            func startWriter(_ state: inout State) -> Effect<Action> {
+                guard !state.isWriting, !state.outbox.isEmpty else { return .none }
+                let batch = state.outbox
+                state.outbox = []
+                state.isWriting = true
+                return .run { send in
+                    for frame in batch { await tcpConnection.send(frame) }
+                    await send(.writerFinished)
+                }
+            }
+
             switch action {
             case .connect:
                 state.status = .connecting
@@ -105,8 +135,25 @@ public struct TCPClientInterface {
                 .cancellable(id: CancelID.reconnect, cancelInFlight: true)
 
             case let .send(raw):
-                let framed = HDLC.frame(raw)
-                return .run { _ in await tcpConnection.send(framed) }
+                // ORDERING. This used to be `.run { _ in await tcpConnection.send(framed) }` — one
+                // unstructured Task PER FRAME. TCA starts each `.run` as its own `Task`
+                // (ComposableArchitecture/Core.swift, `case .run` → `Task(name:priority:)`), the
+                // nonisolated operation runs on the global concurrent executor, and independent
+                // Tasks reach `NWConnectionActor.send` in no guaranteed order. So two frames
+                // reduced A-then-B could hit the socket B-then-A. That is not hypothetical: on a
+                // link initiator the LRRTT is transmitted in the proof branch and LINKIDENTIFY /
+                // REQUEST follow in later `.send`s; reordered, the responder sees the request
+                // while still in `.handshake`, and the request times out ~11 s later.
+                //
+                // The order is fixed HERE, synchronously, at reduce time — the only point at which
+                // it is known. Any FIFO further down (an AsyncStream writer, a serial queue in the
+                // actor) is fed through the same racing Tasks and cannot recover it.
+                state.outbox.append(HDLC.frame(raw))
+                return startWriter(&state)
+
+            case .writerFinished:
+                state.isWriting = false
+                return startWriter(&state)
 
             case .delegate:
                 return .none

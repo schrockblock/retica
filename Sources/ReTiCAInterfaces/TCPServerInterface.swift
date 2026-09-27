@@ -21,12 +21,25 @@ public struct TCPServerInterface {
         /// closed one has its deframer removed, so buffered partial bytes never leak across
         /// connections or outlive the socket.
         var deframers: [TCPConnID: HDLCDeframer]
+        /// Framed bytes waiting for the single writer, in the order their `.send`s were REDUCED.
+        /// One queue for all connections: that keeps every connection's frames in order (and
+        /// costs no fairness worth having, since `tcpListener.send` only enqueues on the socket).
+        var outbox: [OutboundFrame]
+        /// True while the one writer effect is draining a batch.
+        var isWriting: Bool
 
         public init(port: UInt16) {
             self.port = port
             self.status = .stopped
             self.deframers = [:]
+            self.outbox = []
+            self.isWriting = false
         }
+    }
+
+    struct OutboundFrame: Equatable, Sendable {
+        var conn: TCPConnID
+        var framed: Data
     }
 
     public enum Status: Equatable { case stopped, listening }
@@ -36,6 +49,8 @@ public struct TCPServerInterface {
         case stop
         case listenerEvent(TCPListenerEvent)
         case send(conn: TCPConnID, Data)
+        /// The writer finished the batch it took from `outbox`. Internal bookkeeping.
+        case writerFinished
         case delegate(Delegate)
         @CasePathable
         public enum Delegate: Equatable {
@@ -53,6 +68,19 @@ public struct TCPServerInterface {
 
     public var body: some ReducerOf<Self> {
         Reduce { [tcpListener] state, action in
+            // Same single-writer FIFO as `TCPClientInterface` — see its `.send` for why outbound
+            // order must be fixed at reduce time rather than by one `.run` Task per frame.
+            func startWriter(_ state: inout State) -> Effect<Action> {
+                guard !state.isWriting, !state.outbox.isEmpty else { return .none }
+                let batch = state.outbox
+                state.outbox = []
+                state.isWriting = true
+                return .run { send in
+                    for item in batch { await tcpListener.send(item.conn, item.framed) }
+                    await send(.writerFinished)
+                }
+            }
+
             switch action {
             case .listen:
                 state.status = .listening
@@ -99,8 +127,12 @@ public struct TCPServerInterface {
                 return .send(.delegate(.connectionClosed(conn)))
 
             case let .send(conn, raw):
-                let framed = HDLC.frame(raw)
-                return .run { _ in await tcpListener.send(conn, framed) }
+                state.outbox.append(OutboundFrame(conn: conn, framed: HDLC.frame(raw)))
+                return startWriter(&state)
+
+            case .writerFinished:
+                state.isWriting = false
+                return startWriter(&state)
 
             case .delegate:
                 return .none
