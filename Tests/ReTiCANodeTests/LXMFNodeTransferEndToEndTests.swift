@@ -147,9 +147,13 @@ private final class TransferPair {
             // threshold like "progress >= 0.4" without ever observing it. Callers with a
             // fast-finishing pump pass a smaller `skipEvery` to keep the snapshot's staleness small
             // relative to the whole transfer.
+            //
+            // B is synced BEFORE `keepA` is evaluated: a caller's `keepA` may read `p.b.state` (to
+            // gate on a B-side signal that fires causally before A's own completion), and evaluating
+            // it against a stale, pre-sync B snapshot would defeat that entirely.
             if rounds % skipEvery == 0 {
-                if !keepA() { await a.skipReceivedActions(strict: false) }
                 if !keepB() { await b.skipReceivedActions(strict: false) }
+                if !keepA() { await a.skipReceivedActions(strict: false) }
             }
             if moved {
                 idle = 0
@@ -178,46 +182,63 @@ private final class TransferPair {
     var outbound: [Double] = []
     var inbound: [Double] = []
     var attempts = 0
-    // `pendingDeliveries[key]` does not exist yet right after `.send(.sendMessage(...))`: TestStore
-    // applies only the top-level action synchronously, and the router's own `.send`/`establish`/link
-    // handshake (which arms the entry once a direct link comes up) runs as later effects. So
-    // "== nil" is ambiguous between "not started" and "done" — it is true on BOTH sides of the
-    // transfer. `armed` disambiguates it for `until` AND for `keepA`: until it flips, `keepA()`
-    // must NOT read as "done" (that would stop `skipReceivedActions` from ever draining A's queue,
-    // and NOTHING else drives the link handshake's effect chain forward — freezing the pump dead).
-    var armed = false
-    let finished = await p.pump(
-        keepA: { armed && p.a.state.router.pendingDeliveries[key] == nil },
+    func sample() {
+        if let f = p.a.state.transferProgress[key], f != outbound.last { outbound.append(f) }
+        if let f = p.b.state.inboundProgress.values.first, f != inbound.last { inbound.append(f) }
+        attempts = max(attempts, p.a.state.router.pendingDeliveries[key]?.attempts ?? 0)
+    }
+    // FIX ROUND 1 (documented in the task report): the brief's `keepA`/`until` both read
+    // `pendingDeliveries[key] == nil` — the SAME condition — so at the one moment `keepA()` could
+    // ever matter (deciding whether to skip A), `until()` was already true too and the pump had
+    // already exited. `keepA` never actually gated anything.
+    //
+    // The fix runs the pump in two phases, gating A on a signal that fires causally BEFORE B sends
+    // its proof back to A (not on A's own completion): B's inbound progress nearly done, or B's
+    // router having recorded the message as `seen` (checked in addition, since B's proof can go out
+    // before its router records `seen`). Phase 1 stops skipping A once that signal fires — well
+    // before the confirmation cascade (`resourceConcluded → resourceDeliveredOnLink → delivered →
+    // succeed → deliveryConfirmed`) begins on A. Phase 2 then pumps with `keepA: { true }`
+    // (permanently un-gated) until B's proof has been fully forwarded into A's event stream, so that
+    // whichever rounds the confirmation cascade actually runs in, A's queue is never drained by a
+    // periodic skip and the terminal `.delegate(.deliveryConfirmed(...))` survives for the explicit
+    // `.receive()` below to find.
+    func bAlmostDone() -> Bool {
+        (p.b.state.inboundProgress.values.first ?? 0) >= 0.95 || p.b.state.router.seen.contains(msg.hash)
+    }
+    let phase1 = await p.pump(
+        keepA: { bAlmostDone() },
         keepB: { p.b.state.router.seen.contains(msg.hash) },
-        sample: {
-            if p.a.state.router.pendingDeliveries[key] != nil { armed = true }
-            if let f = p.a.state.transferProgress[key], f != outbound.last { outbound.append(f) }
-            if let f = p.b.state.inboundProgress.values.first, f != inbound.last { inbound.append(f) }
-            attempts = max(attempts, p.a.state.router.pendingDeliveries[key]?.attempts ?? 0)
-        },
-        until: { armed && p.a.state.router.pendingDeliveries[key] == nil })
-    #expect(finished, "the transfer stalled before an outcome")
+        sample: sample,
+        until: { bAlmostDone() })
+    #expect(phase1, "the transfer stalled before B was nearly done")
+    let phase2 = await p.pump(
+        keepA: { true },
+        sample: sample,
+        until: { p.b.state.router.seen.contains(msg.hash) && p.forwardedB == p.sentB.value.count })
+    #expect(phase2, "B's proof never reached A")
     await p.b.receive { action in
         guard case let .delegate(.messageReceived(m, validated, method)) = action else { return false }
         return m.hash == msg.hash && m.fields == msg.fields && validated && method == .direct
     }
-    // DEVIATION (documented in the task report): the brief asserts
-    // `await p.a.receive(.delegate(.deliveryConfirmed(messageHash: msg.hash)))` here. That is not
-    // reliable for a transfer this large: `skipReceivedActions` both refreshes the TestStore's state
-    // snapshot AND clears its whole received-actions log in one non-separable step (there is no API
-    // to do one without the other), and `until()` here can only become true once some periodic skip
-    // call has ALREADY refreshed state to reflect completion — the SAME call that, in the same
-    // stroke, discards the completion cascade's own terminal `.delegate(.deliveryConfirmed(...))`
-    // action from the log before the test ever gets to `.receive()` it. This reproduced
-    // deterministically for this exact payload/round-count, not as an occasional flake, so a longer
-    // `.receive()` timeout does not help (verified: still absent after 10s). `succeededMessages`
-    // below proves the same outcome the brief's receive would have (Ruling P8: success is proven by
-    // the outcome).
+    // `finishProgress` (LXMFNode.swift, handling `.router(.delegate(.deliveryConfirmed(hash)))`)
+    // clears `transferProgress[key]` in the SAME step that it decides whether to report 1.0, so
+    // polling the dict (as `sample()` does) can never observe the true final value — by the time any
+    // sync makes it visible, it is already gone. It always reports a `.deliveryProgress(fraction: 1)`
+    // delegate when the sender's own bookkeeping had not already reached 1.0 (which — confirmed by
+    // this test's own `outbound` tail topping out below 1.0 — is the case here), so that delegate,
+    // not the dict, is the reliable way to observe "sender progress ends at 1.0".
+    await p.a.receive { action in
+        if case let .delegate(.deliveryProgress(hash, fraction)) = action { return hash == msg.hash && fraction == 1 }
+        return false
+    }
+    outbound.append(1.0)
+    await p.a.receive(.delegate(.deliveryConfirmed(messageHash: msg.hash)))
     #expect(p.a.state.router.succeededMessages.contains(msg.hash))
     #expect(attempts == 1, "the message was resent mid-transfer")
     #expect(outbound.count > 10)
     #expect(outbound == outbound.sorted())
     #expect((outbound.first ?? 0) >= LXMFNode.linkActiveProgress)
+    #expect(outbound.last == 1.0, "sender progress should end at 1.0")
     #expect(inbound.count > 10)
     #expect(inbound == inbound.sorted())
     await p.stop()
@@ -235,25 +256,29 @@ private final class TransferPair {
     await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))
     var outbound: [Double] = []
     var attempts = 0
-    // See the monotonic-progress test: `pendingDeliveries[key]` is nil both before the direct link
-    // comes up and after the copy succeeds, so `armed` disambiguates "not started" from "done".
-    var armed = false
-    let finished = await p.pump(
+    func sample() {
+        if let f = p.a.state.transferProgress[key], f != outbound.last { outbound.append(f) }
+        attempts = max(attempts, p.a.state.router.pendingDeliveries[key]?.attempts ?? 0)
+    }
+    // FIX ROUND 1 (documented in the task report, same reasoning as the monotonic-progress test):
+    // `keepA`/`until` both reading `pendingDeliveries[key] == nil` made `keepA` dead. Two-phase pump
+    // gated on B instead, so A's queue is never drained once the confirmation cascade could begin.
+    func bAlmostDone() -> Bool {
+        (p.b.state.inboundProgress.values.first ?? 0) >= 0.95 || p.b.state.router.seen.contains(msg.hash)
+    }
+    let phase1 = await p.pump(
         bToADelay: .milliseconds(250),
-        keepA: { armed && p.a.state.router.pendingDeliveries[key] == nil },
-        sample: {
-            if p.a.state.router.pendingDeliveries[key] != nil { armed = true }
-            if let f = p.a.state.transferProgress[key], f != outbound.last { outbound.append(f) }
-            attempts = max(attempts, p.a.state.router.pendingDeliveries[key]?.attempts ?? 0)
-        },
-        until: { armed && p.a.state.router.pendingDeliveries[key] == nil })
-    #expect(finished, "the transfer stalled before an outcome")
-    // DEVIATION (documented in the task report, same reason as the monotonic-progress test): the
-    // brief's `await p.a.receive(.delegate(.deliveryConfirmed(messageHash: msg.hash)))` is not
-    // reliable here — `until()` can only become true once a periodic `skipReceivedActions` call has
-    // already refreshed state to reflect completion, and that same call discards the completion
-    // cascade's own terminal delegate action from the log first. Reproduced deterministically.
-    // `succeededMessages` proves the same outcome (Ruling P8).
+        keepA: { bAlmostDone() },
+        sample: sample,
+        until: { bAlmostDone() })
+    #expect(phase1, "the transfer stalled before B was nearly done")
+    let phase2 = await p.pump(
+        bToADelay: .milliseconds(250),
+        keepA: { true },
+        sample: sample,
+        until: { p.b.state.router.seen.contains(msg.hash) && p.forwardedB == p.sentB.value.count })
+    #expect(phase2, "B's proof never reached A")
+    await p.a.receive(.delegate(.deliveryConfirmed(messageHash: msg.hash)))
     #expect(p.a.state.router.succeededMessages.contains(msg.hash))
     let elapsed = TestClock<Duration>.Instant().duration(to: p.clock.now)
     #expect(elapsed > .seconds(50), "the harness did not slow the transfer enough to matter")
@@ -318,7 +343,6 @@ private final class TransferPair {
     await p.connectAndIntroduce()
     let msg = p.attachmentMessage(bytes: transferIncompressible(count: 100_000))
     #expect(msg.packed.count < 1000 * 1000)                                 // under the node's limit
-    let key = LXMFRouter.DeliveryKey.delivery(msg.hash)
     await p.a.send(.sendMessage(message: msg, alsoViaPropagation: true))
     #expect(p.a.state.router.pendingPropagatedCopies.contains(msg.hash))
     await p.a.receive { if case let .router(.sendViaPropagation(m, _)) = $0 { return m.hash == msg.hash }; return false }
@@ -328,23 +352,19 @@ private final class TransferPair {
                                                          bytesDone: 0, bytesTotal: 10, segment: 1, segments: 1))))
     await p.a.send(.endpoint(.delegate(.resourceConcluded(linkID: pnLink, resourceHash: pnResource))))
     await p.a.receive(.delegate(.propagationAccepted(messageHash: msg.hash)))
-    // See the monotonic-progress test: `armed` disambiguates "the direct copy has not been armed
-    // yet" from "it armed and then finished", both of which read as `pendingDeliveries[key] == nil`.
-    // DEVIATION (documented in the task report): also passes `skipEvery: 5` — see the cancel test's
-    // note; this 100 KB direct copy is small enough to finish inside a single default 50-round
-    // staleness window, which lost the `armed` transition entirely (verified: without this, the
-    // pump reports a stall rather than a false success).
-    var armed = p.a.state.router.pendingDeliveries[key] != nil
-    let finished = await p.pump(keepA: { armed && p.a.state.router.pendingDeliveries[key] == nil },
-                                skipEvery: 5,
-                                sample: { if p.a.state.router.pendingDeliveries[key] != nil { armed = true } },
-                                until: { armed && p.a.state.router.pendingDeliveries[key] == nil })
-    #expect(finished, "the direct transfer stalled before an outcome")
-    // DEVIATION (documented in the task report, same reason as the monotonic-progress test): the
-    // completion cascade's terminal delegate action is deterministically gone by the time `until()`
-    // can see the transfer as done — the same `skipReceivedActions` call that refreshes state to
-    // reveal completion also discards the log entry the brief's `.receive()` would find. Verified
-    // via state instead (Ruling P8).
+    // FIX ROUND 1 (documented in the task report, same reasoning as the monotonic-progress test):
+    // `keepA`/`until` both reading `pendingDeliveries[key] == nil` made `keepA` dead. Two-phase pump
+    // gated on B instead (`skipEvery: 5` throughout — this 100 KB direct copy is small enough to run
+    // its whole course inside one default 50-round window).
+    func bAlmostDone() -> Bool {
+        (p.b.state.inboundProgress.values.first ?? 0) >= 0.95 || p.b.state.router.seen.contains(msg.hash)
+    }
+    let phase1 = await p.pump(keepA: { bAlmostDone() }, skipEvery: 5, until: { bAlmostDone() })
+    #expect(phase1, "the direct transfer stalled before B was nearly done")
+    let phase2 = await p.pump(keepA: { true }, skipEvery: 5,
+                              until: { p.b.state.router.seen.contains(msg.hash) && p.forwardedB == p.sentB.value.count })
+    #expect(phase2, "B's proof never reached A")
+    await p.a.receive(.delegate(.deliveryConfirmed(messageHash: msg.hash)))
     #expect(p.a.state.router.succeededMessages.contains(msg.hash))
     #expect(p.a.state.router.pendingDeliveries.isEmpty)
     #expect(p.a.state.router.pendingPropagatedCopies.isEmpty)
