@@ -1118,7 +1118,7 @@ public struct LinkSession {
                 }
                 guard let hash else { return .none }
                 return .send(.delegate(.resourceConcluded(hash)))
-            case let .transfer(.element(elementID, .delegate(.failed))):
+            case let .transfer(.element(elementID, .delegate(.failed(_)))):
                 let t = state.transfers[id: elementID]
                 state.transfers.remove(id: elementID)
                 if let rid = t?.advertisement?.requestID, state.pendingRequests.contains(rid) {

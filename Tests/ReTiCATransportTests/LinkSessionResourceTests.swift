@@ -163,7 +163,7 @@ private func activeLinkHostingPlainTransfer()
 
 @Test @MainActor func failedTransferIsRemovedFromState() async {
     let (store, tid, hash) = activeLinkHostingPlainTransfer()
-    await store.send(.transfer(.element(id: tid, action: .delegate(.failed))))
+    await store.send(.transfer(.element(id: tid, action: .delegate(.failed(rejected: false)))))
     await store.receive { if case .delegate(.resourceFailed(hash)) = $0 { return true }; return false }
     #expect(store.state.transfers[id: tid] == nil)              // removed
 }
@@ -302,7 +302,7 @@ private func resourceStoreHostingSplitReceivers(
     let store = resourceStoreHostingSplitReceivers(oh: oh, total: 2, clock)
     let id1 = store.state.transfers[0].id
     store.exhaustivity = .off
-    await store.send(.transfer(.element(id: id1, action: .delegate(.failed))))
+    await store.send(.transfer(.element(id: id1, action: .delegate(.failed(rejected: false)))))
     await store.receive { if case let .delegate(.resourceFailed(h)) = $0 { return h == oh }; return false }
 }
 

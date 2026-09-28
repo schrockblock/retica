@@ -47,6 +47,9 @@ public struct ResourceTransfer {
         /// while a genuine re-request (fresh random IV → new packet) is served. Transfer-scoped;
         /// no cap, matching reference's per-resource list.
         public var servedRequestHashes: Set<Data> = []
+        /// Highest whole percent already reported through `.delegate(.progress)`; -1 before the
+        /// first report. The rate limit of spec §3: report only on crossing a new percent.
+        public var lastProgressPercent: Int = -1
         // hashmap-update (receiver)
         public var knownHashmap: Data
         public var hashmapHeight: Int
@@ -147,7 +150,18 @@ public struct ResourceTransfer {
             case transmit(InterfaceID, Data)
             case received(Data)
             case concluded
-            case failed
+            /// The transfer is over without success. `rejected` is true only when the peer REFUSED
+            /// it: a RESOURCE_RCL reaching the sender, whether it answered the advertisement
+            /// (reference `Resource.reject`, RNS/Resource.py:155-159) or cancelled mid-transfer.
+            /// Reference `Link.receive` routes every RCL on an outgoing resource to `_rejected()`
+            /// (RNS/Link.py:1114-1121), and LXMF treats REJECTED as terminal (LXMessage.py:597-606).
+            case failed(rejected: Bool)
+            /// How far the transfer has got. Sender: bytes of the parts served so far; receiver: bytes
+            /// of the parts received. `bytesTotal` is the whole segment's stream size. `segment` and
+            /// `segments` are this segment's 1-based index and the count (1 and 1 unless split).
+            /// Emitted with `bytesDone == 0` when the transfer starts, then only when the done
+            /// fraction crosses a new whole percent, so a transfer reports at most 101 times.
+            case progress(bytesDone: Int, bytesTotal: Int, segment: Int, segments: Int)
         }
     }
 
@@ -216,6 +230,31 @@ public struct ResourceTransfer {
                 return .send(.delegate(.transmit(s.interfaceID, icl)))
             }
 
+            /// One `.progress` event when the done fraction has crossed a new whole percent since the
+            /// last report (spec §3's rate limit), else nothing. The first call always reports
+            /// (`lastProgressPercent` starts at -1), and the final part always reaches 100.
+            func progress(_ s: inout State) -> Effect<Action> {
+                let total: Int
+                let done: Int
+                switch s.role {
+                case .sender:
+                    total = s.parts.reduce(0) { $0 + $1.count }
+                    done = s.sentIndices.reduce(0) { $0 + s.parts[$1].count }
+                case .receiver:
+                    // `t` is off the wire: clamp rather than trap (docs/wire-narrowing-inventory.md).
+                    total = Int(clamping: s.advertisement?.transferSize ?? 0)
+                    done = min(s.receivedParts.values.reduce(0) { $0 + $1.count }, total)
+                }
+                guard total > 0 else { return .none }
+                let percent = Int(Double(done) * 100 / Double(total))
+                guard percent > s.lastProgressPercent else { return .none }
+                s.lastProgressPercent = percent
+                let segments = max(1, Int(clamping: s.advertisement?.totalSegments ?? 1))
+                let segment = min(max(1, Int(clamping: s.advertisement?.segmentIndex ?? 1)), segments)
+                return .send(.delegate(.progress(bytesDone: done, bytesTotal: total,
+                                                 segment: segment, segments: segments)))
+            }
+
             func requestNextWindow(_ s: inout State) -> Effect<Action> {
                 if s.waitingForHMU { return armReceiverWatchdog(s) }   // await the HMU; don't spam REQs
                 let received = Set(s.receivedParts.keys)
@@ -251,7 +290,8 @@ public struct ResourceTransfer {
                                            Link.encrypt(adv.pack(), sessionKey: state.sessionKey))
                 else { return .none }
                 state.status = .advertised
-                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), armSenderWatchdog(state))
+                let started = progress(&state)                        // 0 of the whole: the transfer starts
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), armSenderWatchdog(state), started)
 
             case let .accept(data):
                 guard state.role == .receiver, state.status == .idle,
@@ -274,7 +314,8 @@ public struct ResourceTransfer {
                 state.consecutiveCompletedHeight = -1
                 state.retriesLeft = Const.maxRetries
                 state.status = .requesting
-                return requestNextWindow(&state)
+                let request = requestNextWindow(&state)
+                return .merge(request, progress(&state))              // 0 of the whole: the transfer starts
 
             case let .received(data):
                 guard let packet = Packet(raw: data), packet.destinationHash == state.linkID
@@ -321,7 +362,7 @@ public struct ResourceTransfer {
                                                      Link.encrypt(state.resourceHash, sessionKey: state.sessionKey))
                                 return .merge(.cancel(id: CancelID.watchdog),
                                               icl.map { Effect.send(.delegate(.transmit(state.interfaceID, $0))) } ?? .none,
-                                              .send(.delegate(.failed)))
+                                              .send(.delegate(.failed(rejected: false))))
                             }
                             let chunk = partIndex / Resource.hashmapMaxLen
                             let lo = chunk * Resource.hashmapMaxLen
@@ -337,6 +378,7 @@ public struct ResourceTransfer {
                     if state.sentIndices.count == state.parts.count {
                         state.status = .awaitingProof
                     }
+                    effects.append(progress(&state))
                     effects.append(armSenderWatchdog(state))
                     return .merge(effects)
 
@@ -381,12 +423,13 @@ public struct ResourceTransfer {
                     while state.receivedParts[state.consecutiveCompletedHeight + 1] != nil {
                         state.consecutiveCompletedHeight += 1
                     }
-                    guard state.outstanding.isEmpty else { return armReceiverWatchdog(state) }
+                    let reported = progress(&state)
+                    guard state.outstanding.isEmpty else { return .merge(reported, armReceiverWatchdog(state)) }
                     // round complete
                     if state.receivedParts.count < Int(state.expectedParts) {
                         state.window = state.window.grown()
                         state.retriesLeft = Const.maxRetries
-                        return requestNextWindow(&state)
+                        return .merge(reported, requestNextWindow(&state))
                     }
                     // all parts in: assemble, decompress if flagged, verify + prove (cancel the watchdog)
                     let ordered = (0..<Int(state.expectedParts)).compactMap { state.receivedParts[$0] }
@@ -394,7 +437,7 @@ public struct ResourceTransfer {
                           let payload = Resource.assemble(parts: ordered, sessionKey: state.sessionKey)
                     else {
                         state.status = .failed
-                        return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                        return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed(rejected: false))))
                     }
                     let out: Data
                     if adv.isCompressed {
@@ -413,14 +456,14 @@ public struct ResourceTransfer {
                             // a resource we could have produced, so fail rather than clamp-and-truncate.
                             guard adv.dataSize <= UInt64(Resource.autoCompressMaxSize) else {
                                 state.status = .failed
-                                return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                                return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed(rejected: false))))
                             }
                             segmentExpectedSize = Int(adv.dataSize)
                         }
                         guard let decompressed = Bzip2.decompress(payload, expectedSize: segmentExpectedSize)
                         else {
                             state.status = .failed
-                            return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                            return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed(rejected: false))))
                         }
                         out = decompressed
                     } else {
@@ -429,13 +472,14 @@ public struct ResourceTransfer {
                     guard Resource.verify(data: out, randomHash: state.randomHash, hash: state.resourceHash)
                     else {
                         state.status = .failed
-                        return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                        return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed(rejected: false))))
                     }
                     state.status = .complete
                     let proof = Resource.proofData(data: out, hash: state.resourceHash)
                     guard let praw = linkPacket(.proof, .resourceProof, proof)
-                    else { return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.received(out)))) }
+                    else { return .merge(.cancel(id: CancelID.watchdog), reported, .send(.delegate(.received(out)))) }
                     return .merge(.cancel(id: CancelID.watchdog),
+                                  reported,
                                   .send(.delegate(.transmit(state.interfaceID, praw))),
                                   .send(.delegate(.received(out))))
 
@@ -443,13 +487,15 @@ public struct ResourceTransfer {
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
                           Data(plain) == state.resourceHash else { return .none }
                     state.status = .failed
-                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed(rejected: false))))
 
                 case (.sender, .data, .resourceReceiverCancel):
+                    // The peer refused this transfer — at the advertisement or mid-transfer, which
+                    // reference does not distinguish (RNS/Link.py:1114-1121 → `Resource._rejected`).
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey),
                           Data(plain) == state.resourceHash else { return .none }
                     state.status = .failed
-                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed)))
+                    return .merge(.cancel(id: CancelID.watchdog), .send(.delegate(.failed(rejected: true))))
 
                 case (.receiver, .data, .resourceHashmapUpdate):
                     guard let plain = Link.decrypt(packet.payload, sessionKey: state.sessionKey) else { return .none }
@@ -487,7 +533,7 @@ public struct ResourceTransfer {
                                          Link.encrypt(state.resourceHash, sessionKey: state.sessionKey))
                     return .merge(.cancel(id: CancelID.watchdog),
                                   rcl.map { Effect.send(.delegate(.transmit(state.interfaceID, $0))) } ?? .none,
-                                  .send(.delegate(.failed)))
+                                  .send(.delegate(.failed(rejected: false))))
                 }
                 state.window = state.window.shrunk()
                 state.retriesLeft -= 1
@@ -503,17 +549,17 @@ public struct ResourceTransfer {
                                                Link.encrypt(adv.pack(), sessionKey: state.sessionKey))
                     else {
                         state.status = .failed
-                        return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed)))
+                        return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed(rejected: false))))
                     }
                     state.advRetriesLeft -= 1
                     return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), armSenderWatchdog(state))
                 case .transferring:
                     state.status = .failed
-                    return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed)))
+                    return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed(rejected: false))))
                 case .awaitingProof:
                     guard state.proofRetriesLeft > 0 else {
                         state.status = .failed
-                        return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed)))
+                        return .merge(.cancel(id: CancelID.watchdog), senderCancel(state), .send(.delegate(.failed(rejected: false))))
                     }
                     state.proofRetriesLeft -= 1
                     return armSenderWatchdog(state)
@@ -529,7 +575,7 @@ public struct ResourceTransfer {
                                         Link.encrypt(state.resourceHash, sessionKey: state.sessionKey))
                 return .merge(.cancel(id: CancelID.watchdog),
                               cancel.map { Effect.send(.delegate(.transmit(state.interfaceID, $0))) } ?? .none,
-                              .send(.delegate(.failed)))
+                              .send(.delegate(.failed(rejected: false))))
 
             case .delegate:
                 return .none

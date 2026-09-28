@@ -416,7 +416,7 @@ private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
     await store.send(.accept(advertisementPacket(sender)))
     _ = await captureTransmits(store, count: 1)
     await store.send(.received(cancelPacket(.resourceInitiatorCancel, sender.resourceHash)))
-    await store.receive(.delegate(.failed))
+    await store.receive(.delegate(.failed(rejected: false)))
     #expect(store.state.status == .failed)
 }
 
@@ -427,7 +427,7 @@ private func cancelPacket(_ context: PacketContext, _ hash: Data) -> Data {
     await store.send(.advertise)
     _ = await captureTransmits(store, count: 1)
     await store.send(.received(cancelPacket(.resourceReceiverCancel, store.state.resourceHash)))
-    await store.receive(.delegate(.failed))
+    await store.receive(.delegate(.failed(rejected: true)))
     #expect(store.state.status == .failed)
 }
 
@@ -595,7 +595,7 @@ private func exhaustedRequestPacket(_ s: ResourceTransfer.State, lastMapHash: Da
            Packet(raw: raw)?.context == .resourceInitiatorCancel { iclData.setValue(raw); return true }
         return false
     }
-    await store.receive(.delegate(.failed))
+    await store.receive(.delegate(.failed(rejected: false)))
     #expect(store.state.status == .failed)
     #expect(iclData.value != nil)
 }
