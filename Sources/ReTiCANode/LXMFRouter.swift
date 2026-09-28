@@ -22,6 +22,9 @@ public struct LXMFRouter {
         /// after the success, as a propagated copy is once its stamp search finishes — is then not
         /// reported as `deliveryFailed`. Bounded like `seen`; see `succeededMessageMemory`.
         var succeededMessages = RingSet(capacity: LXMFRouter.succeededMessageMemory)
+        /// Message hashes the app cancelled. A copy of one handed over later (a stamp search that
+        /// finished after the cancel) is never armed. Bounded like `succeededMessages`.
+        var cancelledMessages = RingSet(capacity: LXMFRouter.succeededMessageMemory)
         /// sourceHash (sender's lxmf.delivery destination hash) → identity, for signature validation.
         public var knownIdentities: [Data: Identity] = [:]
         /// destinationHash → direct-link state (reuse an active link, or one being established).
@@ -228,6 +231,9 @@ public struct LXMFRouter {
         /// The Resource in flight on `linkID` failed. `rejected`: the peer refused it (terminal).
         /// Otherwise the link is closed and the copy retried once, `retryWaitSeconds` later.
         case resourceFailedOnLink(linkID: Data, rejected: Bool)
+        /// The app cancelled this message: drop every copy, cancel a Resource in flight, report
+        /// `deliveryCancelled` once. Reference `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744).
+        case cancelOutbound(messageHash: Data)
         case retryDue(messageHash: Data, leg: Leg)
         case idleDeadline(destinationHash: Data, linkID: Data)
         case pathRequestDeadline(destinationHash: Data)
@@ -252,6 +258,10 @@ public struct LXMFRouter {
             case deliveryFailed(messageHash: Data)
             /// Every copy is over, none succeeded, and the last to fail was REJECTED by its peer.
             case deliveryRejected(messageHash: Data)
+            /// The app cancelled the message. Nothing else is reported for it afterwards.
+            case deliveryCancelled(messageHash: Data)
+            /// Cancel our Resource in flight on `linkID` (its copy was cancelled).
+            case cancelResource(linkID: Data)
         }
     }
 
@@ -544,6 +554,8 @@ public struct LXMFRouter {
                                                          method: method)))
 
             case let .send(message, desiredMethod):
+                // A cancelled message is never armed again, whichever path hands it over late.
+                guard !state.cancelledMessages.contains(message.hash) else { return .none }
                 let effective: DeliveryMethod =
                     (desiredMethod == .opportunistic && !message.opportunisticFits) ? .direct : desiredMethod
                 switch effective {
@@ -588,6 +600,7 @@ public struct LXMFRouter {
                 return .none
 
             case let .sendViaPropagation(message, propagationPacked):
+                guard !state.cancelledMessages.contains(message.hash) else { return .none }
                 guard let pn = state.outboundPropagationNode else {
                     return fail(&state, .propagated(message.hash))
                 }
@@ -770,6 +783,45 @@ public struct LXMFRouter {
                 state.pendingDeliveries[key] = pending
                 return .merge(close, retryTimer(key, LXMFDelivery.retryWaitSeconds))
 
+            case let .cancelOutbound(hash):
+                let hadWork = state.hasOutboundState(for: hash)
+                state.cancelledMessages.insert(hash)
+                guard hadWork else { return .none }
+                var effects: [Effect<Action>] = []
+                var freed: [Data] = []
+                for leg in [Leg.delivery, .propagated] {
+                    let key = DeliveryKey(messageHash: hash, leg: leg)
+                    guard let pending = state.pendingDeliveries.removeValue(forKey: key) else { continue }
+                    effects.append(.cancel(id: CancelID.retry(key)))
+                    switch pending.phase {
+                    case .retrying:
+                        break
+                    case .queued:
+                        for (dest, keys) in state.resourceQueue where keys.contains(key) {
+                            let rest = keys.filter { $0 != key }
+                            state.resourceQueue[dest] = rest.isEmpty ? nil : rest
+                        }
+                    case .transferring:
+                        guard let linkID = state.linkResourceInFlight.first(where: { $0.value == key })?.key
+                        else { break }
+                        state.linkResourceInFlight[linkID] = nil
+                        effects.append(.send(.delegate(.cancelResource(linkID: linkID))))
+                        if let dest = destination(ofLink: linkID, state) { freed.append(dest) }
+                    }
+                }
+                for (dest, messages) in state.outboundQueue where messages.contains(where: { $0.hash == hash }) {
+                    let rest = messages.filter { $0.hash != hash }
+                    state.outboundQueue[dest] = rest.isEmpty ? nil : rest
+                }
+                for (dest, items) in state.propagationQueue where items.contains(where: { $0.messageHash == hash }) {
+                    let rest = items.filter { $0.messageHash != hash }
+                    state.propagationQueue[dest] = rest.isEmpty ? nil : rest
+                }
+                effects.append(.send(.delegate(.deliveryCancelled(messageHash: hash))))
+                // The cancel reaches the link (above) before the next copy starts on it (below).
+                for dest in freed { effects.append(startNextQueued(&state, dest: dest)) }
+                return .merge(effects)
+
             case let .retryDue(hash, leg):
                 let key = DeliveryKey(messageHash: hash, leg: leg)
                 guard var pending = state.pendingDeliveries[key] else { return .none }
@@ -841,5 +893,16 @@ public struct LXMFRouter {
                 return .none
             }
         }
+    }
+}
+
+extension LXMFRouter.State {
+    /// Whether the router holds any outbound work for `messageHash`: a pending copy in any phase, or
+    /// a message queued behind link establishment. `cancelOutbound` reports `deliveryCancelled` only
+    /// when this is true; `LXMFNode` reports it itself when the only work was a delivery stamp search.
+    public func hasOutboundState(for messageHash: Data) -> Bool {
+        pendingDeliveries.keys.contains { $0.messageHash == messageHash }
+            || outboundQueue.values.contains { $0.contains { $0.hash == messageHash } }
+            || propagationQueue.values.contains { $0.contains { $0.messageHash == messageHash } }
     }
 }
