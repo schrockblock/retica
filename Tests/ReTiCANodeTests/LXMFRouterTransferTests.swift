@@ -101,6 +101,26 @@ private func transferStore(_ state: LXMFRouter.State, _ clock: TestClock<Duratio
     #expect(store.state.linkResourceInFlight == [freshLink: key])
 }
 
+/// Defensive (F6): a new link recorded over a still-active one must not strand the old link's
+/// transfer — the copy goes back to retrying, exactly as if that link had been lost.
+@Test @MainActor func routerTransferLinkEstablishedOverAnActiveLinkOrphansItsTransfer() async {
+    let big = bigMessage()
+    let key = LXMFRouter.DeliveryKey.delivery(big.hash)
+    let clock = TestClock()
+    let store = transferStore(liveRecipient(), clock)
+    await store.send(.send(message: big, desiredMethod: .direct))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.linkResourceInFlight == [recipientLink: key])
+    await store.send(.linkEstablished(destinationHash: recipient, linkID: freshLink))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.linkResourceInFlight.isEmpty)
+    #expect(store.state.pendingDeliveries[key]?.phase == .retrying)
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive(.delegate(.sendDirect(linkID: freshLink, data: big.packed, asResource: true)))
+    #expect(store.state.pendingDeliveries[key]?.attempts == 2)
+    #expect(store.state.linkResourceInFlight == [freshLink: key])
+}
+
 @Test @MainActor func routerTransferFifthFailureFailsTheCopy() async {
     let big = bigMessage()
     let key = LXMFRouter.DeliveryKey.delivery(big.hash)

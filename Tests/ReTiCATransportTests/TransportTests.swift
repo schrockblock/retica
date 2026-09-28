@@ -31,6 +31,23 @@ extension Transport.Action {
     #expect(set.contains(Data([3])) == true)
 }
 
+@Test func ringSetRemoveForgetsAndAReinsertKeepsItsNewSlot() {
+    var set = RingSet(capacity: 2)
+    _ = set.insert(Data([1]))
+    _ = set.insert(Data([2]))
+    #expect(set.remove(Data([1])) == true)
+    #expect(set.contains(Data([1])) == false)
+    #expect(set.count == 1)
+    #expect(set.remove(Data([1])) == false)           // already gone
+    #expect(set.insert(Data([1])) == true)            // new again; lands in the removed slot
+    #expect(set.contains(Data([1])) == true)          // the stale slot did not evict the fresh insert
+    #expect(set.contains(Data([2])) == true)
+    _ = set.insert(Data([3]))                         // evicts Data([2]), the oldest live entry
+    #expect(set.contains(Data([1])) == true)
+    #expect(set.contains(Data([2])) == false)
+    #expect(set.contains(Data([3])) == true)
+}
+
 @Test func interfaceIDIsHashable() {
     #expect(InterfaceID("a") == InterfaceID("a"))
     #expect(Set([InterfaceID("a"), InterfaceID("a"), InterfaceID("b")]).count == 2)

@@ -213,6 +213,7 @@ private final class TransferPair {
     #expect(phase1, "the transfer stalled before B was nearly done")
     let phase2 = await p.pump(
         keepA: { true },
+        keepB: { p.b.state.router.seen.contains(msg.hash) },
         sample: sample,
         until: { p.b.state.router.seen.contains(msg.hash) && p.forwardedB == p.sentB.value.count })
     #expect(phase2, "B's proof never reached A")
@@ -322,6 +323,54 @@ private final class TransferPair {
     #expect(!p.b.state.router.seen.contains(msg.hash))
     #expect(p.b.state.inboundProgress.isEmpty)
     #expect(!p.a.state.router.succeededMessages.contains(msg.hash))
+    await p.stop()
+}
+
+/// F8: the non-rejected-failure recovery through the real endpoint, in one test. Our transfer fails →
+/// the router closes the link → the endpoint closes it and reports `linkClosed` → the router
+/// re-establishes → a fresh link comes up → the retry starts a fresh transfer on THAT link.
+/// Lives here rather than beside the mapping tests because it needs a real peer to answer the new
+/// link's handshake, which only this file's `TransferPair` provides.
+@Test(.timeLimit(.minutes(5))) @MainActor func nodeTransferFailedTransferRetriesOnAFreshLinkThroughTheEndpoint() async {
+    let p = TransferPair()
+    await p.connectAndIntroduce()
+    let msg = p.attachmentMessage(bytes: transferIncompressible(count: 200_000))
+    let key = LXMFRouter.DeliveryKey.delivery(msg.hash)
+    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    let started = await p.pump(skipEvery: 5, until: { (p.a.state.transferProgress[key] ?? 0) >= 0.2 })
+    #expect(started, "the first transfer never got going")
+    await p.a.skipReceivedActions(strict: false)
+    guard let oldLink = p.a.state.directLinks[p.bDeliveryHash],
+          let ours = p.a.state.outboundTransfers[oldLink] else {
+        Issue.record("no transfer of ours in flight on a link to B")
+        return
+    }
+    #expect(p.a.state.router.pendingDeliveries[key]?.attempts == 1)
+    // Our transfer fails without a rejection (as when the receiver times out).
+    await p.a.send(.endpoint(.delegate(.resourceFailed(linkID: oldLink, resourceHash: ours, rejected: false))))
+    await p.a.receive(.router(.resourceFailedOnLink(linkID: oldLink, rejected: false)))
+    await p.a.receive(.router(.delegate(.closeLink(destinationHash: p.bDeliveryHash))))
+    await p.a.receive(.endpoint(.closeLink(linkID: oldLink)))
+    await p.a.receive { if case .endpoint(.delegate(.linkClosed(oldLink, _))) = $0 { return true }; return false }
+    await p.a.receive(.router(.linkClosed(destinationHash: p.bDeliveryHash)))
+    await p.a.receive(.router(.delegate(.requestLink(destinationHash: p.bDeliveryHash))))
+    // Carry the new link's handshake across until A has it.
+    var freshLink: Data?
+    let linked = await p.pump(skipEvery: 5, until: {
+        if let l = p.a.state.directLinks[p.bDeliveryHash], l != oldLink { freshLink = l; return true }
+        return false
+    })
+    #expect(linked, "no fresh link came up")
+    guard let fresh = freshLink else { return }
+    #expect(p.a.state.router.directLinks[p.bDeliveryHash] == .active(linkID: fresh))
+    #expect(p.a.state.router.pendingDeliveries[key]?.phase == .retrying)
+    // The copy waits out its retry, then starts a fresh transfer on the fresh link: attempt 2.
+    await p.clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await p.a.receive(.router(.retryDue(messageHash: msg.hash, leg: .delivery)))
+    await p.a.receive(.router(.delegate(.sendDirect(linkID: fresh, data: msg.packed, asResource: true))))
+    #expect(fresh != oldLink)
+    #expect(p.a.state.router.pendingDeliveries[key]?.attempts == 2)
+    #expect(p.a.state.router.linkResourceInFlight[fresh] == key)
     await p.stop()
 }
 

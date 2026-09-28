@@ -62,7 +62,10 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
 @Test func nodeTransferFractionsFollowTheReferenceFormula() {
     // Reference `LXMessage.__update_transfer_progress` (LXMessage.py:623-624): 0.10 + 0.90 × progress.
     #expect(abs(LXMFNode.outboundFraction(bytesDone: 0, bytesTotal: 10, segment: 1, segments: 1) - 0.10) < 1e-12)
-    #expect(abs(LXMFNode.outboundFraction(bytesDone: 10, bytesTotal: 10, segment: 1, segments: 1) - 1.0) < 1e-12)
+    #expect(abs(LXMFNode.outboundFraction(bytesDone: 5, bytesTotal: 10, segment: 1, segments: 1) - 0.55) < 1e-12)
+    // Capped below 1.0: every part served is not a confirmation (only `finishProgress` reports 1.0).
+    #expect(LXMFNode.outboundFraction(bytesDone: 10, bytesTotal: 10, segment: 1, segments: 1) == 0.99)
+    #expect(LXMFNode.outboundFraction(bytesDone: 999, bytesTotal: 1000, segment: 1, segments: 1) == 0.99)
     // A split Resource counts its finished segments: segment 3 of 4, half done → 2.5 / 4.
     #expect(abs(LXMFNode.transferFraction(bytesDone: 5, bytesTotal: 10, segment: 3, segments: 4) - 0.625) < 1e-12)
     #expect(LXMFNode.transferFraction(bytesDone: 5, bytesTotal: 0, segment: 1, segments: 1) == 0)
@@ -79,6 +82,9 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
     await store.receive(.delegate(.deliveryProgress(
         messageHash: m.hash,
         fraction: LXMFNode.outboundFraction(bytesDone: 500, bytesTotal: 1000, segment: 1, segments: 1))))
+    // Every part served: the top of the transfer phase, not yet 1.0 — that waits for the proof.
+    await store.send(sent(h1, done: 1000, total: 1000))
+    await store.receive(.delegate(.deliveryProgress(messageHash: m.hash, fraction: 0.99)))
     await store.send(.endpoint(.delegate(.resourceConcluded(linkID: link, resourceHash: h1))))
     await store.receive(.delegate(.deliveryProgress(messageHash: m.hash, fraction: 1.0)))
     await store.receive(.delegate(.deliveryConfirmed(messageHash: m.hash)))
@@ -211,10 +217,13 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
     await store.send(.sendMessage(message: m, alsoViaPropagation: false))
     #expect(store.state.inFlightDeliveryStamps == [m.hash])
     await store.send(.cancelOutbound(messageHash: m.hash))
-    await store.receive(.delegate(.deliveryCancelled(messageHash: m.hash)))
     #expect(store.state.inFlightDeliveryStamps.isEmpty)
-    await store.skipReceivedActions(strict: false)
+    // Exhaustive from here, with nothing drained first: a second `deliveryCancelled` (the router
+    // reporting as well as the node) is left unreceived and fails the probe.
     store.exhaustivity = .on
+    await store.receive(.router(.cancelOutbound(messageHash: m.hash)))
+    await store.receive(.delegate(.deliveryCancelled(messageHash: m.hash)))
+    await store.send(probe)
     await store.finish(timeout: .seconds(10))
 }
 
@@ -235,11 +244,45 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
     let m = LXMessage.create(source: Identity(), destinationHash: dest, timestamp: 1700000000.5,
                              title: Data(), content: Data("x".utf8))
     await store.send(.sendMessage(message: m, alsoViaPropagation: true))
-    await store.send(.cancelOutbound(messageHash: m.hash))
-    await store.receive(.delegate(.deliveryCancelled(messageHash: m.hash)))
     await store.skipReceivedActions(strict: false)
+    await store.send(.cancelOutbound(messageHash: m.hash))
+    // Exhaustive from here, with nothing drained first: the router reports the cancel (it holds the
+    // delivery copy and the marker), and a second `deliveryCancelled` would fail the probe.
     store.exhaustivity = .on
+    await store.receive(.router(.cancelOutbound(messageHash: m.hash))) {
+        $0.router.pendingDeliveries = [:]
+        $0.router.pendingPropagatedCopies = []
+    }
+    await store.receive(.router(.delegate(.deliveryCancelled(messageHash: m.hash))))
+    await store.receive(.delegate(.deliveryCancelled(messageHash: m.hash)))
+    await store.send(probe)
     await store.finish(timeout: .seconds(10))                  // only possible if the search was cancelled
+}
+
+/// A copy that failed while the other was outstanding got no delegate, so its progress entry was
+/// never cleared. The message's terminal outcome drops both copies' entries — unless the other copy
+/// is still outstanding, whose progress must stay monotonic.
+@Test @MainActor func nodeTransferTerminalOutcomeClearsBothLegsProgress() async {
+    let confirmed = Data(repeating: 0x31, count: 32)
+    let accepted = Data(repeating: 0x32, count: 32)
+    let stillSending = bigMessage("z")
+    let store = mappingNode { state in
+        for hash in [confirmed, accepted, stillSending.hash] {
+            state.transferProgress[.delivery(hash)] = 0.4
+            state.transferProgress[.propagated(hash)] = 0.6
+        }
+    }
+    await store.send(.router(.delegate(.deliveryConfirmed(messageHash: confirmed))))
+    #expect(store.state.transferProgress[.delivery(confirmed)] == nil)
+    #expect(store.state.transferProgress[.propagated(confirmed)] == nil)
+    await store.send(.router(.delegate(.propagationAccepted(messageHash: accepted))))
+    #expect(store.state.transferProgress[.propagated(accepted)] == nil)
+    #expect(store.state.transferProgress[.delivery(accepted)] == nil)
+    // The delivery copy of this one is still pending: its entry survives the propagated success.
+    await store.send(.router(.send(message: stillSending, desiredMethod: .direct)))
+    await store.send(.router(.delegate(.propagationAccepted(messageHash: stillSending.hash))))
+    #expect(store.state.transferProgress[.propagated(stillSending.hash)] == nil)
+    #expect(store.state.transferProgress[.delivery(stillSending.hash)] == 0.4)
 }
 
 @Test @MainActor func nodeTransferLinkActivityReArmsTheIdleTimer() async {

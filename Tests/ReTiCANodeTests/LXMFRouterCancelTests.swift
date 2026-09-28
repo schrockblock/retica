@@ -146,6 +146,32 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
     store.exhaustivity = .off                                 // the PN link's idle timer
 }
 
+/// F1: once one copy has succeeded the message has had its terminal outcome. Cancelling it then
+/// still tears the other copy down (its Resource is cancelled on the wire), but reports nothing.
+@Test @MainActor func routerCancelAfterASuccessTearsDownSilently() async {
+    let big = bigMessage("s")
+    var state = liveRecipient()
+    state.outboundPropagationNode = pn
+    state.directLinks[pn] = .active(linkID: pnLink)
+    let store = cancelStore(state)
+    await store.send(.send(message: big, desiredMethod: .direct))            // delivery copy: transferring
+    await store.send(.sendViaPropagation(message: big, propagationPacked: small))
+    await store.send(.delivered(messageHash: big.hash, leg: .propagated))
+    await store.receive(.delegate(.propagationAccepted(messageHash: big.hash)))
+    #expect(store.state.succeededMessages.contains(big.hash))
+    #expect(store.state.pendingDeliveries[.delivery(big.hash)]?.phase == .transferring)
+    await store.skipReceivedActions(strict: false)
+    store.exhaustivity = .on
+    await store.send(.cancelOutbound(messageHash: big.hash)) {
+        $0.pendingDeliveries[.delivery(big.hash)] = nil
+        $0.linkResourceInFlight[recipientLink] = nil
+    }
+    #expect(store.state.cancelledMessages.contains(big.hash))
+    await store.receive(.delegate(.cancelResource(linkID: recipientLink)))
+    await store.send(probe)                                   // no deliveryCancelled after the success
+    store.exhaustivity = .off                                 // both links' idle timers
+}
+
 /// A copy handed over after its message was cancelled — a stamp search that finished anyway — is
 /// never armed. A cancel with nothing to cancel reports nothing (the node reports the stamp case).
 @Test @MainActor func routerCancelLateCopyOfACancelledMessageArmsNothing() async {

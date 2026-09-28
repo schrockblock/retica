@@ -242,7 +242,8 @@ public struct LXMFRouter {
         /// Otherwise the link is closed and the copy retried once, `retryWaitSeconds` later.
         case resourceFailedOnLink(linkID: Data, rejected: Bool)
         /// The app cancelled this message: drop every copy, cancel a Resource in flight, report
-        /// `deliveryCancelled` once. Reference `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744).
+        /// `deliveryCancelled` once — or nothing, when a copy already succeeded (that success was the
+        /// message's terminal outcome). Reference `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744).
         case cancelOutbound(messageHash: Data)
         /// Resource traffic on `linkID` (either direction). Re-arms the idle timer of the
         /// destination it serves, so a long transfer never trips `linkMaxInactivitySeconds` (spec §5).
@@ -251,8 +252,10 @@ public struct LXMFRouter {
         case propagatedCopyPending(messageHash: Data)
         /// `LXMFNode` did not start this message's propagated copy at all (spec §6).
         case propagatedCopyRefused(messageHash: Data, reason: RefusalReason)
-        /// Every propagated-copy stamp search was cancelled: those copies have failed.
-        case abandonPendingPropagatedCopies
+        /// Every propagated-copy stamp search was cancelled: those copies have failed. A message in
+        /// `stillSearching` (its delivery copy is still in `LXMFNode`'s delivery-stamp search, which
+        /// this router cannot see) only loses its marker: its delivery copy decides the outcome.
+        case abandonPendingPropagatedCopies(stillSearching: Set<Data>)
         case retryDue(messageHash: Data, leg: Leg)
         case idleDeadline(destinationHash: Data, linkID: Data)
         case pathRequestDeadline(destinationHash: Data)
@@ -676,6 +679,15 @@ public struct LXMFRouter {
                 return .none
 
             case let .linkEstablished(dest, linkID):
+                // Defensive (unreachable through `establish` today, which only runs with no active
+                // link): a new link replacing a still-active one would otherwise strand the old
+                // link's transfer — its `linkResourceInFlight` entry and its `.transferring` copy,
+                // which no event names any more. Treat it as lost with that link.
+                var orphaned: Effect<Action> = .none
+                if case let .active(oldLink) = state.directLinks[dest], oldLink != linkID,
+                   state.linkResourceInFlight[oldLink] != nil {
+                    orphaned = orphanTransfer(&state, linkID: oldLink)
+                }
                 state.directLinks[dest] = .active(linkID: linkID)
                 state.establishAttempts[dest] = nil
                 // Defensive: if a link arrived while we were still parked in awaitingPath, cancel
@@ -686,7 +698,7 @@ public struct LXMFRouter {
                 let propQueued = state.propagationQueue[dest] ?? []
                 state.propagationQueue[dest] = nil
                 // Copies queued on a previous link go first; newly drained ones queue behind them.
-                var effects: [Effect<Action>] = [startNextQueued(&state, dest: dest)]
+                var effects: [Effect<Action>] = [orphaned, startNextQueued(&state, dest: dest)]
                 for m in queued {
                     let key = DeliveryKey.delivery(m.hash)
                     let asResource = m.directRepresentation == .resource
@@ -842,7 +854,13 @@ public struct LXMFRouter {
                     let rest = items.filter { $0.messageHash != hash }
                     state.propagationQueue[dest] = rest.isEmpty ? nil : rest
                 }
-                effects.append(.send(.delegate(.deliveryCancelled(messageHash: hash))))
+                // A message one of whose copies already succeeded has had its terminal outcome
+                // (`deliveryConfirmed` / `propagationAccepted`): the remaining copy is torn down
+                // above, silently — reporting `deliveryCancelled` after a success would be a second,
+                // contradictory terminal.
+                if !state.succeededMessages.contains(hash) {
+                    effects.append(.send(.delegate(.deliveryCancelled(messageHash: hash))))
+                }
                 // The cancel reaches the link (above) before the next copy starts on it (below).
                 for dest in freed { effects.append(startNextQueued(&state, dest: dest)) }
                 return .merge(effects)
@@ -862,11 +880,16 @@ public struct LXMFRouter {
                 state.pendingPropagatedCopies.remove(hash)
                 return .send(.delegate(.propagationRefused(messageHash: hash, reason: reason)))
 
-            case .abandonPendingPropagatedCopies:
+            case let .abandonPendingPropagatedCopies(stillSearching):
                 let abandoned = state.pendingPropagatedCopies.sorted { $0.lexicographicallyPrecedes($1) }
                 state.pendingPropagatedCopies = []
                 var effects: [Effect<Action>] = []
-                for hash in abandoned { effects.append(fail(&state, .propagated(hash))) }
+                // A delivery copy still searching its stamp is invisible to `fail`'s outstanding
+                // check, so failing here would report `deliveryFailed` and then, once that copy is
+                // handed over and confirmed, a second terminal.
+                for hash in abandoned where !stillSearching.contains(hash) {
+                    effects.append(fail(&state, .propagated(hash)))
+                }
                 return .merge(effects)
 
             case let .retryDue(hash, leg):
@@ -947,15 +970,16 @@ extension LXMFRouter.State {
     /// Whether the router holds any outbound work for `messageHash`: a pending copy in any phase, or
     /// a message queued behind link establishment. `cancelOutbound` reports `deliveryCancelled` only
     /// when this is true; `LXMFNode` reports it itself when the only work was a delivery stamp search.
-    public func hasOutboundState(for messageHash: Data) -> Bool {
+    func hasOutboundState(for messageHash: Data) -> Bool {
         pendingDeliveries.keys.contains { $0.messageHash == messageHash }
             || outboundQueue.values.contains { $0.contains { $0.hash == messageHash } }
             || propagationQueue.values.contains { $0.contains { $0.messageHash == messageHash } }
             || pendingPropagatedCopies.contains(messageHash)
     }
 
-    /// Mark `hash`'s propagated copy pending — UNLESS the app already cancelled this message, in
-    /// which case there is nothing to mark: a resend of a cancelled hash must not revive it (the
+    /// Mark `hash`'s propagated copy pending — UNLESS the message is cancelled, in which case there
+    /// is nothing to mark. (A deliberate re-send from the app is not cancelled: `LXMFNode` calls
+    /// `uncancel` before this.) A cancelled message must not be revived (the
     /// router holds no delivery copy for it either, so marking it pending here would make
     /// `hasOutboundState` report work that doesn't exist, and a later `abandonPendingPropagatedCopies`
     /// would `fail` it into a stray `deliveryFailed` with no preceding send).
@@ -963,8 +987,16 @@ extension LXMFRouter.State {
     /// The ONE place this rule is applied: both the router's own `.propagatedCopyPending` action and
     /// `LXMFNode.sendMessage`'s synchronous write (Ruling P11 — the marker must be visible within the
     /// same reduce cycle) go through here, so the guard cannot be forgotten at either call site.
-    public mutating func markPropagatedCopyPending(_ hash: Data) {
+    mutating func markPropagatedCopyPending(_ hash: Data) {
         guard !cancelledMessages.contains(hash) else { return }
         pendingPropagatedCopies.insert(hash)
+    }
+
+    /// The app is sending `hash` afresh: forget that it was cancelled, so this send is an ordinary
+    /// send. `LXMFNode`'s app-facing send actions call this FIRST, synchronously. The guards on
+    /// `cancelledMessages` exist for LATE hand-overs from a cancelled attempt's stamp search, not
+    /// for a deliberate re-send, which they would otherwise swallow (the row stuck on "sending").
+    mutating func uncancel(_ hash: Data) {
+        cancelledMessages.remove(hash)
     }
 }

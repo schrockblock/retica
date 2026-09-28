@@ -178,6 +178,7 @@ private func plumbTotal(_ t: ResourceTransfer.State) -> Int { t.parts.reduce(0) 
     let store = plumbStore(session)
     await store.send(.session(.cancelResource(hash: oh)))
     #expect(store.state.session.segmentedSend == nil)
+    await store.skipReceivedActions(strict: false)                             // a transmit would land here
     #expect(store.state.transmits.isEmpty)
 }
 

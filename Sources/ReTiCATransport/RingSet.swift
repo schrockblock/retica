@@ -91,6 +91,10 @@ public struct RingSet: Equatable {
         private var order: [Key] = []
         /// Index of the next slot to write.
         private var next = 0
+        /// Slots whose key was `remove`d. Such a slot must not evict when the cursor reaches it:
+        /// its key may have been inserted again since, into a NEWER slot, and evicting it here
+        /// would drop that newer membership early. Empty unless `remove` is used.
+        private var removedSlots: Set<Int> = []
 
         init(capacity: Int) { self.capacity = max(1, capacity) }
 
@@ -102,13 +106,23 @@ public struct RingSet: Equatable {
         func insert(_ key: Key) -> Bool {
             guard members.insert(key).inserted else { return false }
             if next < order.count {
-                members.remove(order[next])      // evict the oldest
+                // Evict the oldest, unless its key was already removed.
+                if removedSlots.remove(next) == nil { members.remove(order[next]) }
                 order[next] = key
             } else {
                 order.append(key)
             }
             next += 1
             if next >= capacity { next = 0 }
+            return true
+        }
+
+        /// O(capacity): finds the key's live slot by a linear scan. For rare removals only.
+        func remove(_ key: Key) -> Bool {
+            guard members.remove(key) != nil else { return false }
+            if let slot = order.indices.first(where: { order[$0] == key && !removedSlots.contains($0) }) {
+                removedSlots.insert(slot)
+            }
             return true
         }
     }
@@ -145,6 +159,11 @@ public struct RingSet: Equatable {
     public mutating func insert(_ item: Data) -> Bool { storage.insert(RingSet.digest(item)) }
 
     public func contains(_ item: Data) -> Bool { storage.contains(RingSet.digest(item)) }
+
+    /// Forget `item`. Returns whether it was present. O(capacity) — a linear scan for its slot —
+    /// so this is for rare removals (an un-cancel), never a per-packet path.
+    @discardableResult
+    public mutating func remove(_ item: Data) -> Bool { storage.remove(RingSet.digest(item)) }
 
     /// Number of items currently remembered (never exceeds `capacity`). Test/diagnostic surface.
     public var count: Int { storage.count }

@@ -262,8 +262,9 @@ public struct LXMFNode {
             /// The app cancelled the message (`.cancelOutbound`).
             case deliveryCancelled(messageHash: Data)
             /// The delivery copy's progress on the reference scale: 0.05 when its link is up and the
-            /// transfer is about to start, 0.10 when it starts, `0.10 + 0.90 × done` during, 1.0 when
-            /// confirmed (LXMRouter.py:2788-2790, LXMessage.py:623-624). Never decreases.
+            /// transfer is about to start, 0.10 when it starts, `0.10 + 0.90 × done` during (at most
+            /// 0.99 — the last part served is not yet a confirmation), 1.0 when confirmed
+            /// (LXMRouter.py:2788-2790, LXMessage.py:623-624). Never decreases.
             case deliveryProgress(messageHash: Data, fraction: Double)
             /// The same for the copy sent to the propagation node; 1.0 when it is accepted.
             case propagationProgress(messageHash: Data, fraction: Double)
@@ -356,10 +357,15 @@ public struct LXMFNode {
 
     /// An outbound copy's progress during its transfer: `0.10 + 0.90 × transfer progress`
     /// (reference `LXMessage.__update_transfer_progress`, LXMessage.py:623-624).
+    /// Capped at `maxTransferProgress`: the last part served is not a confirmation, so only the
+    /// confirmation itself reports 1.0 — otherwise a retry after a fully-sent transfer would sit at 100%.
     public static func outboundFraction(bytesDone: Int, bytesTotal: Int, segment: Int, segments: Int) -> Double {
-        transferStartProgress + (1 - transferStartProgress)
-            * transferFraction(bytesDone: bytesDone, bytesTotal: bytesTotal, segment: segment, segments: segments)
+        min(transferStartProgress + (1 - transferStartProgress)
+                * transferFraction(bytesDone: bytesDone, bytesTotal: bytesTotal, segment: segment, segments: segments),
+            maxTransferProgress)
     }
+    /// The highest progress a transfer reports before its copy is confirmed.
+    public static let maxTransferProgress = 0.99
 
     /// Cancellation identities for the stamp searches.
     ///
@@ -399,18 +405,24 @@ public struct LXMFNode {
                     : .propagationProgress(messageHash: key.messageHash, fraction: clamped)
                 return .send(.delegate(event))
             }
-            /// The copy succeeded: report 1.0 (unless its transfer already did) and forget it.
+            /// The message is over: forget both copies' progress.
+            func clearProgress(_ state: inout LXMFNode.State, _ hash: Data) {
+                state.transferProgress[.delivery(hash)] = nil
+                state.transferProgress[.propagated(hash)] = nil
+            }
+            /// The copy succeeded: report 1.0 (unless its transfer already did) and forget it — and,
+            /// when that was the message's last copy, the other copy's progress too. A copy that
+            /// failed while this one was outstanding got no delegate (the router's `fail` stays
+            /// silent then), so its entry would otherwise outlive the message. The other copy's
+            /// entry is kept while that copy is still outstanding, so its progress stays monotonic.
             func finishProgress(_ state: inout LXMFNode.State, _ key: LXMFRouter.DeliveryKey) -> Effect<Action> {
-                guard let last = state.transferProgress.removeValue(forKey: key), last < 1 else { return .none }
+                let finished = state.transferProgress.removeValue(forKey: key)
+                if !state.router.hasOutboundState(for: key.messageHash) { clearProgress(&state, key.messageHash) }
+                guard let last = finished, last < 1 else { return .none }
                 let event: Action.Delegate = key.leg == .delivery
                     ? .deliveryProgress(messageHash: key.messageHash, fraction: 1)
                     : .propagationProgress(messageHash: key.messageHash, fraction: 1)
                 return .send(.delegate(event))
-            }
-            /// The message is over without success: forget both copies' progress.
-            func clearProgress(_ state: inout LXMFNode.State, _ hash: Data) {
-                state.transferProgress[.delivery(hash)] = nil
-                state.transferProgress[.propagated(hash)] = nil
             }
             /// A new Resource transfer starts on `linkID`: clear any stale hash recorded for it (a
             /// fresh copy names its own hash from its first sender-role progress event) and report the
@@ -522,6 +534,7 @@ public struct LXMFNode {
             case let .send(destinationHash, title, content, method):
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
+                state.router.uncancel(msg.hash)   // an app send is a fresh send (see `.sendMessage`)
                 return deliverySend(&state, message: msg, method: method)
 
             case let .setPropagationNode(destinationHash):
@@ -541,6 +554,7 @@ public struct LXMFNode {
                 else { return .none }
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
+                state.router.uncancel(msg.hash)   // an app send is a fresh send (see `.sendMessage`)
                 let ts = date.now.timeIntervalSince1970
                 return .run { send in
                     guard let (packed, _) = await LXMFPropagation.pack(
@@ -557,6 +571,13 @@ public struct LXMFNode {
                 // OWN, separate stamp: different workblock (1000 rounds vs 3000), different material
                 // (transient_id vs message hash), different CancelID. See `deliverySend` for why a
                 // caller-supplied stamp is never overwritten.
+                //
+                // A re-send of a message the app cancelled earlier is a FRESH send: forget the
+                // cancel first, synchronously, before anything below consults it. The router's
+                // `cancelledMessages` guards are for late hand-overs from the cancelled attempt
+                // (whose per-message stamp effects were cancelled with it), and would otherwise
+                // swallow this deliberate re-send and leave its row on "sending" for good.
+                state.router.uncancel(message.hash)
                 var effects: [Effect<Action>] = [
                     deliverySend(&state, message: message, method: .opportunistic)
                 ]
@@ -1064,8 +1085,11 @@ public struct LXMFNode {
     /// `.setPropagationNode` abandon have failed and must be reported so — through the router's
     /// `fail`, so a message whose delivery copy is still pending is not reported failed yet.
     /// (Ruling P10: this effect is built once and shared by both call sites, not duplicated.)
+    /// Messages whose delivery copy is still in its delivery-stamp search are passed along: the
+    /// router cannot see that copy, and must not fail the message while it can still succeed.
     private func abandonPendingPropagatedCopies(_ state: State) -> Effect<Action> {
-        state.router.pendingPropagatedCopies.isEmpty ? .none : .send(.router(.abandonPendingPropagatedCopies))
+        guard !state.router.pendingPropagatedCopies.isEmpty else { return .none }
+        return .send(.router(.abandonPendingPropagatedCopies(stillSearching: Set(state.inFlightDeliveryStamps))))
     }
 
     /// The delivery stamp cost to apply when sending to `destinationHash`, or **nil meaning

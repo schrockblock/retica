@@ -65,11 +65,11 @@ private func exhaustTheDeliveryCopy(_ store: TestStore<LXMFRouter.State, LXMFRou
     await store.send(.send(message: m, desiredMethod: .opportunistic))
     await store.send(.propagatedCopyPending(messageHash: m.hash))
     await exhaustTheDeliveryCopy(store, clock, m)
-    await store.send(.abandonPendingPropagatedCopies) {
+    await store.send(.abandonPendingPropagatedCopies(stillSearching: [])) {
         $0.pendingPropagatedCopies = []
     }
     await store.receive(.delegate(.deliveryFailed(messageHash: m.hash)))
-    await store.send(.abandonPendingPropagatedCopies)                 // probe: nothing left, nothing again
+    await store.send(.abandonPendingPropagatedCopies(stillSearching: []))                 // probe: nothing left, nothing again
 }
 
 @Test @MainActor func pnCopyArmingClearsTheMarker() async {
@@ -120,11 +120,22 @@ private func exhaustTheDeliveryCopy(_ store: TestStore<LXMFRouter.State, LXMFRou
 
 // MARK: - LXMFNode
 
+/// An exhaustive no-op: a conclusion on a link we have no transfer on changes nothing.
 @MainActor
-private func pnNode(limitKB: Int, stampCost: Int) -> (TestStore<LXMFNode.State, LXMFNode.Action>, Identity) {
+private let pnProbe = LXMFNode.Action.endpoint(.delegate(.resourceConcluded(linkID: Data(repeating: 0x99, count: 16),
+                                                                            resourceHash: Data(repeating: 0x11, count: 32))))
+
+@MainActor
+private func pnNode(limitKB: Int, stampCost: Int,
+                    deliveryStampCost: Int? = nil) -> (TestStore<LXMFNode.State, LXMFNode.Action>, Identity) {
     let recipient = Identity()
     var state = LXMFNode.State(identity: Identity(),
                                endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    if let deliveryStampCost {
+        state.learnedPeers[dest] = LXMFNode.LearnedPeer(displayName: nil, stampCost: deliveryStampCost,
+                                                        supportsCompression: false,
+                                                        learnedAt: Date(timeIntervalSince1970: 1700000000))
+    }
     state.endpoint.transport.learned[dest] = LearnedDestination(
         identity: recipient, appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),
         hops: 1, nextHop: nil, announceEmitted: 0)
@@ -182,7 +193,7 @@ private func pnNode(limitKB: Int, stampCost: Int) -> (TestStore<LXMFNode.State, 
     await store.send(.sendMessage(message: m, alsoViaPropagation: true))
     #expect(store.state.router.pendingPropagatedCopies == [m.hash])
     await store.send(.cancelPropagationStamps)
-    await store.receive(.router(.abandonPendingPropagatedCopies))
+    await store.receive(.router(.abandonPendingPropagatedCopies(stillSearching: [])))
     #expect(store.state.router.pendingPropagatedCopies.isEmpty)
     #expect(store.state.router.pendingDeliveries[.delivery(m.hash)] != nil)   // so no failure is reported yet
 }
@@ -192,22 +203,55 @@ private func pnNode(limitKB: Int, stampCost: Int) -> (TestStore<LXMFNode.State, 
     let m = note()
     await store.send(.sendMessage(message: m, alsoViaPropagation: true))
     await store.send(.setPropagationNode(destinationHash: Data(repeating: 0xC1, count: 16)))
-    await store.receive(.router(.abandonPendingPropagatedCopies))
+    await store.receive(.router(.abandonPendingPropagatedCopies(stillSearching: [])))
     #expect(store.state.router.pendingPropagatedCopies.isEmpty)
 }
 
-/// Review finding (Task 7, fix round 1): a resend of an already-cancelled hash must never mark a
-/// propagated copy pending — the router holds no delivery copy for it either, so marking it would
-/// make `hasOutboundState` report phantom work and a later abandon would `fail` it into a stray
-/// `deliveryFailed` with no preceding send.
-@Test @MainActor func pnCopyResendOfACancelledMessageNeverMarksTheCopy() async {
+/// Final review F2: the app deliberately re-sending a message it cancelled earlier is a FRESH send.
+/// The node forgets the cancel first, so the propagated copy is marked and the delivery copy is
+/// armed — before, both were swallowed by the cancelled-message guards and the row stayed on
+/// "sending" for good. (A LATE hand-over from the cancelled attempt is still refused by the router:
+/// `routerCancelLateCopyOfACancelledMessageArmsNothing`.)
+@Test @MainActor func pnCopyResendOfACancelledMessageIsAFreshSend() async {
     let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost)
     let m = note()
     await store.send(.cancelOutbound(messageHash: m.hash))
     #expect(store.state.router.cancelledMessages.contains(m.hash))
     await store.send(.sendMessage(message: m, alsoViaPropagation: true))
-    #expect(store.state.router.pendingPropagatedCopies.isEmpty)
-    await store.send(.cancelPropagationStamps)
+    #expect(!store.state.router.cancelledMessages.contains(m.hash))
+    #expect(store.state.router.pendingPropagatedCopies == [m.hash])
+    await store.receive(.router(.send(message: m, desiredMethod: .opportunistic)))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.router.pendingDeliveries[.delivery(m.hash)] != nil)   // the delivery copy is armed
+    await store.send(.cancelPropagationStamps)                                // stop the cost-20 search
+}
+
+/// Final review F3: abandoning the propagated copies while a message's DELIVERY copy is still in
+/// its delivery-stamp search (so the router holds nothing for it) must not fail the message — that
+/// copy can still succeed, and did: failing here gave `deliveryFailed` and then a confirmation.
+@Test(.timeLimit(.minutes(1))) @MainActor func pnCopyAbandonWhileTheDeliveryStampIsSearchedDoesNotFailTheMessage() async {
+    // Both stamps at cost 20: neither search can finish during the test, so the delivery search is
+    // deterministically in flight when the abandon lands. Its eventual hand-over is then played by
+    // sending the `.router(.send)` it would deliver.
+    let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost,
+                            deliveryStampCost: LXMFNode.maxDeliveryStampCost)
+    let m = note()
+    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    #expect(store.state.inFlightDeliveryStamps == [m.hash])
+    #expect(store.state.router.pendingPropagatedCopies == [m.hash])
     store.exhaustivity = .on
-    await store.send(.cancelDeliveryStamps)   // probe: a stray deliveryFailed/deliveryCancelled fails here
+    await store.send(.cancelPropagationStamps)
+    await store.receive(.router(.abandonPendingPropagatedCopies(stillSearching: [m.hash]))) {
+        $0.router.pendingPropagatedCopies = []
+    }
+    await store.send(pnProbe)                                    // no deliveryFailed was reported
+    store.exhaustivity = .off
+    // The delivery copy is handed over and confirms: the message's one terminal outcome.
+    await store.send(.router(.send(message: m, desiredMethod: .opportunistic)))
+    #expect(store.state.inFlightDeliveryStamps.isEmpty)
+    await store.send(.router(.opportunisticDelivered(messageHash: m.hash)))
+    await store.receive(.delegate(.deliveryConfirmed(messageHash: m.hash)))
+    await store.send(.cancelDeliveryStamps)                      // stop the real search (nothing to fail now)
+    store.exhaustivity = .on
+    await store.send(pnProbe)                                    // and it failed nothing
 }
