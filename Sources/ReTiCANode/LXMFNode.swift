@@ -676,7 +676,9 @@ public struct LXMFNode {
                     .cancel(id: CancelID.propagationStampFor(hash)),
                     .send(.router(.cancelOutbound(messageHash: hash))),
                 ]
-                if wasSearching && !routerReports {
+                // A message one of whose copies already succeeded has had its terminal outcome: the
+                // stamp search is still stopped above, but silently (the router is silent too, F1).
+                if wasSearching && !routerReports && !state.router.succeededMessages.contains(hash) {
                     effects.append(.send(.delegate(.deliveryCancelled(messageHash: hash))))
                 }
                 return .merge(effects)

@@ -227,6 +227,30 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
     await store.finish(timeout: .seconds(10))
 }
 
+/// Round 2 (F1, node side): a message one of whose copies already succeeded (here its propagated
+/// copy was accepted) has had its terminal outcome. Cancelling it while its delivery stamp is still
+/// searched stops the search and forwards the cancel, but reports nothing.
+@Test(.timeLimit(.minutes(1))) @MainActor func nodeTransferCancelAfterASuccessIsSilent() async {
+    let m = LXMessage.create(source: Identity(), destinationHash: dest, timestamp: 1700000000.5,
+                             title: Data(), content: Data("x".utf8))
+    let store = mappingNode { state in
+        state.learnedPeers[dest] = LXMFNode.LearnedPeer(displayName: nil, stampCost: LXMFNode.maxDeliveryStampCost,
+                                                        supportsCompression: false,
+                                                        learnedAt: Date(timeIntervalSince1970: 1700000000))
+        state.router.succeededMessages.insert(m.hash)          // the propagated copy was accepted
+    }
+    await store.send(.sendMessage(message: m, alsoViaPropagation: false))
+    #expect(store.state.inFlightDeliveryStamps == [m.hash])
+    #expect(store.state.router.succeededMessages.contains(m.hash))
+    store.exhaustivity = .on
+    await store.send(.cancelOutbound(messageHash: m.hash)) {
+        $0.inFlightDeliveryStamps = []
+    }
+    await store.receive(.router(.cancelOutbound(messageHash: m.hash)))
+    await store.send(probe)                                    // no deliveryCancelled after the success
+    await store.finish(timeout: .seconds(10))                  // the stamp search was stopped
+}
+
 @Test(.timeLimit(.minutes(1))) @MainActor func nodeTransferCancelOutboundStopsThePropagationStampSearch() async {
     let recipient = Identity()
     let store = mappingNode { state in
