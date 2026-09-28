@@ -271,6 +271,9 @@ public struct LXMFNode {
             /// `sourceHash` is the far end of the link when WE opened it; nil when a peer linked to our
             /// own destination, because LXMF senders do not identify on delivery links.
             case inboundTransferProgress(sourceHash: Data?, linkID: Data, fraction: Double)
+            /// The propagated copy was not attempted — `.tooLargeForNode`: larger than the configured
+            /// node's announced per-transfer limit. The delivery copy is unaffected.
+            case propagationRefused(messageHash: Data, reason: LXMFRouter.RefusalReason)
         }
     }
 
@@ -527,7 +530,9 @@ public struct LXMFNode {
                 // could only burn a core for a message the new node would reject. Constructed on this
                 // branch only: `Effect.cancel(id:)` performs the cancellation when it is BUILT, so
                 // hoisting it out of the switch would cancel on every action (fixed once already, 86ee622).
-                return .merge(.cancel(id: CancelID.propagationStamp),
+                // The copies whose searches this abandons have failed (through the router's `fail`,
+                // so a message whose delivery copy is still pending is not reported failed).
+                return .merge(.cancel(id: CancelID.propagationStamp), abandonPendingPropagatedCopies(state),
                               .send(.router(.setOutboundPropagationNode(destinationHash))))
 
             case let .sendViaPropagation(destinationHash, title, content):
@@ -574,15 +579,32 @@ public struct LXMFNode {
                 if alsoViaPropagation,
                    let recipient = state.endpoint.learned[message.destinationHash]?.identity,
                    let cost = propagationStampCost(state) {
-                    let ts = date.now.timeIntervalSince1970
-                    effects.append(.run { send in
-                        guard let (packed, _) = await LXMFPropagation.pack(
-                            message: message, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
-                        else { return }                              // cancelled mid-search
-                        await send(.router(.sendViaPropagation(message: message, propagationPacked: packed)))
+                    if let limit = propagationTransferLimitBytes(state), message.packed.count > limit {
+                        // Spec §6: the node would refuse it, so the copy is not attempted at all.
+                        effects.append(.send(.router(.propagatedCopyRefused(messageHash: message.hash,
+                                                                            reason: .tooLargeForNode))))
+                    } else {
+                        // Outstanding from now on, although the router only gets the copy once its
+                        // stamp is found (spec §6). Set directly rather than dispatched as a nested
+                        // `.send(.router(.propagatedCopyPending))` effect: under `TestStore`, an
+                        // action delivered via an effect is queued and only applied to `state` on an
+                        // explicit `receive`/drain (`TestReducer._reduce`, ComposableArchitecture),
+                        // so a dispatched action could never satisfy a check made immediately after
+                        // this very `send` — see `pnCopyNodeMarksTheCopyPendingWhileItsStampIsSearched`,
+                        // which does exactly that (Ruling P11). Direct mutation also removes a race a
+                        // dispatched action would have against `.cancelPropagationStamps` /
+                        // `.setPropagationNode` reading this same set moments later.
+                        state.router.pendingPropagatedCopies.insert(message.hash)
+                        let ts = date.now.timeIntervalSince1970
+                        effects.append(.run { send in
+                            guard let (packed, _) = await LXMFPropagation.pack(
+                                message: message, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                            else { return }                          // cancelled mid-search
+                            await send(.router(.sendViaPropagation(message: message, propagationPacked: packed)))
+                        }
+                        .cancellable(id: CancelID.propagationStampFor(message.hash))
+                        .cancellable(id: CancelID.propagationStamp))
                     }
-                    .cancellable(id: CancelID.propagationStampFor(message.hash))
-                    .cancellable(id: CancelID.propagationStamp))
                 }
                 return .merge(effects)
 
@@ -595,7 +617,8 @@ public struct LXMFNode {
                 // `Task.isCancelled` each round, which is what makes the cancel stop the CPU and not
                 // merely discard its result. Reference exposes the same lever as
                 // `LXMRouter.cancel_outbound` → `LXStamper.cancel_work` (LXStamper.py:146-175).
-                return .cancel(id: CancelID.propagationStamp)
+                // ...and the copies those searches were for have failed, through the router's `fail`.
+                return .merge(.cancel(id: CancelID.propagationStamp), abandonPendingPropagatedCopies(state))
 
             case .cancelDeliveryStamps:
                 // The app's explicit reclaim for in-flight delivery-stamp searches. Even an accepted
@@ -840,6 +863,10 @@ public struct LXMFNode {
                 let done = finishProgress(&state, .propagated(hash))
                 return .merge(done, .send(.delegate(.propagationAccepted(messageHash: hash))))
 
+            case let .router(.delegate(.propagationRefused(hash, reason))):
+                state.transferProgress[.propagated(hash)] = nil
+                return .send(.delegate(.propagationRefused(messageHash: hash, reason: reason)))
+
             case let .router(.delegate(.cancelResource(linkID))):
                 // Our transfer's hash on that link names it to the session. Unknown (the router
                 // started the copy but its transfer never reported): nothing on the wire to cancel.
@@ -1018,6 +1045,31 @@ public struct LXMFNode {
         else { return LXMFPropagation.defaultPropagationStampCost }
         guard ann.targetStampCost <= LXMFPropagation.maxPropagationStampCost else { return nil }
         return ann.targetStampCost
+    }
+
+    /// The configured propagation node's per-transfer limit in bytes, or nil when unknown.
+    ///
+    /// Reference expresses these limits in KB and compares byte sizes against `limit * 1000`
+    /// (LXMRouter.py:1528, `client_transfer_limit = float(data[2])*1000`). A limit of 0 or less is
+    /// treated as UNKNOWN rather than "nothing fits": no working node announces it (it would refuse
+    /// every message), while test fixtures and minimal announces do, and the spec's rule for an
+    /// unknown limit is to attempt the copy as before. The product is overflow-checked because the
+    /// field is unauthenticated wire input.
+    private func propagationTransferLimitBytes(_ state: State) -> Int? {
+        guard let pn = state.router.outboundPropagationNode,
+              let appData = state.endpoint.learned[pn]?.appData,
+              let ann = PNAnnounce.parse(appData), ann.perTransferLimit > 0
+        else { return nil }
+        let (bytes, overflow) = ann.perTransferLimit.multipliedReportingOverflow(by: 1000)
+        return overflow ? nil : bytes
+    }
+
+    /// The copies whose propagation stamp searches `.cancelPropagationStamps` or
+    /// `.setPropagationNode` abandon have failed and must be reported so — through the router's
+    /// `fail`, so a message whose delivery copy is still pending is not reported failed yet.
+    /// (Ruling P10: this effect is built once and shared by both call sites, not duplicated.)
+    private func abandonPendingPropagatedCopies(_ state: State) -> Effect<Action> {
+        state.router.pendingPropagatedCopies.isEmpty ? .none : .send(.router(.abandonPendingPropagatedCopies))
     }
 
     /// The delivery stamp cost to apply when sending to `destinationHash`, or **nil meaning

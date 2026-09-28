@@ -25,6 +25,11 @@ public struct LXMFRouter {
         /// Message hashes the app cancelled. A copy of one handed over later (a stamp search that
         /// finished after the cancel) is never armed. Bounded like `succeededMessages`.
         var cancelledMessages = RingSet(capacity: LXMFRouter.succeededMessageMemory)
+        /// Message hashes whose propagated copy is still in `LXMFNode`'s stamp search, so not yet
+        /// handed over. `isOutstanding` counts them: without this, the delivery copy running out first
+        /// reported `deliveryFailed` for a message whose propagated copy was about to go out
+        /// (2026-09-26 single-packet proofs spec, Amendment 3).
+        public var pendingPropagatedCopies: Set<Data> = []
         /// sourceHash (sender's lxmf.delivery destination hash) → identity, for signature validation.
         public var knownIdentities: [Data: Identity] = [:]
         /// destinationHash → direct-link state (reuse an active link, or one being established).
@@ -168,6 +173,11 @@ public struct LXMFRouter {
     }
     /// Why a copy failed for good; the terminal delegate says which.
     enum FailureReason: Equatable { case exhausted, rejected }
+    /// Why a propagated copy was not attempted at all.
+    public enum RefusalReason: Equatable, Sendable {
+        /// Larger than the propagation node's announced per-transfer limit.
+        case tooLargeForNode
+    }
     public struct PropagationItem: Equatable { public var messageHash: Data; public var propagationPacked: Data }
 
     public enum Action: Equatable {
@@ -237,6 +247,12 @@ public struct LXMFRouter {
         /// Resource traffic on `linkID` (either direction). Re-arms the idle timer of the
         /// destination it serves, so a long transfer never trips `linkMaxInactivitySeconds` (spec §5).
         case linkActivity(linkID: Data)
+        /// `LXMFNode` started the stamp search for this message's propagated copy.
+        case propagatedCopyPending(messageHash: Data)
+        /// `LXMFNode` did not start this message's propagated copy at all (spec §6).
+        case propagatedCopyRefused(messageHash: Data, reason: RefusalReason)
+        /// Every propagated-copy stamp search was cancelled: those copies have failed.
+        case abandonPendingPropagatedCopies
         case retryDue(messageHash: Data, leg: Leg)
         case idleDeadline(destinationHash: Data, linkID: Data)
         case pathRequestDeadline(destinationHash: Data)
@@ -265,6 +281,8 @@ public struct LXMFRouter {
             case deliveryCancelled(messageHash: Data)
             /// Cancel our Resource in flight on `linkID` (its copy was cancelled).
             case cancelResource(linkID: Data)
+            /// The propagated copy was not attempted. Not terminal: the delivery copy decides.
+            case propagationRefused(messageHash: Data, reason: RefusalReason)
         }
     }
 
@@ -378,7 +396,8 @@ public struct LXMFRouter {
                 case .delivery:
                     return state.outboundQueue.values.contains { $0.contains { $0.hash == hash } }
                 case .propagated:
-                    return state.propagationQueue.values.contains { $0.contains { $0.messageHash == hash } }
+                    return state.pendingPropagatedCopies.contains(hash)
+                        || state.propagationQueue.values.contains { $0.contains { $0.messageHash == hash } }
                 }
             }
             /// One copy of a message has failed for good. `deliveryFailed` is reported only when no
@@ -387,6 +406,7 @@ public struct LXMFRouter {
             /// `deliveryFailed` itself and bypasses this helper.)
             func fail(_ state: inout State, _ key: DeliveryKey, reason: FailureReason = .exhausted) -> Effect<Action> {
                 state.pendingDeliveries[key] = nil
+                if key.leg == .propagated { state.pendingPropagatedCopies.remove(key.messageHash) }
                 let other: Leg = key.leg == .delivery ? .propagated : .delivery
                 guard !isOutstanding(state, key.messageHash, other),
                       !state.succeededMessages.contains(key.messageHash)
@@ -603,6 +623,7 @@ public struct LXMFRouter {
                 return .none
 
             case let .sendViaPropagation(message, propagationPacked):
+                state.pendingPropagatedCopies.remove(message.hash)       // handed over: armed or failed below
                 guard !state.cancelledMessages.contains(message.hash) else { return .none }
                 guard let pn = state.outboundPropagationNode else {
                     return fail(&state, .propagated(message.hash))
@@ -789,6 +810,7 @@ public struct LXMFRouter {
             case let .cancelOutbound(hash):
                 let hadWork = state.hasOutboundState(for: hash)
                 state.cancelledMessages.insert(hash)
+                state.pendingPropagatedCopies.remove(hash)
                 guard hadWork else { return .none }
                 var effects: [Effect<Action>] = []
                 var freed: [Data] = []
@@ -828,6 +850,25 @@ public struct LXMFRouter {
             case let .linkActivity(linkID):
                 guard let dest = destination(ofLink: linkID, state) else { return .none }
                 return idleTimer(dest, linkID)
+
+            case let .propagatedCopyPending(hash):
+                guard !state.cancelledMessages.contains(hash) else { return .none }
+                state.pendingPropagatedCopies.insert(hash)
+                return .none
+
+            case let .propagatedCopyRefused(hash, reason):
+                // Never started, so there is nothing to fail: the delivery copy's own outcome decides
+                // the message. Running `fail` here could report `deliveryFailed` while the delivery copy
+                // is still in ITS stamp search, which the router cannot see.
+                state.pendingPropagatedCopies.remove(hash)
+                return .send(.delegate(.propagationRefused(messageHash: hash, reason: reason)))
+
+            case .abandonPendingPropagatedCopies:
+                let abandoned = state.pendingPropagatedCopies.sorted { $0.lexicographicallyPrecedes($1) }
+                state.pendingPropagatedCopies = []
+                var effects: [Effect<Action>] = []
+                for hash in abandoned { effects.append(fail(&state, .propagated(hash))) }
+                return .merge(effects)
 
             case let .retryDue(hash, leg):
                 let key = DeliveryKey(messageHash: hash, leg: leg)
@@ -911,5 +952,6 @@ extension LXMFRouter.State {
         pendingDeliveries.keys.contains { $0.messageHash == messageHash }
             || outboundQueue.values.contains { $0.contains { $0.hash == messageHash } }
             || propagationQueue.values.contains { $0.contains { $0.messageHash == messageHash } }
+            || pendingPropagatedCopies.contains(messageHash)
     }
 }
