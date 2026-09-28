@@ -3,7 +3,7 @@ import Security
 
 /// The Keychain primitives `IdentityKeychain` needs, injectable for tests.
 /// The live value is logic-free apart from pure OSStatus mapping; every decision lives in
-/// `IdentityKeychain.loadOrCreate`.
+/// `IdentityKeychain` (`load`, `loadOrCreate`, `importIdentity`).
 public struct KeychainOps: Sendable {
     public enum ReadResult: Sendable, Equatable {
         /// One matching item: its bytes and its persistent reference, which addresses exactly

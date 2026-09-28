@@ -15,6 +15,8 @@ import ReTiCA
 ///    If a legacy group is named wrongly, the pre-mint probe still sees the item and the load
 ///    fails with `.unexpectedItem` instead of minting — fix the location; don't work around it.
 /// 3. Treat `.failed` as "identity unavailable right now" (e.g. prewarm before first unlock) —
+///    (an app that must not mint — e.g. because it holds memberships — calls `load`, which
+///    returns `.absent` instead of minting, and restores with `importIdentity`)
 ///    NEVER mint a replacement yourself.
 ///
 /// Anti-rotation rules (do not weaken): an existing identity is never overwritten or replaced;
@@ -56,6 +58,27 @@ public struct IdentityKeychain {
         }
     }
 
+    /// What `load` found. It is never "created": `load` NEVER mints. A separate type (not a new
+    /// `Outcome` case) so adopters' exhaustive `Outcome` switches keep compiling.
+    public enum LoadOutcome: Sendable, Equatable {
+        /// The shared item existed (possibly created by another app).
+        case loaded(Identity)
+        /// A legacy item was copied into the shared item, verified, and (normally) deleted.
+        case migrated(Identity)
+        /// Nothing at the shared location, at any legacy location, or — by the group-less probe —
+        /// under either service in any accessible group. Nothing was written. Callers decide
+        /// whether that means "fresh install" (mint via `loadOrCreate`) or "key missing" (restore).
+        case absent
+        case failed(Failure)
+
+        public var identity: Identity? {
+            switch self {
+            case let .loaded(identity), let .migrated(identity): identity
+            case .absent, .failed: nil
+            }
+        }
+    }
+
     public enum Failure: Error, Sendable, Equatable {
         /// A read failed with a non-"not found" status (e.g. -25308 errSecInteractionNotAllowed
         /// during prewarm). Whether an identity exists is unknown, so nothing is minted.
@@ -82,7 +105,7 @@ public struct IdentityKeychain {
         case unexpectedItem(service: String)
     }
 
-    /// Rules, in order (spec 2026-09-26-shared-identity-design §5.1):
+    /// Rules 0–3 without the mint (spec 2026-09-28-identity-recovery-design §3):
     /// 0. Every location (shared and legacy) must name a non-empty access group, else
     ///    `.failed(.invalidLocation)` with no Keychain access. A legacy location equal to the
     ///    shared one is ignored (a same-service legacy item in another group IS legacy).
@@ -94,16 +117,15 @@ public struct IdentityKeychain {
     ///    the shared item first: it wins (`.loaded`) and the legacy item is kept unless it holds
     ///    the same seed.
     /// 3. Nothing at any named location → a read-only, group-less probe of the shared and every
-    ///    legacy service; any item anywhere → `.failed(.unexpectedItem)`. Only a truly empty
-    ///    keychain mints, add-only → `.created`; a duplicate → re-read, the stored identity wins
-    ///    (`.loaded`).
-    /// 4. Any read/add error → `.failed`; never mint on error.
-    public static func loadOrCreate(
+    ///    legacy service; any item anywhere → `.failed(.unexpectedItem)`; nothing anywhere →
+    ///    `.absent`. NOTHING is minted.
+    /// Any read/add error → `.failed`.
+    public static func load(
         shared: Location,
         legacy: [Location] = [],
         ops: KeychainOps = .live
-    ) -> Outcome {
-        if let unscoped = ([shared] + legacy).first(where: { $0.accessGroup?.isEmpty != false }) {
+    ) -> LoadOutcome {
+        if let unscoped = firstUnscoped(shared: shared, legacy: legacy) {
             return .failed(.invalidLocation(unscoped))
         }
         // Only an exact alias of the shared item is dropped: the leftover cleanup would otherwise
@@ -139,10 +161,30 @@ public struct IdentityKeychain {
             }
         }
 
-        // Rule 3
+        // Rule 3 (read-only half)
         if let failure = probeForUnexpectedItems(shared: shared, legacy: legacy, ops: ops) {
             return .failed(failure)
         }
+        return .absent
+    }
+
+    /// `load`, then — only when it is `.absent` — mint add-only into the shared item → `.created`;
+    /// a duplicate on add → re-read, the stored identity wins (`.loaded`). One rule path: every
+    /// guarantee of `load` holds here, and nothing is minted on any error or while any item exists.
+    public static func loadOrCreate(
+        shared: Location,
+        legacy: [Location] = [],
+        ops: KeychainOps = .live
+    ) -> Outcome {
+        switch load(shared: shared, legacy: legacy, ops: ops) {
+        case let .loaded(identity): return .loaded(identity)
+        case let .migrated(identity): return .migrated(identity)
+        case let .failed(failure): return .failed(failure)
+        case .absent: return mint(into: shared, ops: ops)
+        }
+    }
+
+    private static func mint(into shared: Location, ops: KeychainOps) -> Outcome {
         let minted = Identity()
         guard let seed = minted.privateKey else { return .failed(.mintFailed) }
         switch ops.add(shared, seed) {
@@ -155,7 +197,12 @@ public struct IdentityKeychain {
         }
     }
 
-    private static func migrate(seed: Data, legacyRef: Data, to shared: Location, ops: KeychainOps) -> Outcome {
+    /// The first location with no (or an empty) access group — rejected before any Keychain access.
+    private static func firstUnscoped(shared: Location, legacy: [Location]) -> Location? {
+        ([shared] + legacy).first(where: { $0.accessGroup?.isEmpty != false })
+    }
+
+    private static func migrate(seed: Data, legacyRef: Data, to shared: Location, ops: KeychainOps) -> LoadOutcome {
         switch ops.add(shared, seed) {
         case let .failed(status):
             return .failed(.addFailed(status: status))
