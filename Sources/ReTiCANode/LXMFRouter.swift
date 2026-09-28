@@ -39,6 +39,11 @@ public struct LXMFRouter {
         /// linkID → the copy whose Resource is currently in flight on that link. One per link:
         /// `resourceDeliveredOnLink` / `resourceFailedOnLink` resolve exactly that copy.
         public var linkResourceInFlight: [Data: DeliveryKey] = [:]
+        /// Destination (recipient or propagation node) → Resource copies waiting for its link's
+        /// transfer slot, oldest first; each is `.queued` in `pendingDeliveries`. One transfer per
+        /// link: `LinkSession` keeps a single split-send slot, and reference's several concurrent
+        /// Resources per link is out of scope (spec §4).
+        public var resourceQueue: [Data: [DeliveryKey]] = [:]
         /// The configured store-and-forward propagation node (all PROPAGATED sends link to it).
         public var outboundPropagationNode: Data? = nil
         /// PN hash → propagated messages queued until a link to the PN becomes active.
@@ -300,6 +305,28 @@ public struct LXMFRouter {
                     return .none
                 }
             }
+            /// Start this Resource copy now if `linkID` has no transfer in flight, else queue it.
+            func startOrQueueResource(_ state: inout State, _ key: DeliveryKey, dest: Data, linkID: Data) -> Effect<Action> {
+                guard state.linkResourceInFlight[linkID] == nil else {
+                    state.pendingDeliveries[key]?.phase = .queued
+                    state.resourceQueue[dest, default: []].append(key)
+                    return .none
+                }
+                return startResource(&state, key, linkID: linkID)
+            }
+            /// `dest`'s transfer slot may be free: start its oldest copy still waiting, if the link is up.
+            func startNextQueued(_ state: inout State, dest: Data) -> Effect<Action> {
+                guard case let .active(linkID) = state.directLinks[dest],
+                      state.linkResourceInFlight[linkID] == nil else { return .none }
+                while var queue = state.resourceQueue[dest], !queue.isEmpty {
+                    let key = queue.removeFirst()
+                    state.resourceQueue[dest] = queue.isEmpty ? nil : queue
+                    if state.pendingDeliveries[key]?.phase == .queued {
+                        return startResource(&state, key, linkID: linkID)
+                    }
+                }
+                return .none
+            }
             /// `linkID` is going away with a Resource in flight. A closing `LinkSession` reaps its
             /// transfers without reporting them, so this IS that transfer's failure: back to
             /// `.retrying` with one retry timer, exactly as `.resourceFailedOnLink` would — UNLESS
@@ -393,6 +420,10 @@ public struct LXMFRouter {
                 var effects: [Effect<Action>] = [orphaned, .cancel(id: CancelID.pathRequest(dest))]
                 for message in queued { effects.append(fail(&state, .delivery(message.hash))) }
                 for item in propQueued { effects.append(fail(&state, .propagated(item.messageHash))) }
+                // Resource copies waiting for this destination's link have no timer of their own.
+                for key in state.resourceQueue.removeValue(forKey: dest) ?? [] where state.pendingDeliveries[key] != nil {
+                    effects.append(fail(&state, key))
+                }
                 return .merge(effects)
             }
             func establish(_ state: inout State, _ dest: Data) -> Effect<Action> {
@@ -532,7 +563,8 @@ public struct LXMFRouter {
                         let asResource = message.directRepresentation == .resource
                         arm(&state, key, .direct(destinationHash: dest, data: message.packed, asResource: asResource))
                         if asResource {
-                            return .merge(startResource(&state, key, linkID: linkID), idleTimer(dest, linkID))
+                            return .merge(startOrQueueResource(&state, key, dest: dest, linkID: linkID),
+                                          idleTimer(dest, linkID))
                         }
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: message.packed,
                                                                   asResource: false))),
@@ -572,7 +604,8 @@ public struct LXMFRouter {
                                       idleTimer(pn, linkID))
                     } else {
                         // Large container: send as Resource; its transfer decides the outcome.
-                        return .merge(startResource(&state, key, linkID: linkID), idleTimer(pn, linkID))
+                        return .merge(startOrQueueResource(&state, key, dest: pn, linkID: linkID),
+                                      idleTimer(pn, linkID))
                     }
                 }
                 state.propagationQueue[pn, default: []].append(
@@ -615,13 +648,14 @@ public struct LXMFRouter {
                 state.outboundQueue[dest] = nil
                 let propQueued = state.propagationQueue[dest] ?? []
                 state.propagationQueue[dest] = nil
-                var effects: [Effect<Action>] = []
+                // Copies queued on a previous link go first; newly drained ones queue behind them.
+                var effects: [Effect<Action>] = [startNextQueued(&state, dest: dest)]
                 for m in queued {
                     let key = DeliveryKey.delivery(m.hash)
                     let asResource = m.directRepresentation == .resource
                     arm(&state, key, .direct(destinationHash: dest, data: m.packed, asResource: asResource))
                     if asResource {
-                        effects.append(startResource(&state, key, linkID: linkID))
+                        effects.append(startOrQueueResource(&state, key, dest: dest, linkID: linkID))
                     } else {
                         effects.append(.send(.delegate(.sendDirect(linkID: linkID, data: m.packed, asResource: false))))
                         effects.append(retryTimer(key, LXMFDelivery.retryWaitSeconds))
@@ -636,7 +670,7 @@ public struct LXMFRouter {
                                                                               messageHash: item.messageHash))))
                         effects.append(retryTimer(key, LXMFDelivery.retryWaitSeconds))
                     } else {
-                        effects.append(startResource(&state, key, linkID: linkID))
+                        effects.append(startOrQueueResource(&state, key, dest: dest, linkID: linkID))
                     }
                 }
                 // Always arm — not only when a queue was drained. A link re-established for a
@@ -707,7 +741,9 @@ public struct LXMFRouter {
             case let .resourceDeliveredOnLink(linkID):
                 guard let key = state.linkResourceInFlight[linkID] else { return .none }
                 state.linkResourceInFlight[linkID] = nil
-                return .send(.delivered(messageHash: key.messageHash, leg: key.leg))
+                var next: Effect<Action> = .none
+                if let dest = destination(ofLink: linkID, state) { next = startNextQueued(&state, dest: dest) }
+                return .merge(.send(.delivered(messageHash: key.messageHash, leg: key.leg)), next)
 
             case let .resourceFailedOnLink(linkID, rejected):
                 // Reference `LXMessage.__resource_concluded` (LXMessage.py:597-606): REJECTED is
@@ -716,7 +752,11 @@ public struct LXMFRouter {
                 guard let key = state.linkResourceInFlight.removeValue(forKey: linkID),
                       var pending = state.pendingDeliveries[key] else { return .none }
                 if rejected {
-                    return fail(&state, key, reason: .rejected)
+                    // The link stays up (reference does not tear it down on REJECTED): next copy.
+                    let failed = fail(&state, key, reason: .rejected)
+                    var next: Effect<Action> = .none
+                    if let dest = destination(ofLink: linkID, state) { next = startNextQueued(&state, dest: dest) }
+                    return .merge(failed, next)
                 }
                 var close: Effect<Action> = .none
                 if let dest = destination(ofLink: linkID, state) {
@@ -753,7 +793,7 @@ public struct LXMFRouter {
                                   retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 case let .direct(destinationHash, data, asResource):
                     if case let .active(linkID) = state.directLinks[destinationHash] {
-                        if asResource { return startResource(&state, key, linkID: linkID) }
+                        if asResource { return startOrQueueResource(&state, key, dest: destinationHash, linkID: linkID) }
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: false))),
                                       retryTimer(key, LXMFDelivery.retryWaitSeconds))
                     }
@@ -768,7 +808,7 @@ public struct LXMFRouter {
                                                                                 messageHash: hash))),
                                           retryTimer(key, LXMFDelivery.retryWaitSeconds))
                         } else {
-                            return startResource(&state, key, linkID: linkID)   // Resource: the transfer decides
+                            return startOrQueueResource(&state, key, dest: destinationHash, linkID: linkID)
                         }
                     }
                     // Link down/re-establishing: no live link; wait and re-check (bounded by maxAttempts).
