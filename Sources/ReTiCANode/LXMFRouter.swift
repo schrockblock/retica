@@ -36,8 +36,8 @@ public struct LXMFRouter {
         /// delivery copy and a propagated copy of one message; under one key the second overwrote
         /// the first and its outcome was reported as the other's.
         public var pendingDeliveries: [DeliveryKey: PendingDelivery] = [:]
-        /// linkID → the copy whose Resource is currently in flight on that link. Single-in-flight per
-        /// link (last write wins); `resourceDeliveredOnLink` resolves exactly that copy.
+        /// linkID → the copy whose Resource is currently in flight on that link. One per link:
+        /// `resourceDeliveredOnLink` / `resourceFailedOnLink` resolve exactly that copy.
         public var linkResourceInFlight: [Data: DeliveryKey] = [:]
         /// The configured store-and-forward propagation node (all PROPAGATED sends link to it).
         public var outboundPropagationNode: Data? = nil
@@ -135,16 +135,31 @@ public struct LXMFRouter {
         case direct(destinationHash: Data, data: Data, asResource: Bool)
         case propagated(destinationHash: Data, data: Data)
     }
+    /// Where a pending copy is in its life (spec §1).
+    public enum Phase: Equatable, Sendable {
+        /// Armed with a retry timer: opportunistic packets, link packets, and a Resource copy whose
+        /// last transfer failed and is waiting for its retry.
+        case retrying
+        /// A Resource is in flight for this copy. No retry timer: the transfer decides the outcome,
+        /// as reference does while a message is SENDING (LXMRouter.py:2788-2796).
+        case transferring
+        /// Waiting for its link's current Resource transfer to finish (one transfer per link).
+        case queued
+    }
     public struct PendingDelivery: Equatable {
         public var resend: ResendInfo
         public var attempts: Int
+        public var phase: Phase
         /// Explicit because the synthesised memberwise init on a `public struct` is INTERNAL,
         /// which made this type public in name only — no other module could construct one.
-        public init(resend: ResendInfo, attempts: Int) {
+        public init(resend: ResendInfo, attempts: Int, phase: Phase = .retrying) {
             self.resend = resend
             self.attempts = attempts
+            self.phase = phase
         }
     }
+    /// Why a copy failed for good; the terminal delegate says which.
+    enum FailureReason: Equatable { case exhausted, rejected }
     public struct PropagationItem: Equatable { public var messageHash: Data; public var propagationPacked: Data }
 
     public enum Action: Equatable {
@@ -205,6 +220,9 @@ public struct LXMFRouter {
         /// `singlePacketDelivered`, token = message hash). Confirms the DELIVERY copy.
         case opportunisticDelivered(messageHash: Data)
         case resourceDeliveredOnLink(linkID: Data)
+        /// The Resource in flight on `linkID` failed. `rejected`: the peer refused it (terminal).
+        /// Otherwise the link is closed and the copy retried once, `retryWaitSeconds` later.
+        case resourceFailedOnLink(linkID: Data, rejected: Bool)
         case retryDue(messageHash: Data, leg: Leg)
         case idleDeadline(destinationHash: Data, linkID: Data)
         case pathRequestDeadline(destinationHash: Data)
@@ -227,6 +245,8 @@ public struct LXMFRouter {
             case deliveryConfirmed(messageHash: Data)
             case propagationAccepted(messageHash: Data)
             case deliveryFailed(messageHash: Data)
+            /// Every copy is over, none succeeded, and the last to fail was REJECTED by its peer.
+            case deliveryRejected(messageHash: Data)
         }
     }
 
@@ -259,6 +279,42 @@ public struct LXMFRouter {
             func arm(_ state: inout State, _ key: DeliveryKey, _ resend: ResendInfo) {
                 state.pendingDeliveries[key] = PendingDelivery(resend: resend, attempts: 1)
             }
+            /// The destination whose ACTIVE link is `linkID`, if any.
+            func destination(ofLink linkID: Data, _ state: State) -> Data? {
+                state.directLinks.first { $0.value == .active(linkID: linkID) }?.key
+            }
+            /// Start this Resource copy's transfer on `linkID`: it becomes `.transferring` and owns the
+            /// link's transfer slot. No retry timer — `resourceDeliveredOnLink` / `resourceFailedOnLink`
+            /// (or losing the link, see `orphanTransfer`) decide what happens next.
+            func startResource(_ state: inout State, _ key: DeliveryKey, linkID: Data) -> Effect<Action> {
+                guard var pending = state.pendingDeliveries[key] else { return .none }
+                pending.phase = .transferring
+                state.pendingDeliveries[key] = pending
+                state.linkResourceInFlight[linkID] = key
+                switch pending.resend {
+                case let .direct(_, data, _):
+                    return .send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: true)))
+                case let .propagated(_, data):
+                    return .send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: data)))
+                case .opportunistic:
+                    return .none
+                }
+            }
+            /// `linkID` is going away with a Resource in flight. A closing `LinkSession` reaps its
+            /// transfers without reporting them, so this IS that transfer's failure: back to
+            /// `.retrying` with one retry timer, exactly as `.resourceFailedOnLink` would — UNLESS
+            /// this copy already used its last transfer (Ruling P6): a lost link is a failed attempt
+            /// too, so at `maxAttempts` it fails the copy outright rather than arming a sixth.
+            func orphanTransfer(_ state: inout State, linkID: Data) -> Effect<Action> {
+                guard let key = state.linkResourceInFlight.removeValue(forKey: linkID),
+                      state.pendingDeliveries[key]?.phase == .transferring else { return .none }
+                guard let attempts = state.pendingDeliveries[key]?.attempts,
+                      attempts < LXMFDelivery.maxAttempts else {
+                    return fail(&state, key)
+                }
+                state.pendingDeliveries[key]?.phase = .retrying
+                return retryTimer(key, LXMFDelivery.retryWaitSeconds)
+            }
             /// One copy of a message was confirmed: settle that copy only, stop its retries, remember
             /// the success, and report the outcome that copy stands for. A receipt for a copy no
             /// longer pending is ignored.
@@ -289,22 +345,30 @@ public struct LXMFRouter {
             /// other copy can still succeed and none already did (spec §3). Every router failure path
             /// goes through here. (Accepted gap: `LXMFNode`'s `.cancelDeliveryStamps` emits
             /// `deliveryFailed` itself and bypasses this helper.)
-            func fail(_ state: inout State, _ key: DeliveryKey) -> Effect<Action> {
+            func fail(_ state: inout State, _ key: DeliveryKey, reason: FailureReason = .exhausted) -> Effect<Action> {
                 state.pendingDeliveries[key] = nil
                 let other: Leg = key.leg == .delivery ? .propagated : .delivery
                 guard !isOutstanding(state, key.messageHash, other),
                       !state.succeededMessages.contains(key.messageHash)
                 else { return .none }
-                return .send(.delegate(.deliveryFailed(messageHash: key.messageHash)))
+                // The terminal outcome carries the reason of the copy that ended the message.
+                let outcome: Action.Delegate = reason == .rejected
+                    ? .deliveryRejected(messageHash: key.messageHash)
+                    : .deliveryFailed(messageHash: key.messageHash)
+                return .send(.delegate(outcome))
             }
             // Tear down a direct link, reaping its in-flight Resource entry. `linkResourceInFlight`
             // is keyed on the linkID carried by `.active`, so it can only be reaped BEFORE
             // `directLinks[dest]` is cleared — do both here so no teardown path can strand an entry (F7).
-            func clearDirectLink(_ state: inout State, _ dest: Data) {
+            // The copy that owned the entry goes back to retrying (`orphanTransfer`); the returned
+            // effect is its retry timer.
+            func clearDirectLink(_ state: inout State, _ dest: Data) -> Effect<Action> {
+                var orphaned: Effect<Action> = .none
                 if case let .active(linkID) = state.directLinks[dest] {
-                    state.linkResourceInFlight[linkID] = nil
+                    orphaned = orphanTransfer(&state, linkID: linkID)
                 }
                 state.directLinks[dest] = nil
+                return orphaned
             }
             /// Give up on `dest`: cancel the path-request park timer, fail everything queued for it,
             /// forget the path, and clear all establishment state. Both call sites (the `establish`
@@ -313,7 +377,7 @@ public struct LXMFRouter {
             func giveUp(_ state: inout State, _ dest: Data) -> Effect<Action> {
                 state.establishAttempts[dest] = nil
                 state.knownPaths.remove(dest)
-                clearDirectLink(&state, dest)
+                let orphaned = clearDirectLink(&state, dest)
                 let queued = state.outboundQueue[dest] ?? []
                 let propQueued = state.propagationQueue[dest] ?? []
                 state.outboundQueue[dest] = nil
@@ -326,7 +390,7 @@ public struct LXMFRouter {
                 // future PN link resurrect the abandoned sync with a surprise `requestMessageList`.
                 // Guarded on the PN: an unrelated destination giving up says nothing about the sync.
                 if dest == state.outboundPropagationNode { state.pendingDownloadFromPN = false }
-                var effects: [Effect<Action>] = [.cancel(id: CancelID.pathRequest(dest))]
+                var effects: [Effect<Action>] = [orphaned, .cancel(id: CancelID.pathRequest(dest))]
                 for message in queued { effects.append(fail(&state, .delivery(message.hash))) }
                 for item in propQueued { effects.append(fail(&state, .propagated(item.messageHash))) }
                 return .merge(effects)
@@ -362,7 +426,7 @@ public struct LXMFRouter {
             /// `knownPaths` was cleared before this runs, which decides which branch `establish`
             /// takes.
             func closed(_ state: inout State, _ dest: Data) -> Effect<Action> {
-                clearDirectLink(&state, dest)
+                let orphaned = clearDirectLink(&state, dest)
                 let hasPending = state.pendingDeliveries.values.contains {
                     switch $0.resend {
                     case let .direct(d, _, _): return d == dest
@@ -380,7 +444,7 @@ public struct LXMFRouter {
                 // no timer. Bounded by `establish()`'s budget like any other destination.
                 let hasPendingSync = dest == state.outboundPropagationNode && state.pendingDownloadFromPN
                 if hasPending || hasQueued || hasPendingSync {
-                    return establish(&state, dest)
+                    return .merge(orphaned, establish(&state, dest))
                 }
                 // No work left for this destination: the establishment saga is OVER, so its budget
                 // ends with it. The other clearers are `.linkEstablished` (success) and `giveUp`
@@ -413,7 +477,7 @@ public struct LXMFRouter {
                 // `LXMFNode` routes every path-shaped failure through `.pathLostAndClosed`, which
                 // parks instead. A stale binding now costs ONE attempt, not the whole budget.
                 state.establishAttempts[dest] = nil
-                return .none
+                return orphaned
             }
             switch action {
             case let .rehydrateDedup(seenHashes, transientIds):
@@ -467,9 +531,11 @@ public struct LXMFRouter {
                         let key = DeliveryKey.delivery(message.hash)
                         let asResource = message.directRepresentation == .resource
                         arm(&state, key, .direct(destinationHash: dest, data: message.packed, asResource: asResource))
-                        if asResource { state.linkResourceInFlight[linkID] = key }
+                        if asResource {
+                            return .merge(startResource(&state, key, linkID: linkID), idleTimer(dest, linkID))
+                        }
                         return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: message.packed,
-                                                                  asResource: asResource))),
+                                                                  asResource: false))),
                                       retryTimer(key, LXMFDelivery.retryWaitSeconds),
                                       idleTimer(dest, linkID))
                     }
@@ -505,11 +571,8 @@ public struct LXMFRouter {
                                       retryTimer(key, LXMFDelivery.retryWaitSeconds),
                                       idleTimer(pn, linkID))
                     } else {
-                        // Large container: send as Resource; receipt via resourceDeliveredOnLink.
-                        state.linkResourceInFlight[linkID] = key
-                        return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: propagationPacked))),
-                                      retryTimer(key, LXMFDelivery.retryWaitSeconds),
-                                      idleTimer(pn, linkID))
+                        // Large container: send as Resource; its transfer decides the outcome.
+                        return .merge(startResource(&state, key, linkID: linkID), idleTimer(pn, linkID))
                     }
                 }
                 state.propagationQueue[pn, default: []].append(
@@ -557,9 +620,12 @@ public struct LXMFRouter {
                     let key = DeliveryKey.delivery(m.hash)
                     let asResource = m.directRepresentation == .resource
                     arm(&state, key, .direct(destinationHash: dest, data: m.packed, asResource: asResource))
-                    if asResource { state.linkResourceInFlight[linkID] = key }
-                    effects.append(.send(.delegate(.sendDirect(linkID: linkID, data: m.packed, asResource: asResource))))
-                    effects.append(retryTimer(key, LXMFDelivery.retryWaitSeconds))
+                    if asResource {
+                        effects.append(startResource(&state, key, linkID: linkID))
+                    } else {
+                        effects.append(.send(.delegate(.sendDirect(linkID: linkID, data: m.packed, asResource: false))))
+                        effects.append(retryTimer(key, LXMFDelivery.retryWaitSeconds))
+                    }
                 }
                 for item in propQueued {
                     let key = DeliveryKey.propagated(item.messageHash)
@@ -568,11 +634,10 @@ public struct LXMFRouter {
                         effects.append(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
                                                                               propagationPacked: item.propagationPacked,
                                                                               messageHash: item.messageHash))))
+                        effects.append(retryTimer(key, LXMFDelivery.retryWaitSeconds))
                     } else {
-                        state.linkResourceInFlight[linkID] = key
-                        effects.append(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: item.propagationPacked))))
+                        effects.append(startResource(&state, key, linkID: linkID))
                     }
-                    effects.append(retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 }
                 // Always arm — not only when a queue was drained. A link re-established for a
                 // still-pending delivery or a PN sync drains no queue, so the old "only if queued"
@@ -644,9 +709,33 @@ public struct LXMFRouter {
                 state.linkResourceInFlight[linkID] = nil
                 return .send(.delivered(messageHash: key.messageHash, leg: key.leg))
 
+            case let .resourceFailedOnLink(linkID, rejected):
+                // Reference `LXMessage.__resource_concluded` (LXMessage.py:597-606): REJECTED is
+                // terminal; any other failure tears the link down and returns the message to
+                // OUTBOUND, where the next pass counts an attempt after DELIVERY_RETRY_WAIT.
+                guard let key = state.linkResourceInFlight.removeValue(forKey: linkID),
+                      var pending = state.pendingDeliveries[key] else { return .none }
+                if rejected {
+                    return fail(&state, key, reason: .rejected)
+                }
+                var close: Effect<Action> = .none
+                if let dest = destination(ofLink: linkID, state) {
+                    close = .merge(clearDirectLink(&state, dest), .send(.delegate(.closeLink(destinationHash: dest))))
+                }
+                // `attempts` counts transfers started: the `maxAttempts`-th failure is the last.
+                guard pending.attempts < LXMFDelivery.maxAttempts else {
+                    return .merge(close, fail(&state, key))
+                }
+                pending.phase = .retrying
+                state.pendingDeliveries[key] = pending
+                return .merge(close, retryTimer(key, LXMFDelivery.retryWaitSeconds))
+
             case let .retryDue(hash, leg):
                 let key = DeliveryKey(messageHash: hash, leg: leg)
                 guard var pending = state.pendingDeliveries[key] else { return .none }
+                // Only a `.retrying` copy has a timer. One whose Resource is in flight (or queued
+                // behind one) is decided by its transfer, so a stray retry must not count or resend.
+                guard pending.phase == .retrying else { return .none }
                 pending.attempts += 1
                 if pending.attempts > LXMFDelivery.maxAttempts {
                     return fail(&state, key)
@@ -664,8 +753,8 @@ public struct LXMFRouter {
                                   retryTimer(key, LXMFDelivery.retryWaitSeconds))
                 case let .direct(destinationHash, data, asResource):
                     if case let .active(linkID) = state.directLinks[destinationHash] {
-                        if asResource { state.linkResourceInFlight[linkID] = key }
-                        return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: asResource))),
+                        if asResource { return startResource(&state, key, linkID: linkID) }
+                        return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: false))),
                                       retryTimer(key, LXMFDelivery.retryWaitSeconds))
                     }
                     // Link is down or re-establishing: no live link to send on. Wait and re-check; the
@@ -679,9 +768,7 @@ public struct LXMFRouter {
                                                                                 messageHash: hash))),
                                           retryTimer(key, LXMFDelivery.retryWaitSeconds))
                         } else {
-                            state.linkResourceInFlight[linkID] = key
-                            return .merge(.send(.delegate(.sendPropagated(linkID: linkID, propagationPacked: data))),
-                                          retryTimer(key, LXMFDelivery.retryWaitSeconds))
+                            return startResource(&state, key, linkID: linkID)   // Resource: the transfer decides
                         }
                     }
                     // Link down/re-establishing: no live link; wait and re-check (bounded by maxAttempts).
@@ -694,8 +781,8 @@ public struct LXMFRouter {
                 // linkID — or none — and no-ops (F5.2).
                 guard case let .active(current) = state.directLinks[dest], current == linkID
                 else { return .none }
-                clearDirectLink(&state, dest)
-                return .send(.delegate(.closeLink(destinationHash: dest)))
+                let orphaned = clearDirectLink(&state, dest)
+                return .merge(orphaned, .send(.delegate(.closeLink(destinationHash: dest))))
 
             case let .pathRequestDeadline(dest):
                 // The park timer fired: the path response never arrived (or was rejected by

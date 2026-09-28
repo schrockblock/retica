@@ -614,37 +614,6 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
 }
 
-@Test @MainActor func routerArmsRetryForDrainedResourceMessage() async {
-    let big = makeMessage(source: Identity(), content: String(repeating: "x", count: 2000))
-    #expect(big.directRepresentation == .resource)
-    let clock = TestClock()
-    var initial = LXMFRouter.State()
-    initial.knownPaths.insert(big.destinationHash)   // path known → establishes directly
-    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
-        $0.continuousClock = clock
-    }
-    store.exhaustivity = .off
-    await store.send(.send(message: big, desiredMethod: .direct))
-    await store.receive { if case .delegate(.requestLink) = $0 { return true }; return false }
-    let linkID = Data(repeating: 0xCD, count: 16)
-    await store.send(.linkEstablished(destinationHash: big.destinationHash, linkID: linkID))
-    await store.receive { action in
-        if case let .delegate(.sendDirect(_, _, asResource)) = action { #expect(asResource == true); return true }
-        return false
-    }
-    #expect(store.state.pendingDeliveries[.delivery(big.hash)]?.attempts == 1)   // drained send armed a retry
-    // A retry re-emits sendDirect with asResource preserved.
-    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
-    await store.receive { action in
-        if case let .delegate(.sendDirect(lid, _, asResource)) = action {
-            #expect(lid == linkID); #expect(asResource == true); return true
-        }
-        return false
-    }
-    await store.send(.delivered(messageHash: big.hash, leg: .delivery))
-    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
-}
-
 // MARK: - LXMF-4c-3a link-CLOSED recovery
 
 @Test @MainActor func routerRecoversPendingOnNewLinkAfterClose() async {
@@ -1181,11 +1150,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
     #expect(store.state.linkResourceInFlight[linkID] == LXMFRouter.DeliveryKey.delivery(bigMsg.hash))
 
-    // Resolve the delivery so its retry timer is cancelled; the idle timer and the in-flight entry
-    // both remain (the Resource is still notionally in flight for eviction purposes).
-    await store.send(.delivered(messageHash: bigMsg.hash, leg: .delivery))
-    await store.receive { if case .delegate(.deliveryConfirmed) = $0 { return true }; return false }
-    #expect(store.state.linkResourceInFlight[linkID] == LXMFRouter.DeliveryKey.delivery(bigMsg.hash), "still in-flight before idle")
+    // A Resource copy arms no retry timer, so nothing needs resolving first: the in-flight entry and
+    // the idle timer are all that is running.
+    #expect(store.state.pendingDeliveries[.delivery(bigMsg.hash)]?.phase == .transferring)
     #expect(store.state.directLinks[bigMsg.destinationHash] == .active(linkID: linkID))
 
     // Idle window elapses → the link is torn down. The in-flight entry MUST be reaped.
@@ -1197,6 +1164,8 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.linkResourceInFlight[linkID] == nil,
             "idle teardown must reap the in-flight Resource entry — F7 leak")
     #expect(store.state.directLinks[bigMsg.destinationHash] == nil)
+    #expect(store.state.pendingDeliveries[.delivery(bigMsg.hash)]?.phase == .retrying,
+            "the transfer died with the link, so the copy goes back to retrying")
 }
 
 // MARK: - LXMF-4d-2b PROPAGATED outbound
@@ -1277,32 +1246,6 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         return false
     }
     #expect(store.state.pendingDeliveries[.propagated(msg.hash)]?.attempts == 1)
-}
-
-@Test @MainActor func routerPropagationRetryResendsSameBytes() async {
-    let msg = makeMessage(source: Identity(), content: "prop")
-    // Use a large container (> Link.mdu = 431 bytes) so this test stays on the Resource path.
-    let packed = Data(repeating: 0xAA, count: 432)
-    let pn = Data(repeating: 0xBB, count: 16)
-    let linkID = Data(repeating: 0xC0, count: 16)
-    let clock = TestClock()
-    var initial = LXMFRouter.State()
-    initial.outboundPropagationNode = pn
-    initial.directLinks[pn] = .active(linkID: linkID)
-    let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: {
-        $0.continuousClock = clock
-    }
-    store.exhaustivity = .off
-    await store.send(.sendViaPropagation(message: msg, propagationPacked: packed))
-    await store.receive { if case .delegate(.sendPropagated) = $0 { return true }; return false }
-    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
-    await store.receive { action in
-        if case let .delegate(.sendPropagated(lid, p)) = action {
-            #expect(lid == linkID); #expect(p == packed); return true   // same bytes on retry
-        }
-        return false
-    }
-    #expect(store.state.pendingDeliveries[.propagated(msg.hash)]?.attempts == 2)
 }
 
 // MARK: - Task-2: propagation small-packet + genuine propagationAccepted
