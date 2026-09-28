@@ -241,6 +241,36 @@ mutate → red → revert → green, with no "Skipped assertions" known issues.
 - ReTiCaMsgr's `docs/superpowers/backlog-retica-followups.md`: remove the false-"failed" item once
   merged; hop count / interface / retry count stay.
 
+## Amendments at planning time (2026-09-27)
+
+Writing the plan against the real code surfaced these corrections. They override the text above
+where they conflict.
+
+1. **Inbound progress can't name the sender.** A peer delivering to us links to our own
+   `lxmf.delivery` destination without identifying, so the link's remote hash is ours, not theirs.
+   The delegate becomes `inboundTransferProgress(sourceHash: Data?, linkID: Data, fraction:)`;
+   `sourceHash` is nil on ordinary delivery links and set only when the initiator identified. The app
+   can show "Receiving…" keyed by link, and attributes the message once it unpacks.
+2. **Transfer identity is by resource hash, matched in `LXMFNode`.** `LinkSession` emits
+   `resourceFailed`/`resourceConcluded` for inbound transfers too, so a link-ID-only mapping would let
+   a peer's failed transfer to us fail our outbound message on the same link. `LXMFNode` records the
+   resource hash of its own outbound transfer per link (from the first sender progress event, emitted
+   at advertisement, so `resourceProgress` carries a `role`) and ignores conclusions for other hashes.
+   `cancelResource` therefore takes that hash, supplied by the node.
+3. **Rejection is terminal for both copies.** Reference retries a rejected *propagated* copy; we
+   don't, because a PN rejection is a policy/size decision that a retry won't change. The message
+   reports `deliveryRejected` only if the last copy to fail was rejected.
+4. **Oversize refusal does not call `fail`.** The propagated copy is simply never armed; the router
+   reports `propagationRefused` and the delivery copy alone decides the message's outcome. A PN
+   `perTransferLimit` of 0 or less counts as unknown (every existing PN fixture announces 0), and an
+   unknown limit means the copy is attempted as today. The up-front check is a deliberate divergence
+   from reference, which never checks the PN limit on send; recorded in the parity checklist.
+5. **A link closing mid-transfer counts as a failed transfer** (closed, idle teardown or give-up):
+   the copy returns to `retrying` with one timer. Give-up also fails queued copies.
+6. **`setPropagationNode` clears pending markers** the same way `cancelPropagationStamps` does.
+7. The 5th consecutive transfer failure fails the copy immediately, with no further 10 s wait.
+8. Stale citation: `closed()` is at `LXMFRouter.swift:364`, not `:321`.
+
 ## Out of scope
 
 - Bandwidth throttling, resumable transfers, or partial-transfer persistence across relaunch.
