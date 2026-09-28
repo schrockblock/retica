@@ -51,8 +51,8 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
     await store.send(.cancelOutbound(messageHash: big.hash)) {
         $0.pendingDeliveries[.delivery(big.hash)] = nil
         $0.linkResourceInFlight[recipientLink] = nil
-        $0.cancelledMessages.insert(big.hash)
     }
+    #expect(store.state.cancelledMessages.contains(big.hash))
     await store.receive(.delegate(.cancelResource(linkID: recipientLink)))
     await store.receive(.delegate(.deliveryCancelled(messageHash: big.hash)))
     // A late outcome of the cancelled transfer finds nothing to resolve: no state, no delegate.
@@ -72,8 +72,8 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
     await store.send(.cancelOutbound(messageHash: second.hash)) {
         $0.pendingDeliveries[.delivery(second.hash)] = nil
         $0.resourceQueue[recipient] = nil
-        $0.cancelledMessages.insert(second.hash)
     }
+    #expect(store.state.cancelledMessages.contains(second.hash))
     await store.receive(.delegate(.deliveryCancelled(messageHash: second.hash)))
     await store.send(.resourceDeliveredOnLink(linkID: recipientLink)) {
         $0.linkResourceInFlight[recipientLink] = nil
@@ -96,8 +96,8 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
     store.exhaustivity = .on
     await store.send(.cancelOutbound(messageHash: m.hash)) {
         $0.pendingDeliveries[.delivery(m.hash)] = nil
-        $0.cancelledMessages.insert(m.hash)
     }
+    #expect(store.state.cancelledMessages.contains(m.hash))
     await store.receive(.delegate(.deliveryCancelled(messageHash: m.hash)))
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
     await store.send(probe)                                   // no retryDue ever fired
@@ -116,8 +116,8 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
         $0.linkResourceInFlight[recipientLink] = k2
         $0.pendingDeliveries[k2]?.phase = .transferring
         $0.resourceQueue[recipient] = nil
-        $0.cancelledMessages.insert(first.hash)
     }
+    #expect(store.state.cancelledMessages.contains(first.hash))
     // The cancel reaches the link before the next transfer starts on it.
     await store.receive(.delegate(.cancelResource(linkID: recipientLink)))
     await store.receive(.delegate(.deliveryCancelled(messageHash: first.hash)))
@@ -138,8 +138,8 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
     store.exhaustivity = .on
     await store.send(.cancelOutbound(messageHash: m.hash)) {
         $0.pendingDeliveries = [:]
-        $0.cancelledMessages.insert(m.hash)
     }
+    #expect(store.state.cancelledMessages.contains(m.hash))
     await store.receive(.delegate(.deliveryCancelled(messageHash: m.hash)))
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
     await store.send(probe)                                   // neither copy retries or fails later
@@ -154,12 +154,13 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
         $0.continuousClock = TestClock()
     }
     // `cancelledMessages` is reference-backed storage (RingSet.swift): with no other pending work
-    // for `m`, inserting into it is the closure's ONLY mutation, and such a ring insert is invisible
-    // to TestStore's state diffing (RingSet.swift:132-135 documents this exact trap) — asserting it
-    // here would fail with "no change occurred" even though the insert genuinely happened. The
-    // insert's effect is instead verified behaviourally below: a copy handed over afterwards is
-    // silently dropped rather than armed.
+    // for `m`, inserting into it would be the state closure's ONLY mutation, and such a ring insert
+    // is invisible to TestStore's closure-based diffing (RingSet.swift:132-135 documents this exact
+    // trap) — a `{ $0.cancelledMessages.insert(m.hash) }` closure here would fail with "no change
+    // occurred" even though the insert genuinely happened. Asserting directly against `store.state`
+    // afterwards sidesteps the trap and restores the direct check.
     await store.send(.cancelOutbound(messageHash: m.hash))
+    #expect(store.state.cancelledMessages.contains(m.hash))
     await store.send(.send(message: m, desiredMethod: .opportunistic))
     await store.send(.sendViaPropagation(message: m, propagationPacked: small))   // no PN: would fail if armed
 }
@@ -174,8 +175,8 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
     store.exhaustivity = .on
     await store.send(.cancelOutbound(messageHash: big.hash)) {
         $0.outboundQueue[recipient] = nil
-        $0.cancelledMessages.insert(big.hash)
     }
+    #expect(store.state.cancelledMessages.contains(big.hash))
     await store.receive(.delegate(.deliveryCancelled(messageHash: big.hash)))
     await store.send(.linkEstablished(destinationHash: recipient, linkID: recipientLink)) {
         $0.directLinks[recipient] = .active(linkID: recipientLink)
