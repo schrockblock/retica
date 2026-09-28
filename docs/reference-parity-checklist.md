@@ -600,7 +600,11 @@ exactly the class Tier 1 just closed.*
       one per link and queue the rest (`LXMFRouter.resourceQueue`), because `LinkSession` keeps a
       single split-send slot. Not a wire behaviour. **Also:** a propagated copy larger than the
       node's announced per-transfer limit is refused up front (`propagationRefused`); reference
-      attempts it and lets the node reject it. Known gaps: the propagation-only entry point
+      attempts it and lets the node reject it. A rejected *propagated* copy is terminal for that
+      copy (reference retries it like any failure). `cancelOutbound` does not stop the
+      propagation-only entry point's stamp search
+      (`sendViaPropagation(destinationHash:title:content:)` is not per-hash cancellable).
+      Known gaps: the propagation-only entry point
       (`LXMFNode.sendViaPropagation(destinationHash:title:content:)`) gets neither the size refusal
       nor the pending marker, and the size check compares the packed message, not the larger
       propagation container, so a message just under the limit can still be rejected by the node.

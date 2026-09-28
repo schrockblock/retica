@@ -277,10 +277,12 @@ where they conflict.
      not only peers with a stamp cost. It predates this work. The proper fix is a "propagated copy
      pending" marker, set when the stamp search starts and honoured by `isOutstanding`.
      **Fixed** by `2026-09-27-transfer-aware-delivery-design.md` §6:
-     `LXMFRouter.State.pendingPropagatedCopies`, set by `.propagatedCopyPending` when
-     `sendMessage(alsoViaPropagation: true)` starts the search, cleared when the copy is armed,
-     failed, or cancelled; `.cancelPropagationStamps` and `.setPropagationNode` fail the marked
-     copies through `fail` (`.abandonPendingPropagatedCopies`).
+     `LXMFRouter.State.pendingPropagatedCopies`, set synchronously through
+     `State.markPropagatedCopyPending` when `sendMessage(alsoViaPropagation: true)` starts the
+     search, cleared when the copy is armed, failed, or cancelled; `.cancelPropagationStamps` and
+     `.setPropagationNode` fail the marked copies through `fail`
+     (`.abandonPendingPropagatedCopies`), except copies whose delivery stamp search is still
+     running, whose marker is dropped without `fail` so the delivery copy decides the message.
 
    The cancellation gap and the delivery-stamp-search gap affect only peers with a delivery stamp
    cost, or cancellation, and are still open. The propagated-stamp-search gap affected every user

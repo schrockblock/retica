@@ -286,7 +286,8 @@ where they conflict.
 12. **`cancelledMessages` is consulted at hand-over.** The router uses it only where it can act: a
    copy handed over after a cancel (a stamp search finishing late, via `send`/`sendViaPropagation`)
    is never armed, and `markPropagatedCopyPending` refuses a cancelled hash. It is not consulted on
-   the transfer path.
+   the transfer path. A fresh app-level `LXMFNode.sendMessage` for a cancelled hash un-cancels it
+   first, so a deliberate re-send is a normal send (final-review ruling F2).
 13. **Fractions are byte-based.** `ResourceTransfer` sums the sizes of the parts sent (`sentIndices`)
    or received (`receivedParts`); a split Resource's fraction spans its segments
    (`transferFraction`). The 0.10 point is the transfer's first progress event (`bytesDone == 0`),
@@ -296,6 +297,12 @@ where they conflict.
    dispatched `.propagatedCopyPending` action), so a `cancelPropagationStamps` or
    `setPropagationNode` later in the same cycle already sees it; the router action remains as a thin
    wrapper over the same method.
+15. **Transfer-phase progress is capped at 0.99.** `outboundFraction` never reports 1.0; only
+   `finishProgress` does, on confirmation, so a full bar always means delivered (ruling F4).
+16. **Cancel after a success is silent.** `cancelOutbound` for a hash in `succeededMessages` tears
+   down the remaining copy — and the node stops its remaining stamp search — without
+   `deliveryCancelled` (rulings F1, F1b). Abandoning a pending propagated copy while the delivery
+   stamp search still runs drops the marker without `fail` (ruling F3).
 
 ## Out of scope
 
