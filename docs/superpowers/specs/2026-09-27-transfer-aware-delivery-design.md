@@ -271,6 +271,32 @@ where they conflict.
 7. The 5th consecutive transfer failure fails the copy immediately, with no further 10 s wait.
 8. Stale citation: `closed()` is at `LXMFRouter.swift:364`, not `:321`.
 
+### Amendments at implementation time (2026-09-28)
+
+9. **`sourceHash` refines amendment 1:** it is the far end of a link *we* opened (the destination
+   we linked to) and nil for every inbound link, identified or not. `LXMFNode` does not track
+   `linkIdentified`; an app wanting the sender of an identified inbound transfer waits for unpack.
+10. **Cancelling a split send sends a cancel packet.** `LinkSession.cancelResource` drops the unsent
+   segments and sends the standard RESOURCE_ICL for the segment in flight; "without a packet" only
+   when no segment transfer is left. No `resourceFailed` follows a cancel.
+11. **`deliveryCancelled` is reported once, and only if there was work.** The router reports it when
+   it held any copy or queued message; the node reports it when the only work was a delivery stamp
+   search the router never saw. A cancel for a message with nothing outstanding reports nothing,
+   but the hash is still remembered.
+12. **`cancelledMessages` is consulted at hand-over.** The router uses it only where it can act: a
+   copy handed over after a cancel (a stamp search finishing late, via `send`/`sendViaPropagation`)
+   is never armed, and `markPropagatedCopyPending` refuses a cancelled hash. It is not consulted on
+   the transfer path.
+13. **Fractions are byte-based.** `ResourceTransfer` sums the sizes of the parts sent (`sentIndices`)
+   or received (`receivedParts`); a split Resource's fraction spans its segments
+   (`transferFraction`). The 0.10 point is the transfer's first progress event (`bytesDone == 0`),
+   emitted when the sender advertises; the receiver reports 0 on accept.
+14. **The pending marker is set synchronously.** `LXMFNode.sendMessage(alsoViaPropagation: true)`
+   marks the copy through `LXMFRouter.State.markPropagatedCopyPending` in the same reduce (not a
+   dispatched `.propagatedCopyPending` action), so a `cancelPropagationStamps` or
+   `setPropagationNode` later in the same cycle already sees it; the router action remains as a thin
+   wrapper over the same method.
+
 ## Out of scope
 
 - Bandwidth throttling, resumable transfers, or partial-transfer persistence across relaunch.
