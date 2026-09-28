@@ -96,6 +96,8 @@ public struct LinkPlane {
 
         case sendOverLink(linkID: Data, data: Data)
         case sendResourceOverLink(linkID: Data, data: Data)
+        /// Cancel our outbound Resource `hash` on `linkID` (see `LinkSession.Action.cancelResource`).
+        case cancelResource(linkID: Data, hash: Data)
         case identifyOverLink(linkID: Data, identity: Identity)
         case sendRequestOverLink(linkID: Data, path: String, data: Data)
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
@@ -117,7 +119,9 @@ public struct LinkPlane {
             case linkFailed(destinationHash: Data, reason: LinkFailure)
             case resourceReceived(linkID: Data, data: Data)
             case resourceConcluded(linkID: Data, resourceHash: Data)
-            case resourceFailed(linkID: Data, resourceHash: Data)
+            case resourceFailed(linkID: Data, resourceHash: Data, rejected: Bool)
+            case resourceProgress(linkID: Data, resourceHash: Data, role: ResourceTransfer.Role,
+                                  bytesDone: Int, bytesTotal: Int, segment: Int, segments: Int)
             case linkIdentified(linkID: Data, remoteIdentity: Identity)
             case requestReceived(linkID: Data, requestID: Data, pathHash: Data, data: Data)
             case responseReceived(linkID: Data, requestID: Data, data: Data)
@@ -262,6 +266,10 @@ public struct LinkPlane {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .sendResource(data))))
 
+            case let .cancelResource(linkID, hash):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .cancelResource(hash: hash))))
+
             case let .identifyOverLink(linkID, identity):
                 // Same crash surface as `acceptLinkRequest`: `LinkSession.identify` signs with this
                 // identity, so a keyless one would `preconditionFailure` in `Identity.sign`. Public
@@ -400,9 +408,15 @@ public struct LinkPlane {
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
                 return .send(.delegate(.resourceConcluded(linkID: linkID, resourceHash: hash)))
 
-            case let .link(.element(elementID, .delegate(.resourceFailed(hash)))):
+            case let .link(.element(elementID, .delegate(.resourceFailed(hash, rejected)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
-                return .send(.delegate(.resourceFailed(linkID: linkID, resourceHash: hash)))
+                return .send(.delegate(.resourceFailed(linkID: linkID, resourceHash: hash, rejected: rejected)))
+
+            case let .link(.element(elementID, .delegate(.resourceProgress(hash, role, done, total, segment, segments)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.resourceProgress(linkID: linkID, resourceHash: hash, role: role,
+                                                         bytesDone: done, bytesTotal: total,
+                                                         segment: segment, segments: segments)))
 
             case let .link(.element(elementID, .delegate(.identified(identity)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }

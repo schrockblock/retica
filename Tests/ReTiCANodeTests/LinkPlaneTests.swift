@@ -100,6 +100,7 @@ private let ifA = InterfaceID("iface-a")
     let linkID = Data(repeating: 0x04, count: 16)
     #expect(roundTrips(.sendOverLink(linkID: linkID, data: Data("hello".utf8))))
     #expect(roundTrips(.sendResourceOverLink(linkID: linkID, data: Data("res".utf8))))
+    #expect(roundTrips(.cancelResource(linkID: linkID, hash: Data(repeating: 0x0E, count: 32))))
     #expect(roundTrips(.identifyOverLink(linkID: linkID, identity: Identity())))
     #expect(roundTrips(.sendRequestOverLink(linkID: linkID, path: "svc/echo", data: Data("req".utf8))))
     #expect(roundTrips(.sendResponseOverLink(linkID: linkID, requestID: Data(repeating: 0x05, count: 16),
@@ -124,7 +125,11 @@ private let ifA = InterfaceID("iface-a")
     #expect(roundTrips(.delegate(.linkFailed(destinationHash: destHash, reason: .handshakeRejected))))
     #expect(roundTrips(.delegate(.resourceReceived(linkID: linkID, data: Data([0x11])))))
     #expect(roundTrips(.delegate(.resourceConcluded(linkID: linkID, resourceHash: Data(repeating: 0x07, count: 16)))))
-    #expect(roundTrips(.delegate(.resourceFailed(linkID: linkID, resourceHash: Data(repeating: 0x08, count: 16)))))
+    #expect(roundTrips(.delegate(.resourceFailed(linkID: linkID, resourceHash: Data(repeating: 0x08, count: 16),
+                                                 rejected: true))))
+    #expect(roundTrips(.delegate(.resourceProgress(linkID: linkID, resourceHash: Data(repeating: 0x0F, count: 16),
+                                                   role: .sender, bytesDone: 1, bytesTotal: 2,
+                                                   segment: 1, segments: 1))))
     #expect(roundTrips(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: Identity()))))
     let rid = Data(repeating: 0x09, count: 16)
     let ph  = Data(repeating: 0x0A, count: 16)

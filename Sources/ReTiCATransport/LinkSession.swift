@@ -93,6 +93,10 @@ public struct LinkSession {
             public var currentTransferID: UUID   // the hosted transfer for the segment in flight
         }
         public var segmentedSend: SegmentedSend? = nil
+        /// Transfers ended by `.cancelResource`. Their `.failed` is not surfaced as
+        /// `resourceFailed`: the owner asked for the cancel, so it is not news, and a late report
+        /// could otherwise be mistaken for the failure of whatever the owner sends next.
+        public internal(set) var cancelledTransferIDs: Set<UUID> = []
         public struct SegmentAccumulator: Equatable, Sendable {
             public var total: UInt64
             public var parts: [UInt64: Data]     // segmentIndex (1-based) -> segment data
@@ -207,6 +211,12 @@ public struct LinkSession {
         /// policy flag: RNS proves per-destination (`proof_strategy`, default `PROVE_NONE`), so the
         /// decision belongs to whichever composition classified the packet — see `LXMFServiceNode`.
         case provePacket(packetHash: Data)
+        /// Cancel OUR plain outbound Resource `hash` — the hash `resourceProgress` and
+        /// `resourceConcluded` report, i.e. a split send's original hash. The transfer in flight
+        /// sends the standard RESOURCE_ICL, segments not yet sent are dropped, and no
+        /// `resourceFailed` follows. Unknown hash: no-op. Mirrors reference `Resource.cancel()`
+        /// (RNS/Resource.py:1084-1117) as driven by `LXMRouter.cancel_outbound`.
+        case cancelResource(hash: Data)
         case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
 
@@ -222,7 +232,13 @@ public struct LinkSession {
             case closed(CloseReason)
             case resourceReceived(Data)
             case resourceConcluded(Data)
-            case resourceFailed(Data)
+            /// A plain Resource on this link failed. `rejected` is true when the peer refused it (see
+            /// `ResourceTransfer.Action.Delegate.failed`). Not emitted for a `.cancelResource`.
+            case resourceFailed(Data, rejected: Bool)
+            /// Progress of a plain (non-request, non-response) Resource, either direction. `hash` is
+            /// what `resourceConcluded`/`resourceFailed` carry: a split Resource's original hash.
+            case resourceProgress(hash: Data, role: ResourceTransfer.Role, bytesDone: Int,
+                                  bytesTotal: Int, segment: Int, segments: Int)
             case identified(Identity)
             case responseReceived(requestID: Data, data: Data)
             case requestFailed(requestID: Data)
@@ -1053,6 +1069,28 @@ public struct LinkSession {
                 state.pendingDataReceipts[packetHash] = nil
                 return .send(.delegate(.packetDeliveryFailed(token: token)))
 
+            case let .cancelResource(hash):
+                if let send = state.segmentedSend, send.originalHash == hash {
+                    // A split send: drop the segments not yet sent, then cancel the one in flight.
+                    state.segmentedSend = nil
+                    guard state.transfers[id: send.currentTransferID] != nil else { return .none }
+                    state.cancelledTransferIDs.insert(send.currentTransferID)
+                    return .send(.transfer(.element(id: send.currentTransferID, action: .cancel)))
+                }
+                guard let target = state.transfers.first(where: {
+                    $0.role == .sender && $0.resourceHash == hash
+                        && $0.advertisement?.isRequest != true && $0.advertisement?.isResponse != true
+                }) else { return .none }
+                state.cancelledTransferIDs.insert(target.id)
+                return .send(.transfer(.element(id: target.id, action: .cancel)))
+
+            case let .transfer(.element(elementID, .delegate(.progress(done, total, segment, segments)))):
+                // Request/response Resources are this link's own plumbing, not deliveries.
+                guard let t = state.transfers[id: elementID], let adv = t.advertisement,
+                      !adv.isRequest, !adv.isResponse else { return .none }
+                return .send(.delegate(.resourceProgress(hash: adv.isSplit ? adv.originalHash : t.resourceHash,
+                                                         role: t.role, bytesDone: done, bytesTotal: total,
+                                                         segment: segment, segments: segments)))
             case let .transfer(.element(_, .delegate(.transmit(ifID, raw)))):
                 return .send(.delegate(.transmit(ifID, raw)))
             case let .transfer(.element(elementID, .delegate(.received(payload)))):
@@ -1118,9 +1156,11 @@ public struct LinkSession {
                 }
                 guard let hash else { return .none }
                 return .send(.delegate(.resourceConcluded(hash)))
-            case let .transfer(.element(elementID, .delegate(.failed(_)))):
+            case let .transfer(.element(elementID, .delegate(.failed(rejected)))):
                 let t = state.transfers[id: elementID]
                 state.transfers.remove(id: elementID)
+                // Ended by `.cancelResource`: the owner asked for it.
+                if state.cancelledTransferIDs.remove(elementID) != nil { return .none }
                 if let rid = t?.advertisement?.requestID, state.pendingRequests.contains(rid) {
                     state.pendingRequests.remove(rid)
                     return .merge(.cancel(id: CancelID.request(rid)),
@@ -1130,14 +1170,14 @@ public struct LinkSession {
                 // Segmented send in progress on this element?
                 if let send = state.segmentedSend, send.currentTransferID == elementID {
                     state.segmentedSend = nil
-                    return .send(.delegate(.resourceFailed(send.originalHash)))
+                    return .send(.delegate(.resourceFailed(send.originalHash, rejected: rejected)))
                 }
                 if let a = t?.advertisement, a.isSplit == true {
                     state.incomingSegments[a.originalHash] = nil
-                    return .send(.delegate(.resourceFailed(a.originalHash)))
+                    return .send(.delegate(.resourceFailed(a.originalHash, rejected: rejected)))
                 }
                 guard let hash = t?.resourceHash else { return .none }
-                return .send(.delegate(.resourceFailed(hash)))
+                return .send(.delegate(.resourceFailed(hash, rejected: rejected)))
             case .transfer:
                 return .none
 
@@ -1153,8 +1193,10 @@ public struct LinkSession {
         // Before this, they ran until `LinkPlane` removed the whole element, and a session used
         // standalone kept transmitting resource traffic after it closed.
         Reduce { state, _ in
-            guard state.status == .closed, !state.transfers.isEmpty else { return .none }
+            guard state.status == .closed, !state.transfers.isEmpty || !state.cancelledTransferIDs.isEmpty
+            else { return .none }
             state.transfers.removeAll()
+            state.cancelledTransferIDs.removeAll()
             return .none
         }
     }

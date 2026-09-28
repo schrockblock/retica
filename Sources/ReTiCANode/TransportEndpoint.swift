@@ -96,6 +96,7 @@ public struct TransportEndpoint {
         case openLink(destinationHash: Data)
         case sendOverLink(linkID: Data, data: Data)
         case sendResourceOverLink(linkID: Data, data: Data)
+        case cancelResource(linkID: Data, hash: Data)
         case identifyOverLink(linkID: Data, identity: Identity)
         case sendRequestOverLink(linkID: Data, path: String, data: Data)
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
@@ -119,7 +120,9 @@ public struct TransportEndpoint {
             case linkFailed(destinationHash: Data, reason: LinkFailure)
             case resourceReceived(linkID: Data, data: Data)
             case resourceConcluded(linkID: Data, resourceHash: Data)
-            case resourceFailed(linkID: Data, resourceHash: Data)
+            case resourceFailed(linkID: Data, resourceHash: Data, rejected: Bool)
+            case resourceProgress(linkID: Data, resourceHash: Data, role: ResourceTransfer.Role,
+                                  bytesDone: Int, bytesTotal: Int, segment: Int, segments: Int)
             case linkIdentified(linkID: Data, remoteIdentity: Identity)
             case requestReceived(linkID: Data, requestID: Data, pathHash: Data, data: Data)
             case responseReceived(linkID: Data, requestID: Data, data: Data)
@@ -293,8 +296,12 @@ public struct TransportEndpoint {
                 return .send(.delegate(.resourceReceived(linkID: linkID, data: data)))
             case let .linkPlane(.delegate(.resourceConcluded(linkID, hash))):
                 return .send(.delegate(.resourceConcluded(linkID: linkID, resourceHash: hash)))
-            case let .linkPlane(.delegate(.resourceFailed(linkID, hash))):
-                return .send(.delegate(.resourceFailed(linkID: linkID, resourceHash: hash)))
+            case let .linkPlane(.delegate(.resourceFailed(linkID, hash, rejected))):
+                return .send(.delegate(.resourceFailed(linkID: linkID, resourceHash: hash, rejected: rejected)))
+            case let .linkPlane(.delegate(.resourceProgress(linkID, hash, role, done, total, segment, segments))):
+                return .send(.delegate(.resourceProgress(linkID: linkID, resourceHash: hash, role: role,
+                                                         bytesDone: done, bytesTotal: total,
+                                                         segment: segment, segments: segments)))
             case let .linkPlane(.delegate(.linkIdentified(linkID, identity))):
                 return .send(.delegate(.linkIdentified(linkID: linkID, remoteIdentity: identity)))
             case let .linkPlane(.delegate(.requestReceived(linkID, rid, ph, data))):
@@ -315,7 +322,7 @@ public struct TransportEndpoint {
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).
             case .tcpClient, .tcpServer, .ble, .transport, .linkPlane, .link, .delegate,
-                 .sendOverLink, .sendResourceOverLink, .identifyOverLink, .sendRequestOverLink,
+                 .sendOverLink, .sendResourceOverLink, .cancelResource, .identifyOverLink, .sendRequestOverLink,
                  .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
                  .closeLink, .registerRequestHandler, .deregisterRequestHandler:
                 return .none
@@ -400,6 +407,8 @@ extension TransportEndpoint.Action.AllCasePaths {
                     return .sendOverLink(linkID: linkID, data: data)
                 case let .sendResourceOverLink(linkID, data):
                     return .sendResourceOverLink(linkID: linkID, data: data)
+                case let .cancelResource(linkID, hash):
+                    return .cancelResource(linkID: linkID, hash: hash)
                 case let .identifyOverLink(linkID, identity):
                     return .identifyOverLink(linkID: linkID, identity: identity)
                 case let .sendRequestOverLink(linkID, path, data):
@@ -428,6 +437,8 @@ extension TransportEndpoint.Action.AllCasePaths {
                     return .sendOverLink(linkID: linkID, data: data)
                 case let .sendResourceOverLink(linkID, data):
                     return .sendResourceOverLink(linkID: linkID, data: data)
+                case let .cancelResource(linkID, hash):
+                    return .cancelResource(linkID: linkID, hash: hash)
                 case let .identifyOverLink(linkID, identity):
                     return .identifyOverLink(linkID: linkID, identity: identity)
                 case let .sendRequestOverLink(linkID, path, data):
