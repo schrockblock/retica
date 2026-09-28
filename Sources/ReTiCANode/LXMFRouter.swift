@@ -852,8 +852,7 @@ public struct LXMFRouter {
                 return idleTimer(dest, linkID)
 
             case let .propagatedCopyPending(hash):
-                guard !state.cancelledMessages.contains(hash) else { return .none }
-                state.pendingPropagatedCopies.insert(hash)
+                state.markPropagatedCopyPending(hash)
                 return .none
 
             case let .propagatedCopyRefused(hash, reason):
@@ -953,5 +952,19 @@ extension LXMFRouter.State {
             || outboundQueue.values.contains { $0.contains { $0.hash == messageHash } }
             || propagationQueue.values.contains { $0.contains { $0.messageHash == messageHash } }
             || pendingPropagatedCopies.contains(messageHash)
+    }
+
+    /// Mark `hash`'s propagated copy pending — UNLESS the app already cancelled this message, in
+    /// which case there is nothing to mark: a resend of a cancelled hash must not revive it (the
+    /// router holds no delivery copy for it either, so marking it pending here would make
+    /// `hasOutboundState` report work that doesn't exist, and a later `abandonPendingPropagatedCopies`
+    /// would `fail` it into a stray `deliveryFailed` with no preceding send).
+    ///
+    /// The ONE place this rule is applied: both the router's own `.propagatedCopyPending` action and
+    /// `LXMFNode.sendMessage`'s synchronous write (Ruling P11 — the marker must be visible within the
+    /// same reduce cycle) go through here, so the guard cannot be forgotten at either call site.
+    public mutating func markPropagatedCopyPending(_ hash: Data) {
+        guard !cancelledMessages.contains(hash) else { return }
+        pendingPropagatedCopies.insert(hash)
     }
 }

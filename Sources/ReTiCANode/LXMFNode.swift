@@ -585,16 +585,12 @@ public struct LXMFNode {
                                                                             reason: .tooLargeForNode))))
                     } else {
                         // Outstanding from now on, although the router only gets the copy once its
-                        // stamp is found (spec §6). Set directly rather than dispatched as a nested
-                        // `.send(.router(.propagatedCopyPending))` effect: under `TestStore`, an
-                        // action delivered via an effect is queued and only applied to `state` on an
-                        // explicit `receive`/drain (`TestReducer._reduce`, ComposableArchitecture),
-                        // so a dispatched action could never satisfy a check made immediately after
-                        // this very `send` — see `pnCopyNodeMarksTheCopyPendingWhileItsStampIsSearched`,
-                        // which does exactly that (Ruling P11). Direct mutation also removes a race a
-                        // dispatched action would have against `.cancelPropagationStamps` /
-                        // `.setPropagationNode` reading this same set moments later.
-                        state.router.pendingPropagatedCopies.insert(message.hash)
+                        // stamp is found (spec §6). Marked synchronously, in this same reduce, so a
+                        // `.cancelPropagationStamps` or `.setPropagationNode` later in the same cycle
+                        // already sees it (Ruling P11) — routed through the router's own
+                        // `markPropagatedCopyPending` so the cancelled-message guard is applied in
+                        // exactly one place, not duplicated here.
+                        state.router.markPropagatedCopyPending(message.hash)
                         let ts = date.now.timeIntervalSince1970
                         effects.append(.run { send in
                             guard let (packed, _) = await LXMFPropagation.pack(

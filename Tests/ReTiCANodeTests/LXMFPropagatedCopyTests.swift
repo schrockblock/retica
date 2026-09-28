@@ -195,3 +195,19 @@ private func pnNode(limitKB: Int, stampCost: Int) -> (TestStore<LXMFNode.State, 
     await store.receive(.router(.abandonPendingPropagatedCopies))
     #expect(store.state.router.pendingPropagatedCopies.isEmpty)
 }
+
+/// Review finding (Task 7, fix round 1): a resend of an already-cancelled hash must never mark a
+/// propagated copy pending — the router holds no delivery copy for it either, so marking it would
+/// make `hasOutboundState` report phantom work and a later abandon would `fail` it into a stray
+/// `deliveryFailed` with no preceding send.
+@Test @MainActor func pnCopyResendOfACancelledMessageNeverMarksTheCopy() async {
+    let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost)
+    let m = note()
+    await store.send(.cancelOutbound(messageHash: m.hash))
+    #expect(store.state.router.cancelledMessages.contains(m.hash))
+    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    #expect(store.state.router.pendingPropagatedCopies.isEmpty)
+    await store.send(.cancelPropagationStamps)
+    store.exhaustivity = .on
+    await store.send(.cancelDeliveryStamps)   // probe: a stray deliveryFailed/deliveryCancelled fails here
+}
