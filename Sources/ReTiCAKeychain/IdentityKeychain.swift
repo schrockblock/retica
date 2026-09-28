@@ -15,9 +15,10 @@ import ReTiCA
 ///    If a legacy group is named wrongly, the pre-mint probe still sees the item and the load
 ///    fails with `.unexpectedItem` instead of minting — fix the location; don't work around it.
 /// 3. Treat `.failed` as "identity unavailable right now" (e.g. prewarm before first unlock) —
-///    (an app that must not mint — e.g. because it holds memberships — calls `load`, which
-///    returns `.absent` instead of minting, and restores with `importIdentity`)
 ///    NEVER mint a replacement yourself.
+/// 4. An app that must not mint — e.g. because it holds memberships — calls `load`, which
+///    returns `.absent` instead of minting, and restores with `importIdentity`. Never write an
+///    identity yourself: `importIdentity` is the only supported way to store one.
 ///
 /// Anti-rotation rules (do not weaken): an existing identity is never overwritten or replaced;
 /// every Keychain error fails closed (no mint); nothing is minted while ANY item exists under
@@ -77,6 +78,17 @@ public struct IdentityKeychain {
             case .absent, .failed: nil
             }
         }
+    }
+
+    public enum ImportOutcome: Sendable, Equatable {
+        /// The key was added to the shared item (add-only) and re-read byte-equal.
+        case imported(Identity)
+        /// Not a 64-byte Reticulum private key. Nothing was read or written.
+        case invalidKey
+        /// An item already exists — at a named location, or under a scanned service in another
+        /// group (named by `service`). Nothing was written: an existing identity is never replaced.
+        case identityPresent(service: String)
+        case failed(Failure)
     }
 
     public enum Failure: Error, Sendable, Equatable {
@@ -200,6 +212,83 @@ public struct IdentityKeychain {
     /// The first location with no (or an empty) access group — rejected before any Keychain access.
     private static func firstUnscoped(shared: Location, legacy: [Location]) -> Location? {
         ([shared] + legacy).first(where: { $0.accessGroup?.isEmpty != false })
+    }
+
+    /// Stores a user-supplied identity (e.g. restored from an Identity Export backup) into the
+    /// shared item — only when NO identity or item exists anywhere. In order (spec 2026-09-28 §3):
+    /// 1. The key is exactly 64 bytes and `Identity(privateKey:)` accepts it, else `.invalidKey`
+    ///    (before any Keychain access).
+    /// 2. Every location names a non-empty access group, else `.failed(.invalidLocation)`.
+    /// 3. Full scan: the shared location, every legacy location, then the read-only group-less
+    ///    probe of every scanned service. Any item → `.identityPresent`; any read error →
+    ///    `.failed` (unknown is never "empty").
+    /// 4. Add-only into the shared location. A duplicate (another process won the race) → re-read:
+    ///    the same bytes → `.imported`; different → `.identityPresent` (the stored identity wins).
+    /// 5. Re-read and verify byte-equality → `.imported`.
+    /// It NEVER deletes and NEVER overwrites.
+    public static func importIdentity(
+        privateKey: Data,
+        shared: Location,
+        legacy: [Location] = [],
+        ops: KeychainOps = .live
+    ) -> ImportOutcome {
+        // 1
+        guard privateKey.count == Identity.keySize, let candidate = Identity(privateKey: privateKey) else {
+            return .invalidKey
+        }
+        // 2
+        if let unscoped = firstUnscoped(shared: shared, legacy: legacy) {
+            return .failed(.invalidLocation(unscoped))
+        }
+        let legacy = legacy.filter { $0 != shared }
+
+        // 3 — named locations
+        for location in [shared] + legacy {
+            switch ops.read(location) {
+            case .notFound:
+                continue
+            case .found:
+                return .identityPresent(service: location.service)
+            case let .failed(status):
+                return .failed(.readFailed(location: location, status: status))
+            }
+        }
+        // 3 — any group
+        switch probeForUnexpectedItems(shared: shared, legacy: legacy, ops: ops) {
+        case nil:
+            break
+        case let .unexpectedItem(service)?:
+            return .identityPresent(service: service)
+        case let failure?:
+            return .failed(failure)
+        }
+
+        // 4
+        switch ops.add(shared, privateKey) {
+        case let .failed(status):
+            return .failed(.addFailed(status: status))
+        case .duplicate:
+            switch ops.read(shared) {
+            case let .failed(status):
+                return .failed(.readFailed(location: shared, status: status))
+            case .notFound:
+                return .failed(.verifyFailed(status: nil))
+            case let .found(data, _):
+                guard data == privateKey else { return .identityPresent(service: shared.service) }
+                return .imported(candidate)
+            }
+        case .added:
+            // 5
+            switch ops.read(shared) {
+            case let .failed(status):
+                return .failed(.verifyFailed(status: status))
+            case .notFound:
+                return .failed(.verifyFailed(status: nil))
+            case let .found(data, _):
+                guard data == privateKey else { return .failed(.verifyFailed(status: nil)) }
+                return .imported(candidate)
+            }
+        }
     }
 
     private static func migrate(seed: Data, legacyRef: Data, to shared: Location, ops: KeychainOps) -> LoadOutcome {
