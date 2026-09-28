@@ -234,6 +234,9 @@ public struct LXMFRouter {
         /// The app cancelled this message: drop every copy, cancel a Resource in flight, report
         /// `deliveryCancelled` once. Reference `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744).
         case cancelOutbound(messageHash: Data)
+        /// Resource traffic on `linkID` (either direction). Re-arms the idle timer of the
+        /// destination it serves, so a long transfer never trips `linkMaxInactivitySeconds` (spec §5).
+        case linkActivity(linkID: Data)
         case retryDue(messageHash: Data, leg: Leg)
         case idleDeadline(destinationHash: Data, linkID: Data)
         case pathRequestDeadline(destinationHash: Data)
@@ -821,6 +824,10 @@ public struct LXMFRouter {
                 // The cancel reaches the link (above) before the next copy starts on it (below).
                 for dest in freed { effects.append(startNextQueued(&state, dest: dest)) }
                 return .merge(effects)
+
+            case let .linkActivity(linkID):
+                guard let dest = destination(ofLink: linkID, state) else { return .none }
+                return idleTimer(dest, linkID)
 
             case let .retryDue(hash, leg):
                 let key = DeliveryKey(messageHash: hash, leg: leg)

@@ -162,6 +162,17 @@ public struct LXMFNode {
         /// message onward, so a search that already completed is never failed retroactively.
         public internal(set) var inFlightDeliveryStamps: [Data] = []
 
+        /// linkID → the resource hash of OUR Resource in flight on that link, learned from the first
+        /// sender-role `resourceProgress` after the router starts a copy there. A conclusion or
+        /// failure naming any other hash on that link is not our copy's: an inbound transfer's, or a
+        /// cancelled one landing late.
+        public internal(set) var outboundTransfers: [Data: Data] = [:]
+        /// The last fraction reported per outbound copy, so `deliveryProgress` /
+        /// `propagationProgress` never go backwards — a retry restarts the wire transfer, not the copy.
+        public internal(set) var transferProgress: [LXMFRouter.DeliveryKey: Double] = [:]
+        /// linkID → the last `inboundTransferProgress` fraction reported for the Resource arriving on it.
+        public internal(set) var inboundProgress: [Data: Double] = [:]
+
         public init(identity: Identity, endpoint: TransportEndpoint.State) {
             self.identity = identity
             self.endpoint = endpoint
@@ -232,6 +243,11 @@ public struct LXMFNode {
         /// ends the search also suppresses every action the search's effect could still emit, so
         /// "send it unstamped instead" cannot be implemented from inside that effect at all.
         case cancelDeliveryStamps
+        /// Cancel one outbound message, wherever it is: in its delivery or propagation stamp search,
+        /// queued, retrying, or mid-transfer (its Resource is cancelled on the wire). Reports
+        /// `.delegate(.deliveryCancelled)` once; nothing else is reported for it afterwards.
+        /// Reference `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744).
+        case cancelOutbound(messageHash: Data)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -241,6 +257,20 @@ public struct LXMFNode {
             case deliveryFailed(messageHash: Data)
             case deliveryConfirmed(messageHash: Data)
             case propagationAccepted(messageHash: Data)
+            /// Every copy is over, none succeeded, and the last one's transfer was refused by its peer.
+            case deliveryRejected(messageHash: Data)
+            /// The app cancelled the message (`.cancelOutbound`).
+            case deliveryCancelled(messageHash: Data)
+            /// The delivery copy's progress on the reference scale: 0.05 when its link is up and the
+            /// transfer is about to start, 0.10 when it starts, `0.10 + 0.90 × done` during, 1.0 when
+            /// confirmed (LXMRouter.py:2788-2790, LXMessage.py:623-624). Never decreases.
+            case deliveryProgress(messageHash: Data, fraction: Double)
+            /// The same for the copy sent to the propagation node; 1.0 when it is accepted.
+            case propagationProgress(messageHash: Data, fraction: Double)
+            /// A Resource arriving on `linkID`, 0…1, before any message can be unpacked from it.
+            /// `sourceHash` is the far end of the link when WE opened it; nil when a peer linked to our
+            /// own destination, because LXMF senders do not identify on delivery links.
+            case inboundTransferProgress(sourceHash: Data?, linkID: Data, fraction: Double)
         }
     }
 
@@ -308,14 +338,41 @@ public struct LXMFNode {
     /// the next one.
     public static let stampCostExpiry: TimeInterval = 45 * 24 * 60 * 60
 
-    /// Cancellation identity for the propagation stamp search.
+    /// Progress when a copy's link is active and its transfer is about to start (LXMRouter.py:2788-2790).
+    public static let linkActiveProgress = 0.05
+    /// Progress when a copy's transfer starts (reference: once the Resource exists).
+    public static let transferStartProgress = 0.10
+
+    /// A Resource's overall done fraction: finished segments plus this segment's share.
+    public static func transferFraction(bytesDone: Int, bytesTotal: Int, segment: Int, segments: Int) -> Double {
+        guard bytesTotal > 0, segments > 0 else { return 0 }
+        let within = min(max(Double(bytesDone) / Double(bytesTotal), 0), 1)
+        let index = min(max(segment, 1), segments)
+        return (Double(index - 1) + within) / Double(segments)
+    }
+
+    /// An outbound copy's progress during its transfer: `0.10 + 0.90 × transfer progress`
+    /// (reference `LXMessage.__update_transfer_progress`, LXMessage.py:623-624).
+    public static func outboundFraction(bytesDone: Int, bytesTotal: Int, segment: Int, segments: Int) -> Double {
+        transferStartProgress + (1 - transferStartProgress)
+            * transferFraction(bytesDone: bytesDone, bytesTotal: bytesTotal, segment: segment, segments: segments)
+    }
+
+    /// Cancellation identities for the stamp searches.
     ///
-    /// One id for all in-flight searches rather than one per message: `.sendViaPropagation` builds the
-    /// `LXMessage` internally, so a caller wanting to abandon *that* send has no message hash to name.
-    /// Reference's `LXStamper.cancel_work` is keyed per message (LXStamper.py:146), driven from
-    /// `cancel_outbound(message_id)`; ours is coarser by exactly that much. Effects are registered
-    /// **without** `cancelInFlight`, so two concurrent sends coexist and are reclaimed together.
-    enum CancelID: Hashable { case propagationStamp; case deliveryStamp }
+    /// `propagationStamp` / `deliveryStamp` cover ALL in-flight searches of that kind
+    /// (`.cancelPropagationStamps`, `.cancelDeliveryStamps`, `.setPropagationNode`). A search for a
+    /// message the caller built (`.sendMessage`, `.send`) is ALSO registered under its per-message id,
+    /// which `.cancelOutbound(messageHash:)` cancels — reference's `LXStamper.cancel_work` is keyed per
+    /// message the same way (LXStamper.py:146). `.sendViaPropagation` builds its message internally, so
+    /// the caller has no hash to name and it has only the shared id. Effects are registered
+    /// **without** `cancelInFlight`, so concurrent sends coexist.
+    enum CancelID: Hashable {
+        case propagationStamp
+        case deliveryStamp
+        case propagationStampFor(Data)
+        case deliveryStampFor(Data)
+    }
 
     @Dependency(\.date) var date
     public init() {}
@@ -327,6 +384,39 @@ public struct LXMFNode {
             func isServedPropagationLink(_ state: LXMFNode.State, _ linkID: Data) -> Bool {
                 guard let served = state.propagationDestinationHash else { return false }
                 return state.linkDestinations[linkID] == served
+            }
+            /// Report `fraction` for this copy unless it would not move its progress forward.
+            func reportProgress(_ state: inout LXMFNode.State, _ key: LXMFRouter.DeliveryKey,
+                                _ fraction: Double) -> Effect<Action> {
+                let clamped = min(max(fraction, 0), 1)
+                if let last = state.transferProgress[key], clamped <= last { return .none }
+                state.transferProgress[key] = clamped
+                let event: Action.Delegate = key.leg == .delivery
+                    ? .deliveryProgress(messageHash: key.messageHash, fraction: clamped)
+                    : .propagationProgress(messageHash: key.messageHash, fraction: clamped)
+                return .send(.delegate(event))
+            }
+            /// The copy succeeded: report 1.0 (unless its transfer already did) and forget it.
+            func finishProgress(_ state: inout LXMFNode.State, _ key: LXMFRouter.DeliveryKey) -> Effect<Action> {
+                guard let last = state.transferProgress.removeValue(forKey: key), last < 1 else { return .none }
+                let event: Action.Delegate = key.leg == .delivery
+                    ? .deliveryProgress(messageHash: key.messageHash, fraction: 1)
+                    : .propagationProgress(messageHash: key.messageHash, fraction: 1)
+                return .send(.delegate(event))
+            }
+            /// The message is over without success: forget both copies' progress.
+            func clearProgress(_ state: inout LXMFNode.State, _ hash: Data) {
+                state.transferProgress[.delivery(hash)] = nil
+                state.transferProgress[.propagated(hash)] = nil
+            }
+            /// A new Resource transfer starts on `linkID`: clear any stale hash recorded for it (a
+            /// fresh copy names its own hash from its first sender-role progress event) and report the
+            /// reference scale's 0.05 if the router started a copy there. Shared by `.sendDirect`'s and
+            /// `.sendPropagated`'s handlers (Ruling P10) — both start a Resource copy on a link the same way.
+            func startResourceTransfer(_ state: inout LXMFNode.State, _ linkID: Data) -> Effect<Action> {
+                state.outboundTransfers[linkID] = nil
+                guard let key = state.router.linkResourceInFlight[linkID] else { return .none }
+                return reportProgress(&state, key, LXMFNode.linkActiveProgress)
             }
             switch action {
             case let .rehydrateLearnedPeers(peers):
@@ -491,6 +581,7 @@ public struct LXMFNode {
                         else { return }                              // cancelled mid-search
                         await send(.router(.sendViaPropagation(message: message, propagationPacked: packed)))
                     }
+                    .cancellable(id: CancelID.propagationStampFor(message.hash))
                     .cancellable(id: CancelID.propagationStamp))
                 }
                 return .merge(effects)
@@ -531,6 +622,24 @@ public struct LXMFNode {
                 state.inFlightDeliveryStamps = []
                 return .merge([Effect<Action>.cancel(id: CancelID.deliveryStamp)]
                               + abandoned.map { .send(.delegate(.deliveryFailed(messageHash: $0))) })
+
+            case let .cancelOutbound(hash):
+                // Stop the stamp work for this message (reference `LXStamper.cancel_work`, keyed per
+                // message) and hand the rest to the router, which owns every copy it was given. A
+                // delivery copy still in its stamp search was never handed over, so if the router holds
+                // nothing else for the message the cancel is reported here — once either way.
+                let wasSearching = state.inFlightDeliveryStamps.contains(hash)
+                state.inFlightDeliveryStamps.removeAll { $0 == hash }
+                let routerReports = state.router.hasOutboundState(for: hash)
+                var effects: [Effect<Action>] = [
+                    .cancel(id: CancelID.deliveryStampFor(hash)),
+                    .cancel(id: CancelID.propagationStampFor(hash)),
+                    .send(.router(.cancelOutbound(messageHash: hash))),
+                ]
+                if wasSearching && !routerReports {
+                    effects.append(.send(.delegate(.deliveryCancelled(messageHash: hash))))
+                }
+                return .merge(effects)
 
             // --- Propagation sync: phase-1 (IDENTIFY + list request) ---
             case let .router(.delegate(.requestMessageList(linkID))):
@@ -712,13 +821,30 @@ public struct LXMFNode {
                 return .none
 
             case let .router(.delegate(.deliveryFailed(hash))):
+                clearProgress(&state, hash)
                 return .send(.delegate(.deliveryFailed(messageHash: hash)))
 
+            case let .router(.delegate(.deliveryRejected(hash))):
+                clearProgress(&state, hash)
+                return .send(.delegate(.deliveryRejected(messageHash: hash)))
+
+            case let .router(.delegate(.deliveryCancelled(hash))):
+                clearProgress(&state, hash)
+                return .send(.delegate(.deliveryCancelled(messageHash: hash)))
+
             case let .router(.delegate(.deliveryConfirmed(hash))):
-                return .send(.delegate(.deliveryConfirmed(messageHash: hash)))
+                let done = finishProgress(&state, .delivery(hash))
+                return .merge(done, .send(.delegate(.deliveryConfirmed(messageHash: hash))))
 
             case let .router(.delegate(.propagationAccepted(hash))):
-                return .send(.delegate(.propagationAccepted(messageHash: hash)))
+                let done = finishProgress(&state, .propagated(hash))
+                return .merge(done, .send(.delegate(.propagationAccepted(messageHash: hash))))
+
+            case let .router(.delegate(.cancelResource(linkID))):
+                // Our transfer's hash on that link names it to the session. Unknown (the router
+                // started the copy but its transfer never reported): nothing on the wire to cancel.
+                guard let hash = state.outboundTransfers.removeValue(forKey: linkID) else { return .none }
+                return .send(.endpoint(.cancelResource(linkID: linkID, hash: hash)))
 
             // --- Direct-over-link: router delegates → endpoint actions ---
             case let .router(.delegate(.requestLink(dest))):
@@ -728,12 +854,14 @@ public struct LXMFNode {
                 return .send(.endpoint(.requestPath(destinationHash: dest)))
 
             case let .router(.delegate(.sendDirect(linkID, data, asResource))):
-                return asResource
-                    ? .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: data)))
-                    : .send(.endpoint(.sendOverLink(linkID: linkID, data: data)))
+                guard asResource else { return .send(.endpoint(.sendOverLink(linkID: linkID, data: data))) }
+                // A new transfer starts on this link; its first sender progress names its hash.
+                let started = startResourceTransfer(&state, linkID)
+                return .merge(started, .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: data))))
 
             case let .router(.delegate(.sendPropagated(linkID, propagationPacked))):
-                return .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: propagationPacked)))
+                let started = startResourceTransfer(&state, linkID)
+                return .merge(started, .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: propagationPacked))))
 
             case let .router(.delegate(.sendPropagatedPacket(linkID, propagationPacked, messageHash))):
                 return .send(.endpoint(.sendWithReceiptOverLink(linkID: linkID, data: propagationPacked, token: messageHash)))
@@ -764,6 +892,8 @@ public struct LXMFNode {
 
             case let .endpoint(.delegate(.linkClosed(linkID, _))):
                 state.linkDestinations[linkID] = nil
+                state.outboundTransfers[linkID] = nil
+                state.inboundProgress[linkID] = nil
                 state.syncPhase[linkID] = nil   // Minor-2: clear leak from a mid-phase sync death
                 guard let dest = state.directLinks.first(where: { $0.value == linkID })?.key else { return .none }
                 state.directLinks[dest] = nil
@@ -825,11 +955,47 @@ public struct LXMFNode {
                 return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
 
             case let .endpoint(.delegate(.resourceReceived(linkID, data))):
+                state.inboundProgress[linkID] = nil
                 guard !isServedPropagationLink(state, linkID) else { return .none }
                 return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
 
-            case let .endpoint(.delegate(.resourceConcluded(linkID, _))):
+            case let .endpoint(.delegate(.resourceConcluded(linkID, hash))):
+                // Only OUR transfer on that link resolves the copy (Review Focus 1).
+                guard state.outboundTransfers[linkID] == hash else { return .none }
+                state.outboundTransfers[linkID] = nil
                 return .send(.router(.resourceDeliveredOnLink(linkID: linkID)))
+
+            case let .endpoint(.delegate(.resourceFailed(linkID, hash, rejected))):
+                guard state.outboundTransfers[linkID] == hash else {
+                    state.inboundProgress[linkID] = nil          // an inbound transfer failed
+                    return .none
+                }
+                state.outboundTransfers[linkID] = nil
+                return .send(.router(.resourceFailedOnLink(linkID: linkID, rejected: rejected)))
+
+            case let .endpoint(.delegate(.resourceProgress(linkID, hash, role, done, total, segment, segments))):
+                let activity = Effect<Action>.send(.router(.linkActivity(linkID: linkID)))
+                switch role {
+                case .sender:
+                    guard let key = state.router.linkResourceInFlight[linkID] else { return .none }
+                    if state.outboundTransfers[linkID] == nil { state.outboundTransfers[linkID] = hash }
+                    guard state.outboundTransfers[linkID] == hash else { return .none }
+                    let fraction = LXMFNode.outboundFraction(bytesDone: done, bytesTotal: total,
+                                                             segment: segment, segments: segments)
+                    return .merge(reportProgress(&state, key, fraction), activity)
+                case .receiver:
+                    guard !isServedPropagationLink(state, linkID) else { return activity }
+                    let fraction = LXMFNode.transferFraction(bytesDone: done, bytesTotal: total,
+                                                             segment: segment, segments: segments)
+                    if let last = state.inboundProgress[linkID], fraction <= last { return activity }
+                    state.inboundProgress[linkID] = fraction
+                    let terminus = state.linkDestinations[linkID]
+                    let source = terminus == state.deliveryDestinationHash
+                        || terminus == state.propagationDestinationHash ? nil : terminus
+                    return .merge(.send(.delegate(.inboundTransferProgress(sourceHash: source, linkID: linkID,
+                                                                           fraction: fraction))),
+                                  activity)
+                }
 
             case .endpoint, .router, .delegate:
                 return .none
@@ -915,6 +1081,7 @@ public struct LXMFNode {
             else { return }
             await send(.router(.send(message: message.withStamp(stamp), desiredMethod: method)))
         }
+        .cancellable(id: CancelID.deliveryStampFor(message.hash))
         .cancellable(id: CancelID.deliveryStamp)
     }
 }
