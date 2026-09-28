@@ -276,10 +276,15 @@ where they conflict.
      propagated copy later fails too. This affects every user with a propagation node configured,
      not only peers with a stamp cost. It predates this work. The proper fix is a "propagated copy
      pending" marker, set when the stamp search starts and honoured by `isOutstanding`.
+     **Fixed** by `2026-09-27-transfer-aware-delivery-design.md` §6:
+     `LXMFRouter.State.pendingPropagatedCopies`, set by `.propagatedCopyPending` when
+     `sendMessage(alsoViaPropagation: true)` starts the search, cleared when the copy is armed,
+     failed, or cancelled; `.cancelPropagationStamps` and `.setPropagationNode` fail the marked
+     copies through `fail` (`.abandonPendingPropagatedCopies`).
 
    The cancellation gap and the delivery-stamp-search gap affect only peers with a delivery stamp
-   cost, or cancellation. The propagated-stamp-search gap does not: it affects every user with a
-   propagation node.
+   cost, or cancellation, and are still open. The propagated-stamp-search gap affected every user
+   with a propagation node; it is fixed (above).
 4. **Chosen constants:** `receiptTimeoutBase = 6` s and `receiptTimeoutPerHop = 6` s (reference
    `DEFAULT_PER_HOP_TIMEOUT`), and `maxPendingReceipts = 1024` (reference `MAX_RECEIPTS`).
 5. **The app compile fix is larger than stated.** Besides the `messageReceived` pattern, it also

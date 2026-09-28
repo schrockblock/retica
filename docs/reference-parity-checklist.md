@@ -582,6 +582,28 @@ exactly the class Tier 1 just closed.*
       BLE when not"): slot presence is chosen by the app/config, there is no capability-based
       auto-selection between transports — the router picks the OUTBOUND interface per learned path,
       but nothing promotes/demotes whole transports by availability.
+- [x] **Outbound Resource semantics** — CLOSED (`2026-09-27-transfer-aware-delivery-design.md`).
+      A message sent as a Resource is no longer resent while its transfer runs (reference: a
+      SENDING message is not resent, LXMRouter.py:2788-2796): `LXMFRouter` puts the copy in
+      `.transferring` with no retry timer and lets the transfer decide — concluded → confirmed,
+      failed → the link is torn down and one retry follows `DELIVERY_RETRY_WAIT` later on a fresh
+      link, rejected (any RESOURCE_RCL at the sender) → terminal `deliveryRejected`
+      (`LXMessage.__resource_concluded`, LXMessage.py:597-606). A link lost mid-transfer counts as
+      a failed transfer. **Cancel:** `LXMFNode.cancelOutbound(messageHash:)` mirrors
+      `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744): stamp searches for that message stop,
+      a Resource in flight gets the standard RESOURCE_ICL, `deliveryCancelled` is reported once.
+      **Progress:** `deliveryProgress` / `propagationProgress` on the reference scale (0.05 link
+      active, 0.10 transfer start, `0.10 + 0.90 × progress`, 1.0 done — LXMessage.py:623-624) and
+      `inboundTransferProgress` for arriving Resources; `LinkSession` reports per-transfer progress
+      at whole-percent steps. Transfer traffic re-arms the router's 600 s link idle timer.
+      **Deliberate divergence:** reference allows several concurrent Resources per link; we run
+      one per link and queue the rest (`LXMFRouter.resourceQueue`), because `LinkSession` keeps a
+      single split-send slot. Not a wire behaviour. **Also:** a propagated copy larger than the
+      node's announced per-transfer limit is refused up front (`propagationRefused`); reference
+      attempts it and lets the node reject it. Known gaps: the propagation-only entry point
+      (`LXMFNode.sendViaPropagation(destinationHash:title:content:)`) gets neither the size refusal
+      nor the pending marker, and the size check compares the packed message, not the larger
+      propagation container, so a message just under the limit can still be rejected by the node.
 - [ ] **Resource window capped at the slow ceiling** — `ResourceWindow.swift`: `maxWindowSlow = 10`
       vs reference's `WINDOW_MAX_FAST = 75`. A **7.5× throughput ceiling** on any link fast enough
       to qualify — every TCP link and most BLE.
@@ -721,3 +743,4 @@ exactly the class Tier 1 just closed.*
 | Interop & crashes | Tier 1 | `2026-08-14-lxmf-interop-data-loss.md` | **in progress** |
 | Wire-input trap sweep | Tier 2 | `2026-08-12-wire-input-trap-sweep.md` | 9/10 |
 | Link liveness remainder | — | `2026-08-11-link-liveness-remainder.md` | ⚠️ do-not-execute; needs rework |
+| Transfer-aware delivery | Tier 5 | `2026-09-27-transfer-aware-delivery.md` | done |
