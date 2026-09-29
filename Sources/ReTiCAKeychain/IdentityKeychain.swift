@@ -25,7 +25,8 @@ import ReTiCA
 /// the shared or a legacy service in any group; a legacy item is deleted only after the shared
 /// item is re-read and byte-equal to it, and only that exact item (by persistent reference) —
 /// a legacy item holding a DIFFERENT identity is never deleted; items are device-local (never
-/// `kSecAttrSynchronizable`).
+/// `kSecAttrSynchronizable`); a location holding more than one item, or any iCloud-synchronizable
+/// item, fails closed the same way.
 public struct IdentityKeychain {
     /// A generic-password item address. `accessGroup == nil` puts no `kSecAttrAccessGroup` in
     /// the query: reads and deletes then match the service in EVERY group the app can access —
@@ -115,6 +116,18 @@ public struct IdentityKeychain {
         /// 1's read and the probe. Callers should treat it as retryable ("not now"), like
         /// `readFailed`; the next load then finds the shared item. Never mint in response.
         case unexpectedItem(service: String)
+        /// More than one item at this location. Nothing is read, minted, migrated, deleted or imported.
+        case ambiguousItems(location: Location, count: Int)
+        /// An item at this location is iCloud-synchronizable. Fails closed the same way.
+        case synchronizableItem(location: Location)
+    }
+
+    /// The failure a rejected read means at this location.
+    static func failure(for rejection: KeychainOps.ReadRejection, at location: Location) -> Failure {
+        switch rejection {
+        case let .multipleItems(count): return .ambiguousItems(location: location, count: count)
+        case .synchronizableItem: return .synchronizableItem(location: location)
+        }
     }
 
     /// Rules 0–3 without the mint (spec 2026-09-28-identity-recovery-design §3):
@@ -148,6 +161,8 @@ public struct IdentityKeychain {
         switch ops.read(shared) {
         case let .failed(status):
             return .failed(.readFailed(location: shared, status: status))
+        case let .rejected(r):
+            return .failed(failure(for: r, at: shared))
         case let .found(data, _):
             guard let identity = Identity(privateKey: data) else {
                 return .failed(.corrupt(location: shared))
@@ -163,6 +178,8 @@ public struct IdentityKeychain {
             switch ops.read(location) {
             case let .failed(status):
                 return .failed(.readFailed(location: location, status: status))
+            case let .rejected(r):
+                return .failed(failure(for: r, at: location))
             case .notFound:
                 continue
             case let .found(seed, legacyRef):
@@ -251,6 +268,8 @@ public struct IdentityKeychain {
                 return .identityPresent(service: location.service)
             case let .failed(status):
                 return .failed(.readFailed(location: location, status: status))
+            case let .rejected(r):
+                return .failed(failure(for: r, at: location))
             }
         }
         // 3 — any group
@@ -271,6 +290,8 @@ public struct IdentityKeychain {
             switch ops.read(shared) {
             case let .failed(status):
                 return .failed(.readFailed(location: shared, status: status))
+            case let .rejected(r):
+                return .failed(failure(for: r, at: shared))
             case .notFound:
                 return .failed(.verifyFailed(status: nil))
             case let .found(data, _):
@@ -282,6 +303,8 @@ public struct IdentityKeychain {
             switch ops.read(shared) {
             case let .failed(status):
                 return .failed(.verifyFailed(status: status))
+            case let .rejected(r):
+                return .failed(failure(for: r, at: shared))
             case .notFound:
                 return .failed(.verifyFailed(status: nil))
             case let .found(data, _):
@@ -301,6 +324,8 @@ public struct IdentityKeychain {
             switch ops.read(shared) {
             case let .failed(status):
                 return .failed(.readFailed(location: shared, status: status))
+            case let .rejected(r):
+                return .failed(failure(for: r, at: shared))
             case .notFound:
                 return .failed(.verifyFailed(status: nil))
             case let .found(data, _):
@@ -322,6 +347,8 @@ public struct IdentityKeychain {
             switch ops.read(shared) {
             case let .failed(status):
                 return .failed(.verifyFailed(status: status))
+            case let .rejected(r):
+                return .failed(failure(for: r, at: shared))
             case .notFound:
                 return .failed(.verifyFailed(status: nil))
             case let .found(data, _):
@@ -349,6 +376,8 @@ public struct IdentityKeychain {
             return .failed(.verifyFailed(status: nil))
         case let .failed(status):
             return .failed(.readFailed(location: shared, status: status))
+        case let .rejected(r):
+            return .failed(failure(for: r, at: shared))
         }
     }
 
@@ -368,6 +397,10 @@ public struct IdentityKeychain {
                 return .unexpectedItem(service: service)
             case let .failed(status):
                 return .readFailed(location: anyGroup, status: status)
+            case .rejected(.multipleItems):
+                return .unexpectedItem(service: service)
+            case .rejected(.synchronizableItem):
+                return .synchronizableItem(location: anyGroup)
             }
         }
         return nil

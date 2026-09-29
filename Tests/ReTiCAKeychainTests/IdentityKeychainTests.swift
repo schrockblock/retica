@@ -321,40 +321,52 @@ struct IdentityKeychainTests {
         #expect(keychain.item(at: legacy) == data)
     }
 
-    /// Two items differ only by account; the location query matches both. Only the one whose
-    /// bytes were copied and verified may be deleted.
-    @Test func migrationDeletesOnlyTheVerifiedItemNotAnAccountSibling() {
-        let (x, xData) = makeSeed()
+    /// Two items differ only by account; the location query now matches both and, under the
+    /// 2026-09-29 hardening, that is ambiguous: a legacy item is never picked and nothing is
+    /// added, migrated or deleted. (Superseded by the account-sibling variant of this test:
+    /// before the hardening, the query returned only one of the two and the one whose bytes were
+    /// copied and verified was deleted, leaving the sibling untouched.)
+    @Test func migrationFailsClosedOnALegacyAccountSibling() {
+        let (_, xData) = makeSeed()
         let (_, yData) = makeSeed()
         let keychain = InMemoryKeychain()
         keychain.set(xData, at: legacy)
         keychain.set(yData, at: legacy, account: "other")
-        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .migrated(x))
-        #expect(keychain.item(at: shared) == xData)
-        #expect(keychain.item(at: legacy) == nil)
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.ambiguousItems(location: legacy, count: 2)))
+        #expect(keychain.addCount == 0)
+        #expect(keychain.item(at: shared) == nil)
+        #expect(keychain.item(at: legacy) == xData)
         #expect(keychain.item(at: legacy, account: "other") == yData)
     }
 
-    @Test func migrationRaceWithTheSameSeedDeletesOnlyTheVerifiedItem() {
-        let (x, xData) = makeSeed()
+    /// Same as above with a race hook armed: the ambiguous legacy read fails closed before
+    /// `add` is ever called, so the hook never fires and nothing changes.
+    @Test func migrationRaceNeverAddsWhenLegacyHasAnAccountSibling() {
+        let (_, xData) = makeSeed()
         let (_, yData) = makeSeed()
         let keychain = InMemoryKeychain()
         keychain.set(xData, at: legacy)
         keychain.set(yData, at: legacy, account: "other")
         keychain.onBeforeAdd { location in keychain.set(xData, at: location) }
-        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .migrated(x))
-        #expect(keychain.item(at: legacy) == nil)
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.ambiguousItems(location: legacy, count: 2)))
+        #expect(keychain.addCount == 0)
+        #expect(keychain.item(at: legacy) == xData)
         #expect(keychain.item(at: legacy, account: "other") == yData)
     }
 
-    @Test func leftoverCleanupDeletesOnlyTheVerifiedItem() {
+    /// The shared item already loads fine (rule 1 reads only `shared`); the leftover-cleanup read
+    /// of the legacy location sees both accounts and is ambiguous, so `removeLegacyCopies`
+    /// (whose `if case let .found` already ignores `.rejected`) deletes nothing.
+    @Test func leftoverCleanupSkipsAnAmbiguousLegacyLocation() {
         let (x, xData) = makeSeed()
         let (_, yData) = makeSeed()
         let keychain = InMemoryKeychain([shared: xData])
         keychain.set(xData, at: legacy)
         keychain.set(yData, at: legacy, account: "other")
         #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops) == .loaded(x))
-        #expect(keychain.item(at: legacy) == nil)
+        #expect(keychain.item(at: legacy) == xData)
         #expect(keychain.item(at: legacy, account: "other") == yData)
     }
 

@@ -4,12 +4,15 @@ import Foundation
 /// - an item is keyed by location + account (as `SecItem*`'s primary key); `add` never sets an
 ///   account (account "") and is an atomic check-and-insert: `.duplicate` if an item already
 ///   exists at that location with account "" (nothing is overwritten);
-/// - a read returns one match (lowest group, then account, first) with an opaque persistent
-///   reference; `deleteItem` removes exactly that item, while `delete(location)` removes EVERY
-///   match (all accounts; a nil access group matches the service in ANY group, as `SecItem*` does);
+/// - a read returns the one match with an opaque persistent reference, or `rejected` when several
+///   match (all accounts; a nil access group matches the service in ANY group, as `SecItem*` does)
+///   or when any match is synchronizable; `deleteItem` removes exactly the item a prior `found`
+///   read named, while `delete(location)` removes EVERY match regardless;
 /// - failures can be injected per location (`failDelete` also covers `deleteItem` of items at
 ///   that location), and `dropAdds` makes an add report `.added` while storing nothing.
 /// `onBeforeAdd` runs outside the lock, so a hook may call `set` (e.g. another app winning a race).
+/// Fidelity note: an unentitled named group returns `notFound` here where the real Keychain
+/// returns `-34018` `errSecMissingEntitlement`.
 public final class InMemoryKeychain: @unchecked Sendable {
     public typealias Location = IdentityKeychain.Location
 
@@ -21,6 +24,7 @@ public final class InMemoryKeychain: @unchecked Sendable {
     private struct Stored {
         var data: Data
         var ref: Data
+        var synchronizable: Bool
     }
 
     private let lock = NSLock()
@@ -35,7 +39,7 @@ public final class InMemoryKeychain: @unchecked Sendable {
 
     public init(_ items: [Location: Data] = [:]) {
         for (location, data) in items {
-            self.items[Key(location: location, account: "")] = Stored(data: data, ref: makeRef())
+            self.items[Key(location: location, account: "")] = Stored(data: data, ref: makeRef(), synchronizable: false)
         }
     }
 
@@ -56,11 +60,12 @@ public final class InMemoryKeychain: @unchecked Sendable {
         locked { items[Key(location: location, account: account)]?.data }
     }
     /// Plants (or with nil, removes) an item at exactly this location and account.
-    public func set(_ data: Data?, at location: Location, account: String = "") {
+    /// `synchronizable` models an iCloud-synced copy (something `add` never writes).
+    public func set(_ data: Data?, at location: Location, account: String = "", synchronizable: Bool = false) {
         locked {
             let key = Key(location: location, account: account)
             if let data {
-                items[key] = Stored(data: data, ref: makeRef())
+                items[key] = Stored(data: data, ref: makeRef(), synchronizable: synchronizable)
             } else {
                 items[key] = nil
             }
@@ -106,8 +111,11 @@ public final class InMemoryKeychain: @unchecked Sendable {
     private func read(_ location: Location) -> KeychainOps.ReadResult {
         locked {
             if let status = readFailures[location] { return .failed(status) }
-            guard let key = matchingKeys(location).first, let stored = items[key] else { return .notFound }
-            return .found(stored.data, persistentRef: stored.ref)
+            let matches = matchingKeys(location).compactMap { items[$0] }
+            guard !matches.isEmpty else { return .notFound }
+            if matches.contains(where: \.synchronizable) { return .rejected(.synchronizableItem) }
+            if matches.count > 1 { return .rejected(.multipleItems(count: matches.count)) }
+            return .found(matches[0].data, persistentRef: matches[0].ref)
         }
     }
 
@@ -123,7 +131,7 @@ public final class InMemoryKeychain: @unchecked Sendable {
             let key = Key(location: location, account: "")
             if items[key] != nil { return .duplicate }
             if droppedAdds.contains(location) { return .added }
-            items[key] = Stored(data: data, ref: makeRef())
+            items[key] = Stored(data: data, ref: makeRef(), synchronizable: false)
             return .added
         }
     }

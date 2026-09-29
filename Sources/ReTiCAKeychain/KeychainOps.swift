@@ -5,12 +5,23 @@ import Security
 /// The live value is logic-free apart from pure OSStatus mapping; every decision lives in
 /// `IdentityKeychain` (`load`, `loadOrCreate`, `importIdentity`).
 public struct KeychainOps: Sendable {
+    public enum ReadRejection: Sendable, Equatable {
+        /// More than one item matched the query (two accounts at one location, or the group-less
+        /// probe found the service in several groups). One is never picked.
+        case multipleItems(count: Int)
+        /// At least one matching item is `kSecAttrSynchronizable`: an iCloud-synced identity would
+        /// split direct LXMF delivery across devices, so it is refused even when it is the only one.
+        case synchronizableItem
+    }
+
     public enum ReadResult: Sendable, Equatable {
-        /// One matching item: its bytes and its persistent reference, which addresses exactly
-        /// that item (whatever its account) for `deleteItem`.
+        /// Exactly one device-local item: its bytes and its persistent reference, which addresses
+        /// exactly that item (whatever its account) for `deleteItem`.
         case found(Data, persistentRef: Data)
         case notFound
         case failed(Int32)
+        /// Items exist but the read refuses to pick one (see `ReadRejection`). Callers fail closed.
+        case rejected(ReadRejection)
 
         /// The item's bytes when found.
         public var data: Data? {
@@ -50,20 +61,17 @@ extension KeychainOps {
     /// after the first unlock; iOS prewarm BEFORE first unlock fails with
     /// errSecInteractionNotAllowed, which callers must treat as "not now", never "absent").
     /// Queries address items by class + service (+ access group) only — no `kSecAttrAccount` is
-    /// ever set — and never set `kSecAttrSynchronizable`; every adopting app must write the
-    /// shared item with these exact same attributes, or the copies won't collide/dedupe.
-    /// Because a query ignores the account, reads return a persistent reference and
-    /// `IdentityKeychain` deletes by that reference, never by query.
+    /// ever set. Writes and deletes never set `kSecAttrSynchronizable`; every adopting app must
+    /// write the shared item with these exact same attributes, or the copies won't collide/dedupe.
+    /// Reads see EVERY matching item, synced or not, and refuse to pick one when there is more
+    /// than one or when any is iCloud-synchronizable — callers fail closed instead of silently
+    /// choosing an item. Because a query ignores the account, a single-item read returns a
+    /// persistent reference and `IdentityKeychain` deletes by that reference, never by query.
     public static let live = KeychainOps(
         read: { location in
             var result: AnyObject?
             let status = SecItemCopyMatching(readQuery(location) as CFDictionary, &result)
-            let attributes = result as? [String: Any]
-            return mapRead(
-                status: status,
-                data: attributes?[kSecValueData as String] as? Data,
-                persistentRef: attributes?[kSecValuePersistentRef as String] as? Data
-            )
+            return mapRead(status: status, items: result as? [[String: Any]])
         },
         add: { location, data in
             mapAdd(status: SecItemAdd(addAttributes(location, data: data) as CFDictionary, nil))
@@ -91,12 +99,16 @@ extension KeychainOps {
         return query
     }
 
-    /// One item's data AND persistent reference (the result is then an attributes dictionary).
+    /// Every item the location matches, synced or not, with attributes, data and persistent ref
+    /// (the result is then an array of attribute dictionaries). Match-limit-all and
+    /// synchronizable-any make duplicates and iCloud copies visible instead of silently picking one.
     static func readQuery(_ location: IdentityKeychain.Location) -> [String: Any] {
         var query = baseQuery(location)
+        query[kSecReturnAttributes as String] = true
         query[kSecReturnData as String] = true
         query[kSecReturnPersistentRef as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecMatchLimit as String] = kSecMatchLimitAll
+        query[kSecAttrSynchronizable as String] = kSecAttrSynchronizableAny
         return query
     }
 
@@ -120,18 +132,35 @@ extension KeychainOps {
         ]
     }
 
-    /// success + data + ref → found; success missing either → failed (never "absent": that
-    /// would mint); itemNotFound → notFound; anything else → failed(status).
-    static func mapRead(status: OSStatus, data: Data?, persistentRef: Data?) -> ReadResult {
+    /// itemNotFound → notFound; any other non-success → failed(status); success → a synced item
+    /// anywhere in the result → rejected(.synchronizableItem) (checked first: one is enough);
+    /// more than one item → rejected(.multipleItems); exactly one with data and ref → found;
+    /// success with no items or an item missing data/ref → failed(errSecSuccess) (never "absent":
+    /// that would mint).
+    static func mapRead(status: OSStatus, items: [[String: Any]]?) -> ReadResult {
         switch status {
-        case errSecSuccess:
-            guard let data, let persistentRef else { return .failed(errSecSuccess) }
-            return .found(data, persistentRef: persistentRef)
         case errSecItemNotFound:
             return .notFound
+        case errSecSuccess:
+            guard let items, !items.isEmpty else { return .failed(errSecSuccess) }
+            if items.contains(where: isSynchronizable) { return .rejected(.synchronizableItem) }
+            if items.count > 1 { return .rejected(.multipleItems(count: items.count)) }
+            guard let data = items[0][kSecValueData as String] as? Data,
+                  let persistentRef = items[0][kSecValuePersistentRef as String] as? Data
+            else { return .failed(errSecSuccess) }
+            return .found(data, persistentRef: persistentRef)
         default:
             return .failed(status)
         }
+    }
+
+    /// `kSecAttrSynchronizable` comes back as a CFBoolean / NSNumber on synced items and is absent
+    /// (or 0) on device-local ones.
+    static func isSynchronizable(_ attributes: [String: Any]) -> Bool {
+        guard let value = attributes[kSecAttrSynchronizable as String] else { return false }
+        if let number = value as? NSNumber { return number.boolValue }
+        if let flag = value as? Bool { return flag }
+        return false
     }
 
     static func mapAdd(status: OSStatus) -> AddResult {
