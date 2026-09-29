@@ -110,11 +110,12 @@ public struct IdentityKeychain {
         /// a group-less add lands in the app's default group instead of the shared one.
         case invalidLocation(Location)
         /// Nothing was found at the named locations, but an item exists under this service in
-        /// some other access group (e.g. a mistyped legacy group). Minting would rotate the
-        /// identity, so nothing is written or deleted.
-        /// It can also surface from a race: another process adds the shared item between rule
-        /// 1's read and the probe. Callers should treat it as retryable ("not now"), like
-        /// `readFailed`; the next load then finds the shared item. Never mint in response.
+        /// some other access group (e.g. a mistyped legacy group), or under a legacy service via
+        /// the group-less probe. Minting would rotate the identity, so nothing is written or
+        /// deleted. (A hit on the SHARED service is not reported this way: it is re-read at the
+        /// named shared location and resolved like rule 1 — see `load`'s rule 3 — so this case
+        /// only surfaces for a legacy hit, or a shared hit that vanishes on re-read.) Callers
+        /// should still treat it as retryable ("not now"), like `readFailed`. Never mint in response.
         case unexpectedItem(service: String)
         /// More than one item at this location. Nothing is read, minted, migrated, deleted or imported.
         case ambiguousItems(location: Location, count: Int)
@@ -142,7 +143,10 @@ public struct IdentityKeychain {
     ///    the shared item first: it wins (`.loaded`) and the legacy item is kept unless it holds
     ///    the same seed.
     /// 3. Nothing at any named location → a read-only, group-less probe of the shared and every
-    ///    legacy service; any item anywhere → `.failed(.unexpectedItem)`; nothing anywhere →
+    ///    legacy service. A hit on the shared service is re-read at the named shared location
+    ///    (the other app may have written it between rule 1 and this probe — the first-launch
+    ///    race) and resolved exactly like rule 1; a hit on a legacy service, or a shared-service
+    ///    hit that vanishes on re-read, → `.failed(.unexpectedItem)`; nothing anywhere →
     ///    `.absent`. NOTHING is minted.
     /// Any read/add error → `.failed`.
     public static func load(
@@ -190,11 +194,28 @@ public struct IdentityKeychain {
             }
         }
 
-        // Rule 3 (read-only half)
-        if let failure = probeForUnexpectedItems(shared: shared, legacy: legacy, ops: ops) {
+        // Rule 3 (read-only half). A hit on the shared service itself is re-read: the other app may
+        // have written the shared item between rule 1 and the probe (the first-launch race).
+        switch probe(shared: shared, legacy: legacy, ops: ops) {
+        case .clear:
+            return .absent
+        case let .failed(failure):
             return .failed(failure)
+        case let .hit(service):
+            guard service == shared.service else { return .failed(.unexpectedItem(service: service)) }
+            switch ops.read(shared) {
+            case let .found(data, _):
+                guard let identity = Identity(privateKey: data) else { return .failed(.corrupt(location: shared)) }
+                removeLegacyCopies(of: data, legacy: legacy, ops: ops)
+                return .loaded(identity)
+            case .notFound:
+                return .failed(.unexpectedItem(service: service))
+            case let .failed(status):
+                return .failed(.readFailed(location: shared, status: status))
+            case let .rejected(rejection):
+                return .failed(failure(for: rejection, at: shared))
+            }
         }
-        return .absent
     }
 
     /// `load`, then — only when it is `.absent` — mint add-only into the shared item → `.created`;
@@ -273,13 +294,10 @@ public struct IdentityKeychain {
             }
         }
         // 3 — any group
-        switch probeForUnexpectedItems(shared: shared, legacy: legacy, ops: ops) {
-        case nil:
-            break
-        case let .unexpectedItem(service)?:
-            return .identityPresent(service: service)
-        case let failure?:
-            return .failed(failure)
+        switch probe(shared: shared, legacy: legacy, ops: ops) {
+        case .clear: break
+        case let .hit(service): return .identityPresent(service: service)
+        case let .failed(failure): return .failed(failure)
         }
 
         // 4
@@ -381,9 +399,15 @@ public struct IdentityKeychain {
         }
     }
 
+    enum ProbeResult: Equatable {
+        case clear
+        case hit(service: String)
+        case failed(Failure)
+    }
+
     /// Read-only, group-less look for ANY item under the shared or a legacy service, in any
     /// group the app can access. Never deletes or writes through these unscoped locations.
-    private static func probeForUnexpectedItems(shared: Location, legacy: [Location], ops: KeychainOps) -> Failure? {
+    private static func probe(shared: Location, legacy: [Location], ops: KeychainOps) -> ProbeResult {
         var services: [String] = []
         for service in [shared.service] + legacy.map(\.service) where !services.contains(service) {
             services.append(service)
@@ -393,17 +417,15 @@ public struct IdentityKeychain {
             switch ops.read(anyGroup) {
             case .notFound:
                 continue
-            case .found:
-                return .unexpectedItem(service: service)
-            case let .failed(status):
-                return .readFailed(location: anyGroup, status: status)
-            case .rejected(.multipleItems):
-                return .unexpectedItem(service: service)
+            case .found, .rejected(.multipleItems):
+                return .hit(service: service)
             case .rejected(.synchronizableItem):
-                return .synchronizableItem(location: anyGroup)
+                return .failed(.synchronizableItem(location: anyGroup))
+            case let .failed(status):
+                return .failed(.readFailed(location: anyGroup, status: status))
             }
         }
-        return nil
+        return .clear
     }
 
     /// Finishes an interrupted migration: deletes the legacy item holding exactly the shared

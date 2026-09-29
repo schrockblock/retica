@@ -10,7 +10,8 @@ import Foundation
 ///   read named, while `delete(location)` removes EVERY match regardless;
 /// - failures can be injected per location (`failDelete` also covers `deleteItem` of items at
 ///   that location), and `dropAdds` makes an add report `.added` while storing nothing.
-/// `onBeforeAdd` runs outside the lock, so a hook may call `set` (e.g. another app winning a race).
+/// `onBeforeAdd` and `onBeforeRead` run outside the lock, so a hook may call `set` (e.g. another
+/// app winning a race).
 /// Fidelity note: an unentitled named group returns `notFound` here where the real Keychain
 /// returns `-34018` `errSecMissingEntitlement`.
 public final class InMemoryKeychain: @unchecked Sendable {
@@ -35,6 +36,7 @@ public final class InMemoryKeychain: @unchecked Sendable {
     private var deleteFailures: [Location: Int32] = [:]
     private var droppedAdds: Set<Location> = []
     private var beforeAdd: (@Sendable (Location) -> Void)?
+    private var beforeRead: (@Sendable (Location) -> Void)?
     private var adds = 0
 
     public init(_ items: [Location: Data] = [:]) {
@@ -84,6 +86,9 @@ public final class InMemoryKeychain: @unchecked Sendable {
         }
     }
     public func onBeforeAdd(_ hook: @escaping @Sendable (Location) -> Void) { locked { beforeAdd = hook } }
+    /// Runs outside the lock before every `read`, so a hook may `set` (e.g. another app writing
+    /// the shared item between rule 1 and the probe).
+    public func onBeforeRead(_ hook: @escaping @Sendable (Location) -> Void) { locked { beforeRead = hook } }
     /// Number of `add` calls (including ones that failed or were duplicates).
     public var addCount: Int { locked { adds } }
 
@@ -109,7 +114,9 @@ public final class InMemoryKeychain: @unchecked Sendable {
     }
 
     private func read(_ location: Location) -> KeychainOps.ReadResult {
-        locked {
+        let hook = locked { beforeRead }
+        hook?(location)
+        return locked {
             if let status = readFailures[location] { return .failed(status) }
             let matches = matchingKeys(location).compactMap { items[$0] }
             guard !matches.isEmpty else { return .notFound }
