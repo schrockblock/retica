@@ -106,8 +106,8 @@ public struct IdentityKeychain {
         case mintFailed
         /// A location has no (or an empty) access group. Rejected before any Keychain access: a
         /// group-less delete matches the service in EVERY accessible group (unbounded — it could
-        /// destroy an item never verified), a group-less read picks one of them arbitrarily, and
-        /// a group-less add lands in the app's default group instead of the shared one.
+        /// destroy an item never verified), a group-less read may see several (and now refuses to
+        /// pick), and a group-less add lands in the app's default group instead of the shared one.
         case invalidLocation(Location)
         /// Nothing was found at the named locations, but an item exists under this service in
         /// some other access group (e.g. a mistyped legacy group), or under a legacy service via
@@ -258,8 +258,9 @@ public struct IdentityKeychain {
     ///    (before any Keychain access).
     /// 2. Every location names a non-empty access group, else `.failed(.invalidLocation)`.
     /// 3. Full scan: the shared location, every legacy location, then the read-only group-less
-    ///    probe of every scanned service. Any item → `.identityPresent`; any read error →
-    ///    `.failed` (unknown is never "empty").
+    ///    probe of every scanned service. Any item → `.identityPresent`; a named location holding
+    ///    two items or a synchronizable one → `.failed(.ambiguousItems / .synchronizableItem)`;
+    ///    any read error → `.failed` (unknown is never "empty").
     /// 4. Add-only into the shared location. A duplicate (another process won the race) → re-read:
     ///    the same bytes → `.imported`; different → `.identityPresent` (the stored identity wins).
     /// 5. Re-read and verify byte-equality → `.imported`.

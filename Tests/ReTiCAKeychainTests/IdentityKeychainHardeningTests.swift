@@ -157,4 +157,58 @@ struct IdentityKeychainHardeningTests {
         #expect(keychain.item(at: shared) == candidate)
         #expect(keychain.item(at: shared, account: "second") == other)
     }
+
+    /// `migrate`'s `.added` re-read (not the `.duplicate` re-read above): the add itself succeeds
+    /// at account "", but another process has also planted a second item under a different
+    /// account, so the verify re-read sees two. Fail, keep the legacy item.
+    @Test func migrationAddedRereadRejectedFailsAndKeepsLegacy() {
+        let (_, legacySeed) = makeSeed()
+        let (_, different) = makeSeed()
+        let keychain = InMemoryKeychain([legacy: legacySeed])
+        keychain.onBeforeAdd { location in
+            guard location == shared else { return }
+            keychain.set(different, at: shared, account: "second")
+        }
+        #expect(IdentityKeychain.load(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.ambiguousItems(location: shared, count: 2)))
+        #expect(keychain.item(at: legacy) == legacySeed)
+        #expect(keychain.item(at: shared) == legacySeed)
+        #expect(keychain.item(at: shared, account: "second") == different)
+    }
+
+    /// `loadOrCreate`'s mint sees `.duplicate` on add (another process planted both accounts
+    /// first), and the `rereadWinner` re-read sees two. Fail; the mint never overwrote.
+    @Test func mintDuplicateRereadRejectedFails() {
+        let (_, a) = makeSeed()
+        let (_, b) = makeSeed()
+        let keychain = InMemoryKeychain()
+        keychain.onBeforeAdd { location in
+            guard location == shared else { return }
+            keychain.set(a, at: shared)
+            keychain.set(b, at: shared, account: "second")
+        }
+        #expect(IdentityKeychain.loadOrCreate(shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.ambiguousItems(location: shared, count: 2)))
+        #expect(keychain.item(at: shared) == a)
+        #expect(keychain.item(at: shared, account: "second") == b)
+    }
+
+    /// `importIdentity` step 4's `.duplicate` re-read (not step 5's verify re-read above): the
+    /// add sees a duplicate because another process planted both accounts first, and the re-read
+    /// sees two. Fail; nothing deleted.
+    @Test func importDuplicateRereadRejectedFails() {
+        let (_, a) = makeSeed()
+        let (_, b) = makeSeed()
+        let (_, candidate) = makeSeed()
+        let keychain = InMemoryKeychain()
+        keychain.onBeforeAdd { location in
+            guard location == shared else { return }
+            keychain.set(a, at: shared)
+            keychain.set(b, at: shared, account: "second")
+        }
+        #expect(IdentityKeychain.importIdentity(privateKey: candidate, shared: shared, legacy: [legacy], ops: keychain.ops)
+                == .failed(.ambiguousItems(location: shared, count: 2)))
+        #expect(keychain.item(at: shared) == a)
+        #expect(keychain.item(at: shared, account: "second") == b)
+    }
 }

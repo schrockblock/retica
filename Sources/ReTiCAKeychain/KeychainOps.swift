@@ -2,8 +2,9 @@ import Foundation
 import Security
 
 /// The Keychain primitives `IdentityKeychain` needs, injectable for tests.
-/// The live value is logic-free apart from pure OSStatus mapping; every decision lives in
-/// `IdentityKeychain` (`load`, `loadOrCreate`, `importIdentity`).
+/// The live value is logic-free apart from pure result mapping (status, the synchronizable check,
+/// the item count); every decision lives in `IdentityKeychain` (`load`, `loadOrCreate`,
+/// `importIdentity`).
 public struct KeychainOps: Sendable {
     public enum ReadRejection: Sendable, Equatable {
         /// More than one item matched the query (two accounts at one location, or the group-less
@@ -160,6 +161,7 @@ extension KeychainOps {
         guard let value = attributes[kSecAttrSynchronizable as String] else { return false }
         if let number = value as? NSNumber { return number.boolValue }
         if let flag = value as? Bool { return flag }
+        // An attribute of an unrecognised type is not evidence of syncing: Security returns CFBoolean/NSNumber, our own writes never set the attribute, and refusing here would lock every adopter out on an SDK type change (a total outage against a theoretical risk). Ruled fail-open on purpose.
         return false
     }
 
