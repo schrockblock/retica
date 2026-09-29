@@ -428,6 +428,77 @@ public struct IdentityKeychain {
         return .clear
     }
 
+    public struct LegacyConflict: Sendable, Equatable {
+        public var location: Location
+        /// The 16-byte identity hash of the legacy item.
+        public var identityHash: Data
+        public init(location: Location, identityHash: Data) {
+            self.location = location
+            self.identityHash = identityHash
+        }
+    }
+
+    public enum ConflictOutcome: Sendable, Equatable {
+        case none
+        /// `sharedHash` is the shared item's identity hash, or nil when the shared item is absent
+        /// and the reference was the first legacy identity (the one migration would copy).
+        case conflicts(sharedHash: Data?, legacy: [LegacyConflict])
+        case failed(Failure)
+    }
+
+    /// Read-only (spec 2026-09-29 §4.4): every legacy item holding a valid identity that differs
+    /// from the reference — the shared item's identity, or, when the shared item is absent, the
+    /// first legacy identity found (it would win the migration). Corrupt, unreadable or rejected
+    /// items fail. The group-less probe is NOT run (a conflict query names its locations; strays
+    /// are `load`'s job). Nothing is ever written or deleted.
+    public static func legacyConflicts(
+        shared: Location,
+        legacy: [Location] = [],
+        ops: KeychainOps = .live
+    ) -> ConflictOutcome {
+        if let unscoped = firstUnscoped(shared: shared, legacy: legacy) {
+            return .failed(.invalidLocation(unscoped))
+        }
+        let legacy = legacy.filter { $0 != shared }
+
+        var reference: Data?
+        var sharedHash: Data?
+        switch ops.read(shared) {
+        case let .failed(status):
+            return .failed(.readFailed(location: shared, status: status))
+        case let .rejected(rejection):
+            return .failed(failure(for: rejection, at: shared))
+        case let .found(data, _):
+            guard let identity = Identity(privateKey: data) else { return .failed(.corrupt(location: shared)) }
+            reference = identity.hash
+            sharedHash = identity.hash
+        case .notFound:
+            break
+        }
+
+        var conflicts: [LegacyConflict] = []
+        for location in legacy {
+            switch ops.read(location) {
+            case .notFound:
+                continue
+            case let .failed(status):
+                return .failed(.readFailed(location: location, status: status))
+            case let .rejected(rejection):
+                return .failed(failure(for: rejection, at: location))
+            case let .found(data, _):
+                guard let identity = Identity(privateKey: data) else { return .failed(.corrupt(location: location)) }
+                guard let winner = reference else {
+                    reference = identity.hash
+                    continue
+                }
+                if identity.hash != winner {
+                    conflicts.append(LegacyConflict(location: location, identityHash: identity.hash))
+                }
+            }
+        }
+        return conflicts.isEmpty ? .none : .conflicts(sharedHash: sharedHash, legacy: conflicts)
+    }
+
     /// Finishes an interrupted migration: deletes the legacy item holding exactly the shared
     /// seed, by the persistent reference of the item just read. Errors are ignored — the load
     /// already succeeded, and a different identity is never touched.
