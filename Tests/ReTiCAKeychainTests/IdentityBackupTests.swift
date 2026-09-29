@@ -38,6 +38,7 @@ struct IdentityBackupTests {
         #expect(IdentityBackup.decodeBase32("mzxw6===") == nil)      // lowercase
         #expect(IdentityBackup.decodeBase32("MZXW6Y=") == nil)       // wrong pad count
         #expect(IdentityBackup.decodeBase32("MZXW6YTBO") == nil)     // impossible length (remainder 1)
+        #expect(IdentityBackup.decodeBase32("MZXW6YTBA") == nil)      // impossible length with zero spare bits: only the remainder rule catches it
         #expect(IdentityBackup.decodeBase32("MZXW6YR=") == nil)      // non-zero trailing bits
         #expect(IdentityBackup.decodeBase32("MZXW6===\n") == nil)    // callers trim; the codec does not
         #expect(IdentityBackup.decodeBase32("MZXW1===") == nil)      // '1' is not in the alphabet
