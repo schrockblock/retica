@@ -1898,3 +1898,49 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     await store.send(.stop)
     await store.receive(\.tcpClient.interface.disconnect)
 }
+
+// MARK: - Explicit stop deregisters the TCP interface
+
+/// An EXPLICIT `.stop` (a host closing the socket when it goes to the background) must deregister
+/// the TCP interface exactly as a dropped socket does. `TCPClientInterface.disconnect` cancels the
+/// connection stream silently and emits no `.disconnected` event, so before this arm existed the
+/// router kept the interface registered: `interfaces` still held it, links on it never learned the
+/// interface was gone, and a host keying "is TCP up?" on `interfaceDisconnected` never re-dialled.
+///
+/// Mutation: remove the `.tcpClient(.disconnect)` arm from `TransportEndpoint` → no
+/// `interfaceDisconnected` is ever emitted → the `receive` below times out and the test fails.
+@Test @MainActor func explicitStopDeregistersTheTCPInterface() async {
+    let (store, events) = makeStore()
+    await store.send(.start)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+    let id = store.state.tcpClient!.interfaceID
+    #expect(store.state.transport.interfaces[id] == .tcp)
+
+    await store.send(.stop)
+    await store.receive { if case .transport(.interfaceDisconnected(id)) = $0 { return true }; return false }
+    #expect(store.state.transport.interfaces[id] == nil,
+            "an explicit stop must deregister the TCP interface like a dropped socket does")
+    await store.receive { if case .linkPlane(.interfaceDisconnected(id)) = $0 { return true }; return false }
+    await store.skipReceivedActions(strict: false)
+}
+
+/// A `.stop` while still CONNECTING (no `interfaceConnected` yet) has nothing to deregister and
+/// must not emit a spurious `interfaceDisconnected` — the router never registered the id.
+///
+/// Mutation: drop the `state.transport.interfaces[id] != nil` guard from the new arm →
+/// `interfaceDisconnected` is emitted for an unregistered id → it is still queued when the
+/// exhaustive probe is sent, and the probe send fails.
+@Test @MainActor func stopWhileConnectingEmitsNoInterfaceDisconnected() async {
+    let (store, _) = makeStore()
+    await store.send(.start)
+    #expect(store.state.transport.interfaces.isEmpty, "nothing is registered before the socket is up")
+
+    await store.send(.stop)
+    await store.receive(\.tcpClient.interface.disconnect)
+    await store.finish()
+    // Exhaustive no-op probe: with exhaustivity on, a send fails if any received action is still
+    // pending, so a spurious `interfaceDisconnected` would surface here.
+    store.exhaustivity = .on
+    await store.send(.delegate(.pathLearned(destinationHash: Data(repeating: 0, count: 16), hops: 0)))
+}

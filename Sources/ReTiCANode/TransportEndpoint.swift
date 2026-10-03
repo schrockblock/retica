@@ -200,6 +200,19 @@ public struct TransportEndpoint {
                 return .merge([.send(.transport(.interfaceDisconnected(id))),
                                .send(.linkPlane(.interfaceDisconnected(id)))]
                               + maintenanceStopEffect(state, departing: id))
+            case .tcpClient(.disconnect):
+                // An EXPLICIT disconnect (`.stop`, or a host closing the socket on background)
+                // cancels the connection stream silently: `TCPClientInterface` deliberately emits
+                // no `.disconnected` event for it, so the router would keep the interface
+                // registered, links on it would stay open, and a host keying "is TCP up?" on
+                // `interfaceDisconnected` (the app's foreground re-dial does) would never re-dial.
+                // Deregister here, exactly as a dropped socket does, but only when the interface
+                // is actually registered — a disconnect while still connecting has nothing to undo.
+                guard let id = state.tcpClient?.interfaceID, state.transport.interfaces[id] != nil
+                else { return .none }
+                return .merge([.send(.transport(.interfaceDisconnected(id))),
+                               .send(.linkPlane(.interfaceDisconnected(id)))]
+                              + maintenanceStopEffect(state, departing: id))
 
             // --- TCP-server connection lifecycle → shared router interface set (+ maintenance) ---
             // Mirrors the BLE 1:N peer wiring: one Transport InterfaceID per accepted connection,
