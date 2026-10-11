@@ -27,7 +27,7 @@ private func plumbSession() -> LinkSession.State {
 private func plumbEndpoint() -> TestStore<TransportEndpoint.State, TransportEndpoint.Action> {
     let store = TestStore(initialState: TransportEndpoint.State(
         linkPlane: LinkPlane.State(links: [plumbSession()]),
-        tcpClient: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        tcpClients: [TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)])
     ) {
         TransportEndpoint()
     } withDependencies: {

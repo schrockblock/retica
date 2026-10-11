@@ -495,16 +495,16 @@ import ComposableArchitecture
     }
 
     func nodeSend(_ act: LXMFServiceNode.Action) -> Bool {
-        if case .client(.endpoint(.tcpClient(.interface(.send)))) = act { return true }; return false
+        if case .client(.endpoint(.tcpClients(.element(id: _, action: .interface(.send))))) = act { return true }; return false
     }
-    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClient(.interface(.send)) = act { return true }; return false }
+    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClients(.element(id: _, action: .interface(.send))) = act { return true }; return false }
 
     let sentNode = LockIsolated<[Data]>([])
     let sentC = LockIsolated<[Data]>([])
     let (node, eventsNode) = makeNode("node", sentNode)
     let (c, eventsC) = makeClient("c", sentC)
 
-    await node.send(.client(.endpoint(.tcpClient(.connect)))); eventsNode.yield(.connected)
+    await node.send(.client(.endpoint(.tcpClients(.element(id: InterfaceID("tcp"), action: .connect))))); eventsNode.yield(.connected)
     await c.send(.start); eventsC.yield(.connected)
 
     // Node registers + announces lxmf.propagation; bridge the announce so C learns its path + identity.
@@ -601,7 +601,7 @@ import ComposableArchitecture
     #expect(recovered?.content == Data("hi C".utf8))
     #expect(recovered?.validateSignature(source: sIdentity) == true)
 
-    await node.send(.client(.endpoint(.tcpClient(.disconnect)))); await c.send(.stop)
+    await node.send(.client(.endpoint(.tcpClients(.element(id: InterfaceID("tcp"), action: .disconnect))))); await c.send(.stop)
 }
 
 // MARK: - Inbound packet proving (reference LXMRouter.py:2255 `packet.prove()`)
@@ -1656,16 +1656,16 @@ import ComposableArchitecture
     }
 
     func nodeSend(_ act: LXMFServiceNode.Action) -> Bool {
-        if case .client(.endpoint(.tcpClient(.interface(.send)))) = act { return true }; return false
+        if case .client(.endpoint(.tcpClients(.element(id: _, action: .interface(.send))))) = act { return true }; return false
     }
-    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClient(.interface(.send)) = act { return true }; return false }
+    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClients(.element(id: _, action: .interface(.send))) = act { return true }; return false }
 
     let sentNode = LockIsolated<[Data]>([])
     let sentC    = LockIsolated<[Data]>([])
     let (node, eventsNode) = makeNode("node", sentNode)
     let (c, eventsC) = makeClient("c", sentC)
 
-    await node.send(.client(.endpoint(.tcpClient(.connect)))); eventsNode.yield(.connected)
+    await node.send(.client(.endpoint(.tcpClients(.element(id: InterfaceID("tcp"), action: .connect))))); eventsNode.yield(.connected)
     await c.send(.start); eventsC.yield(.connected)
 
     // Node registers + announces lxmf.propagation; bridge the announce so C learns the path.
@@ -1713,5 +1713,5 @@ import ComposableArchitecture
         return false
     }
 
-    await node.send(.client(.endpoint(.tcpClient(.disconnect)))); await c.send(.stop)
+    await node.send(.client(.endpoint(.tcpClients(.element(id: InterfaceID("tcp"), action: .disconnect))))); await c.send(.stop)
 }

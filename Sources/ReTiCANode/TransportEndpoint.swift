@@ -12,15 +12,15 @@ import ReTiCATransport
 ///
 /// Task-1b hoist: the router (`transport`) and the link/resource/request machinery (`linkPlane`)
 /// live HERE, one of each, shared across all drivers. Each driver is a thin, KIND-indexed slot
-/// (`tcpClient`, `ble`) owning only its interface(s); the container performs ALL the wiring —
-/// inbound driver bytes are tagged with the arriving `InterfaceID` into the shared router, and
-/// the router's outbound `.transmit(InterfaceID, data)` is routed back to whichever driver owns
-/// that id. A packet arriving over one driver can therefore leave over another.
+/// (`tcpClients`, `tcpServer`, `ble`) owning only its interface(s); the container performs ALL the
+/// wiring — inbound driver bytes are tagged with the arriving `InterfaceID` into the shared
+/// router, and the router's outbound `.transmit(InterfaceID, data)` is routed back to whichever
+/// driver owns that id. A packet arriving over one driver can therefore leave over another.
 ///
-/// Transport-specific driving stays available through the KIND-addressed `.tcpClient(...)` /
-/// `.ble(...)` escape hatches — which is also where BLE-only delegates (`peerOnline`/
-/// `peerOffline`) remain observable; they are deliberately absent from the unified surface
-/// because LXMF has no use for them.
+/// Transport-specific driving stays available through the KIND-addressed
+/// `.tcpClients(.element(id:action:))` / `.ble(...)` escape hatches — which is also where
+/// BLE-only delegates (`peerOnline`/`peerOffline`) remain observable; they are deliberately
+/// absent from the unified surface because LXMF has no use for them.
 @Reducer
 public struct TransportEndpoint {
     @ObservableState
@@ -29,8 +29,10 @@ public struct TransportEndpoint {
         public var transport: Transport.State
         /// The ONE shared link/resource/request plane.
         public var linkPlane: LinkPlane.State
-        /// The TCP-client driver slot (at most one this slice).
-        public var tcpClient: TCPEndpoint.State?
+        /// The TCP-client driver slots, one per dialed node, keyed by `interfaceID`. Each owns
+        /// its own socket (`TCPConnectionPool`); the router, link plane and maintenance loop are
+        /// shared by all of them, exactly as they are shared with the server and BLE slots.
+        public var tcpClients: IdentifiedArrayOf<TCPEndpoint.State>
         /// The TCP-server driver slot (at most one; owns N accepted connections internally).
         public var tcpServer: TCPServerEndpoint.State?
         /// The BLE driver slot.
@@ -52,19 +54,19 @@ public struct TransportEndpoint {
 
         public init(transport: Transport.State = Transport.State(),
                     linkPlane: LinkPlane.State = LinkPlane.State(),
-                    tcpClient: TCPEndpoint.State? = nil,
+                    tcpClients: IdentifiedArrayOf<TCPEndpoint.State> = [],
                     tcpServer: TCPServerEndpoint.State? = nil,
                     ble: BLEEndpoint.State? = nil) {
             self.transport = transport
             self.linkPlane = linkPlane
-            self.tcpClient = tcpClient
+            self.tcpClients = tcpClients
             self.tcpServer = tcpServer
             self.ble = ble
         }
 
         /// Convenience factory: an endpoint running over a single TCP-client driver.
         public static func tcp(_ driver: TCPEndpoint.State) -> State {
-            State(tcpClient: driver)
+            State(tcpClients: [driver])
         }
 
         /// Convenience factory: an endpoint running over a TCP-server (listener) driver.
@@ -79,7 +81,12 @@ public struct TransportEndpoint {
     }
 
     public enum Action: Equatable {
-        case tcpClient(TCPEndpoint.Action)
+        case tcpClients(IdentifiedActionOf<TCPEndpoint>)
+        /// Drop one TCP-client slot: deregister its interface (when registered), remove the slot
+        /// (which cancels its connection stream, reconnect timer and writer — `forEach` cancels a
+        /// removed element's effects) and close its socket. The explicit-disconnect arm is NOT
+        /// enough on its own: it leaves the slot, and `.start` would dial it again.
+        case removeTCPClient(InterfaceID)
         case tcpServer(TCPServerEndpoint.Action)
         case ble(BLEEndpoint.Action)
         case transport(Transport.Action)
@@ -135,6 +142,8 @@ public struct TransportEndpoint {
         }
     }
 
+    @Dependency(\.tcpConnectionPool) var connectionPool
+
     public init() {}
 
     public var body: some ReducerOf<Self> {
@@ -144,13 +153,13 @@ public struct TransportEndpoint {
             switch action {
             // --- unified verbs → shared router / link plane ---
             case .start:
-                return .merge(state.tcpClient != nil ? .send(.tcpClient(.connect)) : .none,
-                              state.tcpServer != nil ? .send(.tcpServer(.start)) : .none,
-                              state.ble != nil ? .send(.ble(.start)) : .none)
+                return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .connect))) }
+                              + [state.tcpServer != nil ? .send(.tcpServer(.start)) : .none,
+                                 state.ble != nil ? .send(.ble(.start)) : .none])
             case .stop:
-                return .merge(state.tcpClient != nil ? .send(.tcpClient(.disconnect)) : .none,
-                              state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
-                              state.ble != nil ? .send(.ble(.stop)) : .none)
+                return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .disconnect))) }
+                              + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
+                                 state.ble != nil ? .send(.ble(.stop)) : .none])
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
             case let .announce(h, a):               return .send(.transport(.announce(destinationHash: h, appData: a)))
             case let .send(h, p, token):            return .send(.transport(.send(destinationHash: h, plaintext: p,
@@ -187,32 +196,44 @@ public struct TransportEndpoint {
             // them again would double-deliver (e.g. two `.close`s to one element — a "forEach
             // received an action for a missing element" crash).
 
-            // --- TCP driver interface events → shared router ---
-            case let .tcpClient(.interface(.delegate(.packetReceived(data)))):
-                guard let id = state.tcpClient?.interfaceID else { return .none }
+            // --- TCP client interface events → shared router (per client, by id) ---
+            case let .tcpClients(.element(id, .interface(.delegate(.packetReceived(data))))):
                 return .send(.transport(.received(id, data)))
-            case .tcpClient(.interface(.connectionEvent(.connected))):
-                guard let driver = state.tcpClient else { return .none }
-                return .merge([.send(.transport(.interfaceConnected(driver.interfaceID, driver.profile)))]
+            case let .tcpClients(.element(id, .interface(.connectionEvent(.connected)))):
+                guard let profile = state.tcpClients[id: id]?.profile else { return .none }
+                return .merge([.send(.transport(.interfaceConnected(id, profile)))]
                               + maintenanceStartEffect(state))
-            case .tcpClient(.interface(.connectionEvent(.disconnected))):
-                guard let id = state.tcpClient?.interfaceID else { return .none }
+            case let .tcpClients(.element(id, .interface(.connectionEvent(.disconnected)))):
                 return .merge([.send(.transport(.interfaceDisconnected(id))),
                                .send(.linkPlane(.interfaceDisconnected(id)))]
                               + maintenanceStopEffect(state, departing: id))
-            case .tcpClient(.disconnect):
-                // An EXPLICIT disconnect (`.stop`, or a host closing the socket on background)
+            case let .tcpClients(.element(id, .disconnect)):
+                // An EXPLICIT disconnect (`.stop`, or a host closing its sockets on background)
                 // cancels the connection stream silently: `TCPClientInterface` deliberately emits
                 // no `.disconnected` event for it, so the router would keep the interface
-                // registered, links on it would stay open, and a host keying "is TCP up?" on
-                // `interfaceDisconnected` (the app's foreground re-dial does) would never re-dial.
-                // Deregister here, exactly as a dropped socket does, but only when the interface
-                // is actually registered — a disconnect while still connecting has nothing to undo.
-                guard let id = state.tcpClient?.interfaceID, state.transport.interfaces[id] != nil
-                else { return .none }
+                // registered, links on it would stay open, and a host keying "is this node up?" on
+                // `interfaceDisconnected` would never re-dial. Deregister here, exactly as a
+                // dropped socket does, but only when the interface is actually registered — a
+                // disconnect while still connecting has nothing to undo. Only THIS client's id.
+                guard state.transport.interfaces[id] != nil else { return .none }
                 return .merge([.send(.transport(.interfaceDisconnected(id))),
                                .send(.linkPlane(.interfaceDisconnected(id)))]
                               + maintenanceStopEffect(state, departing: id))
+
+            case let .removeTCPClient(id):
+                guard let driver = state.tcpClients[id: id] else { return .none }
+                var effects: [Effect<Action>] = []
+                if state.transport.interfaces[id] != nil {
+                    effects.append(.send(.transport(.interfaceDisconnected(id))))
+                    effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
+                    effects.append(contentsOf: maintenanceStopEffect(state, departing: id))
+                }
+                // Removing the element makes `forEach` cancel the slot's effects; cancellation
+                // stops the stream reader but never closes the socket, so close it here.
+                state.tcpClients.remove(id: id)
+                let connection = connectionPool.connection(driver.interface.connectionKey)
+                effects.append(.run { _ in await connection.close() })
+                return .merge(effects)
 
             // --- TCP-server connection lifecycle → shared router interface set (+ maintenance) ---
             // Mirrors the BLE 1:N peer wiring: one Transport InterfaceID per accepted connection,
@@ -334,23 +355,23 @@ public struct TransportEndpoint {
 
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).
-            case .tcpClient, .tcpServer, .ble, .transport, .linkPlane, .link, .delegate,
+            case .tcpClients, .tcpServer, .ble, .transport, .linkPlane, .link, .delegate,
                  .sendOverLink, .sendResourceOverLink, .cancelResource, .identifyOverLink, .sendRequestOverLink,
                  .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
                  .closeLink, .registerRequestHandler, .deregisterRequestHandler:
                 return .none
             }
         }
-        .ifLet(\.tcpClient, action: \.tcpClient) { TCPEndpoint() }
+        .forEach(\.tcpClients, action: \.tcpClients) { TCPEndpoint() }
         .ifLet(\.tcpServer, action: \.tcpServer) { TCPServerEndpoint() }
         .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
     }
 
     /// The ONE maintenance loop (path-expiry / link-table / discovery-request GC) is shared by the
     /// whole router, so its start/stop MUST be driven off the SHARED interface count — not any one
-    /// driver's own map. Otherwise a multi-driver node (tcpClient + tcpServer, the slice's opt-in
-    /// client+listener case) would halt GC for still-live interfaces the moment ANY one driver lost
-    /// its last interface.
+    /// driver's own map. Otherwise a multi-driver node (several tcpClients, tcpServer, the slice's
+    /// opt-in client+listener case) would halt GC for still-live interfaces the moment ANY one
+    /// driver lost its last interface.
     ///
     /// Evaluation order (verified): the connect/disconnect arms register the interface with the
     /// router by RETURNING `.transport(.interfaceConnected/interfaceDisconnected(...))` as effects,
@@ -375,16 +396,16 @@ public struct TransportEndpoint {
         return isLast ? [.send(.transport(.stopMaintenance))] : []
     }
 
-    /// Routes an outbound (already IFAC-masked) buffer to whichever driver owns `txID`. The
-    /// TCP-client owns its single `interfaceID`; the TCP-server owns each accepted connection in
-    /// its `connInterfaces` map (1:N, like BLE); BLE owns each token in its `peerInterfaces` map.
-    /// If the id maps to no live driver interface, the send is not deliverable: for BLE, surface
-    /// `.sendFailed` (a stale binding otherwise dies silently on the ~60s inactivity watchdog);
-    /// for TCP the id mismatch cannot occur for a live socket, so drop.
+    /// Routes an outbound (already IFAC-masked) buffer to whichever driver owns `txID`. Each TCP
+    /// client owns its own `interfaceID` (the set key); the TCP-server owns each accepted
+    /// connection in its `connInterfaces` map (1:N, like BLE); BLE owns each token in its
+    /// `peerInterfaces` map. If the id maps to no live driver interface, the send is not
+    /// deliverable: for BLE, surface `.sendFailed` (a stale binding otherwise dies silently on the
+    /// ~60s inactivity watchdog); for TCP the id mismatch cannot occur for a live socket, so drop.
     private func transmit(_ state: State, to txID: InterfaceID,
                           masked: Data, unmasked: Data) -> Effect<Action> {
-        if let driver = state.tcpClient, driver.interfaceID == txID {
-            return .send(.tcpClient(.interface(.send(masked))))
+        if state.tcpClients[id: txID] != nil {
+            return .send(.tcpClients(.element(id: txID, action: .interface(.send(masked)))))
         }
         if let conn = state.tcpServer?.connInterfaces[txID] {
             return .send(.tcpServer(.interface(.send(conn: conn, masked))))

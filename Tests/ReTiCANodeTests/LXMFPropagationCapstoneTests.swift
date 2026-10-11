@@ -58,9 +58,9 @@ import ComposableArchitecture
     }
 
     // Send-frame predicates.
-    func sSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
-    func rSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
-    func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
+    func sSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = act { return true }; return false }
+    func rSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = act { return true }; return false }
+    func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = act { return true }; return false }
 
     let sentS  = LockIsolated<[Data]>([])
     let sentR  = LockIsolated<[Data]>([])

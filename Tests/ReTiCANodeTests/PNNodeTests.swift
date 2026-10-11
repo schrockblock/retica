@@ -235,12 +235,12 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     let peerDest = Data(repeating: 0xD0, count: 16); let linkID = Data(repeating: 0xD1, count: 16)
     var initial = PNNode.State(identity: aIdentity, endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
-        identity: peerIdentity, appData: nil, ratchet: nil, interfaceID: initial.endpoint.tcpClient!.interfaceID,
+        identity: peerIdentity, appData: nil, ratchet: nil, interfaceID: initial.endpoint.tcpClients[0].interfaceID,
         hops: 1, nextHop: nil, announceEmitted: 0)
     // A learned path implies the interface it was heard on exists; seeding one without the other
     // builds a state the runtime cannot reach. `openLink` now gates on `reachableLearned`, which
     // reads BOTH, so the fixture has to be coherent.
-    initial.endpoint.transport.interfaces[initial.endpoint.tcpClient!.interfaceID] = .tcp
+    initial.endpoint.transport.interfaces[initial.endpoint.tcpClients[0].interfaceID] = .tcp
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
         $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing

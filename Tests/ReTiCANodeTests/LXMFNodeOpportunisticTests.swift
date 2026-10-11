@@ -44,9 +44,9 @@ import ComposableArchitecture
     // Both register + announce their lxmf.delivery destination; bridge announces so each learns the other
     // (path + identity — B needs A's identity to validate A's signature).
     await a.send(.registerDelivery)
-    await a.receive { if case .endpoint(.tcpClient(.interface(.send))) = $0 { return true }; return false }
+    await a.receive { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = $0 { return true }; return false }
     await b.send(.registerDelivery)
-    await b.receive { if case .endpoint(.tcpClient(.interface(.send))) = $0 { return true }; return false }
+    await b.receive { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!))                 // B's announce → A learns B
     await a.receive { if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))                 // A's announce → B learns A
@@ -54,7 +54,7 @@ import ComposableArchitecture
 
     // A sends opportunistically to B; bridge the DATA packet to B.
     await a.send(.send(destinationHash: bDeliveryHash, title: Data("hi".utf8), content: Data("hello node".utf8), method: .opportunistic))
-    await a.receive { if case .endpoint(.tcpClient(.interface(.send))) = $0 { return true }; return false }
+    await a.receive { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
 
     // B's LXMFNode surfaces the reconstructed + validated message.

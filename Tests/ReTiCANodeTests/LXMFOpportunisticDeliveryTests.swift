@@ -43,13 +43,13 @@ import ComposableArchitecture
 
     // B announces its lxmf.delivery destination; A learns it (so A can address + encrypt to B).
     await b.send(.announce(destinationHash: bDelivery.hash, appData: nil))
-    await b.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
+    await b.receive { if case .tcpClients(.element(id: _, action: .interface(.send))) = $0 { return true }; return false }
     eventsA.yield(.data(sentB.value.last!))
     await a.receive(\.transport.received); await a.receive(\.delegate.pathLearned)
 
     // A announces its lxmf.delivery destination; B learns it (so B can resolve the sender identity).
     await a.send(.announce(destinationHash: aDelivery.hash, appData: nil))
-    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
+    await a.receive { if case .tcpClients(.element(id: _, action: .interface(.send))) = $0 { return true }; return false }
     eventsB.yield(.data(sentA.value.last!))
     await b.receive(\.transport.received); await b.receive(\.delegate.pathLearned)
 
@@ -58,7 +58,7 @@ import ComposableArchitecture
                                timestamp: 1700000000.5, title: Data("hi".utf8), content: Data("hello lxmf".utf8))
     #expect(bDelivery.hash == LXMessage.deliveryHash(identityHash: bIdentity.hash))   // addressing sanity
     await a.send(.send(destinationHash: bDelivery.hash, plaintext: msg.opportunisticPayload))
-    await a.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
+    await a.receive { if case .tcpClients(.element(id: _, action: .interface(.send))) = $0 { return true }; return false }
 
     // Bridge the DATA packet to B; B decrypts and surfaces the plaintext.
     let got = LockIsolated<(Data, Data)?>(nil)

@@ -38,7 +38,7 @@ private func makeClientPlusServer()
     let now = LockIsolated(Date(timeIntervalSince1970: 0))
     let clock = TestClock<Duration>()
     let initial = TransportEndpoint.State(
-        tcpClient: TCPEndpoint.State(host: "peer", port: 4242, reconnectOnDrop: false),
+        tcpClients: [TCPEndpoint.State(host: "peer", port: 4242, reconnectOnDrop: false)],
         tcpServer: TCPServerEndpoint.State(port: 5252, profile: .tcp))
     let store = TestStore(initialState: initial) {
         TransportEndpoint()
@@ -173,7 +173,7 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     let clientEvents = AsyncStream<TCPEvent>.makeStream()
     let serverEvents = AsyncStream<TCPListenerEvent>.makeStream()
     let initial = TransportEndpoint.State(
-        tcpClient: TCPEndpoint.State(host: "peer", port: 4242, reconnectOnDrop: false),
+        tcpClients: [TCPEndpoint.State(host: "peer", port: 4242, reconnectOnDrop: false)],
         tcpServer: TCPServerEndpoint.State(port: 5252, profile: .tcp))
     let store = TestStore(initialState: initial) {
         MaintenanceRecorder(log: log) { TransportEndpoint() }

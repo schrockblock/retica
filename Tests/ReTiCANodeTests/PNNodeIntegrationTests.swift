@@ -59,8 +59,8 @@ import ComposableArchitecture
     }
 
     // Predicate helpers.
-    func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
-    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClient(.interface(.send)) = act { return true }; return false }
+    func pnSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = act { return true }; return false }
+    func cSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClients(.element(id: _, action: .interface(.send))) = act { return true }; return false }
 
     let sentPN = LockIsolated<[Data]>([])
     let sentC  = LockIsolated<[Data]>([])

@@ -45,8 +45,8 @@ import ComposableArchitecture
     }
 
     // Send-frame predicates.
-    func aSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
-    func bSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
+    func aSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = act { return true }; return false }
+    func bSend(_ act: PNNode.Action) -> Bool { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = act { return true }; return false }
 
     let sentA = LockIsolated<[Data]>([])
     let sentB = LockIsolated<[Data]>([])

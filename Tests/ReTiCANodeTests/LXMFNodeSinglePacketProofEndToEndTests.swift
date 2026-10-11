@@ -13,11 +13,11 @@ import ComposableArchitecture
 // Depth order on the receiving node B (breadth-first `.send` processing): for an inbound DATA packet,
 // `.endpoint(.proveSinglePacket)` and `.router(.received)` share a depth; the router's
 // `.router(.delegate(...))` comes next, then `.delegate(.messageReceived)`, and the proof's
-// `.endpoint(.tcpClient(.interface(.send)))` comes LAST. The receives below follow that order.
+// `.endpoint(.tcpClients(.element(id: _, action: .interface(.send))))` comes LAST. The receives below follow that order.
 
 /// Nonisolated on purpose: it is passed as `receive`'s matcher.
 private func isTCPSend(_ action: LXMFNode.Action) -> Bool {
-    if case .endpoint(.tcpClient(.interface(.send))) = action { return true }
+    if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = action { return true }
     return false
 }
 
@@ -229,8 +229,8 @@ private final class Pair {
     await p.b.receive(isTCPSend)
     let proof = await nextFrame(p.sentB, after: bFrames)
     p.eventsA.yield(.data(proof))
-    await p.a.receive(.endpoint(.tcpClient(.interface(.connectionEvent(.data(proof))))))
-    await p.a.receive { if case .endpoint(.tcpClient(.interface(.delegate(.packetReceived)))) = $0 { return true }; return false }
+    await p.a.receive(.endpoint(.tcpClients(.element(id: InterfaceID("tcp"), action: .interface(.connectionEvent(.data(proof)))))))
+    await p.a.receive { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.delegate(.packetReceived))))) = $0 { return true }; return false }
     await p.a.receive({ if case .endpoint(.transport(.received)) = $0 { return true }; return false }) {
         $0.endpoint.transport.pendingReceipts = [:]
     }

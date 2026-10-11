@@ -49,9 +49,9 @@ private func makeBLE() -> TestStore<TransportEndpoint.State, TransportEndpoint.A
 @Test @MainActor func startAndStopMapToEachDriversLifecycle() async {
     let tcp = makeTCP()
     await tcp.send(.start)
-    await tcp.receive(.tcpClient(.connect))
+    await tcp.receive(.tcpClients(.element(id: InterfaceID("tcp"), action: .connect)))
     await tcp.send(.stop)
-    await tcp.receive(.tcpClient(.disconnect))
+    await tcp.receive(.tcpClients(.element(id: InterfaceID("tcp"), action: .disconnect)))
 
     let ble = makeBLE()
     await ble.send(.start)

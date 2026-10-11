@@ -100,7 +100,7 @@ struct LiveLinkProbeTests {
 
         // 1. The socket must come up.
         let connected = await waitFor("connect") {
-            store.state.endpoint.tcpClient?.interface.status == .online
+            store.state.endpoint.tcpClients.first?.interface.status == .online
         }
         #expect(connected, "never connected to the hub — is rnsd running on 4250?")
 

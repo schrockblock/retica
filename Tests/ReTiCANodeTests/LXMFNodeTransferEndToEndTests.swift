@@ -30,7 +30,7 @@ private func nextFrame(_ sent: LockIsolated<[Data]>, after count: Int) async -> 
 }
 
 private func isTCPSend(_ action: LXMFNode.Action) -> Bool {
-    if case .endpoint(.tcpClient(.interface(.send))) = action { return true }
+    if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = action { return true }
     return false
 }
 

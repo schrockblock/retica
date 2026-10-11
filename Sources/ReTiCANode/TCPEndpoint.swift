@@ -11,17 +11,20 @@ import ReTiCATransport
 /// does all the transport/link-plane wiring against the arriving `interfaceID`; this driver only
 /// carries the interface and forwards `connect`/`disconnect`/`send` to it.
 ///
-/// The driver is scoped by KIND (`\.tcpClient`) in `TransportEndpoint`, so there is at most one
-/// TCP client per node this slice.
+/// `TransportEndpoint` holds a SET of these (`tcpClients`, keyed by `interfaceID`), one per node
+/// dialed, each over its own socket (`TCPConnectionPool`).
 @Reducer
 public struct TCPEndpoint {
     @ObservableState
-    public struct State: Equatable {
+    public struct State: Equatable, Identifiable {
         public var interface: TCPClientInterface.State
         public let interfaceID: InterfaceID
         /// Metadata registered with the shared Transport for this interface (C1). Mode/bitrate
         /// are configuration — override at init to declare e.g. a roaming node.
         public let profile: InterfaceProfile
+        /// The set key in `TransportEndpoint.tcpClients`: the interface id, which the host app
+        /// derives from what the slot dials (`tcp:<host>:<port>`).
+        public var id: InterfaceID { interfaceID }
 
         public init(host: String, port: UInt16, reconnectOnDrop: Bool = true,
                     interfaceID: InterfaceID = InterfaceID("tcp"),

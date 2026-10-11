@@ -98,7 +98,7 @@ private func tcpServerDriverEndpoint(port: UInt16 = 4242,
     // 3. Client opens a link → LINKREQUEST written out the client socket.
     await client.send(.openLink(destinationHash: dest.hash))
     await client.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
-    await client.receive { if case .tcpClient(.interface(.send)) = $0 { return true }; return false }
+    await client.receive { if case .tcpClients(.element(id: _, action: .interface(.send))) = $0 { return true }; return false }
     let linkRequestFrame = try #require(sentByClient.value.last)
 
     // 4. That LINKREQUEST arrives at the SERVER over its accepted connection → server routes it,

@@ -54,8 +54,8 @@ import ComposableArchitecture
         return (store, events.continuation)
     }
 
-    func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClient(.interface(.send))) = act { return true }; return false }
-    func epSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClient(.interface(.send)) = act { return true }; return false }
+    func aSend(_ act: LXMFNode.Action) -> Bool { if case .endpoint(.tcpClients(.element(id: _, action: .interface(.send)))) = act { return true }; return false }
+    func epSend(_ act: TransportEndpoint.Action) -> Bool { if case .tcpClients(.element(id: _, action: .interface(.send))) = act { return true }; return false }
 
     let sentA = LockIsolated<[Data]>([]); let sentR = LockIsolated<[Data]>([]); let sentPN = LockIsolated<[Data]>([])
     let (a, eventsA) = makeNode("a", aIdentity, sentA)
