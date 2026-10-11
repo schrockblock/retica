@@ -26,6 +26,10 @@ public struct TCPClientInterface {
         /// explicit disconnect), so a `.writerFinished` from a superseded writer is ignored.
         var writerGeneration: UInt64
 
+        /// What this interface dials, as the `TCPConnectionPool` keys it. Stable for the life of a
+        /// socket: the endpoint rebuilds a slot rather than re-pointing a live one.
+        public var connectionKey: String { "\(host):\(port)" }
+
         public init(host: String, port: UInt16, reconnectOnDrop: Bool = true) {
             self.host = host
             self.port = port
@@ -51,7 +55,7 @@ public struct TCPClientInterface {
         public enum Delegate: Equatable { case packetReceived(Data) }
     }
 
-    @Dependency(\.tcpConnection) var tcpConnection
+    @Dependency(\.tcpConnectionPool) var connectionPool
     @Dependency(\.continuousClock) var clock
 
     private enum CancelID { case connection, reconnect, writer }
@@ -59,7 +63,11 @@ public struct TCPClientInterface {
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { [tcpConnection, clock] state, action in
+        Reduce { [connectionPool, clock] state, action in
+            // Each interface dials through its OWN socket (see `TCPConnectionPool`), resolved per
+            // reduce from the current host:port. Resolving here rather than once at init keeps the
+            // dependency context the store's, so a test's injected pool (or `\.tcpConnection`) wins.
+            let tcpConnection = connectionPool.connection(state.connectionKey)
             // Start the single writer if it is idle and there is anything to write. It takes the
             // WHOLE outbox as one batch and awaits each `tcpConnection.send` before starting the
             // next, so frames reach the connection in exactly outbox order. Frames reduced while a
