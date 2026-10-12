@@ -74,3 +74,28 @@ private func quietConnection() -> TCPConnection {
     await store.receive(.connectionEvent(.disconnected(reason: "connection stream ended")))
     #expect(opened.value == ["h:7"], "the interface must dial the pool entry for its own host:port")
 }
+
+@Test func tcpPoolEvictMakesTheNextRequestANewConnection() {
+    let made = LockIsolated(0)
+    let pool = TCPConnectionPool.memoized {
+        made.withValue { $0 += 1 }
+        return quietConnection()
+    }
+    _ = pool.connection("a:1")
+    pool.evict("a:1")
+    _ = pool.connection("a:1")
+    _ = pool.connection("a:1")
+    #expect(made.value == 2, "an evicted key is made again exactly once")
+}
+
+@Test func tcpPoolEvictOfAnUnknownKeyIsANoOp() {
+    let made = LockIsolated(0)
+    let pool = TCPConnectionPool.memoized {
+        made.withValue { $0 += 1 }
+        return quietConnection()
+    }
+    _ = pool.connection("a:1")
+    pool.evict("nobody:9")
+    _ = pool.connection("a:1")
+    #expect(made.value == 1)
+}
