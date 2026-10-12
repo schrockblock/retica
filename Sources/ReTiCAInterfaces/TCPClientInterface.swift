@@ -27,7 +27,9 @@ public struct TCPClientInterface {
         var writerGeneration: UInt64
 
         /// What this interface dials, as the `TCPConnectionPool` keys it. Stable for the life of a
-        /// socket: the endpoint rebuilds a slot rather than re-pointing a live one.
+        /// socket: a host that changes a node's host or port removes the slot
+        /// (`TransportEndpoint.removeTCPClient`, which also evicts this key) and adds a new one
+        /// rather than re-pointing a live interface.
         public var connectionKey: String { "\(host):\(port)" }
 
         public init(host: String, port: UInt16, reconnectOnDrop: Bool = true) {

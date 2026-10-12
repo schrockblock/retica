@@ -1907,7 +1907,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
 /// router kept the interface registered: `interfaces` still held it, links on it never learned the
 /// interface was gone, and a host keying "is TCP up?" on `interfaceDisconnected` never re-dialled.
 ///
-/// Mutation: remove the `.tcpClients(.element(id: InterfaceID("tcp"), action: .disconnect))` arm from `TransportEndpoint` → no
+/// Mutation: remove the `.tcpClients(.element(_, .disconnect))` arm from `TransportEndpoint` → no
 /// `interfaceDisconnected` is ever emitted → the `receive` below times out and the test fails.
 @Test @MainActor func explicitStopDeregistersTheTCPInterface() async {
     let (store, events) = makeStore()

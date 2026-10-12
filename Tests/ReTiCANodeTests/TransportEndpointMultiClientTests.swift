@@ -18,12 +18,19 @@ private let keyA = "a:4242"
 private let keyB = "b:4242"
 
 /// A keyed mock pool: one PRE-MADE event stream per "host:port" (so a test can yield before the
-/// interface starts reading), sends and closes recorded by key, and a close signal to await.
+/// interface starts reading), sends recorded by key, evictions and closes recorded in ONE ordered
+/// log (`events`: `"evict:<key>"` / `"close:<key>"`), and a close signal to await.
 private struct KeyedPool {
     let streams: [String: AsyncStream<TCPEvent>]
     let continuations: [String: AsyncStream<TCPEvent>.Continuation]
     let sends = LockIsolated<[String]>([])
+    let events = LockIsolated<[String]>([])
     let closed = AsyncStream<String>.makeStream()
+
+    /// The keys closed so far, in order.
+    var closedLog: [String] {
+        events.value.compactMap { $0.hasPrefix("close:") ? String($0.dropFirst("close:".count)) : nil }
+    }
 
     init(keys: [String]) {
         var streams: [String: AsyncStream<TCPEvent>] = [:]
@@ -40,16 +47,41 @@ private struct KeyedPool {
     var pool: TCPConnectionPool {
         let streams = self.streams
         let sends = self.sends
+        let events = self.events
         let closedContinuation = self.closed.continuation
-        return TCPConnectionPool { key in
-            TCPConnection(
-                open: { _, _ in streams[key] ?? .finished },
-                send: { _ in sends.withValue { $0.append(key) } },
-                close: { closedContinuation.yield(key) })
-        }
+        return TCPConnectionPool(
+            connection: { key in
+                TCPConnection(
+                    open: { _, _ in streams[key] ?? .finished },
+                    send: { _ in sends.withValue { $0.append(key) } },
+                    close: {
+                        events.withValue { $0.append("close:\(key)") }
+                        closedContinuation.yield(key)
+                    })
+            },
+            evict: { key in events.withValue { $0.append("evict:\(key)") } })
     }
 
     func yield(_ key: String, _ event: TCPEvent) { continuations[key]?.yield(event) }
+}
+
+/// The next close signal, or nil after `seconds`: a lost close must fail the test, not hang the
+/// suite. The stream is made once per pool and read here only, so there is exactly one consumer.
+private func nextClose(_ keyed: KeyedPool, within seconds: Double = 5) async -> String? {
+    let stream = keyed.closed.stream
+    return await withTaskGroup(of: String?.self) { group in
+        group.addTask {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        group.addTask {
+            try? await Task.sleep(for: .seconds(seconds))
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
+    }
 }
 
 /// Records every `.transport(.startMaintenance)` / `.stopMaintenance` the container processes.
@@ -233,9 +265,23 @@ private func activeLink(id: UUID, on interfaceID: InterfaceID, linkID: Data) -> 
 
     await store.send(.removeTCPClient(idA))
     await store.skipReceivedActions(strict: false)
-    var closes = keyed.closed.stream.makeAsyncIterator()
-    let first = await closes.next()
-    #expect(first == keyA, "removal must close the removed client's socket, and only that one")
+    let first = await nextClose(keyed)
+    #expect(first == keyA, "removal must close the removed client's socket")
+    #expect(keyed.closedLog == [keyA], "and only that one")
+    await store.send(.stop)
+    await store.skipReceivedActions(strict: false)
+}
+
+/// The pool entry is retired before the (async) close, so a slot re-added for the same host:port
+/// meanwhile dials a fresh actor and this close can only hit the old one.
+@Test @MainActor func multiClientRemoveTCPClientEvictsBeforeItCloses() async {
+    let (store, keyed) = makeTwoClients()
+    await connectBoth(store, keyed)
+
+    await store.send(.removeTCPClient(idA))
+    await store.skipReceivedActions(strict: false)
+    _ = await nextClose(keyed)
+    #expect(keyed.events.value == ["evict:\(keyA)", "close:\(keyA)"])
     await store.send(.stop)
     await store.skipReceivedActions(strict: false)
 }

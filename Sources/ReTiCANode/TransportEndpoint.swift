@@ -229,9 +229,13 @@ public struct TransportEndpoint {
                     effects.append(contentsOf: maintenanceStopEffect(state, departing: id))
                 }
                 // Removing the element makes `forEach` cancel the slot's effects; cancellation
-                // stops the stream reader but never closes the socket, so close it here.
+                // stops the stream reader but never closes the socket, so close it here. Evict
+                // FIRST (synchronously): a slot re-added for the same host:port in the meantime
+                // then dials a fresh actor, and this late close can only ever hit the old one.
                 state.tcpClients.remove(id: id)
-                let connection = connectionPool.connection(driver.interface.connectionKey)
+                let key = driver.interface.connectionKey
+                let connection = connectionPool.connection(key)
+                connectionPool.evict(key)
                 effects.append(.run { _ in await connection.close() })
                 return .merge(effects)
 
