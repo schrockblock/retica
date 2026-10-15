@@ -85,14 +85,17 @@ func ignoreListKey(_ sender: Identity) -> Data {
 }
 
 @MainActor @Test func ignoreList_rehydrate_replacesRatherThanMerges() async {
-    let old = Data(repeating: 0x01, count: 16)
+    let sender = Identity()
     let new1 = Data(repeating: 0x02, count: 16)
     let new2 = Data(repeating: 0x03, count: 16)
-    let store = makeIgnoreListStore(ignored: [old])
+    let store = makeIgnoreListStore(ignored: [ignoreListKey(sender)])
     store.exhaustivity = .on
     await store.send(.rehydrateIgnoredDestinations([new1, new2])) {
         $0.ignoredDestinations = [new1, new2]
     }
+    store.exhaustivity = .off
+    let hash = await deliveredHash(store, ignoreListMessage(from: sender))
+    #expect(hash != nil)
 }
 
 @MainActor @Test func ignoreList_rehydrateEmpty_clears() async {
@@ -104,8 +107,7 @@ func ignoreListKey(_ sender: Identity) -> Data {
     }
 }
 
-/// Drives one delivery through the node and returns the hash of the message the app would
-/// have received, or nil when nothing was emitted within `wait`.
+/// Drives one delivery through the node and returns the hash of the message the app would have received, or nil when nothing was emitted within one second.
 @MainActor
 func deliveredHash(_ store: TestStore<LXMFNode.State, LXMFNode.Action>,
                    _ message: LXMessage, validated: Bool = false,
@@ -173,11 +175,11 @@ func deliveredHash(_ store: TestStore<LXMFNode.State, LXMFNode.Action>,
     #expect(hash == message.hash)
 }
 
-/// The gate sits before the stamp path. With a cost configured, enforcement off and an invalid
-/// stamp the stamp path alone DELIVERS (flagged invalid), so the only way this message can be
-/// dropped is the ignore guard. The same setup for a non-ignored sender proves the stamp path
-/// still runs when the set is non-empty.
-@MainActor @Test func ignoreList_ignoredSource_dropsBeforeStampPath() async {
+/// With a cost configured, enforcement off and an invalid stamp, the stamp path alone DELIVERS
+/// (flagged invalid), so the only way this message can be dropped is the ignore guard. The same
+/// setup for a non-ignored sender proves the stamp path still runs when the set is non-empty.
+/// (That the guard sits before the stamp work is a cost property, not observable here.)
+@MainActor @Test func ignoreList_ignoredSource_droppedEvenWhenStampPathWouldDeliver() async {
     let cost = 8
     let seed = Data(repeating: 0x11, count: 32) + Data(repeating: 0x22, count: 32)
     let sender = Identity(privateKey: seed)!
