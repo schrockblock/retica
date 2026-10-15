@@ -864,6 +864,17 @@ public struct LXMFNode {
                 // message already reaches the app via `.messageReceived`. A message arriving with
                 // `stampChecked == false` was never validated (no cost configured), which is a different
                 // statement from "validated and failed"; the app can tell those apart.
+                // Ignore list, reference `LXMRouter.lxmf_delivery`'s `ignored_list` check: the
+                // sender's lxmf.delivery hash is on the host's list, so the message goes nowhere.
+                // Sits BEFORE stamp validation so a blocked sender never costs the ~60 ms
+                // workblock, and after the router's `seen` dedup, so a resend of this message is
+                // reported as a duplicate rather than reaching here again. The proof already went
+                // out when the packet arrived; a propagated copy is already marked downloaded.
+                // `sourceHash` is unauthenticated when `validated == false`; a forged hash only
+                // loses the forger's own message. Spec 2026-10-15 §1.
+                if state.ignoredDestinations.contains(message.sourceHash) {
+                    return .none
+                }
                 var delivered = message
                 if let cost = state.deliveryStampCost {
                     let stampValid = message.validateStamp(targetCost: cost)
