@@ -115,6 +115,13 @@ public struct LXMFNode {
         /// to generate a delivery stamp. **Do not feed `stampCost` into stamp generation without a
         /// ceiling check first** — see `LXMFNode.LearnedPeer` for the security rationale.
         public var learnedPeers: [Data: LXMFNode.LearnedPeer] = [:]
+        /// Senders whose messages are dropped on delivery: `lxmf.delivery` destination hashes
+        /// (what `LXMessage.sourceHash` carries), never raw identity hashes. Reference
+        /// `LXMRouter.ignored_list` (LXMRouter.py, LXMF 1.1.1). The library holds the set in
+        /// memory only; the host persists it and replays it with `.rehydrateIgnoredDestinations`
+        /// on launch, like `rehydrateLearnedPeers`. Announces from an ignored peer still update
+        /// `learnedPeers`: the library hides no peers, the host does.
+        public var ignoredDestinations: Set<Data> = []
 
         /// Display name advertised in every delivery-destination announce.
         /// Nil means no name is encoded (the announce still carries the full app-data blob per
@@ -208,6 +215,14 @@ public struct LXMFNode {
         /// comparison keeps an entry exactly one expiry old, matching reference's strict
         /// `time.time() > entry[0] + STAMP_COST_EXPIRY`.
         case rehydrateLearnedPeers([Data: LearnedPeer])
+        /// Drop every message whose `sourceHash` equals this lxmf.delivery hash. State only.
+        /// Reference `LXMRouter.ignore_destination`.
+        case ignoreDestination(Data)
+        /// Reverse of `ignoreDestination`. State only. Reference `LXMRouter.unignore_destination`.
+        case unignoreDestination(Data)
+        /// Replace the whole ignore set. The host sends it on launch next to
+        /// `rehydrateLearnedPeers`; an empty set clears everything.
+        case rehydrateIgnoredDestinations(Set<Data>)
         case registerDelivery
         /// Update the display name and delivery stamp cost carried in the delivery-destination
         /// app data. **State only — this sends nothing.** Follow it with `.announceDelivery`
@@ -470,6 +485,18 @@ public struct LXMFNode {
                     if let live = state.learnedPeers[hash], live.learnedAt >= peer.learnedAt { continue }
                     state.learnedPeers[hash] = peer
                 }
+                return .none
+
+            case let .ignoreDestination(hash):
+                state.ignoredDestinations.insert(hash)
+                return .none
+
+            case let .unignoreDestination(hash):
+                state.ignoredDestinations.remove(hash)
+                return .none
+
+            case let .rehydrateIgnoredDestinations(hashes):
+                state.ignoredDestinations = hashes
                 return .none
 
             case .registerDelivery:
