@@ -763,11 +763,16 @@ public struct Transport {
                         // A reflection of our OWN LINKREQUEST carries our own linkID (hashablePart excludes
                         // header/transport fields), so it would otherwise table a shadow of our live link. Drop it.
                         guard !state.localLinkIDs.contains(linkID) else { return .none }
+                        // Amended Contract 4: plus one MTU of airtime on the interface the request
+                        // ARRIVED on (`interfaceID`, which is the link's `rcvdIf`), as reference does:
+                        // `extra_link_proof_timeout(packet.receiving_interface)`
+                        // (RNS/Transport.py:1643-1644, local 1.4.1 fork). Unknown bitrate → no extra.
                         state.linkTable[linkID] = State.LinkTableEntry(
                             rcvdIf: interfaceID, nhIf: entry.interfaceID, refreshedAt: date.now,
                             validated: false,
                             proofDeadline: date.now.addingTimeInterval(
-                                Self.establishmentTimeoutPerHop * Double(max(1, entry.hops))))
+                                Self.establishmentTimeoutPerHop * Double(max(1, entry.hops))
+                                + LinkTiming.relayProofExtraTimeout(bitrate: state.interfaces[interfaceID]?.bitrate)))
                         guard let raw = forwardTowardDest(packet, entry) else { return .none }
                         return .send(.delegate(.transmit(entry.interfaceID, raw)))
                     }
@@ -1254,7 +1259,8 @@ public struct Transport {
     static let linkTableExpiry: TimeInterval = 900              // 720 * 1.25
     /// RNS ESTABLISHMENT_TIMEOUT_PER_HOP (Link.py). An unvalidated relay entry gets a hard deadline
     /// of now + this * max(1, hops-to-dest); if no proof flows through by then it is reaped, so junk
-    /// LINKREQUESTs cannot accumulate.
+    /// LINKREQUESTs cannot accumulate. Plus `LinkTiming.relayProofExtraTimeout` of the interface the
+    /// request arrived on.
     static let establishmentTimeoutPerHop: TimeInterval = LinkTiming.establishmentTimeoutPerHop
     /// Single-packet receipt lifetime: `receiptTimeoutBase + receiptTimeoutPerHop * max(1, hops)`.
     /// Reference: `PacketReceipt.timeout = first_hop_timeout + TIMEOUT_PER_HOP * hops_to(dest)`
