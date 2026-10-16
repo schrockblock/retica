@@ -795,6 +795,9 @@ public struct LXMFNode {
                               deliver)
 
             case let .endpoint(.delegate(.pathLearned(h, _))):
+                // Synchronous, before the router sees anything for `h` (Transport already holds the
+                // new path: its Scope ran first).
+                refreshNextHopRetryWait(&state, h)
                 var effects: [Effect<Action>] = [.send(.router(.learnedPath(destinationHash: h)))]
                 if let learned = state.endpoint.learned[h] {
                     effects.append(.send(.router(.learnedIdentity(destinationHash: h, identity: learned.identity))))
@@ -1133,6 +1136,25 @@ public struct LXMFNode {
         return .send(.router(.abandonPendingPropagatedCopies(stillSearching: Set(state.inFlightDeliveryStamps))))
     }
 
+    /// Copy Transport's CURRENT next hop for `destinationHash` into the router's retry-wait table
+    /// (Contract 4: LXMF retry wait = max(10, 4·MTU·8/b)). A wait equal to the default is REMOVED
+    /// rather than stored, so on TCP/BLE the router's state never changes.
+    ///
+    /// Called where a path can appear or change (`.pathLearned`) and immediately before a delivery
+    /// copy is handed to the router (`deliverySend`). The second call covers what the first cannot
+    /// see: a path restored by `rehydrateLearnedDestinations` (no `pathLearned`), an interface
+    /// re-registered under the same id with a new bitrate, and a next hop that has disconnected
+    /// (falls back to the default). Accepted gap (spec): a change DURING a retry run is seen only at
+    /// the next announce or send.
+    private func refreshNextHopRetryWait(_ state: inout State, _ destinationHash: Data) {
+        let bitrate = state.endpoint.transport.nextHopInterfaceProfile(destinationHash)?.bitrate
+        let wait = LXMFDelivery.retryWait(nextHopBitrate: bitrate)
+        let stored: Int? = wait == LXMFDelivery.retryWaitSeconds ? nil : wait
+        if state.router.nextHopRetryWaits[destinationHash] != stored {
+            state.router.nextHopRetryWaits[destinationHash] = stored
+        }
+    }
+
     /// The delivery stamp cost to apply when sending to `destinationHash`, or **nil meaning
     /// "no stamp"** (either no cost is known or the announced cost exceeds the ceiling).
     ///
@@ -1182,6 +1204,7 @@ public struct LXMFNode {
     /// `.delegate(.deliveryFailed)` for every hash in `State.inFlightDeliveryStamps` — appended here.
     private func deliverySend(_ state: inout State, message: LXMessage,
                               method: LXMFRouter.DeliveryMethod) -> Effect<Action> {
+        refreshNextHopRetryWait(&state, message.destinationHash)
         guard message.stamp == nil,
               let cost = deliveryStampCost(state, destinationHash: message.destinationHash)
         else { return .send(.router(.send(message: message, desiredMethod: method))) }
