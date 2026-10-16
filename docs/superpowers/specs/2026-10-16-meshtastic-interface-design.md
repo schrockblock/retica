@@ -223,6 +223,14 @@ The app installs the real driver with `$0.meshtasticDriver = .live(session:)` fr
 - There is no slot-removal action: to drop the radio, lane E sends `.meshtastic(.stop)`, waits for
   `.radioOffline`, then sets the slot to nil — nil-ing an online slot leaves its interface
   registered in Transport.
+- **Stop semantics (amended 2026-10-16 after lane B's final review):** a stop-initiated
+  `.radioOffline` is emitted only **after `driver.stop()` has returned** (from the `.driverStopped`
+  arm), so "offline" means "the driver is fully down and the slot may be nil'd". A `.stop` to an
+  interface that is already stopped emits `.radioOffline(reason: nil)` immediately, so a waiter can
+  never hang. A stop that cancels a deferred restart (`restartPending`) still waits for the
+  in-flight `driver.stop()`. Lane B shipped the earlier semantics (offline concurrent with
+  `driver.stop()`, nothing on an already-stopped `.stop`); lane E corrects them first. The live
+  `driver.stop()` must always return.
 - `.adapterUnavailable(.other(_))` is non-terminal by `BLEAdapterUnavailable.isTerminal`, including
   the uninstalled-live-driver message; the app must not read "non-terminal" as "installed".
 
@@ -339,6 +347,10 @@ interface count (see the multi-interface lesson: never per-driver).
 | **C** slow-link timing | `pods/ReTiCA-worktrees/slow-link-timing` | existing `InterfaceProfile.bitrate` | now |
 | **D** ReTiCAMsgr UI (no new ReTiCA symbols) | `apps/ReTiCAMsgr-meshtastic` | `RadioScanner` client (own stub) | now |
 | **E** live adapter, app wiring, hardware | ReTiCA + ReTiCAMsgr | A, B, C, D merged | last |
+| **F** FCB scan ownership + power-off pending ops | `pods/FCB` (+ ReTiCA's `FCBDriverAdapter`) | — | with E |
+
+Lane E's ReTiCA-side tasks (stop fix, ingress-window fix, live adapter, coexistence probe) do not
+need F; E's app tasks that open the picker alongside a running BLE slot are gated on F merging.
 
 **Worktree path depth:** relative package paths must still resolve from the worktree. ReTiCA uses
 `../FCB` — `pods/ReTiCA-worktrees/FCB` is already a symlink to `pods/FCB`; lane E adds
@@ -388,25 +400,59 @@ Commits go straight to main in each repo (no feature-branch merge dance).
   `MeshtasticEndpoint.State.counters: MeshtasticCounters` (Contract 3), the rest from its delegates.
 - Merging D before E ships a toggle that only shows "radio not connected" in Diagnostics. Accepted.
 
-**Lane E (integration):**
+**Lane E (integration).** Order: ReTiCA-side tasks (0, 1, 2) in a ReTiCA worktree, fast-forward
+ReTiCA main, *then* app tasks (3, 4) in an app worktree — ReTiCaMsgrCore resolves
+`../../../pods/ReTiCA`, i.e. ReTiCA's main checkout, so app work only sees merged ReTiCA code.
+0. **Inherited fixes, first:** (a) Contract 3 stop semantics as amended above, in
+   `MeshtasticInterface`/`MeshtasticEndpoint`/`TransportEndpoint`, with tests for nil-ing the slot
+   right after `.radioOffline` followed by a new slot's `.start` (driver call order must be
+   `start, stop, start`, never `start, start, stop`) and for `.stop` on a stopped interface; (b) a
+   repeated `.interfaceConnected` for an id that is already registered must not reset
+   `Transport.interfaceConnectedAt` (it reopens the 2 h new-interface ingress window on every radio
+   reconnect) — fix in `Transport.swift`, decide and record whether a disconnect→reconnect of the
+   same id keeps the original time.
 1. `ReTiCAMeshtasticLive`: `MeshtasticDriver.live(session:)` — maps `.configured` → `.connected`,
    connection loss → `.disconnected`, `.packet(portnum 76, from ≠ myNodeNum)` → `.fragment`,
    adapter → `.unavailable`; `send` → `session.send(MeshtasticOutbound(portnum: 76, …))`.
    Loopback test against `MeshtasticMock` (live value, not a mock of it — the mocked-boundary lesson).
 2. **Coexistence probe** (first, before app wiring): RBTP `BLEDriver` and `MeshtasticSession`
    running on the one live FCB central — disconnect events filtered per peripheral, no scan
-   interference after the picker closes. **Known race to fix:** BLE stop is fire-and-forget and the
-   FCB driver adapter's stop always ends with `central.stopScan()` (`FCBDriverAdapter.swift:273-276`),
-   which ends *whatever* scan is current (`BluetoothCentralClient+Live.swift:228-231`) — so a slow
-   BLE stop (peers connected) can kill the picker's scan that just started. Fix in FCB by making
-   `stopScan` token-scoped (stop only the caller's own scan), with a probe that reproduces the race
-   first.
-3. App wiring: slot in `syncEndpointNodes`, restart in `redialDownNodes`, "will something dial"
-   checks, delegates → diagnostics state, live `RadioScanner`, targeted re-announce (the app's
+   interference after the picker closes. The scan race itself is lane F's to fix; E's probe pins
+   the end-to-end behaviour once F lands (written first as a failing probe if F hasn't merged).
+3. App wiring: slot in `syncEndpointNodes` (removal via the amended stop protocol), restart in
+   `redialDownNodes` keeping lane D's picker-deferred BLE start (`blePausedForRadioScan` means "start
+   BLE when the picker closes"), "will something dial" checks, guard Connect while the picker is
+   open, delegates + `counters` → `MeshtasticStatus`, the app installs `$0.meshtasticDriver =
+   .live(session:)` with one app-owned `MeshtasticSession` that is always `disconnect()`ed before
+   being dropped (its reconnect loop retains it), live `RadioScanner` over `MeshtasticScanner`
+   (stream finishes only when scanning has stopped for good), and targeted re-announce (the app's
    `interfaceConnected` handler sends lane C's `LXMFNode.Action.announceDeliveryOnInterface(id)`,
    which rides `TransportEndpoint.Action.announceOn(interface:destinationHash:appData:)`).
-4. Hardware verification per §1 criterion 3, recorded with the radio model, firmware version and
-   preset used.
+   ReTiCaMsgrCore adds `../../../pods/MeshtasticKit` as a direct dependency (it constructs the
+   session and scanner).
+4. Hardware verification per §1 criterion 3 — needs the user and two radios; recorded with radio
+   model, firmware version and preset. Includes radio → ReTiCA gateway → TCP responder (that
+   responder's 15 s timeout is a spec choice, unverified) and checks that `hopLimit: nil` → firmware
+   default behaves.
+
+**Lane F (FCB).** Both FCB defects are shared by every FCB consumer, so they're fixed in FCB, not
+worked around per consumer:
+1. **Scan ownership, both directions.** (a) open side: a slow BLE stop's `central.stopScan()`
+   (`FCBDriverAdapter.swift:273-276`) ends the picker's freshly started scan; (b) dismiss side: the
+   picker scanner's teardown ends BLE's freshly restarted scan, leaving BLE "online" but not
+   discovering. FCB's live `stopScan()` ends *whatever* scan is current
+   (`BluetoothCentralClient+Live.swift:228-231`) although `endScan(token:)` is already token-scoped.
+   Fix: a caller can only stop **its own** scan (token-scoped stop, or stream termination as the
+   only stop), and ReTiCA's `FCBDriverAdapter` and MeshtasticKit's scanner stop their own scans
+   only. Reproduce both directions as failing probes against the live FCB client over
+   CoreBluetoothMock first.
+2. **Pending operations at power-off.** `handleDidUpdateState` never calls `failPending`, so every
+   pending read/write/notify/discover continuation leaks at Bluetooth power-off and a stale
+   `pendingReads` entry makes the next `readValue` throw `operationCancelled` after reconnect;
+   `pendingConnect`/`pendingDiscover*` are overwritten on retry, leaking the old continuation.
+   Fix: fail every pending operation when the state leaves `.poweredOn`; a new pending op for a
+   slot that is already occupied fails the old one instead of overwriting it. MeshtasticKit's
+   workaround stays (harmless); ReTiCA's BLE driver gains coverage that it no longer hangs.
 
 ## 8. Testing
 
