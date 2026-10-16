@@ -304,7 +304,10 @@ public struct TransportEndpoint {
             // bitrate — is only known once the radio is configured, so the profile is computed
             // here. A repeated `.online` (preset changed, or a reconnect the driver reported
             // without a drop) re-registers with the new profile; maintenance is not re-armed
-            // because the shared interface set is not empty.
+            // because the shared interface set is not empty. Re-registering also resets
+            // Transport's interfaceConnectedAt for the id, reopening the new-interface ingress-
+            // control window (stricter announce ingress only). Preserving the
+            // timestamp across a re-register belongs in Transport.swift (lane C), not here.
             case let .meshtastic(.interface(.delegate(.online(myNodeNum, modemPreset)))):
                 guard let mesh = state.meshtastic else { return .none }
                 let id = mesh.interfaceID

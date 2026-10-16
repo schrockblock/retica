@@ -12,7 +12,8 @@ private let tcpID = InterfaceID("tcp")
 private let ownNode: UInt32 = 0x0A0A_0A0A
 private let peerNode: UInt32 = 0x0B0B_0B0B
 
-/// Records every maintenance start/stop the wrapped reducer processes, exactly once each.
+/// Records every maintenance start/stop, and every deregistration of the radio's interface id,
+/// that the wrapped reducer processes, exactly once each.
 private struct MeshMaintenanceRecorder<Wrapped: Reducer>: Reducer
 where Wrapped.State == TransportEndpoint.State, Wrapped.Action == TransportEndpoint.Action {
     let log: LockIsolated<[String]>
@@ -25,6 +26,7 @@ where Wrapped.State == TransportEndpoint.State, Wrapped.Action == TransportEndpo
         -> Effect<TransportEndpoint.Action> {
         if case .transport(.startMaintenance) = action { log.withValue { $0.append("start") } }
         if case .transport(.stopMaintenance) = action { log.withValue { $0.append("stop") } }
+        if case .transport(.interfaceDisconnected(radioID)) = action { log.withValue { $0.append("radioDisconnected") } }
         return wrapped.reduce(into: &state, action: action)
     }
 }
@@ -155,6 +157,30 @@ private func makeAnnounce(hops: UInt8 = 0, emitted: UInt64 = 1000) -> (raw: Data
         await h.store.receive { $0 == .transport(.interfaceDisconnected(radioID)) }
         #expect(h.store.state.interfaces[radioID] == nil)
         await h.store.skipReceivedActions(strict: false)
+    }
+
+    /// Contract 3: lane E sends `.meshtastic(.stop)` and waits for `.radioOffline` before
+    /// clearing the slot — so a radio that never connected must still report it.
+    @Test func endpointStopBeforeTheRadioConnectsSurfacesRadioOffline() async {
+        let h = makeMeshEndpoint()
+        await h.store.send(.start)                       // started, never connected
+        await h.store.send(.stop)
+        await h.store.receive { $0 == .meshtastic(.delegate(.radioOffline(reason: nil))) }
+        await h.store.skipReceivedActions(strict: false)
+    }
+
+    /// A `.stop` after a drop reports offline a second time; the radio was already
+    /// deregistered by the drop and must not be deregistered again.
+    @Test func endpointStopAfterARadioDropDeregistersTheRadioOnce() async {
+        let h = makeMeshEndpoint()
+        await bringRadioOnline(h)
+        h.radio.yield(.disconnected(reason: "gone"))
+        await h.store.receive { $0 == .meshtastic(.delegate(.radioOffline(reason: "gone"))) }
+        await h.store.send(.stop)
+        await h.store.receive { $0 == .meshtastic(.delegate(.radioOffline(reason: nil))) }
+        await h.store.skipReceivedActions(strict: false)
+        let deregistrations = h.maintenance.value.filter { $0 == "radioDisconnected" }.count
+        #expect(deregistrations == 1, "saw \(deregistrations) interfaceDisconnected for the radio")
     }
 
     @Test func inboundFragmentsReachTheRouterTaggedWithTheRadioID() async {

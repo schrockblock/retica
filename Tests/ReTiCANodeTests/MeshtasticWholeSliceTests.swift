@@ -57,11 +57,11 @@ private func runMeshProbe(ifac: IFAC?) async -> ProbeResult {
     let aIdentity = Identity(), bIdentity = Identity()
     let aRadio = AsyncStream<MeshtasticDriverEvent>.makeStream()
     let bRadio = AsyncStream<MeshtasticDriverEvent>.makeStream()
-    let aOnAir = LockIsolated<[Data]>([]), bOnAir = LockIsolated<[Data]>([])
+    let aOnAir = LockIsolated<[Data]>([])
     let a = makeMeshNode(identity: aIdentity, radio: radioA, nodeNum: nodeA, own: aRadio,
                          peer: bRadio.continuation, onAir: aOnAir, ifac: ifac)
     let b = makeMeshNode(identity: bIdentity, radio: radioB, nodeNum: nodeB, own: bRadio,
-                         peer: aRadio.continuation, onAir: bOnAir, ifac: ifac)
+                         peer: aRadio.continuation, onAir: LockIsolated([]), ifac: ifac)   // only A's air is inspected
 
     await a.send(.endpoint(.start))
     await b.send(.endpoint(.start))

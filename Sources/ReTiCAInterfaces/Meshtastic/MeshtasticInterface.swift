@@ -85,6 +85,12 @@ public struct MeshtasticInterface {
         var sentCache: [SentPacket] = []
         /// A fragment went out and its pacing delay has not yet elapsed.
         var pacing = false
+        /// `.stop` launched `driver.stop()` and its `.driverStopped` has not arrived yet. The
+        /// driver's start and stop run in separate effects, so a start launched now could be torn
+        /// down by the stop still in flight; `.start` defers instead.
+        var stopping = false
+        /// A `.start` arrived while `stopping`: `.driverStopped` starts the driver.
+        var restartPending = false
 
         public init(config: MeshtasticDriverConfig, framing: MeshtasticFraming = .landandair) {
             self.config = config
@@ -120,10 +126,15 @@ public struct MeshtasticInterface {
         case driverEvent(MeshtasticDriverEvent)
         case fragmentSent(ok: Bool)
         case pacingElapsed
+        /// `driver.stop()` returned: a deferred `.start` may now run.
+        case driverStopped
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
             case online(myNodeNum: UInt32, modemPreset: Int?)
+            /// The radio is no longer usable. Reported on a drop or unavailability of an ONLINE
+            /// radio, and on EVERY `.stop` of a non-stopped interface — online or not — so a host
+            /// that sends `.stop` can always wait for it (spec Contract 3).
             case offline(reason: String?)
             case packetReceived(Data)
             case adapterUnavailable(BLEAdapterUnavailable)
@@ -147,24 +158,35 @@ public struct MeshtasticInterface {
                 case .connecting, .online: return .none
                 }
                 state.status = .connecting
-                let config = state.config
-                return .run { [driver] send in
-                    for await event in driver.start(config) {
-                        await send(.driverEvent(event))
-                    }
+                if state.stopping {
+                    state.restartPending = true
+                    return .none
                 }
-                .cancellable(id: CancelID.driver, cancelInFlight: true)
+                return startDriver(state)
 
             case .stop:
                 guard state.status != .stopped else { return .none }
-                let wasOnline = state.isOnline
                 state.status = .stopped
+                if state.restartPending {
+                    // The deferred start never reached the driver; the stop in flight covers it.
+                    state.restartPending = false
+                    return .send(.delegate(.offline(reason: nil)))
+                }
+                state.stopping = true
                 clearTraffic(&state)
-                var effects: [Effect<Action>] = [.cancel(id: CancelID.driver),
-                                                 .cancel(id: CancelID.pacing),
-                                                 .run { [driver] _ in await driver.stop() }]
-                if wasOnline { effects.append(.send(.delegate(.offline(reason: nil)))) }
-                return .merge(effects)
+                return .merge(.cancel(id: CancelID.driver),
+                              .cancel(id: CancelID.pacing),
+                              .run { [driver] send in
+                                  await driver.stop()
+                                  await send(.driverStopped)
+                              },
+                              .send(.delegate(.offline(reason: nil))))
+
+            case .driverStopped:
+                state.stopping = false
+                guard state.restartPending else { return .none }
+                state.restartPending = false
+                return startDriver(state)
 
             case let .driverEvent(.connected(myNodeNum, modemPreset)):
                 guard state.status != .stopped else { return .none }
@@ -239,6 +261,16 @@ public struct MeshtasticInterface {
         }
     }
 
+    private func startDriver(_ state: State) -> Effect<Action> {
+        let config = state.config
+        return .run { [driver] send in
+            for await event in driver.start(config) {
+                await send(.driverEvent(event))
+            }
+        }
+        .cancellable(id: CancelID.driver, cancelInFlight: true)
+    }
+
     /// Send the queue head now if the radio is online and no pacing window is open. landandair
     /// sleeps after EVERY send (L304); we do the same but never delay the first.
     private func pump(_ state: inout State) -> Effect<Action> {
@@ -258,6 +290,10 @@ public struct MeshtasticInterface {
     /// A REQ for (index, |pos|) re-queues that cached fragment at the FRONT. Unknown index or
     /// out-of-range position: ignored. A fragment already queued is not queued again — any peer
     /// can broadcast REQs, so without that the front of the queue would grow without bound.
+    ///
+    /// Known v1 limit: answers ALWAYS go to the queue front (landandair-faithful, spec-mandated).
+    /// A peer that REQs once per pacing window therefore keeps a retransmit at the head and can
+    /// starve fresh traffic queued behind it.
     private func answerRequest(_ state: inout State, index: UInt8, pos: Int8) -> Effect<Action> {
         let slot = Int(pos.magnitude)   // never abs(): abs(Int8.min) traps
         guard let packet = state.sentCache.last(where: { $0.index == index }),

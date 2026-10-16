@@ -132,12 +132,19 @@ extension MeshtasticReassembler {
 
     @Test func sixtyFifthBufferEvictsTheOldestOverall() {
         var r = MeshtasticReassembler()
+        let packets = (1...65).map { ramp(500, seed: $0) }
+        let ps = packets.map { parts($0, index: 0) }
         for sender in 1...65 {
-            r.feed(parts(ramp(500, seed: sender), index: 0)[0], from: UInt32(sender),
+            r.feed(ps[sender - 1][0], from: UInt32(sender),
                    at: t0.addingTimeInterval(Double(sender) / 10))
         }
         #expect(r.bufferCount == 64)
         #expect(r.counters.evicted == 1)
+        let later = t0.addingTimeInterval(10)
+        r.feed(ps[0][1], from: 1, at: later)
+        #expect(r.feed(ps[0][2], from: 1, at: later) == nil, "sender 1's buffer was the oldest and must have been evicted")
+        r.feed(ps[64][1], from: 65, at: later)
+        #expect(r.feed(ps[64][2], from: 65, at: later) == packets[64])
     }
 
     @Test func packetOf508BytesCompletes() {
