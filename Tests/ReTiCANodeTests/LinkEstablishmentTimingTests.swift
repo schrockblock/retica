@@ -107,3 +107,81 @@ private func initiatorTimeout(over profile: InterfaceProfile, wireHops: UInt8) a
         #expect(store.state.linkPlane.links.isEmpty)
     }
 }
+
+/// An inbound LINKREQUEST for `dest`, carrying `wireHops` (unauthenticated) on the wire.
+private func linkRequest(to dest: Destination, wireHops: UInt8) -> Data {
+    let request = Packet(headerType: .header1, packetType: .linkRequest, transportType: .broadcast,
+                         destinationType: .single, context: .none, contextFlag: false, hops: wireHops,
+                         destinationHash: dest.hash, transportId: nil,
+                         payload: Identity().publicKey + Link.signallingBytes)
+    return try! request.packed()
+}
+
+/// Register a local destination and deliver a LINKREQUEST for it on `mesh` (registered as `profile`).
+@MainActor
+private func acceptRequest(_ store: TestStoreOf<TransportEndpoint>, arrivingOver profile: InterfaceProfile,
+                           wireHops: UInt8) async {
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["responder"],
+                           identity: Identity())!
+    await store.send(.registerLocalDestination(dest))
+    await store.send(.transport(.interfaceConnected(mesh, profile)))
+    await store.send(.transport(.received(mesh, linkRequest(to: dest, wireHops: wireHops))))
+    await store.skipReceivedActions(strict: false)
+}
+
+@MainActor
+private func responderTimeout(arrivingOver profile: InterfaceProfile, wireHops: UInt8) async -> TimeInterval? {
+    let store = makeEndpoint()
+    await acceptRequest(store, arrivingOver: profile, wireHops: wireHops)
+    return store.state.linkPlane.links.first?.establishmentTimeout
+}
+
+/// Amended Contract 4, responder: max(15, 2·4000/b_recv + 6), NO hop term. Driven end to end:
+/// LINKREQUEST on the wire → Transport → TransportEndpoint → LinkPlane.acceptLinkRequest → LinkSession.
+@Suite @MainActor struct ResponderEstablishmentTimingTests {
+    @Test func fastArrivalInterfacesAlwaysGiveFifteenSeconds() async {
+        #expect(await responderTimeout(arrivingOver: .tcp, wireHops: 0) == 15)
+        #expect(await responderTimeout(arrivingOver: .tcp, wireHops: 3) == 15)
+        #expect(await responderTimeout(arrivingOver: .ble, wireHops: 0) == 15)
+    }
+
+    @Test func aSlowArrivalInterfaceStretchesTheTimeout() async {
+        #expect(approx(await responderTimeout(arrivingOver: slow202, wireHops: 0), 45.603960396039604))
+    }
+
+    @Test func hopsNeverStretchTheResponder() async {
+        // A LINKREQUEST's hop count is attacker-controlled. 127 is the largest value Packet.parse
+        // accepts (maxHops = 128): it must change nothing.
+        #expect(await responderTimeout(arrivingOver: .tcp, wireHops: 127) == 15)
+        #expect(approx(await responderTimeout(arrivingOver: slow202, wireHops: 127), 45.603960396039604))
+        // 255 never reaches the plane (Packet.parse drops hops >= 128): no link, and no trap.
+        #expect(await responderTimeout(arrivingOver: slow202, wireHops: 255) == nil)
+    }
+
+    @Test func anUnknownArrivalBitrateKeepsFifteenSeconds() async {
+        let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+            $0.uuid = .incrementing
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+        }
+        store.exhaustivity = .off
+        let owner = Identity()
+        let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["responder"], identity: owner)!
+        await store.send(.acceptLinkRequest(owner: owner, destinationHash: dest.hash, interfaceID: mesh,
+                                            data: linkRequest(to: dest, wireHops: 3)))
+        #expect(store.state.links.first?.establishmentTimeout == 15)
+    }
+
+    @Test func aSlowArrivalKeepsTheHalfOpenLinkUntilItsStretchedDeadline() async {
+        let clock = TestClock()
+        let store = makeEndpoint(clock: clock)
+        await acceptRequest(store, arrivingOver: slow202, wireHops: 0)
+        #expect(store.state.linkPlane.links.count == 1)
+        await clock.advance(by: .seconds(45.5))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.linkPlane.links.count == 1, "the old fixed 15 s would already have reaped it")
+        await clock.advance(by: .seconds(0.2))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.linkPlane.links.isEmpty, "a half-open responder still leaves on its deadline")
+    }
+}

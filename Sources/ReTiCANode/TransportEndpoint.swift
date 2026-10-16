@@ -370,9 +370,11 @@ public struct TransportEndpoint {
                 guard let owner = state.transport.localDestinations[destHash]?.identity,
                       owner.privateKey != nil
                 else { return .none }
-                // Reply on the interface the request arrived from.
+                // Reply on the interface the request arrived from; its bitrate sets the responder
+                // establishment deadline (Contract 4).
                 return .send(.linkPlane(.acceptLinkRequest(owner: owner, destinationHash: destHash,
-                                                           interfaceID: arrivalInterface, data: data)))
+                                                           interfaceID: arrivalInterface, data: data,
+                                                           arrivalBitrate: state.transport.interfaces[arrivalInterface]?.bitrate)))
 
             // --- shared link plane delegates → interface / unified delegate ---
             case let .linkPlane(.delegate(.transmit(txID, raw))):

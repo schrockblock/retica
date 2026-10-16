@@ -87,9 +87,11 @@ public struct LinkPlane {
         case openLink(initiatorTo: Identity, destinationHash: Data,
                       interfaceID: InterfaceID, relayNextHop: Data?,
                       establishmentTimeout: TimeInterval = LinkTiming.defaultEstablishmentTimeout)
-        /// Create a responder link for an inbound LINKREQUEST and accept it.
+        /// Create a responder link for an inbound LINKREQUEST and accept it. `arrivalBitrate` is
+        /// the bitrate of the interface the request arrived on (`nil` = unknown → 15 s); it sets the
+        /// establishment deadline via `LinkTiming.responderEstablishmentTimeout`.
         case acceptLinkRequest(owner: Identity, destinationHash: Data,
-                               interfaceID: InterfaceID, data: Data)
+                               interfaceID: InterfaceID, data: Data, arrivalBitrate: Int? = nil)
         /// Route an inbound link-addressed packet to the link that owns it.
         case routeLinkPacket(linkID: Data, arrivalInterface: InterfaceID, data: Data)
 
@@ -171,7 +173,7 @@ public struct LinkPlane {
                                                      relayNextHop: relayNextHop))
                 return .send(.link(.element(id: newID, action: .establish)))
 
-            case let .acceptLinkRequest(owner, destinationHash, interfaceID, data):
+            case let .acceptLinkRequest(owner, destinationHash, interfaceID, data, arrivalBitrate):
                 // A responder cannot sign the LRPROOF without a private key: `Link.buildProof` →
                 // `Identity.sign` `preconditionFailure`s (the only one in `Sources`). The endpoints
                 // guard `owner.privateKey != nil` before forwarding here, but this method is public
@@ -231,9 +233,12 @@ public struct LinkPlane {
                     guard incomplete.count < incompleteCap else { return .none }
                 }
                 let newID = uuid()
+                // No hop term: the request's hop count is unauthenticated and must not lengthen a half-open hold.
+                let timeout = LinkTiming.responderEstablishmentTimeout(bitrate: arrivalBitrate)
                 state.links.append(LinkSession.State(id: newID, responderFor: owner,
                                                      destinationHash: destinationHash,
-                                                     interfaceID: interfaceID))
+                                                     interfaceID: interfaceID,
+                                                     establishmentTimeout: timeout))
                 return .send(.link(.element(id: newID, action: .acceptRequest(data))))
 
             case let .routeLinkPacket(linkID, arrivalInterface, data):
