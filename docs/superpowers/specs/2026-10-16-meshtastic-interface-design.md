@@ -248,10 +248,16 @@ the fixed 15 s lacks); lane C's tests must pin both the unchanged and the multi-
 
 Deliberate deviations from the reference, recorded so they are not "fixed" later: the responder
 timeout has **no hop term** and no KEEPALIVE (reference: `6·h + KEEPALIVE` ≈ 366 s) because a
-LINKREQUEST's `hops` is unauthenticated — an attacker could set it to 255 and pin each of the 32
+LINKREQUEST's `hops` is unauthenticated — an attacker could set it to 127 (the largest value that
+survives parse; ≥ 128 is dropped at `Packet.swift:99`) and pin each of the 32
 half-open responder slots (`LinkPlane.swift:73`) for minutes, defeating the 2026-08-13 lifecycle
 slice's admission budget. It depends only on our own receiving interface's bitrate (two first-hop
-packet times + 6 s); the LXMF retry wait scales (the reference's `DELIVERY_RETRY_WAIT` is a fixed 10 s), because
+packet times + 6 s). Because that bitrate stretch alone lengthens a half-open hold to ≈45.6 s at
+202 bps (cutting the rate needed to keep the shared 32-slot budget full from ≈2.1 to ≈0.7 req/s,
+which a radio can sustain), a responder whose timeout is stretched past 15 s also counts against a
+per-arrival-interface cap of 8 (`LinkPlane.State.maxStretchedIncompleteResponderLinksPerInterface`,
+⌈32/4⌉) and is refused like the shared cap refuses, so one slow interface can never hold more than a
+quarter of the budget; 15 s (TCP/BLE/unknown) requests are never subject to it. The LXMF retry wait scales (the reference's `DELIVERY_RETRY_WAIT` is a fixed 10 s), because
 at ~200 bps a 391 B packet is ~24 s of airtime and a 10 s retry stacks duplicates. Local announces
 and path requests are otherwise **not** paced — matching the reference (`Transport.py:1271-1274`:
 locally originated announces bypass the cap; path requests are paced only when recursive).
@@ -416,7 +422,9 @@ Commits go straight to main in each repo (no feature-branch merge dance).
   jumps queue, queue-full drop, disconnect clears); **whole-slice probe** — two `TransportEndpoint`s
   with mock drivers cross-wired as one broadcast medium deliver an LXMF opportunistic message.
 - **C:** at `.tcp`/`.ble` profiles: LXMF retry = 10 s at every hop count, initiator establishment =
-  15 s at wire hops 0 and 1, responder = 15 s at any `packet.hops` including 255, and the multi-hop
+  15 s at wire hops 0 and 1, responder = 15 s at any `packet.hops` (hops ≥ 128 are dropped at parse,
+  `Packet.swift:99`, so 127 is the largest hostile value that reaches the responder: still 15 s on
+  TCP, ≈45.6 s at 202 bps; a hops-255 LINKREQUEST mints no link and does not trap), and the multi-hop
   initiator values in Contract 4's table; stretched values at 202 bps; relay proof deadline gains
   the arrival-interface term; targeted announce goes out only the named interface.
 - **D:** TCA tests (non-exhaustive, outcome-asserting) for toggle persistence, picker selection,

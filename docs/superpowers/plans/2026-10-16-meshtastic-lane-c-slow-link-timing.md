@@ -42,7 +42,7 @@
 
 ## Review Focus
 
-1. **A LINKREQUEST with a hostile hop count (255).** Expected: no trap. The responder timeout is unaffected by hops: 15 s on TCP, about 45.6 s at 202 bps. The initiator's `h` is clamped at 128. Pinned in Task 1 (`hostileHopCountIsClampedForTheInitiator`) and Task 3 (`hopsNeverStretchTheResponder`).
+1. **A LINKREQUEST with a hostile hop count.** Expected: no trap. Hops ≥ 128 (e.g. 255) are dropped at parse (`Packet.swift:99`), so a hops-255 LINKREQUEST never reaches the responder and mints no link; 127 is the largest hostile value that does, and the responder timeout is unaffected by it: 15 s on TCP, about 45.6 s at 202 bps. (The Task 3 code sample below predates this and asserts 255; the committed test uses 127 and asserts no link at 255.) The initiator's `h` is clamped at 128. Pinned in Task 1 (`hostileHopCountIsClampedForTheInitiator`) and Task 3 (`hopsNeverStretchTheResponder`).
 2. **The next-hop interface disconnects before an LXMF send.** Expected: that send's retry falls back to 10 s. It must not reuse a stale stretched wait. Pinned in Task 5 (`aDisconnectedNextHopFallsBackToTenSecondsAtSend`).
 3. **The same InterfaceID re-registers with a new bitrate** (for example a radio preset change). Expected: the next link open and the next LXMF send both read the new bitrate. Pinned in Task 2 (`aReRegisteredInterfaceBitrateIsReadWhenTheLinkOpens`) and Task 5 (`aReRegisteredInterfaceBitrateIsReadAtSend`).
 4. **A targeted announce names an interface that is not connected.** Expected: it transmits nothing, with no fallback to every interface. Pinned in Task 6 (`aTargetedAnnounceToADisconnectedInterfaceTransmitsNothing`).
