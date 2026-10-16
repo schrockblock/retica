@@ -582,6 +582,7 @@ public struct LXMFNode {
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
                                            timestamp: date.now.timeIntervalSince1970, title: title, content: content)
                 state.router.uncancel(msg.hash)   // an app send is a fresh send (see `.sendMessage`)
+                refreshOutboundPropagationNodeRetryWait(&state)
                 let ts = date.now.timeIntervalSince1970
                 return .run { send in
                     guard let (packed, _) = await LXMFPropagation.pack(
@@ -639,6 +640,7 @@ public struct LXMFNode {
                         // `markPropagatedCopyPending` so the cancelled-message guard is applied in
                         // exactly one place, not duplicated here.
                         state.router.markPropagatedCopyPending(message.hash)
+                        refreshOutboundPropagationNodeRetryWait(&state)
                         let ts = date.now.timeIntervalSince1970
                         effects.append(.run { send in
                             guard let (packed, _) = await LXMFPropagation.pack(
@@ -1140,12 +1142,14 @@ public struct LXMFNode {
     /// (Contract 4: LXMF retry wait = max(10, 4·MTU·8/b)). A wait equal to the default is REMOVED
     /// rather than stored, so on TCP/BLE the router's state never changes.
     ///
-    /// Called where a path can appear or change (`.pathLearned`) and immediately before a delivery
-    /// copy is handed to the router (`deliverySend`). The second call covers what the first cannot
-    /// see: a path restored by `rehydrateLearnedDestinations` (no `pathLearned`), an interface
-    /// re-registered under the same id with a new bitrate, and a next hop that has disconnected
-    /// (falls back to the default). Accepted gap (spec): a change DURING a retry run is seen only at
-    /// the next announce or send.
+    /// Called where a path can appear or change (`.pathLearned`) and when a send is ACCEPTED
+    /// (`deliverySend`, and the two propagated hand-overs via
+    /// `refreshOutboundPropagationNodeRetryWait`), i.e. before any stamp search. The second call
+    /// covers what the first cannot see: a path restored by `rehydrateLearnedDestinations` (no
+    /// `pathLearned`), an interface re-registered under the same id with a new bitrate, and a next
+    /// hop that has disconnected (falls back to the default). Accepted gap (spec), same class: a
+    /// change DURING a retry run, or during an async stamp search (the router receives the copy
+    /// only after it), is seen only at the next announce or send.
     private func refreshNextHopRetryWait(_ state: inout State, _ destinationHash: Data) {
         let bitrate = state.endpoint.transport.nextHopInterfaceProfile(destinationHash)?.bitrate
         let wait = LXMFDelivery.retryWait(nextHopBitrate: bitrate)
@@ -1153,6 +1157,13 @@ public struct LXMFNode {
         if state.router.nextHopRetryWaits[destinationHash] != stored {
             state.router.nextHopRetryWaits[destinationHash] = stored
         }
+    }
+
+    /// Propagated retries are keyed on the PROPAGATION NODE's hash (`ResendInfo.propagated`), so a
+    /// propagated send refreshes the wait for that hash, not the recipient's. No node, no-op.
+    private func refreshOutboundPropagationNodeRetryWait(_ state: inout State) {
+        guard let pn = state.router.outboundPropagationNode else { return }
+        refreshNextHopRetryWait(&state, pn)
     }
 
     /// The delivery stamp cost to apply when sending to `destinationHash`, or **nil meaning

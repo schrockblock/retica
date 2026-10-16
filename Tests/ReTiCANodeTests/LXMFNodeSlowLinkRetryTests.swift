@@ -137,3 +137,99 @@ private func attemptsAfter(_ store: TestStoreOf<LXMFNode>, _ clock: TestClock<Du
         #expect(await attemptsAfter(store, clock, 1, hash) == 2)
     }
 }
+
+// MARK: - Propagated copies (retry timer keyed on the PROPAGATION NODE's hash)
+
+private let pnLinkID = Data(repeating: 0x5C, count: 16)
+
+private func rehydrated(_ identity: Identity, hash: Data, on iface: InterfaceID,
+                        appData: Data? = nil) -> LearnedDestination {
+    LearnedDestination(identity: identity, appData: appData, ratchet: nil, interfaceID: iface, hops: 0,
+                       nextHop: hash, announceEmitted: 0, learnedAt: Date(timeIntervalSince1970: 0))
+}
+
+/// A node whose router already has a PN as outbound propagation node with an ACTIVE link to it
+/// (the propagated retry timer is armed only with a live link), and whose Transport has
+/// REHYDRATED paths to the PN and to the recipient over `slowIface` (so no `.pathLearned` ever
+/// fires). `staleWait` seeds a leftover table entry for the PN.
+@MainActor
+private func makePropagatedNode(_ me: Identity, _ clock: TestClock<Duration>, pn: Identity, recipient: Identity,
+                                staleWait: Int? = nil) async
+    -> (store: TestStoreOf<LXMFNode>, pnHash: Data, recipientDest: Data) {
+    let pnHash = LXMessage.deliveryHash(identityHash: pn.hash)   // any 16-byte key; just consistent
+    let recipientDest = LXMessage.deliveryHash(identityHash: recipient.hash)
+    var initial = LXMFNode.State(identity: me, endpoint: TransportEndpoint.State())
+    initial.router.outboundPropagationNode = pnHash
+    initial.router.directLinks[pnHash] = .active(linkID: pnLinkID)
+    initial.router.nextHopRetryWaits[pnHash] = staleWait
+    let store = TestStore(initialState: initial) { LXMFNode() } withDependencies: {
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: sentAt))
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.endpoint(.transport(.interfaceConnected(slowIface, slow202))))
+    await store.send(.endpoint(.transport(.rehydrateLearnedDestinations([
+        // Advertised stamp cost 4 keeps the propagation stamp search fast (the default, 16, takes ~1 min).
+        pnHash: rehydrated(pn, hash: pnHash, on: slowIface, appData: PNAnnounce(
+            timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
+            targetStampCost: 4, stampCostFlexibility: 0, peeringCost: 0).packed),
+        recipientDest: rehydrated(recipient, hash: recipientDest, on: slowIface)]))))
+    return (store, pnHash, recipientDest)
+}
+
+@MainActor
+private func propagatedAttempts(_ store: TestStoreOf<LXMFNode>, _ clock: TestClock<Duration>, _ seconds: Int,
+                                _ hash: Data) async -> Int? {
+    await clock.advance(by: .seconds(seconds))
+    await store.skipReceivedActions(strict: false)
+    return store.state.router.pendingDeliveries[.propagated(hash)]?.attempts
+}
+
+@MainActor
+private func sendViaPN(_ store: TestStoreOf<LXMFNode>, from me: Identity, to dest: Data) async -> Data {
+    await store.send(.sendViaPropagation(destinationHash: dest, title: Data("t".utf8), content: Data("hi".utf8)))
+    // The stamp search runs off-thread; wait for its hand-over to reach the router.
+    await store.receive({ if case .router(.sendViaPropagation) = $0 { return true } else { return false } },
+                        timeout: .seconds(60))
+    return LXMessage.create(source: me, destinationHash: dest, timestamp: sentAt,
+                            title: Data("t".utf8), content: Data("hi".utf8)).hash
+}
+
+@Suite @MainActor struct LXMFNodeSlowLinkPropagatedRetryTests {
+    @Test func aRehydratedSlowPropagationNodeStretchesThePropagatedRetry() async {
+        let me = Identity(), pn = Identity(), recipient = Identity(), clock = TestClock()
+        let (store, pnHash, recipientDest) = await makePropagatedNode(me, clock, pn: pn, recipient: recipient)
+        #expect(store.state.router.nextHopRetryWaits[pnHash] == nil, "no pathLearned fires on rehydration")
+        let hash = await sendViaPN(store, from: me, to: recipientDest)
+        #expect(store.state.router.nextHopRetryWaits[pnHash] == 80)
+        #expect(store.state.router.pendingDeliveries[.propagated(hash)]?.attempts == 1, "armed on the live PN link")
+        #expect(await propagatedAttempts(store, clock, 79, hash) == 1)
+        #expect(await propagatedAttempts(store, clock, 1, hash) == 2)
+    }
+
+    @Test func aSendMessagePropagatedCopyStretchesThePropagatedRetryToo() async {
+        let me = Identity(), pn = Identity(), recipient = Identity(), clock = TestClock()
+        let (store, pnHash, recipientDest) = await makePropagatedNode(me, clock, pn: pn, recipient: recipient)
+        let msg = LXMessage.create(source: me, destinationHash: recipientDest, timestamp: sentAt,
+                                   title: Data("t".utf8), content: Data("hi".utf8))
+        await store.send(.sendMessage(message: msg, alsoViaPropagation: true))
+        await store.receive({ if case .router(.sendViaPropagation) = $0 { return true } else { return false } },
+                            timeout: .seconds(60))
+        #expect(store.state.router.nextHopRetryWaits[pnHash] == 80)
+        #expect(await propagatedAttempts(store, clock, 79, msg.hash) == 1)
+        #expect(await propagatedAttempts(store, clock, 1, msg.hash) == 2)
+    }
+
+    @Test func aDisconnectedPropagationNodeHopFallsBackToTenSeconds() async {
+        let me = Identity(), pn = Identity(), recipient = Identity(), clock = TestClock()
+        let (store, pnHash, recipientDest) = await makePropagatedNode(me, clock, pn: pn, recipient: recipient,
+                                                                       staleWait: 80)
+        #expect(store.state.router.nextHopRetryWaits[pnHash] == 80, "stale stretched entry from an earlier send")
+        await store.send(.endpoint(.transport(.interfaceDisconnected(slowIface))))
+        let hash = await sendViaPN(store, from: me, to: recipientDest)
+        #expect(store.state.router.nextHopRetryWaits[pnHash] == nil, "stale stretched wait removed")
+        #expect(await propagatedAttempts(store, clock, 9, hash) == 1)
+        #expect(await propagatedAttempts(store, clock, 1, hash) == 2)
+    }
+}
