@@ -37,6 +37,10 @@ public struct TransportEndpoint {
         public var tcpServer: TCPServerEndpoint.State?
         /// The BLE driver slot.
         public var ble: BLEEndpoint.State?
+        /// The Meshtastic radio slot: at most one radio, with ONE `InterfaceID`
+        /// (`meshtastic:<UUID>`) and the TCP-client lifecycle — registered when the radio comes
+        /// online, deregistered when it drops. A broadcast medium has no per-peer interfaces.
+        public var meshtastic: MeshtasticEndpoint.State?
 
         /// Learned-destination table of the shared router (identity / appData / path).
         public var learned: [Data: LearnedDestination] { transport.learned }
@@ -56,12 +60,14 @@ public struct TransportEndpoint {
                     linkPlane: LinkPlane.State = LinkPlane.State(),
                     tcpClients: IdentifiedArrayOf<TCPEndpoint.State> = [],
                     tcpServer: TCPServerEndpoint.State? = nil,
-                    ble: BLEEndpoint.State? = nil) {
+                    ble: BLEEndpoint.State? = nil,
+                    meshtastic: MeshtasticEndpoint.State? = nil) {
             self.transport = transport
             self.linkPlane = linkPlane
             self.tcpClients = tcpClients
             self.tcpServer = tcpServer
             self.ble = ble
+            self.meshtastic = meshtastic
         }
 
         /// Convenience factory: an endpoint running over a single TCP-client driver.
@@ -78,6 +84,11 @@ public struct TransportEndpoint {
         public static func ble(_ driver: BLEEndpoint.State) -> State {
             State(ble: driver)
         }
+
+        /// Convenience factory: an endpoint running over one Meshtastic radio.
+        public static func meshtastic(_ driver: MeshtasticEndpoint.State) -> State {
+            State(meshtastic: driver)
+        }
     }
 
     public enum Action: Equatable {
@@ -89,6 +100,7 @@ public struct TransportEndpoint {
         case removeTCPClient(InterfaceID)
         case tcpServer(TCPServerEndpoint.Action)
         case ble(BLEEndpoint.Action)
+        case meshtastic(MeshtasticEndpoint.Action)
         case transport(Transport.Action)
         case linkPlane(LinkPlane.Action)
         case link(IdentifiedActionOf<LinkSession>)
@@ -155,11 +167,13 @@ public struct TransportEndpoint {
             case .start:
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .connect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.start)) : .none,
-                                 state.ble != nil ? .send(.ble(.start)) : .none])
+                                 state.ble != nil ? .send(.ble(.start)) : .none,
+                                 state.meshtastic != nil ? .send(.meshtastic(.start)) : .none])
             case .stop:
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .disconnect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
-                                 state.ble != nil ? .send(.ble(.stop)) : .none])
+                                 state.ble != nil ? .send(.ble(.stop)) : .none,
+                                 state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none])
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
             case let .announce(h, a):               return .send(.transport(.announce(destinationHash: h, appData: a)))
             case let .send(h, p, token):            return .send(.transport(.send(destinationHash: h, plaintext: p,
@@ -285,6 +299,41 @@ public struct TransportEndpoint {
             case let .ble(.ble(.delegate(.adapterUnavailable(cause)))):
                 return .send(.ble(.delegate(.adapterUnavailable(cause))))
 
+            // --- Meshtastic radio lifecycle → shared router interface set (+ maintenance) ---
+            // ONE InterfaceID per radio, the TCP-client shape. The preset — hence the paced
+            // bitrate — is only known once the radio is configured, so the profile is computed
+            // here. A repeated `.online` (preset changed, or a reconnect the driver reported
+            // without a drop) re-registers with the new profile; maintenance is not re-armed
+            // because the shared interface set is not empty.
+            case let .meshtastic(.interface(.delegate(.online(myNodeNum, modemPreset)))):
+                guard let mesh = state.meshtastic else { return .none }
+                let id = mesh.interfaceID
+                let startEffects = maintenanceStartEffect(state)
+                return .merge([.send(.transport(.interfaceConnected(id, mesh.registeredProfile(modemPreset: modemPreset))))]
+                              + startEffects
+                              + [.send(.meshtastic(.delegate(.radioOnline(myNodeNum: myNodeNum,
+                                                                           modemPreset: modemPreset))))])
+
+            case let .meshtastic(.interface(.delegate(.offline(reason)))):
+                guard let mesh = state.meshtastic else { return .none }
+                let id = mesh.interfaceID
+                var effects: [Effect<Action>] = []
+                if state.transport.interfaces[id] != nil {
+                    effects.append(.send(.transport(.interfaceDisconnected(id))))
+                    effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
+                    effects.append(contentsOf: maintenanceStopEffect(state, departing: id))
+                }
+                effects.append(.send(.meshtastic(.delegate(.radioOffline(reason: reason)))))
+                return .merge(effects)
+
+            case let .meshtastic(.interface(.delegate(.packetReceived(packet)))):
+                guard let mesh = state.meshtastic else { return .none }
+                return .send(.transport(.received(mesh.interfaceID, packet)))
+
+            // Like BLE's (S6), adapter unavailability is Meshtastic-hatch-only; the app consumes it.
+            case let .meshtastic(.interface(.delegate(.adapterUnavailable(cause)))):
+                return .send(.meshtastic(.delegate(.adapterUnavailable(cause))))
+
             // --- shared router delegates → interface / unified delegate ---
             case let .transport(.delegate(.transmit(txID, raw))):
                 // C5 IFAC outbound masking, on the interface's OWN profile. `transport.interfaces`
@@ -359,7 +408,7 @@ public struct TransportEndpoint {
 
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).
-            case .tcpClients, .tcpServer, .ble, .transport, .linkPlane, .link, .delegate,
+            case .tcpClients, .tcpServer, .ble, .meshtastic, .transport, .linkPlane, .link, .delegate,
                  .sendOverLink, .sendResourceOverLink, .cancelResource, .identifyOverLink, .sendRequestOverLink,
                  .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
                  .closeLink, .registerRequestHandler, .deregisterRequestHandler:
@@ -369,6 +418,7 @@ public struct TransportEndpoint {
         .forEach(\.tcpClients, action: \.tcpClients) { TCPEndpoint() }
         .ifLet(\.tcpServer, action: \.tcpServer) { TCPServerEndpoint() }
         .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
+        .ifLet(\.meshtastic, action: \.meshtastic) { MeshtasticEndpoint() }
     }
 
     /// The ONE maintenance loop (path-expiry / link-table / discovery-request GC) is shared by the
@@ -417,10 +467,16 @@ public struct TransportEndpoint {
         if let peerToken = state.ble?.peerInterfaces[txID] {
             return .send(.ble(.ble(.send(peer: peerToken, packet: masked))))
         }
+        // The radio's ONE id, while the radio is online. Between a drop and the reconnect learned
+        // paths still name it, so a send then falls through to `.interfaceUnavailable` below.
+        let meshOwnsID = state.meshtastic?.interfaceID == txID
+        if meshOwnsID, state.meshtastic?.interface.isOnline == true {
+            return .send(.meshtastic(.interface(.send(masked))))
+        }
         // Not deliverable. `Packet(raw:)` recovers the destination hash; for established link
         // traffic that value IS the link ID, so the failure correlates. An unparseable packet
         // drops silently (no destination to report).
-        guard state.ble != nil, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
+        guard state.ble != nil || meshOwnsID, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
         return .send(.delegate(.sendFailed(destinationHash: destHash, reason: .interfaceUnavailable)))
     }
 }
