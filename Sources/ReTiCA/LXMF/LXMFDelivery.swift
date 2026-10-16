@@ -6,6 +6,20 @@ import Foundation
 public enum LXMFDelivery {
     /// Seconds between outbound delivery retries (RNS `LXMRouter.DELIVERY_RETRY_WAIT`).
     public static let retryWaitSeconds = 10
+
+    /// The retry wait for a copy whose destination's next hop runs at `nextHopBitrate` bits/s:
+    /// `max(retryWaitSeconds, ⌈4 · MTU·8 / b⌉)` — four MTU packets of airtime (2026-10-16
+    /// Meshtastic spec, Contract 4). Rounded UP because router timers take whole seconds; never
+    /// below the reference's fixed 10 s, so TCP and BLE are unchanged. `nil` or `≤ 0` (no path, no
+    /// profile) → `retryWaitSeconds`.
+    ///
+    /// DELIBERATE DEVIATION from reference, which keeps `DELIVERY_RETRY_WAIT` fixed: at ~200 bps a
+    /// 391-byte packet is ~24 s of airtime, so a fixed 10 s retry stacks duplicates on the medium.
+    public static func retryWait(nextHopBitrate: Int?) -> Int {
+        guard let bitrate = nextHopBitrate, bitrate > 0 else { return retryWaitSeconds }
+        let airtime = (4.0 * Double(Packet.mtu * 8) / Double(bitrate)).rounded(.up)
+        return max(retryWaitSeconds, Int(airtime))
+    }
     /// Max delivery attempts before a message is failed (RNS `LXMRouter.MAX_DELIVERY_ATTEMPTS`).
     /// ReTiCA also reuses this as the ceiling on consecutive link-ESTABLISHMENT attempts per
     /// destination (`LXMFRouter.establish`), which has no counterpart in the reference constant —
