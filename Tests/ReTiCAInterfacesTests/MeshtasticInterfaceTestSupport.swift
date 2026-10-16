@@ -80,3 +80,12 @@ func stopMeshInterface(_ h: MeshInterfaceHarness) async {
     await h.store.send(.stop)
     await h.store.skipReceivedActions(strict: false)
 }
+
+/// Advance the pacing clock `count` times by `delay`, waiting for each resulting driver send.
+@MainActor
+func drainMeshFrames(_ h: MeshInterfaceHarness, every delay: Duration, count: Int) async {
+    for _ in 0..<count {
+        await h.clock.advance(by: delay)
+        await h.store.receive { if case .fragmentSent = $0 { return true }; return false }
+    }
+}
