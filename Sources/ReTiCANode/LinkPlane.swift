@@ -67,6 +67,23 @@ public struct LinkPlane {
         /// establishment timeout; it can neither consume the plane nor touch a link that is
         /// already up.
         public var maxIncompleteResponderLinks: Int?
+        /// Upper bound on half-open responder links with a STRETCHED establishment timeout
+        /// (strictly greater than `LinkTiming.defaultEstablishmentTimeout`) held per ARRIVAL
+        /// interface. Applies in addition to `maxIncompleteResponderLinks`, never instead of it.
+        ///
+        /// Why. `maxIncompleteResponderLinks` is one budget shared by every interface, and its
+        /// sizing assumed a half-open element leaves within 15 s, so pinning all of it takes about
+        /// 32/15 ≈ 2.1 requests per second — more than LongFast airtime carries. Contract 4 stretches
+        /// a responder that a LINKREQUEST reached over a slow interface to `2·L(b_recv) + 6`
+        /// (≈ 45.6 s at 202 bps), which drops that rate to ≈ 0.7 req/s, and that a radio CAN send.
+        /// Without this bound one slow interface could hold the whole shared budget and refuse
+        /// every TCP/BLE link request behind it. Capping the stretched population per interface at
+        /// ⌈32/4⌉ = 8 lets one slow interface spend at most a quarter of the shared budget.
+        ///
+        /// Requests that get the default 15 s (TCP, BLE, unknown bitrate) are never counted against
+        /// or refused by this bound. Only INCOMPLETE links count: a slot frees when its link
+        /// reaches `.active` or leaves on its establishment deadline.
+        public static let maxStretchedIncompleteResponderLinksPerInterface = 8
         public init(links: IdentifiedArrayOf<LinkSession.State> = [],
                     registrations: [Data: RequestRegistration] = [:],
                     maxResponderLinks: Int? = 256,
@@ -232,9 +249,21 @@ public struct LinkPlane {
                     let incomplete = state.links.filter { $0.role == .responder && $0.status != .active }
                     guard incomplete.count < incompleteCap else { return .none }
                 }
-                let newID = uuid()
                 // No hop term: the request's hop count is unauthenticated and must not lengthen a half-open hold.
                 let timeout = LinkTiming.responderEstablishmentTimeout(bitrate: arrivalBitrate)
+                // A STRETCHED half-open hold also spends a per-arrival-interface budget, refused the
+                // same way as the shared one above — see `maxStretchedIncompleteResponderLinksPerInterface`.
+                // A 15 s request never reaches this check, so TCP/BLE admission is unchanged.
+                if timeout > LinkTiming.defaultEstablishmentTimeout {
+                    let stretchedHere = state.links.filter {
+                        $0.role == .responder && $0.status != .active
+                            && $0.interfaceID == interfaceID
+                            && $0.establishmentTimeout > LinkTiming.defaultEstablishmentTimeout
+                    }
+                    guard stretchedHere.count < State.maxStretchedIncompleteResponderLinksPerInterface
+                    else { return .none }
+                }
+                let newID = uuid()
                 state.links.append(LinkSession.State(id: newID, responderFor: owner,
                                                      destinationHash: destinationHash,
                                                      interfaceID: interfaceID,
