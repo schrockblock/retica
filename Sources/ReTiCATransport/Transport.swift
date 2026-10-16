@@ -188,6 +188,15 @@ public struct Transport {
             return entry
         }
 
+        /// The profile of the interface the learned path to `destinationHash` leaves on — reference
+        /// `Transport.next_hop_interface` / `next_hop_interface_bitrate` (`RNS/Transport.py:2750-2765`,
+        /// local 1.4.1 fork), whose interface is the path's receiving interface, as `interfaceID` is
+        /// here. `nil` when there is no learned path, or it names an interface that is not connected.
+        public func nextHopInterfaceProfile(_ destinationHash: Data) -> InterfaceProfile? {
+            guard let entry = reachableLearned(destinationHash) else { return nil }
+            return interfaces[entry.interfaceID]
+        }
+
         public struct LinkTableEntry: Equatable, Sendable {
             public var rcvdIf: InterfaceID
             public var nhIf: InterfaceID
@@ -1240,7 +1249,7 @@ public struct Transport {
     /// RNS ESTABLISHMENT_TIMEOUT_PER_HOP (Link.py). An unvalidated relay entry gets a hard deadline
     /// of now + this * max(1, hops-to-dest); if no proof flows through by then it is reaped, so junk
     /// LINKREQUESTs cannot accumulate.
-    static let establishmentTimeoutPerHop: TimeInterval = 6
+    static let establishmentTimeoutPerHop: TimeInterval = LinkTiming.establishmentTimeoutPerHop
     /// Single-packet receipt lifetime: `receiptTimeoutBase + receiptTimeoutPerHop * max(1, hops)`.
     /// Reference: `PacketReceipt.timeout = first_hop_timeout + TIMEOUT_PER_HOP * hops_to(dest)`
     /// (Packet.py:417-418), where `first_hop_timeout` is `DEFAULT_PER_HOP_TIMEOUT` (6 s) plus a

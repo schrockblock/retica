@@ -132,7 +132,7 @@ public struct LinkSession {
         /// Initiator: link to a known destination identity.
         public init(id: UUID = UUID(), initiatorTo destinationIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
-                    establishmentTimeout: TimeInterval = 15, keepaliveInterval: TimeInterval = 30,
+                    establishmentTimeout: TimeInterval = LinkTiming.defaultEstablishmentTimeout, keepaliveInterval: TimeInterval = 30,
                     relayNextHop: Data? = nil) {
             self.id = id
             self.role = .initiator
@@ -161,7 +161,7 @@ public struct LinkSession {
         /// Responder: accept links for a destination owned by `owningIdentity`.
         public init(id: UUID = UUID(), responderFor owningIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
-                    establishmentTimeout: TimeInterval = 15, keepaliveInterval: TimeInterval = 30) {
+                    establishmentTimeout: TimeInterval = LinkTiming.defaultEstablishmentTimeout, keepaliveInterval: TimeInterval = 30) {
             self.id = id
             self.role = .responder
             self.status = .pending
