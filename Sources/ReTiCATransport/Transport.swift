@@ -248,7 +248,11 @@ public struct Transport {
         case registerLocalLink(Data)
         case unregisterLocalLink(Data)
         case received(InterfaceID, Data)
-        case announce(destinationHash: Data, appData: Data?)
+        /// Announce a local destination. `interface: nil` sends on every connected interface (the
+        /// original behaviour). A non-nil `interface` sends on THAT interface only — used to
+        /// re-announce on an interface that just came up (2026-10-16 Meshtastic spec, Contract 4) —
+        /// and on nothing when it is not connected: never a silent fallback to every interface.
+        case announce(destinationHash: Data, appData: Data?, interface: InterfaceID? = nil)
         case requestPath(destinationHash: Data)
         /// Encrypt `plaintext` to a learned destination and send it as one packet. With a non-nil
         /// `receiptToken`, also record a `PendingReceipt` so a valid proof for this packet emits
@@ -1023,7 +1027,7 @@ public struct Transport {
                 }
                 return .send(.delegate(.transmit(entry.interfaceID, raw)))
 
-            case let .announce(destinationHash, appData):
+            case let .announce(destinationHash, appData, interface):
                 guard let dest = state.localDestinations[destinationHash],
                       let identity = dest.identity, identity.privateKey != nil
                 else { return .none }
@@ -1069,7 +1073,9 @@ public struct Transport {
                 let packet = Packet.announce(from: dest, payload: payload)
                 guard let raw = try? packet.packed() else { return .none }
                 if let appData { state.localAppData[destinationHash] = appData }
-                return .merge(state.interfaces.keys.map { .send(.delegate(.transmit($0, raw))) })
+                let targets: [InterfaceID] = interface.map { state.interfaces[$0] != nil ? [$0] : [] }
+                    ?? Array(state.interfaces.keys)
+                return .merge(targets.map { .send(.delegate(.transmit($0, raw))) })
 
             case let .requestPath(destinationHash):
                 // RNS request_path (Transport.py:2799): a DATA/BROADCAST/HEADER_1 packet to the

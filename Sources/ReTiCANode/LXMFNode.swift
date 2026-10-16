@@ -239,7 +239,13 @@ public struct LXMFNode {
         /// `deliveryStampCost`. Broadcasts on EVERY connected interface with no throttle, so call
         /// it when a change is settled — not on every keystroke of an edit.
         /// Requires `registerDelivery` to have been called first; silently ignored otherwise.
+        /// For the interface-up re-announce use `.announceDeliveryOnInterface`.
         case announceDelivery
+        /// Announce the delivery destination on ONE interface: the interface-up re-announce
+        /// (2026-10-16 Meshtastic spec, Contract 4), so a node joining a slow link does not
+        /// re-broadcast on every other interface too. Same app data and same no-op rule as
+        /// `.announceDelivery`; transmits nothing when that interface is not connected.
+        case announceDeliveryOnInterface(InterfaceID)
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
         case setPropagationNode(destinationHash: Data)
         case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
@@ -557,6 +563,12 @@ public struct LXMFNode {
                 let appData = LXMFAnnounceData.pack(displayName: state.displayName,
                                                     stampCost: state.deliveryStampCost)
                 return .send(.endpoint(.announce(destinationHash: hash, appData: appData)))
+
+            case let .announceDeliveryOnInterface(interfaceID):
+                guard let hash = state.deliveryDestinationHash else { return .none }
+                let appData = LXMFAnnounceData.pack(displayName: state.displayName,
+                                                    stampCost: state.deliveryStampCost)
+                return .send(.endpoint(.announceOn(interface: interfaceID, destinationHash: hash, appData: appData)))
 
             case let .send(destinationHash, title, content, method):
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
