@@ -187,7 +187,7 @@ public struct TransportEndpoint {
                 // F8 stale-path gate, on the SHARED router. `learned` is deliberately
                 // non-destructive, so an entry outlives the interface it names: the socket drops,
                 // Transport drops the interface, the path stays. Minting a LinkSession on a dead
-                // interface transmits into nothing and exits only via the 15s establishment
+                // interface transmits into nothing and exits only via the establishment
                 // deadline — misreported as a dead ROUTE (soliciting a pointless path request)
                 // rather than a dead interface. `Transport.send` gates the same way.
                 guard let learned = state.transport.learned[destinationHash] else {
@@ -199,10 +199,16 @@ public struct TransportEndpoint {
                 // Via a relay (learned nextHop != the destination) → HEADER_2 LINKREQUEST to the
                 // relay. The learned entry records which interface the destination was heard on.
                 let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
+                // Contract 4: the deadline follows the next hop's bitrate and the path's length,
+                // read NOW, so a re-registered interface's new bitrate applies to the next link.
+                let timeout = LinkTiming.initiatorEstablishmentTimeout(
+                    bitrate: state.transport.nextHopInterfaceProfile(destinationHash)?.bitrate,
+                    wireHops: learned.hops)
                 return .send(.linkPlane(.openLink(initiatorTo: learned.identity,
                                                   destinationHash: destinationHash,
                                                   interfaceID: learned.interfaceID,
-                                                  relayNextHop: relayNextHop)))
+                                                  relayNextHop: relayNextHop,
+                                                  establishmentTimeout: timeout)))
 
             // The link verbs (`.sendOverLink`, `.closeLink`, `.registerRequestHandler`, …) are
             // NOT forwarded here: they are aliased straight into the shared `LinkPlane` by

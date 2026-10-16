@@ -81,9 +81,12 @@ public struct LinkPlane {
     public enum Action: Equatable {
         case link(IdentifiedActionOf<LinkSession>)
 
-        /// Create an initiator link and start establishment.
+        /// Create an initiator link and start establishment. `establishmentTimeout` is computed by
+        /// the host, which can see Transport (`LinkTiming.initiatorEstablishmentTimeout`); this
+        /// plane never reads Transport state.
         case openLink(initiatorTo: Identity, destinationHash: Data,
-                      interfaceID: InterfaceID, relayNextHop: Data?)
+                      interfaceID: InterfaceID, relayNextHop: Data?,
+                      establishmentTimeout: TimeInterval = LinkTiming.defaultEstablishmentTimeout)
         /// Create a responder link for an inbound LINKREQUEST and accept it.
         case acceptLinkRequest(owner: Identity, destinationHash: Data,
                                interfaceID: InterfaceID, data: Data)
@@ -159,11 +162,12 @@ public struct LinkPlane {
     private var core: some ReducerOf<Self> {
         Reduce { state, action in
             switch action {
-            case let .openLink(identity, destinationHash, interfaceID, relayNextHop):
+            case let .openLink(identity, destinationHash, interfaceID, relayNextHop, establishmentTimeout):
                 let newID = uuid()
                 state.links.append(LinkSession.State(id: newID, initiatorTo: identity,
                                                      destinationHash: destinationHash,
                                                      interfaceID: interfaceID,
+                                                     establishmentTimeout: establishmentTimeout,
                                                      relayNextHop: relayNextHop))
                 return .send(.link(.element(id: newID, action: .establish)))
 
