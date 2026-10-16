@@ -811,7 +811,18 @@ public struct LXMFNode {
             case let .endpoint(.delegate(.pathLearned(h, _))):
                 // Synchronous, before the router sees anything for `h` (Transport already holds the
                 // new path: its Scope ran first).
-                refreshNextHopRetryWait(&state, h)
+                //
+                // Only for hashes the router can retry to: an `lxmf.delivery` destination (same
+                // destination check as the app-data gate below) or our outbound propagation node.
+                // `.pathLearned` fires for every announce from every app, and nothing prunes
+                // `nextHopRetryWaits`, so refreshing unconditionally grew it with every slow-link
+                // destination ever heard. Send-time refreshes remain the backstop.
+                let isDeliveryDestination = state.endpoint.learned[h].map {
+                    h == LXMessage.deliveryHash(identityHash: $0.identity.hash)
+                } ?? false
+                if isDeliveryDestination || h == state.router.outboundPropagationNode {
+                    refreshNextHopRetryWait(&state, h)
+                }
                 var effects: [Effect<Action>] = [.send(.router(.learnedPath(destinationHash: h)))]
                 if let learned = state.endpoint.learned[h] {
                     effects.append(.send(.router(.learnedIdentity(destinationHash: h, identity: learned.identity))))

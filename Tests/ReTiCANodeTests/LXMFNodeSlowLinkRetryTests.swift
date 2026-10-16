@@ -136,6 +136,44 @@ private func attemptsAfter(_ store: TestStoreOf<LXMFNode>, _ clock: TestClock<Du
         #expect(await attemptsAfter(store, clock, 9, hash) == 1)
         #expect(await attemptsAfter(store, clock, 1, hash) == 2)
     }
+
+    /// `.pathLearned` fires for every announce from every app; only hashes the router can retry
+    /// to may enter the (never-pruned) retry-wait table.
+    @Test func aNonLXMFAnnounceOverASlowInterfaceLeavesNoRetryWaitEntry() async {
+        let store = makeNode(Identity(), TestClock())
+        let other = Identity()
+        let dest = Destination(kind: .single, direction: .in, appName: "someapp", aspects: ["telemetry"],
+                               identity: other)!
+        await hear(store, signedAnnounce(of: dest, identity: other), on: slowIface, as: slow202)
+        #expect(store.state.endpoint.transport.learned[dest.hash]?.interfaceID == slowIface,
+                "the path must really be learned over the slow interface")
+        #expect(store.state.router.nextHopRetryWaits.isEmpty)
+    }
+
+    @Test func anOutboundPropagationNodeAnnounceOverASlowInterfaceStretchesItsRetryWait() async {
+        let pn = Identity()
+        let pnDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                                 aspects: ["propagation"], identity: pn)!
+        var initial = LXMFNode.State(identity: Identity(), endpoint: TransportEndpoint.State())
+        initial.router.outboundPropagationNode = pnDest.hash
+        let store = TestStore(initialState: initial) { LXMFNode() } withDependencies: {
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: sentAt))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        await hear(store, signedAnnounce(of: pnDest, identity: pn), on: slowIface, as: slow202)
+        #expect(store.state.endpoint.transport.learned[pnDest.hash]?.interfaceID == slowIface)
+        #expect(store.state.router.nextHopRetryWaits[pnDest.hash] == 80)
+    }
+}
+
+/// A signed announce for an arbitrary destination, heard directly (0 wire hops).
+private func signedAnnounce(of dest: Destination, identity: Identity) -> Data {
+    let randomHash = Announce.randomHash(now: 1_700_000_000, randomPrefix: Data(repeating: 0x04, count: 5))
+    let payload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
+                                        nameHash: dest.nameHash, randomHash: randomHash)
+    return try! Packet.announce(from: dest, payload: payload).packed()
 }
 
 // MARK: - Propagated copies (retry timer keyed on the PROPAGATION NODE's hash)
