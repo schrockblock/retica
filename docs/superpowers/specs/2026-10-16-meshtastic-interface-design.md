@@ -19,8 +19,9 @@ deployed implementation), with the fragment codec swappable so a sturdier format
 3. On hardware: iPhone → Meshtastic radio → air → radio → Mac running `rnsd` + landandair's interface
    (and the reverse); then iPhone ↔ iPhone.
 4. All existing test suites in all four repos stay green. At TCP/BLE bitrates the LXMF retry wait
-   is unchanged, and link-establishment timeouts are unchanged for paths of ≤ 2 hops (initiator:
-   1 hop; see Contract 4 — longer paths gain the reference's 6 s/hop allowance, a deliberate change).
+   and responder link-establishment timeout are unchanged, and the initiator's is unchanged for
+   paths of ≤ 1 wire hop (see Contract 4 — longer paths gain the reference's 6 s/hop allowance, a
+   deliberate change).
 
 **Non-goals (v1):** serial/TCP connection to the radio; rewriting the radio's modem preset; emitting
 REQ (NACK) frames; direct-to-node (unicast) Meshtastic addressing; the floscodes framing (the seam
@@ -99,7 +100,14 @@ public enum MeshtasticConnectionState: Equatable, Sendable {
     case disconnected(reason: String?), connecting, configuring, connected, reconnecting(attempt: Int)
 }
 
-public enum MeshtasticEvent: Sendable {
+public enum MeshtasticSessionError: Error, Equatable, Sendable { case payloadTooLarge, notConnected }
+
+public enum MeshtasticAdapterUnavailable: Equatable, Sendable {
+    case poweredOff, unauthorized, unsupported, other(String?)
+    public var isTerminal: Bool   // unauthorized, unsupported
+}
+
+public enum MeshtasticEvent: Equatable, Sendable {
     case connection(MeshtasticConnectionState)
     /// Emitted once per completed want_config handshake (so again after every reconnect).
     case configured(myNodeNum: UInt32, modemPreset: Int?)   // raw Config.LoRaConfig.ModemPreset value
@@ -108,7 +116,7 @@ public enum MeshtasticEvent: Sendable {
     case routing(packetID: UInt32, ok: Bool)
     /// Every decoded FromRadio frame, unfiltered — for Meshtastified's node DB / channels / text.
     case frame(FromRadio)
-    case adapterUnavailable(terminal: Bool, reason: String?)
+    case adapterUnavailable(MeshtasticAdapterUnavailable)
 }
 
 public actor MeshtasticSession {
@@ -132,6 +140,13 @@ public enum MeshtasticScanner {
 Requirements: platforms **iOS 17, macOS 13, macCatalyst 17** (ReTiCA's floor; MeshtastifiedKit is
 macOS 14 today — SPM rejects a dependency with a higher floor). The session filters FCB's global
 `events()` to its own radio's peripheral id. Reconnect backoff (1→30 s capped) is preserved.
+All public types get public memberwise-style inits. `connect(radio:)` emits `.connecting` first and
+returns once the first attempt resolves; a non-terminal first-attempt failure enters the backoff;
+CoreBluetooth connects never time out, so callers invoke it from a Task. The want_config handshake
+has a **30 s timeout** (no `config_complete` → treat as a lost link → backoff). Every MeshPacket
+also arrives as `.frame`; a consumer maps **either** `.frame` **or** `.packet`/`.routing`, never both
+(Meshtastified maps `.frame`; ReTiCA's live adapter maps `.packet`). `myNodeNum` is 0 if the radio
+sent no `myInfo`; `modemPreset` is the raw value even when `use_preset` is false.
 
 ### Contract 2 — ReTiCA `MeshtasticDriver` (lane B consumes via mock; lane E implements live)
 
@@ -177,6 +192,9 @@ The app installs the real driver with `$0.meshtasticDriver = .live(session:)` fr
   on `.disconnected` — the TCP-client lifecycle, not BLE's per-peer one.
 - Delegates: `.radioOnline(myNodeNum:, modemPreset:)`, `.radioOffline(reason:)`,
   `.adapterUnavailable(BLEAdapterUnavailable)`.
+- `public struct MeshtasticCounters: Equatable, Sendable` with Int fields `malformed, evicted,
+  timedOut, oversize, completed, queueFull, sendFailed`, readable as
+  `MeshtasticEndpoint.State.counters` (no delegate; the app reads state).
 - `InterfaceProfile.meshtastic(modemPreset: Int?) -> InterfaceProfile`: `name "meshtastic"`,
   `hwMTU 500`, IFAC size 8 when IFAC is configured, mode = same default as `.tcp`, and **bitrate =
   effective paced rate** `Int(202 * 8 / fragmentDelay(preset))`:
@@ -195,27 +213,45 @@ The app installs the real driver with `$0.meshtasticDriver = .live(session:)` fr
 
   The delays are landandair's `speed_to_delay` verbatim, including its fallback of 7.
   Because the preset is only known after `.connected`, the profile is computed there; the endpoint
-  state's `profile` supplies only IFAC and mode.
+  state's `profile` supplies only IFAC and mode. The preset→delay table lives in
+  `ReTiCAInterfaces/Meshtastic/MeshtasticModemPreset.swift` (the interface's pacer needs it) and the
+  `InterfaceProfile.meshtastic(modemPreset:)` extension lives in `ReTiCANode/MeshtasticEndpoint.swift`
+  — `ReTiCATransport` and `ReTiCAInterfaces` don't depend on each other, so `InterfaceProfile.swift`
+  is not touched. IFAC for this interface is built with `MeshtasticEndpoint.ifac(networkName:passphrase:)`
+  (fixed size 8; `IFAC.size` is private), so a network using a larger landandair `ifac_size` is not
+  supported in v1 (and the 508 B reassembly bound follows from size 8).
+- There is no slot-removal action: to drop the radio, lane E sends `.meshtastic(.stop)`, waits for
+  `.radioOffline`, then sets the slot to nil — nil-ing an online slot leaves its interface
+  registered in Transport.
+- `.adapterUnavailable(.other(_))` is non-terminal by `BLEAdapterUnavailable.isTerminal`, including
+  the uninstalled-live-driver message; the app must not read "non-terminal" as "installed".
 
 ### Contract 4 — slow-link timing (lane C provides; nothing in lane B depends on it)
 
 Behavioural contract; lane C owns the mechanism. `b` = bitrate of the next-hop interface for the
-destination (reference `Transport.next_hop_interface_bitrate`); `h = max(1, hops)`.
+destination (reference `Transport.next_hop_interface_bitrate`); `b_recv` = bitrate of the interface a
+LINKREQUEST arrived on; `h = max(1, hops)` where `hops` is ReTiCA's stored **on-wire** count
+(directly heard = 0; the reference increments on receipt, ReTiCA does not — `Transport.swift:1248-1250`).
+This is the same `max(1, wire)` convention ReTiCA's other per-hop timers use (`Transport.swift:757,
+1009`), so a relayed peer gets one hop less allowance than the reference would give it, consistently.
 
 | value | today | new | at TCP/BLE |
 |---|---|---|---|
-| initiator link establishment | 15 s | `max(15, 500·8/b + 6 + 6·h)` (reference `Link.py:282-283` + floor) | 15 for h = 1; 18 / 24 / … for h = 2 / 3 / … |
-| responder link establishment | 15 s | `max(15, 500·8/b + 6·h)` | 15 for h ≤ 2; 18 / 24 / … for h = 3 / 4 / … |
-| LXMF retry wait | 10 s | `max(10, 4 · 500·8/b)` | 10 (unchanged) |
+| initiator link establishment | 15 s | `max(15, 500·8/b + 6 + 6·h)` (reference `Link.py:282-283` + floor) | 15 for wire hops ≤ 1; ≈18 / 24 / … for 2 / 3 / … |
+| responder link establishment | 15 s | `max(15, 2 · 500·8/b_recv + 6)` — **no hop term** | 15 (unchanged) |
+| relay link-table proof deadline | `6·h` | `6·h + 500·8/b_recv` — the interface the LINKREQUEST **arrived on** (reference `extra_link_proof_timeout(packet.receiving_interface)`, `Transport.py:1643-1644`) | +0.0004 s / +0.05 s |
+| LXMF retry wait | 10 s | `max(10, 4 · 500·8/b)`, rounded up to whole seconds | 10 (unchanged) |
 | local re-announce on interface-up | all interfaces | **only the interface that came up** | — |
 
-The multi-hop growth at fast bitrates is intended (it is the reference's per-hop allowance, which the
-fixed 15 s lacks); lane C's tests must pin both the unchanged 1-hop values and the multi-hop values.
+The multi-hop initiator growth at fast bitrates is intended (the reference's per-hop allowance, which
+the fixed 15 s lacks); lane C's tests must pin both the unchanged and the multi-hop values.
 
-Deliberate deviations from the reference, recorded so they are not "fixed" later: the responder uses
-`6·h + first-hop latency` rather than the reference's `6·h + KEEPALIVE` (≈ 366 s), because the link
-table's admission budget (see the 2026-08-13 lifecycle slice) must not hold half-open links for six
-minutes; the LXMF retry wait scales (the reference's `DELIVERY_RETRY_WAIT` is a fixed 10 s), because
+Deliberate deviations from the reference, recorded so they are not "fixed" later: the responder
+timeout has **no hop term** and no KEEPALIVE (reference: `6·h + KEEPALIVE` ≈ 366 s) because a
+LINKREQUEST's `hops` is unauthenticated — an attacker could set it to 255 and pin each of the 32
+half-open responder slots (`LinkPlane.swift:73`) for minutes, defeating the 2026-08-13 lifecycle
+slice's admission budget. It depends only on our own receiving interface's bitrate (two first-hop
+packet times + 6 s); the LXMF retry wait scales (the reference's `DELIVERY_RETRY_WAIT` is a fixed 10 s), because
 at ~200 bps a 391 B packet is ~24 s of airtime and a 10 s retry stacks duplicates. Local announces
 and path requests are otherwise **not** paced — matching the reference (`Transport.py:1271-1274`:
 locally originated announces bypass the cap; path requests are paced only when recursive).
@@ -255,9 +291,11 @@ equal counts corrupt each other; it is not reused.
 - Buffers keyed by `(from: UInt32, index: UInt8)`; each holds `[pos: body]` and `lastActivity`.
 - Insert `pos` as `abs(pos)`. If a different body already exists at that position, restart the
   buffer with only the new fragment.
-- On a negative `pos` = `-n`: complete iff keys are exactly `1...n`; then emit concatenated bodies
-  and drop the buffer. If incomplete, keep the buffer (a late middle fragment can still finish it —
-  landandair's semantics) until timeout.
+- A buffer completes when it holds a negative `pos` = `-n` and keys exactly `1...n`, checked on
+  every insert; then emit concatenated bodies and drop the buffer. If incomplete, keep it until
+  timeout, so a late middle fragment can still finish it. This is **stronger than landandair**, which
+  only assembles when the arriving fragment is the negative one (`Meshtastic_Interface.py:380-387`);
+  the cross-validation fixture pins the difference.
 - Bounds: 30 s inactivity purge; ≤ 8 buffers per sender and ≤ 64 total, oldest-activity evicted;
   reassembled packet > 508 B dropped. Purge runs on each insert using the injected date
   (`\.bleDate` pattern — a `\.meshtasticDate` key).
@@ -270,7 +308,8 @@ equal counts corrupt each other; it is not reused.
 - One fragment per `fragmentDelay(preset)` on an injected clock: send immediately when idle, then
   wait the delay before the next (landandair sleeps after every send; we don't delay the first).
 - REQ answering: retain the framed fragments of the last **16** packets sent, keyed by index. A REQ
-  for a retained `(index, abs(pos))` puts that fragment at the **front** of the queue (not counted
+  for a retained `(index, abs(pos))` that is **not already queued** puts it at the **front** of the
+  queue (already-queued → ignored, which bounds REQ-driven growth by the cache size; not counted
   against the cap). Unknown index: ignore. We never emit REQ.
 - `send` returning false: count `sendFailed`, drop that fragment, continue.
 - `.disconnected`: clear the queue and all reassembly buffers; keep the REQ cache; cancel the
@@ -303,12 +342,13 @@ interface count (see the multi-interface lesson: never per-driver).
 
 **File ownership** (to keep merges mechanical):
 - B owns: `ReTiCAInterfaces/Meshtastic/*` (new), `ReTiCANode/MeshtasticEndpoint.swift` (new),
-  `ReTiCANode/TransportEndpoint.swift`, `ReTiCATransport/InterfaceProfile.swift`, new test files and
+  `ReTiCANode/TransportEndpoint.swift`, new test files and
   fixture resources, the `ReTiCAInterfacesTests` resources line in `Package.swift`.
 - C owns: `LinkSession.swift`, `LinkPlane.swift`, `Transport.swift`, `LXMFRouter.swift`,
-  `LXMFDelivery.swift`, `LXMFNode.swift`. If C needs `TransportEndpoint.swift` (e.g. threading a
-  profile query into LinkPlane), it confines changes to the linkPlane-wiring region and rebases onto
-  main after B merges.
+  `LXMFDelivery.swift`, `LXMFNode.swift`. In `TransportEndpoint.swift` C may touch only the
+  `.openLink` and `.linkRequest` arms and add one new `announceOn` action case + arm (a new case, not
+  a parameter on `.announce`, so the 12 existing `.endpoint(.announce(_, appData))` test matches stay
+  intact); none of these overlap §5.4. C rebases onto main after B merges.
 - D owns: ReTiCAMsgr files only; it must not reference `TransportEndpoint.State.meshtastic` or any
   other lane-B symbol.
 - E owns: `Package.swift` dependency on `../MeshtasticKit` + the `ReTiCAMeshtasticLive` target;
@@ -329,10 +369,18 @@ Commits go straight to main in each repo (no feature-branch merge dance).
   (`scan() -> AsyncStream<RadioScanResult>`); D ships `testValue` + a preview value; E adds the live
   value over `MeshtasticScanner`. Rows tappable across the full width (`.frame(maxWidth: .infinity,
   alignment: .leading).contentShape(Rectangle())`).
-- **Scan ownership:** while the picker is presented and `bleEnabled` is on, the app sends
-  `.endpoint(.ble(.stop))` and restarts BLE on dismiss — FCB has one scan per process (§2).
+- Also persists `meshtasticRadioName: String?` so the Settings row shows a name after relaunch.
+- **Scan ownership:** while the picker is presented, if the BLE slot **exists and is running**
+  (starting / online / waiting-for-adapter — *not* keyed on `bleEnabled`, which only takes effect at
+  Connect, and never sending to an absent slot, which trips `.ifLet`), the app stops BLE and restarts
+  it on every exit (swipe, cancel, pick); `redialDownNodes` gets one guard so a foreground/push wake
+  doesn't restart BLE mid-picker (lane D adds that one guard in a lane-E-owned function; E merges
+  around it). FCB has one scan per process (§2).
 - Diagnostics: a Meshtastic layer modelled on `bleLayer` (`DiagnosticsSnapshot.swift:148-164`) fed
-  from a plain app-side state struct (online, preset, node number, counters) that E populates.
+  from a plain app-side `MeshtasticStatus` (online, preset, node number, offline reason, adapter
+  unavailable, and the seven counters) that E populates — counters from the public
+  `MeshtasticEndpoint.State.counters: MeshtasticCounters` (Contract 3), the rest from its delegates.
+- Merging D before E ships a toggle that only shows "radio not connected" in Diagnostics. Accepted.
 
 **Lane E (integration):**
 1. `ReTiCAMeshtasticLive`: `MeshtasticDriver.live(session:)` — maps `.configured` → `.connected`,
@@ -341,9 +389,16 @@ Commits go straight to main in each repo (no feature-branch merge dance).
    Loopback test against `MeshtasticMock` (live value, not a mock of it — the mocked-boundary lesson).
 2. **Coexistence probe** (first, before app wiring): RBTP `BLEDriver` and `MeshtasticSession`
    running on the one live FCB central — disconnect events filtered per peripheral, no scan
-   interference after the picker closes.
+   interference after the picker closes. **Known race to fix:** BLE stop is fire-and-forget and the
+   FCB driver adapter's stop always ends with `central.stopScan()` (`FCBDriverAdapter.swift:273-276`),
+   which ends *whatever* scan is current (`BluetoothCentralClient+Live.swift:228-231`) — so a slow
+   BLE stop (peers connected) can kill the picker's scan that just started. Fix in FCB by making
+   `stopScan` token-scoped (stop only the caller's own scan), with a probe that reproduces the race
+   first.
 3. App wiring: slot in `syncEndpointNodes`, restart in `redialDownNodes`, "will something dial"
-   checks, delegates → diagnostics state, live `RadioScanner`, targeted re-announce.
+   checks, delegates → diagnostics state, live `RadioScanner`, targeted re-announce (the app's
+   `interfaceConnected` handler sends lane C's `LXMFNode.Action.announceDeliveryOnInterface(id)`,
+   which rides `TransportEndpoint.Action.announceOn(interface:destinationHash:appData:)`).
 4. Hardware verification per §1 criterion 3, recorded with the radio model, firmware version and
    preset used.
 
@@ -361,8 +416,9 @@ Commits go straight to main in each repo (no feature-branch merge dance).
   jumps queue, queue-full drop, disconnect clears); **whole-slice probe** — two `TransportEndpoint`s
   with mock drivers cross-wired as one broadcast medium deliver an LXMF opportunistic message.
 - **C:** at `.tcp`/`.ble` profiles: LXMF retry = 10 s at every hop count, initiator establishment =
-  15 s at h = 1, responder = 15 s at h ≤ 2, and the multi-hop values in Contract 4's table; stretched
-  values at 202 bps; targeted announce goes out only the named interface.
+  15 s at wire hops 0 and 1, responder = 15 s at any `packet.hops` including 255, and the multi-hop
+  initiator values in Contract 4's table; stretched values at 202 bps; relay proof deadline gains
+  the arrival-interface term; targeted announce goes out only the named interface.
 - **D:** TCA tests (non-exhaustive, outcome-asserting) for toggle persistence, picker selection,
   BLE pause/resume around the picker.
 - **E:** live-adapter loopback, coexistence probe, hardware runs.
