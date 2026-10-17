@@ -109,6 +109,11 @@ public struct MeshtasticInterface {
 
         public var queuedFragmentCount: Int { queue.count }
 
+        /// Stopped with no `driver.stop()` still in flight: nothing of this interface runs, so a
+        /// host may drop its state now (spec Contract 3). `.stopped` alone is not enough — a stop
+        /// in flight would be cancelled by dropping the state and could race the next start.
+        public var isIdle: Bool { status == .stopped && !stopping }
+
         /// Reassembler and sender counters in one public value (read by `MeshtasticEndpoint`).
         public var diagnostics: MeshtasticCounters {
             let r = reassembler.counters
@@ -133,8 +138,9 @@ public struct MeshtasticInterface {
         public enum Delegate: Equatable {
             case online(myNodeNum: UInt32, modemPreset: Int?)
             /// The radio is no longer usable. Reported on a drop or unavailability of an ONLINE
-            /// radio, and on EVERY `.stop` of a non-stopped interface — online or not — so a host
-            /// that sends `.stop` can always wait for it (spec Contract 3).
+            /// radio, and for every `.stop` — only once `driver.stop()` has returned, so "offline"
+            /// means "fully down, the slot may be dropped" (spec Contract 3, amended 2026-10-16).
+            /// A `.stop` to an interface that is already idle reports it at once.
             case offline(reason: String?)
             case packetReceived(Data)
             case adapterUnavailable(BLEAdapterUnavailable)
@@ -165,12 +171,18 @@ public struct MeshtasticInterface {
                 return startDriver(state)
 
             case .stop:
-                guard state.status != .stopped else { return .none }
+                guard state.status != .stopped else {
+                    // A host that sends `.stop` waits for offline (Contract 3), so an already idle
+                    // interface answers at once. With a `driver.stop()` still in flight, its
+                    // `.driverStopped` answers for this stop too: offline must mean "fully down".
+                    return state.stopping ? .none : .send(.delegate(.offline(reason: nil)))
+                }
                 state.status = .stopped
                 if state.restartPending {
-                    // The deferred start never reached the driver; the stop in flight covers it.
+                    // The deferred start never reached the driver. The stop already in flight
+                    // covers this one, and its `.driverStopped` reports offline.
                     state.restartPending = false
-                    return .send(.delegate(.offline(reason: nil)))
+                    return .none
                 }
                 state.stopping = true
                 clearTraffic(&state)
@@ -179,14 +191,16 @@ public struct MeshtasticInterface {
                               .run { [driver] send in
                                   await driver.stop()
                                   await send(.driverStopped)
-                              },
-                              .send(.delegate(.offline(reason: nil))))
+                              })
 
             case .driverStopped:
                 state.stopping = false
-                guard state.restartPending else { return .none }
+                // Contract 3 (amended): the stop-initiated offline, now that `driver.stop()` has
+                // returned. Also when a deferred `.start` runs next, and BEFORE it, so the host
+                // deregisters the radio's interface before the restarted driver re-registers it.
+                guard state.restartPending else { return .send(.delegate(.offline(reason: nil))) }
                 state.restartPending = false
-                return startDriver(state)
+                return .concatenate(.send(.delegate(.offline(reason: nil))), startDriver(state))
 
             case let .driverEvent(.connected(myNodeNum, modemPreset)):
                 guard state.status != .stopped else { return .none }
