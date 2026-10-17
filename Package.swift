@@ -14,10 +14,14 @@ let package = Package(
         .library(name: "ReTiCATransport", targets: ["ReTiCATransport"]),
         .library(name: "ReTiCANode", targets: ["ReTiCANode"]),
         .library(name: "ReTiCAKeychain", targets: ["ReTiCAKeychain"]),
+        // The live Meshtastic driver (spec 2026-10-16 Contract 2). The ONLY ReTiCA code that
+        // imports MeshtasticKit.
+        .library(name: "ReTiCAMeshtasticLive", targets: ["ReTiCAMeshtasticLive"]),
     ],
     dependencies: [
         .package(url: "https://github.com/pointfreeco/swift-composable-architecture", from: "1.15.0"),
         .package(path: "../FCB"),
+        .package(path: "../MeshtasticKit"),
         .package(url: "https://github.com/NordicSemiconductor/IOS-CoreBluetooth-Mock.git", from: "1.0.0"),
         .package(url: "https://github.com/leif-ibsen/SwiftEdDSA", exact: "4.1.0"),
     ],
@@ -32,6 +36,15 @@ let package = Package(
                 .product(name: "FCBComposable", package: "FCB"),
             ]
         ),
+        .target(
+            name: "ReTiCAMeshtasticLive",
+            dependencies: [
+                "ReTiCAInterfaces",
+                .product(name: "MeshtasticKit", package: "MeshtasticKit"),
+                .product(name: "FCBComposable", package: "FCB"),
+                .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
+            ]
+        ),
         .testTarget(
             name: "ReTiCATests",
             dependencies: ["ReTiCA"],
@@ -41,6 +54,13 @@ let package = Package(
             name: "ReTiCAInterfacesTests",
             dependencies: [
                 "ReTiCAInterfaces",
+                // The live Meshtastic tests drive CoreBluetoothMock, which is process-global: they
+                // live in THIS target, nested in the serialized `FCBDriverAdapterCBMTests`, so they
+                // never overlap the BLE adapter's CBM tests.
+                "ReTiCAMeshtasticLive",
+                .product(name: "MeshtasticKit", package: "MeshtasticKit"),
+                .product(name: "MeshtasticMock", package: "MeshtasticKit"),
+                .product(name: "MeshProto", package: "MeshtasticKit"),
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
                 .product(name: "FCBComposable", package: "FCB"),
                 .product(name: "CoreBluetoothMock", package: "IOS-CoreBluetooth-Mock"),
