@@ -150,6 +150,7 @@ struct AdapterStubs {
     let publishHeld: LockIsolated<Bool>                // while true, publishL2CAPChannel stays in flight
     let publishEncryption: LockIsolated<[Bool]>        // withEncryption argument of every publishL2CAPChannel call
     let openL2CAPHeld: LockIsolated<Bool>              // while true, openL2CAPChannel stays in flight (after being counted started)
+    let disconnectHeld: LockIsolated<Bool>             // while true, central.disconnect stays in flight (a deterministic "slow" stop)
 }
 
 @MainActor
@@ -181,6 +182,7 @@ func makeStubs() -> AdapterStubs {
     let publishHeld = LockIsolated(false)
     let publishEncryption = LockIsolated<[Bool]>([])
     let openL2CAPHeld = LockIsolated(false)
+    let disconnectHeld = LockIsolated(false)
     let unpublished = LockIsolated<[UInt16]>([])
     let openL2CAPResult = LockIsolated<L2CAPConnection?>(nil)
     let openL2CAPDelayNanos = LockIsolated<UInt64>(0)
@@ -199,6 +201,7 @@ func makeStubs() -> AdapterStubs {
             // its trailing cleanup call while this disconnect is in flight — a bare actor-hop
             // resolves too fast to force that interleaving reliably.
             try? await Task.sleep(nanoseconds: 5_000_000)
+            while disconnectHeld.value { try? await Task.sleep(nanoseconds: 2_000_000) }
             await calls.disconnect(id)
         },
         retrievePeripherals: { _ in [] },
@@ -326,7 +329,8 @@ func makeStubs() -> AdapterStubs {
         canSendHeld: canSendHeld,
         publishPSM: publishPSM, unpublished: unpublished, openL2CAPResult: openL2CAPResult,
         openL2CAPDelayNanos: openL2CAPDelayNanos, psmResult: psmResult, l2capInbound: inbound.continuation,
-        publishHeld: publishHeld, publishEncryption: publishEncryption, openL2CAPHeld: openL2CAPHeld)
+        publishHeld: publishHeld, publishEncryption: publishEncryption, openL2CAPHeld: openL2CAPHeld,
+        disconnectHeld: disconnectHeld)
 }
 
 /// A scripted L2CAP connection. Nonisolated on purpose: tests build it inside
@@ -495,8 +499,51 @@ func openOutbound(_ adapter: FCBDriverAdapter, _ stubs: AdapterStubs, _ events: 
     #expect(await collect(events2, count: 1) == [.ready])
     #expect(await stubs.calls.removedAll >= 2)
     #expect(await stubs.calls.stoppedAdvertising >= 2)
-    #expect(await stubs.calls.stopScanned >= 1)
+    // The old session's scan ends by terminating ITS stream (its task is cancelled), never by
+    // FCB's global stopScan, which would end whatever scan is current — maybe another owner's.
+    #expect(await stubs.calls.stopScanned == 0)
     #expect(await stubs.calls.addedServices.count == 2)
+    await adapter.stop()
+}
+
+@Test @MainActor func stopNeverCallsTheGlobalStopScan() async {
+    let (adapter, stubs, _) = await onlineAdapter()
+    await adapter.stop()
+    #expect(await stubs.calls.stopScanned == 0)
+}
+
+/// The radio picker's dismiss: the app restarts BLE while the stop it sent when the picker
+/// opened is still disconnecting a peer. That old teardown must not reach into the new session
+/// when it resumes: no stopAdvertising/removeAll of the new session's advertisement and service,
+/// and no finishing of the new session's event stream.
+@Test @MainActor func aStaleStopResumingAfterARestartLeavesTheNewSessionAlone() async {
+    let (adapter, stubs, events1) = await onlineAdapter()
+    let p = peer(1)
+    stubs.scanCont.yield(disc(p))
+    _ = await collect(events1, count: 1)   // peerDiscovered
+    guard await openOutbound(adapter, stubs, events1, p) != nil else { return }
+
+    stubs.disconnectHeld.setValue(true)    // the old session's teardown parks on the peer's disconnect
+    let stop = Task { await adapter.stop() }
+    let calls = stubs.calls
+    try? await Task.sleep(nanoseconds: 100_000_000)   // the stop is now parked in the held disconnect
+    #expect(await calls.disconnected.isEmpty)
+
+    let events2 = adapter.start(BLEDriverConfig(localIdentity: adapterLocalIdentity))
+    #expect(await collect(events2, count: 1) == [.ready])
+    let stoppedAdvertising = await calls.stoppedAdvertising
+    let removedAll = await calls.removedAll
+    let ended = LockIsolated(false)
+    let watcher = Task { for await _ in events2 {}; ended.setValue(true) }
+
+    stubs.disconnectHeld.setValue(false)   // the old teardown resumes into the new session
+    await stop.value
+    try? await Task.sleep(nanoseconds: 100_000_000)
+
+    #expect(await calls.stoppedAdvertising == stoppedAdvertising, "the stale stop tore down the new advertisement")
+    #expect(await calls.removedAll == removedAll, "the stale stop removed the new session's service")
+    #expect(!ended.value, "the stale stop finished the new session's event stream")
+    watcher.cancel()
     await adapter.stop()
 }
 

@@ -244,6 +244,13 @@ actor FCBDriverAdapter {
 
     private func resetSession() async {
         epoch += 1   // first: invalidate any operation still in flight from the outgoing session
+        let myEpoch = epoch
+        // Captured before any await: a newer session may begin while this teardown is suspended,
+        // and its stream must not be the one finished below.
+        let outgoing = continuation
+        continuation = nil
+        // Cancelling the scan task terminates THIS session's scan stream, which is how FCB stops
+        // the radio scan — and only if it is still this session's scan.
         for t in tasks { t.cancel() }
         tasks = []
         for p in pumps.values { p.cancel() }
@@ -271,17 +278,19 @@ actor FCBDriverAdapter {
         inboundL2CAP = [:]
         for c in conns { await c.close() }
         for peerID in peers { try? await central.disconnect(peerID) }
-        // A restart without stop() (the reducer's adapter retry) must leave the managers clean
-        // for the next bring-up: no scan, no advertisement, no published service or PSM.
-        await central.stopScan()
-        await peripheral.stopAdvertising()
-        await peripheral.removeAll()
-        if let psm = publishedPSM {
-            publishedPSM = nil
-            await peripheral.unpublishL2CAPChannel(psm)
+        // A restart without stop() (the reducer's adapter retry) must leave the peripheral
+        // manager clean for the next bring-up: no advertisement, no published service or PSM.
+        // Skipped once a newer session began while this one was suspended: that session's own
+        // reset already cleaned up, and its bring-up now owns the advertisement and service.
+        if epoch == myEpoch {
+            await peripheral.stopAdvertising()
+            await peripheral.removeAll()
+            if epoch == myEpoch, let psm = publishedPSM {
+                publishedPSM = nil
+                await peripheral.unpublishL2CAPChannel(psm)
+            }
         }
-        continuation?.finish()
-        continuation = nil
+        outgoing?.finish()
     }
 
     // MARK: - Discovery
