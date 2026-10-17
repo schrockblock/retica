@@ -62,10 +62,11 @@ private func port76(from: UInt32, _ payload: Data) -> MeshtasticEvent {
         #expect(mapped(.connection(.disconnected(reason: "radio not found"))) == .unavailable(.other("radio not found")))
     }
 
-    /// MeshtasticKit emits `.adapterUnavailable` before ending with these, so they stay plain drops.
+    /// MeshtasticKit emits `.adapterUnavailable` before ending with these; the `.unavailable` already
+    /// told the interface, and a `.disconnected` after it would wedge it in `.connecting`.
     @Test(arguments: ["unauthorized", "unsupported"])
-    func anAdapterTerminalEndStaysDisconnected(reason: String) {
-        #expect(mapped(.connection(.disconnected(reason: reason))) == .disconnected(reason: reason))
+    func anAdapterTerminalEndMapsToNothing(reason: String) {
+        #expect(mapped(.connection(.disconnected(reason: reason))) == nil)
     }
 
     @Test(arguments: [MeshtasticConnectionState.connecting, .configuring, .connected])

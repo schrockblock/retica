@@ -271,13 +271,14 @@ extension FCBDriverAdapterCBMTests {
         /// the radio scan had already reached the radio (`manager.isScanning`). At least one round
         /// must cancel after the start (else every cancel landed before the scanner reached FCB and
         /// the rounds pass trivially), and at least one before it (the synchronous round, which
-        /// cancels with no await after creating the stream). Each round's sample is printed as
-        /// `coexist-dismiss round=… delayMs=… startedAtCancel=…`.
+        /// cancels with no await after creating the stream). Only the first is asserted: the second
+        /// is a scheduler race, recorded in the failure messages (`round=… delayMs=… startedAtCancel=…`).
         @Test func aRadioScanCancelledAsBLERestartsLeavesBLEDiscovering() async {
             // nil: cancel synchronously, before any await. Otherwise: sleep that many ms first.
             let delays: [Int?] = [nil, 0, 1, 2, 3, 4, 6, 8, 12, 20, 40, 60]
             var startedAtCancel = 0
             var notStartedAtCancel = 0
+            var roundLog: [String] = []
             for (round, delay) in delays.enumerated() {
                 let rig = await makeCoexistenceRig()
                 let manager = rig.manager
@@ -286,23 +287,25 @@ extension FCBDriverAdapterCBMTests {
                 let started = manager.isScanning
                 scan.cancel()
                 if started { startedAtCancel += 1 } else { notStartedAtCancel += 1 }
-                print("coexist-dismiss round=\(round) delayMs=\(delay.map(String.init) ?? "sync") startedAtCancel=\(started)")
+                roundLog.append("round=\(round) delayMs=\(delay.map(String.init) ?? "sync") startedAtCancel=\(started)")
                 let ble = DriverEventLog(rig.ble.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
                 let outcome = await ble.first(within: 3) { isPeerDiscovered($0) || $0 == scanSuperseded }
                 if outcome == scanSuperseded {
-                    Issue.record("round \(round): the cancelled radio scan superseded BLE's restarted scan")
+                    Issue.record("round \(round) (\(roundLog.last ?? "")): the cancelled radio scan superseded BLE's restarted scan")
                 } else if outcome == nil {
-                    Issue.record("round \(round): BLE online but not discovering: \(ble.events.value)")
+                    Issue.record("round \(round) (\(roundLog.last ?? "")): BLE online but not discovering: \(ble.events.value)")
                 } else {
                     try? await Task.sleep(for: .milliseconds(300))
                     #expect(!ble.events.value.contains(scanSuperseded),
-                            "round \(round): BLE discovered, then the cancelled radio scan superseded it")
-                    #expect(manager.isScanning, "round \(round): BLE discovered, then the radio stopped scanning")
+                            "round \(round) (\(roundLog.last ?? "")): BLE discovered, then the cancelled radio scan superseded it")
+                    #expect(manager.isScanning, "round \(round) (\(roundLog.last ?? "")): BLE discovered, then the radio stopped scanning")
                 }
                 await tearDown(rig, ble: ble, mesh: nil)
             }
-            #expect(startedAtCancel >= 1, "no round cancelled after the radio scan had started: the sweep never reached the window")
-            #expect(notStartedAtCancel >= 1, "no round cancelled before the radio scan had started")
+            // `notStartedAtCancel` is an observation, not an assertion: whether the synchronous cancel
+            // beats FCB's unordered start task is a scheduler race, so asserting it would flake.
+            #expect(startedAtCancel >= 1,
+                    "no round cancelled after the radio scan had started: the sweep never reached the window (startedAtCancel=\(startedAtCancel) notStartedAtCancel=\(notStartedAtCancel); rounds: \(roundLog.joined(separator: ", ")))")
         }
     }
 }

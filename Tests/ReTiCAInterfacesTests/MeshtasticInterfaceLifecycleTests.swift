@@ -75,6 +75,19 @@ import ComposableArchitecture
         await stopMeshInterface(h)
     }
 
+    /// A drop of a radio that never came online must not turn `.unavailable` back into
+    /// `.connecting` (a later `.start` would then be a no-op).
+    @Test func disconnectAfterUnavailableKeepsTheUnavailableStatus() async {
+        let h = makeMeshInterface()
+        await h.store.send(.start)
+        h.radio.yield(.unavailable(.unauthorized))
+        await h.store.receive { $0 == .delegate(.adapterUnavailable(.unauthorized)) }
+        h.radio.yield(.disconnected(reason: "unauthorized"))
+        await h.store.receive { $0 == .driverEvent(.disconnected(reason: "unauthorized")) }
+        #expect(h.store.state.status == .unavailable(.unauthorized))
+        await stopMeshInterface(h)
+    }
+
     @Test func unavailableWhileOnlineReportsOffline() async {
         let h = await makeOnlineMeshInterface()
         h.radio.yield(.unavailable(.unauthorized))

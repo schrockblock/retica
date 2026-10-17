@@ -139,8 +139,10 @@ public struct MeshtasticInterface {
             case online(myNodeNum: UInt32, modemPreset: Int?)
             /// The radio is no longer usable. Reported on a drop or unavailability of an ONLINE
             /// radio, and for every `.stop` — only once `driver.stop()` has returned, so "offline"
-            /// means "fully down, the slot may be dropped" (spec Contract 3, amended 2026-10-16).
-            /// A `.stop` to an interface that is already idle reports it at once.
+            /// means the stop finished (spec Contract 3, amended 2026-10-16). A `.stop` to an
+            /// interface that is already idle reports it at once. On the deferred-restart arm a
+            /// fresh start follows straight away, so offline is NOT "fully down" there: a consumer
+            /// that needs "fully down, the slot may be dropped" checks `state.isIdle`.
             case offline(reason: String?)
             case packetReceived(Data)
             case adapterUnavailable(BLEAdapterUnavailable)
@@ -211,6 +213,9 @@ public struct MeshtasticInterface {
             case let .driverEvent(.disconnected(reason)):
                 guard state.status != .stopped else { return .none }
                 let wasOnline = state.isOnline
+                // A drop of a radio that never came online must not hide an `.unavailable` already
+                // reported: `.connecting` would make a later `.start` a no-op.
+                if case .unavailable = state.status { return .none }
                 state.status = .connecting
                 clearTraffic(&state)
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.pacing)]

@@ -38,8 +38,12 @@ extension MeshtasticDriver {
         case let .connection(.disconnected(reason)):
             // A terminal end that is not an adapter cause ("radio not found") would otherwise be
             // invisible: the interface reports no delegate for a drop of a never-online radio.
-            if let reason, !adapterEndReasons.contains(reason) { return .unavailable(.other(reason)) }
-            return .disconnected(reason: reason)
+            if let reason {
+                // An adapter cause was already reported as `.unavailable`; a `.disconnected` after it
+                // would flip the interface back to `.connecting` and wedge it.
+                return adapterEndReasons.contains(reason) ? nil : .unavailable(.other(reason))
+            }
+            return .disconnected(reason: nil)
         case .connection(.connecting), .connection(.configuring), .connection(.connected):
             return nil
         case let .adapterUnavailable(cause):
@@ -81,8 +85,9 @@ struct MeshtasticEventMapper: Equatable {
     }
 }
 
-/// The state behind `MeshtasticDriver.live(session:)`. Precondition: callers serialise `start`
-/// after `stop()` has returned (`pendingConnects` is a counter, not a generation).
+/// The state behind `MeshtasticDriver.live(session:)`. `MeshtasticInterface` may `start`
+/// again from `.unavailable` without a `stop()` in between; `pendingConnects` is a counter (not a
+/// generation), so overlapping starts are counted and `stop()` drains them all.
 final class MeshtasticLiveAdapter: Sendable {
     let session: MeshtasticSession
     /// The current start's config, read by `send` (Contract 2's `send` takes only the frame).
@@ -139,7 +144,7 @@ final class MeshtasticLiveAdapter: Sendable {
         config.setValue(nil)
         await session.disconnect()
         while pendingConnects.value > 0 {
-            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(10))
             await session.disconnect()
         }
     }

@@ -99,6 +99,25 @@ Two iPhones, each paired with its own radio (A and B; unplug B from the Mac, sto
 - [ ] Walk one radio out of range and back: Diagnostics shows offline then online without
       touching the app.
 
+## (b2) stop while unreachable, and a Bluetooth power cycle
+
+Why: Contract 3 requires that the live `driver.stop()` always returns. On real iOS that depends on
+CoreBluetooth answering `cancelPeripheralConnection` for a PENDING connect (a radio that is off or
+out of range), which only CoreBluetoothMock has verified. If (1) or (2) hangs, the follow-up is to
+bound the adapter's stop with a timeout.
+1. Power radio A off (or carry it out of range). In ReTiCAMsgr → Settings → Meshtastic, Connect,
+   so the interface sits in `connecting`.
+- [ ] (1) While it is connecting, toggle Meshtastic OFF. Expected: Diagnostics shows the Meshtastic
+      interface offline within a few seconds, with no wait for the radio. Record the seconds.
+2. Toggle Meshtastic ON again with the radio still unreachable (back to `connecting`).
+- [ ] (2) Open Choose radio… and pick a DIFFERENT radio (radio B's, or any other in range). Expected:
+      the swap completes (the old attempt is torn down, the new radio connects or tries). Record the
+      seconds.
+3. Power radio A on and connect it so Diagnostics shows `online`.
+- [ ] (3) Turn iPhone Bluetooth off, wait about 5 s, turn it back on. Expected: Diagnostics shows
+      offline or an adapter row while it is off, then the radio comes back `online` with no user
+      action. Record the seconds from Bluetooth back on to `online`.
+
 ## (c) radio → ReTiCA gateway → TCP responder
 
 Topology: Mac probe (instance 1, radio B via rnsd) —air— radio A —BLE— iPhone gateway (ReTiCAMsgr,
@@ -165,6 +184,9 @@ Stop rnsd, then restore the value you noted in the Equipment table ("original pr
 | (b) A → B | | | | |
 | (b) B → A | | | | |
 | (b) background | | | | |
+| (b2) disable while connecting to an unreachable radio | | | | |
+| (b2) swap radio while connecting to an unreachable radio | | | | |
+| (b2) Bluetooth power cycle while online | | | | |
 | (c) direct via gateway | | | | |
 | (c) opportunistic via gateway | | | | |
 | (d) Meshtastified hopStart | | | | |
