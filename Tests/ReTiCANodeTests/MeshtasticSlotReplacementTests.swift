@@ -34,6 +34,11 @@ struct MeshtasticRadioSlotHost {
                 return .send(.endpoint(.meshtastic(.stop)))
             case .endpoint(.meshtastic(.delegate(.radioOffline))):
                 guard let next = state.next else { return .none }
+                if let slot = state.endpoint.meshtastic, !slot.interface.isIdle {
+                    // The app's rule: offline from a non-idle slot (a deferred restart follows)
+                    // is answered with another stop; the swap completes at the next offline.
+                    return .send(.endpoint(.meshtastic(.stop)))
+                }
                 state.next = nil
                 state.endpoint.meshtastic = MeshtasticEndpoint.State(config: next)
                 return .send(.endpoint(.meshtastic(.start)))
@@ -125,5 +130,44 @@ private func makeSlotHost(holdStops: Bool) -> SlotHostHarness {
         await h.store.send(.endpoint(.meshtastic(.stop)))
         await h.store.receive { $0 == .endpoint(.meshtastic(.delegate(.radioOffline(reason: nil)))) }
         #expect(h.calls.value.isEmpty)
+    }
+
+    /// Review Focus 5: Connect's `.start` reaches the old slot mid-stop. The interface restarts
+    /// it after its stop and reports offline first; the host sees a NON-idle slot, stops again,
+    /// and only then installs the new radio. Driver calls never show two starts without a stop.
+    @Test func aStartReachingTheOldSlotMidStopNeverOverlapsTheNewRadiosStart() async {
+        let h = makeSlotHost(holdStops: true)
+        await h.store.send(.endpoint(.start))
+        await h.waitForStarts(1)
+        h.yieldToLatest(.connected(myNodeNum: 0x0A0A_0A0A, modemPreset: 8))
+        await h.store.receive { if case .endpoint(.meshtastic(.delegate(.radioOnline))) = $0 { return true }; return false }
+        await h.store.send(.replaceRadio(MeshtasticDriverConfig(radio: slotRadioB)))
+        await h.store.send(.endpoint(.meshtastic(.start)))
+        h.held.setValue(false)
+        let ended = await slotWaitUntil(timeout: .seconds(3)) { h.calls.value.last == .start(slotRadioB) }
+        #expect(ended, "calls: \(h.calls.value)")
+        #expect(slotNoOverlappingStarts(h.calls.value), "calls: \(h.calls.value)")
+        await h.store.skipReceivedActions(strict: false)
+        #expect(h.store.state.endpoint.meshtastic?.interface.config.radio == slotRadioB)
+        #expect(h.store.state.next == nil)
+        await h.shutdown()
+    }
+}
+
+private func slotWaitUntil(timeout: Duration, _ condition: @Sendable () -> Bool) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if condition() { return true }
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return condition()
+}
+
+/// No `.start` directly follows a `.start`.
+private func slotNoOverlappingStarts(_ calls: [SlotRadioCall]) -> Bool {
+    zip(calls, calls.dropFirst()).allSatisfy { pair in
+        if case .start = pair.0, case .start = pair.1 { return false }
+        return true
     }
 }

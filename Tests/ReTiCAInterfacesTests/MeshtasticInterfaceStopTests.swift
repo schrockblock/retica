@@ -10,6 +10,9 @@ private struct StopOrderRecorder: Reducer {
     typealias Action = MeshtasticInterface.Action
     let log: LockIsolated<[String]>
     let calls: LockIsolated<[MeshMockCall]>
+    /// When true, the next `.delegate(.offline)` is answered once with `.stop` (a host that saw a
+    /// non-idle interface at offline). Default: answer nothing.
+    let stopOnOffline: LockIsolated<Bool>
 
     func reduce(into state: inout State, action: Action) -> Effect<Action> {
         switch action {
@@ -18,6 +21,10 @@ private struct StopOrderRecorder: Reducer {
         case .delegate(.offline):
             let starts = calls.value.filter { if case .start = $0 { return true }; return false }.count
             log.withValue { $0.append("offline@\(starts)") }
+            if stopOnOffline.value {
+                stopOnOffline.setValue(false)
+                return .merge(MeshtasticInterface().reduce(into: &state, action: action), .send(.stop))
+            }
         default:
             break
         }
@@ -31,6 +38,7 @@ private struct StopHarness {
     let log: LockIsolated<[String]>
     let calls: LockIsolated<[MeshMockCall]>
     let held: LockIsolated<Bool>
+    let stopOnOffline: LockIsolated<Bool>
 
     var offlineCount: Int { log.value.filter { $0.hasPrefix("offline") }.count }
     var startCount: Int { calls.value.filter { if case .start = $0 { return true }; return false }.count }
@@ -52,13 +60,15 @@ private struct StopHarness {
 /// A mock radio shaped like the live adapter: every `start` opens a FRESH session stream, and
 /// `stop` blocks while `held` is true and records `.stop` only when it RETURNS.
 @MainActor
-private func makeStopHarness(online: Bool, holdStops: Bool = true) async -> StopHarness {
+private func makeStopHarness(online: Bool, holdStops: Bool = true,
+                             answerOfflineWithStop: Bool = false) async -> StopHarness {
     let log = LockIsolated<[String]>([])
     let calls = LockIsolated<[MeshMockCall]>([])
     let held = LockIsolated(holdStops)
+    let stopOnOffline = LockIsolated(answerOfflineWithStop)
     let sessions = LockIsolated<[AsyncStream<MeshtasticDriverEvent>.Continuation]>([])
     let store = TestStore(initialState: MeshtasticInterface.State(config: meshTestConfig)) {
-        StopOrderRecorder(log: log, calls: calls)
+        StopOrderRecorder(log: log, calls: calls, stopOnOffline: stopOnOffline)
     } withDependencies: {
         $0.meshtasticDriver = MeshtasticDriver(
             start: { config in
@@ -83,7 +93,7 @@ private func makeStopHarness(online: Bool, holdStops: Bool = true) async -> Stop
         sessions.value.last?.yield(.connected(myNodeNum: meshOwnNode, modemPreset: 0))
         await store.receive { if case .delegate(.online) = $0 { return true }; return false }
     }
-    return StopHarness(store: store, log: log, calls: calls, held: held)
+    return StopHarness(store: store, log: log, calls: calls, held: held, stopOnOffline: stopOnOffline)
 }
 
 /// Contract 3 (amended 2026-10-16): offline means "the driver is fully down".
@@ -159,5 +169,21 @@ private func makeStopHarness(online: Bool, holdStops: Bool = true) async -> Stop
         h.releaseStop()
         await h.store.receive { $0 == .driverStopped }
         #expect(h.store.state.isIdle)
+    }
+
+    /// Review Focus 5: the host answers the deferred-restart offline with `.stop` (it saw a
+    /// non-idle interface). That stop must win: the driver is never left running after it.
+    @Test func aStopAnsweringTheRestartOfflineWinsOverTheDeferredStart() async {
+        let h = await makeStopHarness(online: true, answerOfflineWithStop: true)
+        await h.store.send(.stop)
+        await h.store.send(.start)
+        h.releaseStop()
+        await h.store.receive { $0 == .delegate(.offline(reason: nil)) }
+        await h.store.receive { $0 == .delegate(.offline(reason: nil)) }
+        for _ in 0..<50 { await Task.megaYield() }
+        await h.store.skipReceivedActions(strict: false)
+        #expect(h.calls.value.last == .stop, "a driver start outlived the answering stop: \(h.calls.value)")
+        #expect(h.store.state.isIdle)
+        #expect(h.offlineCount == 2)
     }
 }

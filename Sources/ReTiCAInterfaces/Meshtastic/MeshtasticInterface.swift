@@ -91,6 +91,10 @@ public struct MeshtasticInterface {
         var stopping = false
         /// A `.start` arrived while `stopping`: `.driverStopped` starts the driver.
         var restartPending = false
+        /// `.driverStopped` queued the deferred start (`.restartDeferred`) behind its offline
+        /// delegate. A `.stop` the host sends in answer to that offline is reduced first and
+        /// clears this, so the queued start then does nothing — the stop wins (Review Focus 5).
+        var restartQueued = false
 
         public init(config: MeshtasticDriverConfig, framing: MeshtasticFraming = .landandair) {
             self.config = config
@@ -133,6 +137,10 @@ public struct MeshtasticInterface {
         case pacingElapsed
         /// `driver.stop()` returned: a deferred `.start` may now run.
         case driverStopped
+        /// The deferred start, sent from a task after the stop-initiated offline so a `.stop` the
+        /// host reduces in that offline's burst wins (it clears `restartQueued`). Ignored unless
+        /// `restartQueued`, so a copy routed to a replacement slot's state does nothing.
+        case restartDeferred
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -141,8 +149,8 @@ public struct MeshtasticInterface {
             /// radio, and for every `.stop` — only once `driver.stop()` has returned, so "offline"
             /// means the stop finished (spec Contract 3, amended 2026-10-16). A `.stop` to an
             /// interface that is already idle reports it at once. On the deferred-restart arm a
-            /// fresh start follows straight away, so offline is NOT "fully down" there: a consumer
-            /// that needs "fully down, the slot may be dropped" checks `state.isIdle`.
+            /// fresh start follows unless the host answers this offline with `.stop`, which wins;
+            /// a consumer that needs "fully down, the slot may be dropped" checks `state.isIdle`.
             case offline(reason: String?)
             case packetReceived(Data)
             case adapterUnavailable(BLEAdapterUnavailable)
@@ -180,6 +188,7 @@ public struct MeshtasticInterface {
                     return state.stopping ? .none : .send(.delegate(.offline(reason: nil)))
                 }
                 state.status = .stopped
+                state.restartQueued = false
                 if state.restartPending {
                     // The deferred start never reached the driver. The stop already in flight
                     // covers this one, and its `.driverStopped` reports offline.
@@ -200,9 +209,22 @@ public struct MeshtasticInterface {
                 // Contract 3 (amended): the stop-initiated offline, now that `driver.stop()` has
                 // returned. Also when a deferred `.start` runs next, and BEFORE it, so the host
                 // deregisters the radio's interface before the restarted driver re-registers it.
+                // The deferred start hops through a task: TCA delivers `.send` synchronously into
+                // the action buffer and a `.run` registers its cancel id only when its task starts,
+                // so a `.stop` the host sends in answer to this offline (reduced in the same burst)
+                // could neither precede a direct `.send(.restartDeferred)` nor cancel a direct
+                // `startDriver`. After the hop, that stop has cleared `restartQueued` and the start
+                // does nothing.
                 guard state.restartPending else { return .send(.delegate(.offline(reason: nil))) }
                 state.restartPending = false
-                return .concatenate(.send(.delegate(.offline(reason: nil))), startDriver(state))
+                state.restartQueued = true
+                return .concatenate(.send(.delegate(.offline(reason: nil))),
+                                    .run { send in await send(.restartDeferred) })
+
+            case .restartDeferred:
+                guard state.restartQueued else { return .none }
+                state.restartQueued = false
+                return startDriver(state)
 
             case let .driverEvent(.connected(myNodeNum, modemPreset)):
                 guard state.status != .stopped else { return .none }
