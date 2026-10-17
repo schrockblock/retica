@@ -100,7 +100,12 @@ private func makeBLEStopHarness(online: Bool, holdStops: Bool = true) async -> B
         #expect(stopped.calls.value == [.start, .stop])
     }
 
-    @Test func aStopDuringAStopIsAnsweredByTheStopInFlight() async {
+    /// Pins the OUTCOME only: one driver.stop(), idle once it returns. With status already
+    /// `.stopped`, the `stopping` branch of `.stop` and the idle guard both make the second stop a
+    /// no-op with identical state, so no observable outcome tells them apart here. The `stopping`
+    /// branch is pinned by `aStopCancelsAStartDeferredBehindTheStopInFlight`, where status is
+    /// `.starting` and only that branch keeps the second stop off the driver.
+    @Test func aSecondStopDuringAStopDoesNotReachTheDriver() async {
         let h = await makeBLEStopHarness(online: true)
         await h.store.send(.stop)
         await h.store.send(.stop)
