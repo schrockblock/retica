@@ -96,7 +96,10 @@ private func makeMeshEpochHarness(answerRestartWithStop: Bool, holdStops: Bool) 
     return MeshEpochHarness(store: store, calls: calls, sessions: sessions, ended: ended, held: held)
 }
 
-/// A `.stop` reduced in the same burst as a start effect's construction must still win.
+/// A `.stop` reduced in the same burst as the action that builds or queues a start must still
+/// win. Scope: both same-burst shapes, whichever guard holds each. The from-stopped test pins
+/// the epoch. The deferred-restart test pins `restartQueued`, which the epoch cannot reach; it
+/// lives here because it shares the burst host with its BLE twin, where the epoch does hold it.
 @MainActor @Suite struct MeshtasticInterfaceStartEpochTests {
     /// The host answers the deferred restart's `.driverStopped` with `.stop` in that burst. Here
     /// the `restartQueued` guard, not the epoch, keeps the restart off the driver: the restart's

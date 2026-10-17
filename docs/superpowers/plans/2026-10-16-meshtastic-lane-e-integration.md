@@ -450,8 +450,13 @@ In `MeshtasticInterface.swift`, after `public var queuedFragmentCount: Int { que
 
 ```swift
         /// Stopped with no `driver.stop()` still in flight: nothing of this interface runs, so a
-        /// host may drop its state now (spec Contract 3). `.stopped` alone is not enough — a stop
-        /// in flight would be cancelled by dropping the state and could race the next start.
+        /// host may drop its state now (spec Contract 3). `.stopped` alone is not enough: a
+        /// `driver.stop()` is still in flight, and what dropping the state does to it depends on
+        /// WHO drops it. An `ifLet` cancels the child's effects only when its own parent reducer
+        /// nils the state; a host outside that reducer (as with `TransportEndpoint.meshtastic`,
+        /// which nothing inside `TransportEndpoint` drops) leaves the stop running, and its
+        /// `.driverStopped` then reaches an `ifLet` with no state (TCA's runtime warning). Either
+        /// way the next slot's start could race the old stop.
         public var isIdle: Bool { status == .stopped && !stopping }
 ```
 

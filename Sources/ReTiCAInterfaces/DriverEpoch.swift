@@ -9,8 +9,14 @@ import ComposableArchitecture
 ///
 /// The interface captures `value` when it builds the start effect and bumps it when it reduces a
 /// `.stop`; the effect calls `driver.start()` only under the lock and only if `value` is still the
-/// captured one. So a start either reaches the driver before the stop's bump (and the stop's
-/// `driver.stop()` ends it) or never reaches the driver at all.
+/// captured one. What that guarantees, on its own, is interface-level CALL order: the synchronous
+/// `driver.start()` call either returns before the stop's bump (so it precedes the stop's
+/// `driver.stop()` call) or never happens.
+///
+/// It does not order any work the driver's `start` spawns. A driver whose `start` only launches
+/// a task must itself make a `stop()` CALLED after `start()` win over that task, however the two
+/// reach it: `FCBDriverAdapter` does this with start/stop tickets, and the Meshtastic live adapter
+/// with `pendingConnects` (its `stop()` disconnects until no connect is outstanding).
 ///
 /// A reference type so the effect sees bumps made after it was built. Equality is identity: a copy
 /// of the state shares its epoch and compares equal; a freshly made state (a replaced slot) has its

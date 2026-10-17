@@ -70,6 +70,14 @@ actor FCBDriverAdapter {
     /// operation aborts silently (no event into whatever session is now live).
     private var epoch = 0
 
+    /// Orders each `start()` against `stop()` by CALL order, which the epoch cannot: `start` only
+    /// spawns `begin`, and a `stop()` reaching the actor first would otherwise let that `begin`
+    /// bring a session up after `stop()` returned. `start` takes a ticket synchronously; `stop()`
+    /// records "stopped through the last ticket issued" before it hops onto the actor; a `begin`
+    /// whose ticket is at or below that never comes up.
+    private struct Tickets { var issued = 0; var stoppedThrough = 0 }
+    private nonisolated let tickets = LockIsolated(Tickets())
+
     private var advertising = false
     private var scanning = false
     private var announcedReady = false
@@ -119,21 +127,38 @@ actor FCBDriverAdapter {
         Data([0x00, UInt8(BLEProtocol.identityLength)]) + identity
     }
 
+    /// Test seam: runs in `start`'s spawned task before `begin`, so a test can make a `stop()`
+    /// reach the actor first deterministically. No-op in production.
+    private let beforeBegin: @Sendable () async -> Void
+
     init(central: BluetoothCentralClient, peripheral: BluetoothPeripheralClient,
-         now: @escaping @Sendable () -> Date = { Date() }, l2capOpenLimit: Duration = .seconds(10)) {
+         now: @escaping @Sendable () -> Date = { Date() }, l2capOpenLimit: Duration = .seconds(10),
+         beforeBegin: @escaping @Sendable () async -> Void = {}) {
         self.central = central
         self.peripheral = peripheral
         self.now = now
         self.l2capOpenLimit = l2capOpenLimit
+        self.beforeBegin = beforeBegin
     }
 
     nonisolated func start(_ config: BLEDriverConfig) -> AsyncStream<BLEDriverEvent> {
-        AsyncStream<BLEDriverEvent> { continuation in
-            Task { await self.begin(config: config, continuation: continuation) }
+        let ticket = tickets.withValue { $0.issued += 1; return $0.issued }
+        return AsyncStream<BLEDriverEvent> { continuation in
+            Task { [beforeBegin] in
+                await beforeBegin()
+                await self.begin(ticket: ticket, config: config, continuation: continuation)
+            }
         }
     }
 
-    private func begin(config: BLEDriverConfig, continuation: AsyncStream<BLEDriverEvent>.Continuation) async {
+    /// No `stop()` was called after the `start()` that issued `ticket`.
+    private func isLive(_ ticket: Int) -> Bool { ticket > tickets.value.stoppedThrough }
+
+    private func begin(ticket: Int, config: BLEDriverConfig,
+                       continuation: AsyncStream<BLEDriverEvent>.Continuation) async {
+        // A stop() called after this start may have reached the actor first (its resetSession
+        // already ran, so the epoch check below cannot see it).
+        guard isLive(ticket) else { continuation.finish(); return }
         // resetSession bumps the epoch first; any other bump while it is suspended means a stop()
         // (or a newer start) arrived mid-begin, and this session must never come up.
         let myEpoch = epoch + 1
@@ -144,11 +169,15 @@ actor FCBDriverAdapter {
         announcedReady = false
         announcedUnavailable = false
         seenPeers = [:]
+        // Captured NOW, not when the state tasks first run: a task that starts only after a stop()
+        // cancelled it still sees a buffered poweredOn, and reading the epoch then would hand the
+        // ended session's bring-up the stop's epoch (it would advertise and scan after stop()).
+        let sessionEpoch = epoch
         tasks.append(Task { [peripheral] in
-            for await state in peripheral.state() { await self.handlePeripheralState(state) }
+            for await state in peripheral.state() { await self.handlePeripheralState(state, session: sessionEpoch) }
         })
         tasks.append(Task { [central] in
-            for await state in central.state() { await self.handleCentralState(state) }
+            for await state in central.state() { await self.handleCentralState(state, session: sessionEpoch) }
         })
         subscribeCentralEvents()
         subscribePeripheralStreams()
@@ -156,7 +185,8 @@ actor FCBDriverAdapter {
 
     // MARK: - Bring-up
 
-    private func handlePeripheralState(_ state: CBManagerState) async {
+    private func handlePeripheralState(_ state: CBManagerState, session: Int) async {
+        guard epoch == session else { return }
         switch state {
         case .poweredOn: await bringUpPeripheral()
         case .poweredOff, .unauthorized, .unsupported: fireUnavailable(Self.cause(state))
@@ -164,7 +194,8 @@ actor FCBDriverAdapter {
         }
     }
 
-    private func handleCentralState(_ state: CBManagerState) async {
+    private func handleCentralState(_ state: CBManagerState, session: Int) async {
+        guard epoch == session else { return }
         switch state {
         case .poweredOn: bringUpCentral()
         case .poweredOff, .unauthorized, .unsupported: fireUnavailable(Self.cause(state))
@@ -657,7 +688,14 @@ actor FCBDriverAdapter {
         if disconnect, let peerID { try? await central.disconnect(peerID) }
     }
 
-    func stop() async {
+    /// Nonisolated so the ticket is recorded in the caller's task, before the hop onto the actor:
+    /// every `start()` called before this `stop()` is then stale even if its `begin` runs later.
+    nonisolated func stop() async {
+        tickets.withValue { $0.stoppedThrough = $0.issued }
+        await stopSession()
+    }
+
+    private func stopSession() async {
         await resetSession()   // also stops scanning/advertising and removes the service
     }
 
