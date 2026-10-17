@@ -62,6 +62,8 @@ actor FCBDriverAdapter {
     private var continuation: AsyncStream<BLEDriverEvent>.Continuation?
     private var config = BLEDriverConfig(localIdentity: Data(repeating: 0, count: BLEProtocol.identityLength))
     private var tasks: [Task<Void, Never>] = []
+    /// This session's scan task (also in `tasks`), replaced on a repeat poweredOn.
+    private var scanTask: Task<Void, Never>?
 
     /// Bumped at the start of every resetSession (stop()/restart). Operations capture it on entry
     /// and check it after every suspension point; a mismatch means "this session is gone" and the
@@ -212,13 +214,32 @@ actor FCBDriverAdapter {
     }
 
     private func bringUpCentral() {
-        tasks.append(Task { [central] in
+        // A repeat poweredOn replaces this session's own scan: cancel it first, so its stream ends
+        // as "cancelled" (ours, on purpose) and never reads as lost to another owner.
+        scanTask?.cancel()
+        let myEpoch = epoch
+        let task = Task { [central] in
             for await discovered in central.scan([bleV22ServiceUUID], ScanOptions(allowDuplicates: true)) {
                 self.handleDiscovered(discovered)
             }
-        })
+            // FCB ended the scan without us cancelling it. Bluetooth off: handleCentralState reports
+            // that and the next poweredOn scans again. Still on: another owner's scan superseded ours.
+            guard !Task.isCancelled else { return }
+            var states = central.state().makeAsyncIterator()
+            if await states.next() == .poweredOn { self.scanLost(epoch: myEpoch) }
+        }
+        scanTask = task
+        tasks.append(task)
         scanning = true
         checkReady()
+    }
+
+    /// Our scan was superseded while Bluetooth stayed on: BLE is not discovering any more. Report it
+    /// as a transient adapter problem, so the interface leaves `.online` and its retry restarts us.
+    private func scanLost(epoch sessionEpoch: Int) {
+        guard epoch == sessionEpoch else { return }
+        scanning = false
+        fireUnavailable(.other("scan superseded by another scanner"))
     }
 
     private func checkReady() {
@@ -253,6 +274,7 @@ actor FCBDriverAdapter {
         // the radio scan — and only if it is still this session's scan.
         for t in tasks { t.cancel() }
         tasks = []
+        scanTask = nil
         for p in pumps.values { p.cancel() }
         pumps = [:]
         // Snapshot and clear BEFORE any await: a cancelled pump's trailing outboundDidClose call

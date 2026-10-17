@@ -58,6 +58,44 @@ final class Broadcaster<Value: Sendable>: @unchecked Sendable {
     }
 }
 
+/// The stub central's scan: every `scan()` call gets its own stream, as FCB's does, fed by
+/// `yield`. A stream ends only when its consumer cancels it, so a restarted session's scan is not
+/// killed by the previous session's cancellation. Values yielded while no stream is listening wait
+/// for the next one, as the single shared stream this replaced buffered them.
+final class ScanFeed: @unchecked Sendable {
+    private let lock = NSLock()
+    private var listeners: [Int: AsyncStream<DiscoveredPeripheral>.Continuation] = [:]
+    private var pending: [DiscoveredPeripheral] = []
+    private var nextID = 0
+
+    func yield(_ value: DiscoveredPeripheral) {
+        lock.lock()
+        let all = Array(listeners.values)
+        if all.isEmpty { pending.append(value) }
+        lock.unlock()
+        for c in all { c.yield(value) }
+    }
+
+    func makeStream() -> AsyncStream<DiscoveredPeripheral> {
+        AsyncStream { continuation in
+            lock.lock()
+            let id = nextID
+            nextID += 1
+            listeners[id] = continuation
+            let backlog = pending
+            pending = []
+            lock.unlock()
+            for value in backlog { continuation.yield(value) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.listeners[id] = nil
+                self.lock.unlock()
+            }
+        }
+    }
+}
+
 /// Records the FCB commands the adapter invokes.
 actor AdapterCalls {
     var addedServices: [MutableService] = []
@@ -115,7 +153,7 @@ struct AdapterStubs {
     let calls: AdapterCalls
     let centralState: Broadcaster<CBManagerState>
     let peripheralState: Broadcaster<CBManagerState>
-    let scanCont: AsyncStream<DiscoveredPeripheral>.Continuation
+    let scanCont: ScanFeed                             // yield discoveries to every live scan() stream
     let centralEvents: AsyncStream<CentralEvent>.Continuation
     let writeRequests: AsyncStream<[WriteRequest]>.Continuation
     let subscriptions: AsyncStream<SubscriptionEvent>.Continuation
@@ -158,7 +196,7 @@ func makeStubs() -> AdapterStubs {
     let calls = AdapterCalls()
     let cState = Broadcaster<CBManagerState>()
     let pState = Broadcaster<CBManagerState>()
-    let scan = AsyncStream<DiscoveredPeripheral>.makeStream()
+    let scan = ScanFeed()
     let cEvents = AsyncStream<CentralEvent>.makeStream()
     let writes = AsyncStream<[WriteRequest]>.makeStream()
     let subs = AsyncStream<SubscriptionEvent>.makeStream()
@@ -192,7 +230,7 @@ func makeStubs() -> AdapterStubs {
     let central = BluetoothCentralClient(
         state: { cState.makeStream() },
         authorization: { .allowedAlways },
-        scan: { _, _ in Task { await calls.scan() }; return scan.stream },
+        scan: { _, _ in Task { await calls.scan() }; return scan.makeStream() },
         stopScan: { await calls.stopScan() },
         connect: { id, _ in await calls.connect(id); return Peripheral(id: id, name: nil, state: .connected) },
         disconnect: { id in
@@ -318,7 +356,7 @@ func makeStubs() -> AdapterStubs {
     return AdapterStubs(
         central: central, peripheral: peripheral, calls: calls,
         centralState: cState, peripheralState: pState,
-        scanCont: scan.continuation, centralEvents: cEvents.continuation,
+        scanCont: scan, centralEvents: cEvents.continuation,
         writeRequests: writes.continuation, subscriptions: subs.continuation,
         peripheralEvents: pEvents.continuation,
         identityResult: identityResult, charsResult: charsResult, writeShouldThrow: writeShouldThrow,

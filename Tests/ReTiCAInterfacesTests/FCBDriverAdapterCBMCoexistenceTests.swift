@@ -173,6 +173,39 @@ extension FCBDriverAdapterCBMTests {
         return (driver, log)
     }
 
+    /// Another owner's scan supersedes BLE's while Bluetooth stays on (FCB runs one radio scan per
+    /// central). BLE must not stay "online" without discovering: the driver reports a transient
+    /// adapter problem, so the interface leaves `.online` and its retry restarts the driver.
+    @Test func aSupersededBLEScanIsReportedAsATransientAdapterProblem() async {
+        let rig = await makeCoexistRig(bleInterval: 0.01)
+        let driver = BLEDriver.fcb(central: rig.central, peripheral: noopPeripheralClient())
+        let log = DriverEventLog(driver.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
+        #expect(await log.first(isPeerDiscovered) != nil)
+        let other = RadioScanLog(rig.central.scan([coexistRadioServiceUUID], ScanOptions(allowDuplicates: true)))
+        let lost = await log.first(within: 2) { if case .unavailable(.other) = $0 { return true }; return false }
+        #expect(lost != nil, "a superseded BLE scan went unreported")
+        other.cancel()
+        log.cancel()
+        #expect(await returns(within: 6) { await driver.stop() }, "stop did not return")
+    }
+
+    /// An off immediately followed by on reaches FCB (and the adapter) as two `.poweredOn` states
+    /// (CoreBluetooth reads `state` at callback time), so the adapter brings its central up twice.
+    /// Its second scan replaces its OWN first one: that is not a scan lost to another owner.
+    @Test func aRepeatPoweredOnReplacingOurOwnScanIsNotALostScan() async {
+        let rig = await makeCoexistRig(bleInterval: 0.01)
+        let driver = BLEDriver.fcb(central: rig.central, peripheral: noopPeripheralClient())
+        let log = DriverEventLog(driver.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
+        #expect(await log.first(isPeerDiscovered) != nil)
+        CBMCentralManagerMock.simulatePowerOff()
+        CBMCentralManagerMock.simulatePowerOn()
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        #expect(!log.events.value.contains { if case .unavailable = $0 { return true }; return false })
+        #expect(rig.manager.isScanning)
+        log.cancel()
+        #expect(await returns(within: 6) { await driver.stop() }, "stop did not return")
+    }
+
     /// Picker DISMISS: the app restarts BLE while the stop it sent at open is still disconnecting.
     /// When that old teardown resumes, the new session must keep its event stream.
     @Test func aRestartDuringASlowStopKeepsTheNewSessionsEventStream() async {
