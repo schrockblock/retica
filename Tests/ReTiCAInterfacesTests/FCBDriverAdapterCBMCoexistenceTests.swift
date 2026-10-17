@@ -162,9 +162,13 @@ extension FCBDriverAdapterCBMTests {
         guard case let .peerDiscovered(handle)? = await log.first(isPeerDiscovered) else {
             Issue.record("no peerDiscovered"); return nil
         }
-        await driver.readIdentity(handle)
+        guard await returns(within: 6, { await driver.readIdentity(handle) }) else {
+            Issue.record("readIdentity did not return"); return nil
+        }
         guard case .identityRead? = await log.first(isIdentityOutcome) else { Issue.record("identity read failed"); return nil }
-        await driver.openChannel(handle)
+        guard await returns(within: 6, { await driver.openChannel(handle) }) else {
+            Issue.record("openChannel did not return"); return nil
+        }
         guard case .channelOpened? = await log.first(isChannelOutcome) else { Issue.record("channel did not open"); return nil }
         return (driver, log)
     }
@@ -177,12 +181,12 @@ extension FCBDriverAdapterCBMTests {
         let stop = Task { await driver.stop() }
         try? await Task.sleep(nanoseconds: 20_000_000)
         let restarted = DriverEventLog(driver.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
-        await stop.value
+        #expect(await returns(within: 6) { await stop.value }, "stop did not return")
         try? await Task.sleep(nanoseconds: 500_000_000)
 
         #expect(!restarted.ended.value, "the old session's teardown finished the new session's stream")
         restarted.cancel()
         log.cancel()
-        await driver.stop()
+        #expect(await returns(within: 6) { await driver.stop() }, "final stop did not return")
     }
 }
