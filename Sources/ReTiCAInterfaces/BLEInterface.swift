@@ -56,6 +56,17 @@ public struct BLEInterface {
         /// v3: dial L2CAP when the peer publishes a PSM, and publish our own. false makes this node
         /// GATT-only: it neither dials L2CAP nor publishes a PSM (passed to the driver at start).
         public var l2capEnabled: Bool
+        /// `.stop` launched `driver.stop()` and its `.driverStopped` has not arrived yet. The
+        /// driver's `stop()` ends whatever session is live when it runs, so a `driver.start()` must
+        /// not run before it returns: `.start` defers instead (`restartPending`).
+        var stopping = false
+        /// A `.start` arrived while `stopping`: `.driverStopped` starts the driver.
+        var restartPending = false
+
+        /// Stopped with no `driver.stop()` still in flight: nothing of this interface runs, so a
+        /// host may drop its state now. `.stopped` alone is not enough: dropping the state cancels
+        /// the stop in flight, and a new slot's start could then race it.
+        public var isIdle: Bool { status == .stopped && !stopping }
 
         public init(localIdentity: Data,
                     maxPeers: Int = BLEInterface.defaultMaxPeers,
@@ -78,6 +89,8 @@ public struct BLEInterface {
         case establishDeadline(BLEPeerHandle)
         case keepalive(BLEChannelID)
         case adapterRetry
+        /// `driver.stop()` returned: a deferred `.start` may now run.
+        case driverStopped
         case delegate(Delegate)
         public enum Delegate: Equatable {
             case peerOnline(Data)
@@ -113,9 +126,24 @@ public struct BLEInterface {
             case .start:
                 guard state.status == .stopped || state.status.isUnavailableTerminal else { return .none }
                 state.status = .starting
+                // The driver's stop() ends whatever session is live when it runs, so a start must
+                // never reach the driver while a stop is still in flight: defer it to that stop.
+                if state.stopping {
+                    state.restartPending = true
+                    return .none
+                }
                 return startDriver(state: &state)
 
             case .stop:
+                if state.stopping {
+                    // The stop in flight covers this one. A start deferred behind it never reached
+                    // the driver: drop it, so nothing restarts.
+                    state.restartPending = false
+                    state.status = .stopped
+                    return .none
+                }
+                // Idle: the driver never started, or the stop that ended it has returned.
+                guard state.status != .stopped else { return .none }
                 let established = Array(state.peers.keys)
                 let channelIDs = Array(state.channels.keys)
                 let pending = Array(state.pendingPeers)
@@ -126,12 +154,26 @@ public struct BLEInterface {
                 state.pendingPaths = [:]
                 state.adapterRetryDelay = Self.adapterRetryMin
                 state.status = .stopped
+                state.stopping = true
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.driver), .cancel(id: CancelID.retry)]
                 effects += channelIDs.flatMap { [.cancel(id: CancelID.handshake($0)), .cancel(id: CancelID.keepalive($0))] }
                 effects += pending.map { .cancel(id: CancelID.establish($0)) }
-                effects.append(.run { [bleDriver] _ in await bleDriver.stop() })
+                effects.append(.run { [bleDriver] send in
+                    await bleDriver.stop()
+                    await send(.driverStopped)
+                })
+                // At once, not after driver.stop(): the channels are already gone from state, so
+                // the host must stop routing to these peers now (a send to them would drop
+                // silently). Each offline still precedes the next session's peerOnline, which needs
+                // a driver.start() that cannot run before `.driverStopped`.
                 effects += established.map { .send(.delegate(.peerOffline($0))) }
                 return .merge(effects)
+
+            case .driverStopped:
+                state.stopping = false
+                guard state.restartPending else { return .none }
+                state.restartPending = false
+                return startDriver(state: &state)
 
             case .driverEvent(.ready):
                 state.status = .online
