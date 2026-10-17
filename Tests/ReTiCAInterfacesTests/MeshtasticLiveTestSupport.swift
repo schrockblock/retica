@@ -32,17 +32,19 @@ func makeLiveRadio(preset: Config.LoRaConfig.ModemPreset? = .shortFast,
     let spec = device.makeSpec(identifier: id)
     CBMCentralManagerMock.simulatePeripherals([spec] + extra)
     let central = BluetoothCentralClient.mocked()
-    if initialState == .poweredOn { await liveWaitUntilPoweredOn(central) }
+    if initialState == .poweredOn { #expect(await liveWaitUntilPoweredOn(central), "precondition: powered on") }
     return LiveRadio(id: id, device: device, spec: spec, central: central)
 }
 
 /// Polls FCB's replaying state stream until the mock manager reports power-on.
-func liveWaitUntilPoweredOn(_ central: BluetoothCentralClient) async {
+/// Returns false if it gave up (about 2 s): callers must check.
+func liveWaitUntilPoweredOn(_ central: BluetoothCentralClient) async -> Bool {
     for _ in 0..<200 {
         var iterator = central.state().makeAsyncIterator()
-        if await iterator.next() == .poweredOn { return }
+        if await iterator.next() == .poweredOn { return true }
         try? await Task.sleep(nanoseconds: 10_000_000)
     }
+    return false
 }
 
 /// Polls `condition` every 10 ms until true or `timeout` (real time).
