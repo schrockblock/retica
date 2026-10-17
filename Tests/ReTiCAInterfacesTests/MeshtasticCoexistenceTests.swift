@@ -112,6 +112,18 @@ private func tearDown(_ rig: CoexistenceRig, ble: DriverEventLog?, mesh: LiveDri
     }
 }
 
+/// The radio driver's send returned `true` within 6 s (a hung radio write fails, never hangs).
+@MainActor
+private func radioSendSucceeds(_ rig: CoexistenceRig, _ data: Data) async -> Bool {
+    let sent = LockIsolated(false)
+    let mesh = rig.mesh
+    let returned = await returns(within: 6) {
+        let ok = await mesh.send(data)
+        sent.setValue(ok)
+    }
+    return returned && sent.value
+}
+
 private let coexistFrame = Data([0x01, 0x00, 0x00, 0x00, 0x01, 0x42])
 
 /// Spec §7 E.2: the RBTP BLE driver (live FCB adapter) and a live Meshtastic session on ONE live
@@ -124,14 +136,17 @@ extension FCBDriverAdapterCBMTests {
             let mesh = LiveDriverRun(rig.mesh.start(MeshtasticDriverConfig(radio: rig.radioID)))
             #expect(await mesh.waitFor(isLiveConnected), "precondition: radio connected")
             let ble = DriverEventLog(rig.ble.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
-            let channel = await openBLEChannel(rig, ble)
-            #expect(channel != nil, "precondition: BLE channel open, events \(ble.events.value)")
+            guard await openBLEChannel(rig, ble) != nil else {
+                Issue.record("precondition: BLE channel open, events \(ble.events.value)")
+                await tearDown(rig, ble: ble, mesh: mesh)
+                return
+            }
             rig.peerSpec.simulateDisconnection()
             #expect(await ble.first(isChannelClosed) != nil, "precondition: the BLE peer dropped")
             try? await Task.sleep(for: .milliseconds(500))
             #expect(mesh.count { $0 == .disconnected(reason: nil) } == 0, "the radio saw the BLE peer's drop: \(mesh.events.value)")
             let before = rig.radio.receivedPackets.count
-            #expect(await rig.mesh.send(Data([0x00, 0xFF, 0x01])))
+            #expect(await radioSendSucceeds(rig, Data([0x00, 0xFF, 0x01])), "the radio send failed or did not return")
             #expect(rig.radio.receivedPackets.count == before + 1)
             await tearDown(rig, ble: ble, mesh: mesh)
         }
@@ -162,13 +177,17 @@ extension FCBDriverAdapterCBMTests {
             let mesh = LiveDriverRun(rig.mesh.start(MeshtasticDriverConfig(radio: rig.radioID)))
             #expect(await mesh.waitFor(isLiveConnected), "precondition: radio connected")
             let ble = DriverEventLog(rig.ble.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
-            #expect(await openBLEChannel(rig, ble) != nil, "precondition: BLE channel open")
+            guard await openBLEChannel(rig, ble) != nil else {
+                Issue.record("precondition: BLE channel open, events \(ble.events.value)")
+                await tearDown(rig, ble: ble, mesh: mesh)
+                return
+            }
             #expect(await returns(within: 6) { await rig.ble.stop() }, "BLE stop did not return")
             ble.cancel()
             try? await Task.sleep(for: .milliseconds(500))
             #expect(mesh.count { $0 == .disconnected(reason: nil) } == 0, "events: \(mesh.events.value)")
             let before = rig.radio.receivedPackets.count
-            #expect(await rig.mesh.send(Data([0x00, 0xFF, 0x02])))
+            #expect(await radioSendSucceeds(rig, Data([0x00, 0xFF, 0x02])), "the radio send failed or did not return")
             #expect(rig.radio.receivedPackets.count == before + 1)
             await tearDown(rig, ble: nil, mesh: mesh)
         }
@@ -243,22 +262,47 @@ extension FCBDriverAdapterCBMTests {
         /// silent — the adapter reports `.unavailable(.other("scan superseded by another
         /// scanner"))`, which BLEInterface retries after its 5–120 s backoff (not waited for here).
         /// Each round waits at most 3 s for whichever comes first: a supersession fails the round
-        /// with a message, and so does silence. Swept over ten cancel delays.
+        /// with a message, and so does silence. A late supersession is caught too: after the
+        /// outcome the round settles 300 ms, then BLE must have reported no supersession and the
+        /// radio must still be scanning (BLE's scan; a late radio start would have superseded it
+        /// and its own cancelled stream would then have stopped the radio).
+        ///
+        /// The sweep must span the window it names: before each cancel the round samples whether
+        /// the radio scan had already reached the radio (`manager.isScanning`). At least one round
+        /// must cancel after the start (else every cancel landed before the scanner reached FCB and
+        /// the rounds pass trivially), and at least one before it (the synchronous round, which
+        /// cancels with no await after creating the stream). Each round's sample is printed as
+        /// `coexist-dismiss round=… delayMs=… startedAtCancel=…`.
         @Test func aRadioScanCancelledAsBLERestartsLeavesBLEDiscovering() async {
-            for round in 0..<10 {
+            // nil: cancel synchronously, before any await. Otherwise: sleep that many ms first.
+            let delays: [Int?] = [nil, 0, 1, 2, 3, 4, 6, 8, 12, 20, 40, 60]
+            var startedAtCancel = 0
+            var notStartedAtCancel = 0
+            for (round, delay) in delays.enumerated() {
                 let rig = await makeCoexistenceRig()
+                let manager = rig.manager
                 let scan = RadioScanRun(MeshtasticScanner.scan(central: rig.central))
-                try? await Task.sleep(for: .milliseconds(round))
+                if let delay { try? await Task.sleep(for: .milliseconds(delay)) }
+                let started = manager.isScanning
                 scan.cancel()
+                if started { startedAtCancel += 1 } else { notStartedAtCancel += 1 }
+                print("coexist-dismiss round=\(round) delayMs=\(delay.map(String.init) ?? "sync") startedAtCancel=\(started)")
                 let ble = DriverEventLog(rig.ble.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
                 let outcome = await ble.first(within: 3) { isPeerDiscovered($0) || $0 == scanSuperseded }
                 if outcome == scanSuperseded {
                     Issue.record("round \(round): the cancelled radio scan superseded BLE's restarted scan")
+                } else if outcome == nil {
+                    Issue.record("round \(round): BLE online but not discovering: \(ble.events.value)")
                 } else {
-                    #expect(outcome != nil, "round \(round): BLE online but not discovering: \(ble.events.value)")
+                    try? await Task.sleep(for: .milliseconds(300))
+                    #expect(!ble.events.value.contains(scanSuperseded),
+                            "round \(round): BLE discovered, then the cancelled radio scan superseded it")
+                    #expect(manager.isScanning, "round \(round): BLE discovered, then the radio stopped scanning")
                 }
                 await tearDown(rig, ble: ble, mesh: nil)
             }
+            #expect(startedAtCancel >= 1, "no round cancelled after the radio scan had started: the sweep never reached the window")
+            #expect(notStartedAtCancel >= 1, "no round cancelled before the radio scan had started")
         }
     }
 }
