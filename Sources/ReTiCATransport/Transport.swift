@@ -148,6 +148,12 @@ public struct Transport {
         public var heldAnnounces: [InterfaceID: [Data: HeldAnnounce]] = [:]
         /// When each interface connected — drives the young/established burst threshold (RNS age()).
         public var interfaceConnectedAt: [InterfaceID: Date] = [:]
+        /// Connect times of interfaces that have DISCONNECTED, oldest departure first, so a
+        /// reconnect of the same id resumes its age: reference `Interface.created` is set once
+        /// per Interface object (Interface.py:101) and a reconnect reuses the object
+        /// (TCPInterface.py:270-297). At most `Transport.maxDepartedInterfaceAges`; an id evicted
+        /// from here returns as a new interface (stricter, never looser).
+        public var departedInterfaceAges: [Transport.DepartedInterfaceAge] = []
 
         /// An outbound single packet awaiting its delivery proof (RNS `PacketReceipt`,
         /// Packet.py:402-419), recorded by `.send(..., receiptToken:)`.
@@ -347,7 +353,16 @@ public struct Transport {
             switch action {
             case let .interfaceConnected(id, profile):
                 state.interfaces[id] = profile
-                state.interfaceConnectedAt[id] = date.now
+                // Spec 2026-10-16 §7 E.0(b): a repeated connect for a registered id (a radio preset
+                // change) keeps its time, and a reconnect resumes the time of its first connect, so
+                // neither reopens the 2 h new-interface ingress window (`icNewTime`).
+                if state.interfaceConnectedAt[id] == nil {
+                    if let departed = state.departedInterfaceAges.firstIndex(where: { $0.id == id }) {
+                        state.interfaceConnectedAt[id] = state.departedInterfaceAges.remove(at: departed).connectedAt
+                    } else {
+                        state.interfaceConnectedAt[id] = date.now
+                    }
+                }
                 return .none
 
             case let .interfaceDisconnected(id):
@@ -357,6 +372,12 @@ public struct Transport {
                 state.announceArrivals[id] = nil
                 state.ingressBursts[id] = nil
                 state.heldAnnounces[id] = nil
+                if let connectedAt = state.interfaceConnectedAt[id] {
+                    state.departedInterfaceAges.removeAll { $0.id == id }
+                    state.departedInterfaceAges.append(Transport.DepartedInterfaceAge(id: id, connectedAt: connectedAt))
+                    let excess = state.departedInterfaceAges.count - Transport.maxDepartedInterfaceAges
+                    if excess > 0 { state.departedInterfaceAges.removeFirst(excess) }
+                }
                 state.interfaceConnectedAt[id] = nil
                 return .merge(.cancel(id: CancelID.announceDrain(id)),
                               .cancel(id: CancelID.ingressRelease(id)))
@@ -1185,6 +1206,20 @@ public struct Transport {
     static let maxHeldAnnounces = 256
     /// Interfaces younger than this use the stricter burst threshold (RNS IC_NEW_TIME).
     static let icNewTime: TimeInterval = 7200
+
+    /// Bound on `State.departedInterfaceAges`: remote churn (TCP-server connections, BLE peers)
+    /// mints ids, so the record of departed ones must not grow without limit.
+    static let maxDepartedInterfaceAges = 64
+
+    /// A departed interface's original connect time (see `State.departedInterfaceAges`).
+    public struct DepartedInterfaceAge: Equatable, Sendable {
+        public var id: InterfaceID
+        public var connectedAt: Date
+        public init(id: InterfaceID, connectedAt: Date) {
+            self.id = id
+            self.connectedAt = connectedAt
+        }
+    }
     /// Burst thresholds in Hz for young / established interfaces (RNS IC_BURST_FREQ_NEW / IC_BURST_FREQ).
     static let icBurstFreqNew: Double = 3
     static let icBurstFreq: Double = 10
