@@ -95,6 +95,9 @@ public struct MeshtasticInterface {
         /// delegate. A `.stop` the host sends in answer to that offline is reduced first and
         /// clears this, so the queued start then does nothing — the stop wins (Review Focus 5).
         var restartQueued = false
+        /// Bumped by every `.stop` that reaches the driver, at reduce time: a start effect built
+        /// before it never calls `driver.start()` (see `DriverEpoch`).
+        var epoch = DriverEpoch()
 
         public init(config: MeshtasticDriverConfig, framing: MeshtasticFraming = .landandair) {
             self.config = config
@@ -114,8 +117,13 @@ public struct MeshtasticInterface {
         public var queuedFragmentCount: Int { queue.count }
 
         /// Stopped with no `driver.stop()` still in flight: nothing of this interface runs, so a
-        /// host may drop its state now (spec Contract 3). `.stopped` alone is not enough — a stop
-        /// in flight would be cancelled by dropping the state and could race the next start.
+        /// host may drop its state now (spec Contract 3). `.stopped` alone is not enough: a
+        /// `driver.stop()` is still in flight, and what dropping the state does to it depends on
+        /// WHO drops it. An `ifLet` cancels the child's effects only when its own parent reducer
+        /// nils the state; a host outside that reducer (as with `TransportEndpoint.meshtastic`,
+        /// which nothing inside `TransportEndpoint` drops) leaves the stop running, and its
+        /// `.driverStopped` then reaches an `ifLet` with no state (TCA's runtime warning). Either
+        /// way the next slot's start could race the old stop.
         public var isIdle: Bool { status == .stopped && !stopping }
 
         /// Reassembler and sender counters in one public value (read by `MeshtasticEndpoint`).
@@ -196,6 +204,9 @@ public struct MeshtasticInterface {
                     return .none
                 }
                 state.stopping = true
+                // Here, not in the stop effect: a start effect built in this same burst has not
+                // registered its cancel id yet, so the `.cancel(id: .driver)` below misses it.
+                state.epoch.invalidate()
                 clearTraffic(&state)
                 return .merge(.cancel(id: CancelID.driver),
                               .cancel(id: CancelID.pacing),
@@ -222,6 +233,8 @@ public struct MeshtasticInterface {
                                     .run { send in await send(.restartDeferred) })
 
             case .restartDeferred:
+                // Load-bearing even with the epoch: this start effect is built only now, after any
+                // `.stop` that answered the offline, so the epoch it captures is already bumped.
                 guard state.restartQueued else { return .none }
                 state.restartQueued = false
                 return startDriver(state)
@@ -301,8 +314,13 @@ public struct MeshtasticInterface {
 
     private func startDriver(_ state: State) -> Effect<Action> {
         let config = state.config
+        let epoch = state.epoch
+        let generation = epoch.current
         return .run { [driver] send in
-            for await event in driver.start(config) {
+            // A `.stop` reduced since this effect was built (possibly in the same burst, before
+            // this task registered its cancel id) wins: never reach the driver after it.
+            guard let events = epoch.start(ifCurrent: generation, { driver.start(config) }) else { return }
+            for await event in events {
                 await send(.driverEvent(event))
             }
         }

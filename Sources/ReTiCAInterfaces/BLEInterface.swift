@@ -62,10 +62,18 @@ public struct BLEInterface {
         var stopping = false
         /// A `.start` arrived while `stopping`: `.driverStopped` starts the driver.
         var restartPending = false
+        /// Bumped by every `.stop` that reaches the driver, at reduce time: a start effect built
+        /// before it never calls `driver.start()` (see `DriverEpoch`).
+        var epoch = DriverEpoch()
 
         /// Stopped with no `driver.stop()` still in flight: nothing of this interface runs, so a
-        /// host may drop its state now. `.stopped` alone is not enough: dropping the state cancels
-        /// the stop in flight, and a new slot's start could then race it.
+        /// host may drop its state now. `.stopped` alone is not enough: a `driver.stop()` is still
+        /// in flight, and what dropping the state does to it depends on WHO drops it. An `ifLet`
+        /// cancels the child's effects only when its own parent reducer nils the state; a host
+        /// outside that reducer (as with `TransportEndpoint`'s slots, which nothing inside
+        /// `TransportEndpoint` drops) leaves the stop running, and its `.driverStopped` then
+        /// reaches an `ifLet` with no state (TCA's runtime warning). Either way a new slot's
+        /// start could race the old stop.
         public var isIdle: Bool { status == .stopped && !stopping }
 
         public init(localIdentity: Data,
@@ -155,6 +163,9 @@ public struct BLEInterface {
                 state.adapterRetryDelay = Self.adapterRetryMin
                 state.status = .stopped
                 state.stopping = true
+                // Here, not in the stop effect: a start effect built in this same burst has not
+                // registered its cancel id yet, so the `.cancel(id: .driver)` below misses it.
+                state.epoch.invalidate()
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.driver), .cancel(id: CancelID.retry)]
                 effects += channelIDs.flatMap { [.cancel(id: CancelID.handshake($0)), .cancel(id: CancelID.keepalive($0))] }
                 effects += pending.map { .cancel(id: CancelID.establish($0)) }
@@ -440,8 +451,13 @@ public struct BLEInterface {
 
     private func startDriver(state: inout State) -> Effect<Action> {
         let config = BLEDriverConfig(localIdentity: state.localIdentity, l2capEnabled: state.l2capEnabled)
+        let epoch = state.epoch
+        let generation = epoch.current
         return .run { [bleDriver] send in
-            for await event in bleDriver.start(config) {
+            // A `.stop` reduced since this effect was built (possibly in the same burst, before
+            // this task registered its cancel id) wins: never reach the driver after it.
+            guard let events = epoch.start(ifCurrent: generation, { bleDriver.start(config) }) else { return }
+            for await event in events {
                 await send(.driverEvent(event))
             }
         }
