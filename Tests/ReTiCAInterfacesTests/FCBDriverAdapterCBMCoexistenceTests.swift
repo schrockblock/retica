@@ -222,4 +222,87 @@ extension FCBDriverAdapterCBMTests {
         log.cancel()
         #expect(await returns(within: 6) { await driver.stop() }, "final stop did not return")
     }
+
+    /// Picker OPEN: the app stops BLE and the picker starts its scan at once; BLE's stop is still
+    /// disconnecting when the picker's scan begins. Its late teardown must not end that scan.
+    @Test func aSlowBLEStopDoesNotEndTheRadioPickersScan() async {
+        let rig = await makeCoexistRig(bleInterval: 0.4)
+        guard let (driver, log) = await bleOnlineWithOpenChannel(rig) else { return }
+        let stop = Task { await driver.stop() }
+        let picker = RadioScanLog(rig.central.scan([coexistRadioServiceUUID], ScanOptions(allowDuplicates: true)))
+        #expect(await poll(within: 2) { picker.discoveries.value > 0 })
+        #expect(await returns(within: 6) { await stop.value }, "stop did not return")
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        let before = picker.discoveries.value
+        #expect(await poll(within: 1) { picker.discoveries.value > before }, "the picker's scan stopped")
+        #expect(!picker.ended.value)
+        picker.cancel()
+        log.cancel()
+    }
+
+    /// Picker DISMISS, scan half: after the old teardown resumes, the new session still scans
+    /// (BLE "online" but not discovering was the field symptom).
+    @Test func aRestartDuringASlowStopKeepsTheNewSessionScanning() async {
+        let rig = await makeCoexistRig(bleInterval: 0.4)
+        guard let (driver, log) = await bleOnlineWithOpenChannel(rig) else { return }
+        let stop = Task { await driver.stop() }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        let restarted = DriverEventLog(driver.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
+        #expect(await returns(within: 6) { await stop.value }, "stop did not return")
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        #expect(rig.manager.isScanning, "the old session's teardown stopped the new session's scan")
+        restarted.cancel()
+        log.cancel()
+        #expect(await returns(within: 6) { await driver.stop() }, "stop did not return")
+    }
+
+    /// Bluetooth switched off with a GATT channel open: FCB ends the channel's notification stream
+    /// (CoreBluetooth sends no didDisconnect), the adapter reports the channel closed, and a stop
+    /// afterwards returns.
+    @Test func anOpenChannelClosesWhenBluetoothPowersOff() async {
+        let rig = await makeCoexistRig(bleInterval: 0.05)
+        guard let (driver, log) = await bleOnlineWithOpenChannel(rig) else { return }
+        let mark = log.count
+        CBMCentralManagerMock.simulatePowerOff()
+        let closed = await log.first(after: mark, within: 3) { if case .channelClosed = $0 { return true }; return false }
+        #expect(closed != nil, "the open channel was not reported closed after the power-off")
+        #expect(await returns(within: 3) { await driver.stop() }, "stop hung after the power-off")
+        log.cancel()
+    }
+
+    /// Bluetooth powered off while an Identity read is in flight (CoreBluetooth reports only a
+    /// state change: no didDisconnect, no read callback). `readIdentity` must return — reporting
+    /// the failure — and, once power is back, the next `readIdentity` of the rediscovered peer
+    /// must succeed instead of hitting a stale pending read.
+    @Test func readIdentityDoesNotHangAcrossABluetoothPowerCycle() async {
+        let rig = await makeCoexistRig(bleInterval: 0.2)
+        let driver = BLEDriver.fcb(central: rig.central, peripheral: noopPeripheralClient())
+        let log = DriverEventLog(driver.start(BLEDriverConfig(localIdentity: adapterLocalIdentity)))
+        guard case let .peerDiscovered(handle)? = await log.first(isPeerDiscovered) else {
+            Issue.record("no peerDiscovered"); log.cancel(); await driver.stop(); return
+        }
+
+        rig.peerDelegate.powerOffOnNextIdentityRead.setValue(true)
+        let returned = await returns(within: 3) { await driver.readIdentity(handle) }
+        #expect(returned, "readIdentity hung across the power-off")
+        #expect(!rig.peerDelegate.powerOffOnNextIdentityRead.value)   // the power-off fired mid-read
+        guard case .identityFailed? = await log.first(within: 1, isIdentityOutcome) else {
+            Issue.record("the read cut short by the power-off was not reported as identityFailed")
+            log.cancel(); await driver.stop(); return
+        }
+
+        let mark = log.count
+        CBMCentralManagerMock.simulatePowerOn()
+        guard case let .peerDiscovered(again)? = await log.first(after: mark, within: 8, isPeerDiscovered) else {
+            Issue.record("the peer was not rediscovered after power-on"); log.cancel(); await driver.stop(); return
+        }
+        let mark2 = log.count
+        #expect(await returns(within: 4) { await driver.readIdentity(again) }, "readIdentity hung after power-on")
+        let outcome = await log.first(after: mark2, within: 1, isIdentityOutcome)
+        #expect(outcome == .identityRead(again, identity: rig.peerDelegate.identity))
+        log.cancel()
+        #expect(await returns(within: 6) { await driver.stop() }, "stop did not return")
+    }
 }
