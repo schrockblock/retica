@@ -93,8 +93,9 @@ extension FCBDriverAdapterCBMTests {
             store.exhaustivity = .off
             await store.send(.start)
             await store.receive({ $0 == .delegate(.adapterUnavailable(.unauthorized)) }, timeout: .seconds(10))
-            // Let the terminal `.disconnected("unauthorized")` (if any is mapped) land.
-            try? await Task.sleep(for: .milliseconds(500))
+            // The session's terminal end has happened, so any mapped `.disconnected` has been sent.
+            #expect(await liveSessionIs(session, .disconnected(reason: "unauthorized")),
+                    "precondition: the session ended with unauthorized")
             await store.skipReceivedActions(strict: false)
             #expect(store.state.status == .unavailable(.unauthorized))
             await store.send(.start)

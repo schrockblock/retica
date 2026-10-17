@@ -75,16 +75,22 @@ import ComposableArchitecture
         await stopMeshInterface(h)
     }
 
-    /// A drop of a radio that never came online must not turn `.unavailable` back into
-    /// `.connecting` (a later `.start` would then be a no-op).
-    @Test func disconnectAfterUnavailableKeepsTheUnavailableStatus() async {
-        let h = makeMeshInterface()
+    /// After `.unavailable(.poweredOff)` a `.disconnected(nil)` (the session retrying) means the
+    /// adapter is back: status is `.connecting`, and a `.start` must not restart the driver.
+    @Test func aReconnectAttemptAfterUnavailableIsConnectingAndBlocksStart() async {
+        let h = await makeOnlineMeshInterface()
+        h.radio.yield(.disconnected(reason: nil))
+        await h.store.receive { $0 == .driverEvent(.disconnected(reason: nil)) }
+        h.radio.yield(.unavailable(.poweredOff))
+        await h.store.receive { $0 == .delegate(.adapterUnavailable(.poweredOff)) }
+        #expect(h.store.state.status == .unavailable(.poweredOff))
+        h.radio.yield(.disconnected(reason: nil))
+        await h.store.receive { $0 == .driverEvent(.disconnected(reason: nil)) }
+        #expect(h.store.state.status == .connecting)
+        let startsBefore = h.calls.value.filter { if case .start = $0 { return true }; return false }.count
         await h.store.send(.start)
-        h.radio.yield(.unavailable(.unauthorized))
-        await h.store.receive { $0 == .delegate(.adapterUnavailable(.unauthorized)) }
-        h.radio.yield(.disconnected(reason: "unauthorized"))
-        await h.store.receive { $0 == .driverEvent(.disconnected(reason: "unauthorized")) }
-        #expect(h.store.state.status == .unavailable(.unauthorized))
+        let startsAfter = h.calls.value.filter { if case .start = $0 { return true }; return false }.count
+        #expect(startsAfter == startsBefore)
         await stopMeshInterface(h)
     }
 

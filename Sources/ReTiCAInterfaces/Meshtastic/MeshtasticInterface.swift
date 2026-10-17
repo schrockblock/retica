@@ -213,9 +213,6 @@ public struct MeshtasticInterface {
             case let .driverEvent(.disconnected(reason)):
                 guard state.status != .stopped else { return .none }
                 let wasOnline = state.isOnline
-                // A drop of a radio that never came online must not hide an `.unavailable` already
-                // reported: `.connecting` would make a later `.start` a no-op.
-                if case .unavailable = state.status { return .none }
                 state.status = .connecting
                 clearTraffic(&state)
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.pacing)]
