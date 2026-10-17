@@ -5,6 +5,35 @@ item 4, §9. Performed by the user with two physical Meshtastic radios; nothing 
 Every shell line below is ONE command. Task 15 runs this from the ReTiCA MAIN checkout after
 Part 1 is merged (the paths below point there).
 
+## What was checked without radios (2026-10-17)
+
+Syntax and valid values only; none of the radio behaviour below has been observed.
+- Probe, `lxmf_probe.py` (RNS stock 1.x, LXMF 1.1.0 in conda env `rns`): [ran] two throwaway
+  loopback instances (TCP server and client, config under `/tmp`, no radio). It printed its
+  `LXMF address:`, announced, heard the peer's `ANNOUNCE`, and received one opportunistic
+  (`method=1`) and one `--method direct` (`method=2`) message with `signature_validated=True`;
+  both senders printed `DELIVERED after 0.0 s`. Also [ran] against a shared `rnsd` (the Mac setup
+  step 7 arrangement: `rnstatus` showed `Shared Instance … Serving 1 program`). Every API the script
+  uses was [read] in the installed sources, including `LXMF.display_name_from_app_data(app_data)`
+  and the announce-handler interface (`aspect_filter` plus a 3-argument `received_announce`,
+  which `Transport.py` dispatches by argument count). No script defect found.
+- Ctrl-C on the probe prints RNS's "Received SIGINT, shutting down now!" notices and exits with
+  code 1. That is RNS's own SIGINT handler (the probe's code never sees `KeyboardInterrupt`), not a failure.
+- landandair file: [ran] its import preamble (`meshtastic.portnums_pb2.RETICULUM_TUNNEL_APP` = 76,
+  `BLEInterface`, `SerialInterface`, `TCPInterface`, `BROADCAST_ADDR`, `pubsub`) against meshtastic
+  2.7.11; [read] that RNS loads `<type>.py` from `<configdir>/interfaces` and that `str(interface)`
+  is `MeshtasticInterface[<name>]` (what step 8 expects).
+- Meshtastic CLI: verified against `meshtastic` **2.7.11** (`--help` and package source, in a
+  throwaway venv; `pip install --dry-run meshtastic` into the `rns` env also resolves to 2.7.11
+  with no conflicts). `meshtastic` is NOT installed in `rns` until Mac setup step 1.
+  Flags used below all exist: `--port`, `--info`, `--listen`, `--set FIELD VALUE`, `--get FIELD`.
+  `lora.modem_preset` and `lora.hop_limit` are real `Config.LoRaConfig` fields.
+  `--set lora.modem_preset X` takes an enum NAME in UPPER_SNAKE case (`SHORT_FAST`; case-sensitive,
+  a wrong name prints the valid list and sets nothing) OR the raw number (`6`). The names are
+  not the Meshtastic app's CamelCase labels: `ShortFast` is wrong, `SHORT_FAST` is right.
+  Hardware only: that the write is accepted, that the radio reboots, and what `--get` prints
+  when the config has not yet been fetched from the radio.
+
 ## Equipment (fill in first)
 
 | | Radio A (iPhone side) | Radio B (Mac / second iPhone side) |
@@ -13,7 +42,7 @@ Part 1 is merged (the paths below point there).
 | firmware version (`meshtastic --port <port> --info`, or the Meshtastic app) | | |
 | region | | |
 | modem preset (name and raw value, e.g. ShortFast 6) | | |
-| original preset of radio B (before this run rewrites it; restore at the end) | n/a | |
+| original preset of radio B (before this run rewrites it; restore at the end). Record the CLI enum NAME and number, e.g. `SHORT_FAST 6`; read it with `meshtastic --port <port> --get lora.modem_preset` BEFORE step 6 | n/a | |
 | LoRa hop limit | | |
 | primary channel name and PSK identical on both? | | |
 
@@ -57,7 +86,8 @@ Prefer ShortTurbo or ShortFast (spec §1 "Expectation setting").
    `port` is radio B's serial port (alternatives: `ble_port = <radio name or address>`,
    `tcp_port = <host[:port]>` for a WiFi radio — set exactly one). `data_speed` MUST be radio A's
    preset raw value (8 ShortTurbo, 6 ShortFast, 5 ShortSlow, 4 MediumFast, 3 MediumSlow,
-   0 LongFast, 7 LongModerate, 1 LongSlow): landandair REWRITES radio B's preset to it on connect
+   0 LongFast, 7 LongModerate, 1 LongSlow; also 9 LongTurbo, 2 VeryLongSlow; values 10-13 exist
+   in meshtastic 2.7.11's protobuf but their firmware support was not checked): landandair REWRITES radio B's preset to it on connect
    (`configure_device`, L174-178; the radio reboots once and the interface reconnects after ~10 s)
    and paces by it.
    `hop_limit = 1` matches ReTiCA's fixed hop limit. No IFAC: ReTiCAMsgr v1 has no Meshtastic
@@ -66,7 +96,9 @@ Prefer ShortTurbo or ShortFast (spec §1 "Expectation setting").
 8. In another terminal: `/Users/ell/opt/anaconda3/envs/rns/bin/rnstatus` → `MeshtasticInterface[Meshtastic Interface]` is `Up`.
 9. Start the probe in a third terminal:
    `/Users/ell/opt/anaconda3/envs/rns/bin/python -u /Users/ell/development/ios/pods/ReTiCA/Scripts/meshtastic-hardware/lxmf_probe.py --name "Mac probe"`
-   → prints `LXMF address: <hex>`. Record it.
+   → prints `LXMF address: <hex>`. Record it. The identity is created on first run at
+   `~/.reticulum-lxmf-probe/identity`, so the address is the same on every rerun. Run only one
+   probe at a time against the shared rnsd (same identity); Ctrl-C stops it (exit code 1 is normal).
 
 ## iPhone setup
 
@@ -157,7 +189,8 @@ MeshtasticKit's, exercised through Meshtastified (its text send omits `hop_limit
 `MeshSessionActor.swift:123-129`).
 1. Stop rnsd (it holds radio B's serial port).
 2. `conda run --no-capture-output -n rns meshtastic --port <your port from Mac setup step 5> --listen`
-   (if `--listen` is unknown in the installed version, use `--debug` instead and read the packet lines).
+   (`--listen` exists in 2.7.11, stays open and enables debug logging; on an older version where it
+   is unknown, use `--debug` and read the packet lines).
 3. Meshtastified on the iPhone, connected to radio A (ReTiCAMsgr disconnected from it): send a text
    on the public channel.
 - [ ] Record the received packet's `hopStart` and `hopLimit`. Expected: `hopStart` = radio A's LoRa
@@ -169,7 +202,10 @@ MeshtasticKit's, exercised through Meshtastified (its text send omits `hop_limit
 
 Stop rnsd, then restore the value you noted in the Equipment table ("original preset of radio B"):
 `conda run -n rns meshtastic --port <your port from Mac setup step 5> --set lora.modem_preset <ORIGINAL_NAME>`
-(or set it in the Meshtastic app; the radio reboots once). Also restore `~/.reticulum/config` from
+where `<ORIGINAL_NAME>` is the UPPER_SNAKE enum name from the Equipment table (`SHORT_FAST`, not
+`ShortFast`) or its raw number (`6`). Syntax and values verified against meshtastic 2.7.11; the
+write itself is unverified without a radio. Confirm with `… --get lora.modem_preset` (prints
+the raw number). Or set it in the Meshtastic app; the radio reboots once. Also restore `~/.reticulum/config` from
 `~/.reticulum/config.pre-meshtastic` if you made that copy.
 - [ ] Radio B back on its original preset.
 
