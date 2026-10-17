@@ -59,7 +59,30 @@ extension MeshtasticDriver {
     }
 }
 
-/// The state behind `MeshtasticDriver.live(session:)`.
+/// Folds ONE subscription's events into driver events. MeshtasticKit replays the session's current
+/// connection state to every new subscriber (EventHub.subscribe) and nothing else (`.configured` is
+/// never replayed). After a terminal end that replay is the STALE `.disconnected("radio not found")`,
+/// which would report a retry as failed before it began. `start`'s connect always emits
+/// `.connection(.connecting)` first (MeshtasticSession.connect), and connect supersedes whatever
+/// link existed, so everything before this subscription's first `.connecting` is replay and is
+/// dropped.
+struct MeshtasticEventMapper: Equatable {
+    private(set) var ownNode: UInt32?
+    private(set) var sawConnecting = false
+
+    mutating func map(_ event: MeshtasticEvent) -> MeshtasticDriverEvent? {
+        if !sawConnecting {
+            guard case .connection(.connecting) = event else { return nil }
+            sawConnecting = true
+            return nil
+        }
+        if case let .configured(myNodeNum, _) = event { ownNode = myNodeNum }
+        return MeshtasticDriver.driverEvent(for: event, ownNode: ownNode)
+    }
+}
+
+/// The state behind `MeshtasticDriver.live(session:)`. Precondition: callers serialise `start`
+/// after `stop()` has returned (`pendingConnects` is a counter, not a generation).
 final class MeshtasticLiveAdapter: Sendable {
     let session: MeshtasticSession
     /// The current start's config, read by `send` (Contract 2's `send` takes only the frame).
@@ -86,12 +109,9 @@ final class MeshtasticLiveAdapter: Sendable {
         }
         return AsyncStream { continuation in
             let pump = Task {
-                var ownNode: UInt32?
+                var mapper = MeshtasticEventMapper()
                 for await event in events {
-                    if case let .configured(myNodeNum, _) = event { ownNode = myNodeNum }
-                    if let mapped = MeshtasticDriver.driverEvent(for: event, ownNode: ownNode) {
-                        continuation.yield(mapped)
-                    }
+                    if let mapped = mapper.map(event) { continuation.yield(mapped) }
                 }
                 continuation.finish()
             }

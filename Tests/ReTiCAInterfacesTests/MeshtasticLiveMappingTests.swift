@@ -78,6 +78,40 @@ private func port76(from: UInt32, _ payload: Data) -> MeshtasticEvent {
         #expect(mapped(.frame(FromRadio())) == nil)
     }
 
+    // MARK: - Replay gating (MeshtasticEventMapper)
+
+    private func fold(_ events: [MeshtasticEvent]) -> [MeshtasticDriverEvent] {
+        var mapper = MeshtasticEventMapper()
+        return events.compactMap { mapper.map($0) }
+    }
+
+    /// A retry after "radio not found": the hub replays the stale terminal state first.
+    @Test func aReplayedStaleTerminalEndIsDroppedAndOnlyTheNewOneCounts() {
+        let out = fold([.connection(.disconnected(reason: "radio not found")),
+                        .connection(.connecting),
+                        .connection(.disconnected(reason: "radio not found"))])
+        #expect(out == [.unavailable(.other("radio not found"))])
+    }
+
+    @Test func aReplayedStaleTerminalEndAloneReportsNothing() {
+        #expect(fold([.connection(.disconnected(reason: "radio not found")), .connection(.connecting)]).isEmpty)
+    }
+
+    /// An already-up session replays only `.connection(.connected)` (never `.configured`); the
+    /// connect then restarts the link, so the handshake's own events are what count.
+    @Test func eventsAfterConnectingMapNormally() {
+        let out = fold([.connection(.connected),
+                        .connection(.connecting), .connection(.configuring),
+                        .configured(myNodeNum: mappingOwn, modemPreset: 6),
+                        port76(from: mappingPeer, Data([1])),
+                        port76(from: mappingOwn, Data([2]))])
+        #expect(out == [.connected(myNodeNum: mappingOwn, modemPreset: 6), .fragment(from: mappingPeer, Data([1]))])
+    }
+
+    @Test func aReplayedStaleReconnectingIsDropped() {
+        #expect(fold([.connection(.reconnecting(attempt: 2)), .connection(.connecting)]).isEmpty)
+    }
+
     @Test(arguments: zip([MeshtasticAdapterUnavailable.poweredOff, .unauthorized, .unsupported, .other("x")],
                          [BLEAdapterUnavailable.poweredOff, .unauthorized, .unsupported, .other("x")]))
     func adapterCausesMapOneToOne(kit: MeshtasticAdapterUnavailable, ble: BLEAdapterUnavailable) {
