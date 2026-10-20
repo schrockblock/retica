@@ -64,6 +64,31 @@ extension DependencyValues {
 }
 
 #if canImport(Network)
+/// The TCP settings every live socket uses, client and listener alike: reference's keepalive and
+/// user timeout (RNS 1.4.2 Interfaces/TCPInterface.py:84-87, applied at :181-207).
+///
+/// Without them a connection whose far end vanished silently (the hub dropped it, or a NAT
+/// forgot it, while iOS had the app suspended) stayed `.ready` for ever on resume: no probe ever
+/// asked, so receive waited on nothing, sends queued without error, and the app showed a
+/// connected node that delivered nothing until a fresh launch. With them the dead socket fails
+/// within about 30 s and `TCPClientInterface` redials.
+enum TCPSocketOptions {
+    static let probeAfter = 5       // TCP_PROBE_AFTER: seconds idle before the first probe
+    static let probeInterval = 2    // TCP_PROBE_INTERVAL
+    static let probes = 12          // TCP_PROBES
+    static let userTimeout = 24     // TCP_USER_TIMEOUT: seconds unacknowledged data may wait
+
+    static func parameters() -> NWParameters {
+        let tcp = NWProtocolTCP.Options()
+        tcp.enableKeepalive = true
+        tcp.keepaliveIdle = probeAfter
+        tcp.keepaliveInterval = probeInterval
+        tcp.keepaliveCount = probes
+        tcp.connectionDropTime = userTimeout
+        return NWParameters(tls: nil, tcp: tcp)
+    }
+}
+
 /// Holds the current NWConnection so `send`/`close` act on it. One active connection per instance.
 private actor NWConnectionActor {
     private var connection: NWConnection?
@@ -98,7 +123,7 @@ private actor NWConnectionActor {
             self.continuation = nil
             return
         }
-        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: TCPSocketOptions.parameters())
         self.connection = conn
         conn.stateUpdateHandler = { [weak self] state in
             Task { await self?.handleState(state, generation: gen) }

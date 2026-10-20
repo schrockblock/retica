@@ -128,7 +128,8 @@ private actor NWListenerActor {
         }
         let l: NWListener
         do {
-            l = try NWListener(using: .tcp, on: nwPort)
+            // Accepted connections inherit these, so a peer that vanishes is dropped too.
+            l = try NWListener(using: TCPSocketOptions.parameters(), on: nwPort)
         } catch {
             continuation.yield(.failed(reason: error.localizedDescription)); continuation.finish()
             self.continuation = nil
