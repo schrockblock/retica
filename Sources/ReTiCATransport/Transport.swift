@@ -588,9 +588,34 @@ public struct Transport {
                     // remember more eagerly on purpose — a strict superset of RNS's anti-replay
                     // memory (never drops a fresh announce RNS keeps, never keeps a replay RNS drops).
                     // Do NOT narrow this to RNS's should_add gating: that would weaken anti-replay.
+                    let emitted = Transport.announceEmitted(parsed.randomHash)
+                    // Path-table next hop: relayed (HEADER_2) → its transport_id; directly heard → the dest.
+                    let nextHop = packet.transportId ?? packet.destinationHash
+                    let candidate = LearnedDestination(
+                        identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
+                        interfaceID: interfaceID, hops: packet.hops, nextHop: nextHop,
+                        announceEmitted: emitted, learnedAt: date.now)
+                    // A route whose interface is gone (a radio switched off, a BLE session ended)
+                    // carries nothing, yet it is kept on purpose (see `reachableLearned`: TCP comes
+                    // back under the same id). Kept, it must not outrank a live route: reference
+                    // removes such a path outright, its random blobs with it (RNS 1.4.2 Transport.py:797-801),
+                    // so an older or already-seen announce over a connected interface is adopted.
+                    // Without this, a peer heard last over a radio that went away stayed unreachable
+                    // until its next announce or for the 7-day expiry, every path response to the
+                    // `requestPath` recovery being older than the dead route or a seen blob.
+                    let strandedRoute = state.interfaces[interfaceID] != nil
+                        && state.learned[packet.destinationHash].map { state.interfaces[$0.interfaceID] == nil } == true
                     var ring = state.announceBlobs[packet.destinationHash]
                         ?? RingSet(capacity: Transport.announceBlobRingSize)
                     guard ring.insert(parsed.randomHash) else {
+                        if strandedRoute {
+                            // A seen announce: adopt the live route, but never relay it again.
+                            state.learned[packet.destinationHash] = candidate
+                            state.announceCache[packet.destinationHash] = State.CachedAnnounce(
+                                payload: packet.payload, contextFlag: packet.contextFlag)
+                            return .send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
+                                                                hops: packet.hops)))
+                        }
                         // REPLAY. A peer/downstream re-broadcast of an announce we are holding is a
                         // same-blob replay. Collaborative suppression: cancel our pending RETRY once
                         // neighbours have propagated it (RNS Transport.py:1774-1791).
@@ -615,16 +640,10 @@ public struct Transport {
                     }
                     state.announceBlobs[packet.destinationHash] = ring
 
-                    let emitted = Transport.announceEmitted(parsed.randomHash)
-                    // Path-table next hop: relayed (HEADER_2) → its transport_id; directly heard → the dest.
-                    let nextHop = packet.transportId ?? packet.destinationHash
-                    let candidate = LearnedDestination(
-                        identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
-                        interfaceID: interfaceID, hops: packet.hops, nextHop: nextHop,
-                        announceEmitted: emitted, learnedAt: date.now)
                     var effects: [Effect<Action>] = []
-                    // Update the path only if this fresh announce improves it (unchanged logic).
-                    if Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate) {
+                    // Update the path only if this fresh announce improves it, or the current one is
+                    // stranded on an interface that is gone.
+                    if strandedRoute || Transport.shouldReplace(state.learned[packet.destinationHash], with: candidate) {
                         state.learned[packet.destinationHash] = candidate
                         state.announceCache[packet.destinationHash] = State.CachedAnnounce(
                             payload: packet.payload, contextFlag: packet.contextFlag)

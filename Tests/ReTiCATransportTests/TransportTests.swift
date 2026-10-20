@@ -137,6 +137,68 @@ private func makeAnnouncePacket(identity: Identity, appName: String, aspects: [S
     #expect(store.state.learned[destHash]?.announceEmitted == 200)
 }
 
+@Test @MainActor func olderAnnounceOverALiveInterfaceReplacesARouteStrandedOnAGoneInterface() async {
+    let id = Identity()
+    let radio = InterfaceID("meshtastic:radio")
+    let tcp = InterfaceID("tcp:hub")
+    let (older, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 2, emitted: 100)
+    let (newer, _) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 0, emitted: 200,
+                                        randomPrefix: Data(repeating: 0x5A, count: 5))
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(radio))
+    await store.send(.interfaceConnected(tcp))
+    await store.send(.received(radio, newer))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 0)))
+    await store.send(.interfaceDisconnected(radio))
+    // The hub's answer is older than the radio announce, but the radio is gone.
+    await store.send(.received(tcp, older))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.learned[destHash]?.interfaceID == tcp)
+    #expect(store.state.reachableLearned(destHash) != nil)
+}
+
+@Test @MainActor func seenAnnounceOverALiveInterfaceReplacesARouteStrandedOnAGoneInterface() async {
+    let id = Identity()
+    let radio = InterfaceID("meshtastic:radio")
+    let tcp = InterfaceID("tcp:hub")
+    let (overTCP, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 2, emitted: 100)
+    let (overRadio, _) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 0, emitted: 200,
+                                            randomPrefix: Data(repeating: 0x5A, count: 5))
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(radio))
+    await store.send(.interfaceConnected(tcp))
+    await store.send(.received(tcp, overTCP))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await store.send(.received(radio, overRadio))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 0)))
+    await store.send(.interfaceDisconnected(radio))
+    // The hub answers a path request with the announce it cached, which we have seen before.
+    await store.send(.received(tcp, overTCP))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    #expect(store.state.learned[destHash]?.interfaceID == tcp)
+}
+
+@Test @MainActor func olderAnnounceDoesNotReplaceARouteWhoseInterfaceIsStillConnected() async {
+    let id = Identity()
+    let radio = InterfaceID("meshtastic:radio")
+    let tcp = InterfaceID("tcp:hub")
+    let (older, destHash) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 2, emitted: 100)
+    let (newer, _) = makeAnnouncePacket(identity: id, appName: "app", aspects: [], hops: 0, emitted: 200,
+                                        randomPrefix: Data(repeating: 0x5A, count: 5))
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(radio))
+    await store.send(.interfaceConnected(tcp))
+    await store.send(.received(radio, newer))
+    await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 0)))
+    await store.send(.received(tcp, older))
+    await store.send(.received(tcp, older))   // and its replay
+    #expect(store.state.learned[destHash]?.interfaceID == radio)
+    #expect(store.state.learned[destHash]?.announceEmitted == 200)
+}
+
 @Test @MainActor func ignoresAnnounceForLocalDestination() async {
     let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["me"],
                            identity: Identity())!
