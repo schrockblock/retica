@@ -24,4 +24,24 @@ public struct LearnedDestination: Equatable, Sendable {
         self.announceEmitted = announceEmitted
         self.learnedAt = learnedAt
     }
+
+    /// The transport instance a packet for `destinationHash` (this entry's destination) must be
+    /// addressed to as HEADER_2, or nil when it goes out HEADER_1 with no transport ID.
+    ///
+    /// Reference inserts the transport header only when the path's hop count is > 1
+    /// (RNS `Transport.outbound`, Transport.py: `if Transport.path_table[...][IDX_PT_HOPS] > 1`),
+    /// and a relay strips it at `remaining_hops == 1` (`Transport.inbound`, the forward branch).
+    /// Reference counts a hop on receipt; ReTiCA stores the ON-WIRE count (see `receiptTimeoutBase`
+    /// in Transport.swift), so reference `> 1` is ReTiCA `>= 1`.
+    ///
+    /// On-wire hops 0 with a next hop that is not the destination is a LOCAL CLIENT of that next hop
+    /// (lxmd behind a shared rnsd: rnsd passes its announce on as HEADER_2, transport_id = rnsd,
+    /// hops 0). Addressed to rnsd, a HEADER_2 request is handed to the client unchanged and dropped
+    /// there, because its transport_id is not the client's — so it must be HEADER_1. (Reference's
+    /// other branch, hops == 1 while itself a client of a shared instance, does not apply: ReTiCA is
+    /// never a shared-instance client.)
+    public func relayNextHop(toward destinationHash: Data) -> Data? {
+        guard let nextHop, nextHop != destinationHash, hops >= 1 else { return nil }
+        return nextHop
+    }
 }

@@ -1478,6 +1478,59 @@ private func makeRelayAnnouncePacket(identity: Identity, appName: String, aspect
     await store.receive(\.tcpClients[id: InterfaceID("tcp")].interface.disconnect)
 }
 
+/// Learn `dest` from a HEADER_2 announce carrying `relayHash` at on-wire `hops`, open a link to it,
+/// and return the LINKREQUEST as sent on the wire.
+@MainActor
+private func linkRequestToDestinationAnnouncedVia(_ relayHash: Data, hops: UInt8) async -> Packet {
+    let (store, events) = makeStore()
+    let (announceRaw, destHash) = makeRelayAnnouncePacket(identity: Identity(), appName: "app",
+                                                          aspects: ["relay-hops-\(hops)"], hops: hops,
+                                                          emitted: 2000, transportId: relayHash)
+    await store.send(.start)
+    events.yield(.connected)
+    await store.receive(\.transport.interfaceConnected)
+    events.yield(.data(HDLC.frame(announceRaw)))
+    await store.receive(\.transport.received)
+    await store.receive(\.delegate.pathLearned)
+    #expect(store.state.transport.learned[destHash]?.nextHop == relayHash)
+    #expect(store.state.transport.learned[destHash]?.hops == hops)
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.openLink(destinationHash: destHash))
+    await store.receive { if case .link(.element(_, .establish)) = $0 { return true }; return false }
+    await store.receive { if case .link(.element(_, .delegate(.transmit))) = $0 { return true }; return false }
+    await store.receive { action in
+        if case let .tcpClients(.element(id: _, action: .interface(.send(raw)))) = action { captured.setValue(raw); return true }
+        return false
+    }
+    let p = Packet(raw: captured.value!)!
+    #expect(store.state.links[0].linkID == Link.linkID(requestPacket: p))
+    await store.send(.stop)
+    await store.receive(\.tcpClients[id: InterfaceID("tcp")].interface.disconnect)
+    return p
+}
+
+/// The propagation node behind a shared rnsd (2026-10-21): lxmd is a LOCAL CLIENT of rnsd, which
+/// passes its announce on as HEADER_2, transport_id = rnsd, on-wire hops 0. Reference counts that
+/// as hops 1 and inserts a transport header only for hops > 1 (`Transport.outbound`), so the
+/// request goes out HEADER_1 broadcast. A HEADER_2 addressed to rnsd was handed to lxmd unchanged
+/// and ignored there (its transport_id is not lxmd's), so the link never established.
+@Test @MainActor func openLinkToALocalClientOfTheNextHopEmitsHeader1LinkRequest() async {
+    let p = await linkRequestToDestinationAnnouncedVia(Data(repeating: 0xB4, count: 16), hops: 0)
+    #expect(p.packetType == .linkRequest)
+    #expect(p.headerType == .header1)
+    #expect(p.transportType == .broadcast)
+    #expect(p.transportId == nil)
+}
+
+/// One on-wire hop (reference hops 2) is a real relay: HEADER_2 to the next hop, as before.
+@Test @MainActor func openLinkAtOneOnWireHopEmitsHeader2LinkRequest() async {
+    let relayHash = Data(repeating: 0x5B, count: 16)
+    let p = await linkRequestToDestinationAnnouncedVia(relayHash, hops: 1)
+    #expect(p.packetType == .linkRequest)
+    #expect(p.headerType == .header2)
+    #expect(p.transportId == relayHash)
+}
+
 // MARK: - 3-node A—R—B link end-to-end (Task 4b-2b)
 
 /// Deframe a single packet from an HDLC-framed buffer (as produced by TCPClientInterface.send).

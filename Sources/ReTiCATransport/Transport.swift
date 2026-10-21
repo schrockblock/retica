@@ -332,20 +332,22 @@ public struct Transport {
     public var body: some ReducerOf<Self> {
         Reduce { [clock, date, randomBytes] state, action in
             // Shared helper: rewrite a packet for forwarding toward its destination.
-            // Final hop (nextHop == destHash) → HEADER_1 direct; onward → HEADER_2 to next hop.
+            // Final hop → HEADER_1 direct; onward → HEADER_2 to next hop. The final hop is the
+            // destination itself OR a local client of the next hop (`LearnedDestination.relayNextHop`,
+            // reference `Transport.inbound` strips the header at remaining_hops == 1).
             func forwardTowardDest(_ packet: Packet, _ entry: LearnedDestination) -> Data? {
                 let fwd: Packet
-                if entry.nextHop == packet.destinationHash {
+                if let nextHop = entry.relayNextHop(toward: packet.destinationHash) {
+                    fwd = Packet(headerType: .header2, packetType: packet.packetType, transportType: .transport,
+                                 destinationType: packet.destinationType, context: packet.context,
+                                 contextFlag: packet.contextFlag, hops: packet.hops + 1,
+                                 destinationHash: packet.destinationHash, transportId: nextHop,
+                                 payload: packet.payload)
+                } else {
                     fwd = Packet(headerType: .header1, packetType: packet.packetType, transportType: .broadcast,
                                  destinationType: packet.destinationType, context: packet.context,
                                  contextFlag: false, hops: packet.hops + 1,
                                  destinationHash: packet.destinationHash, transportId: nil, payload: packet.payload)
-                } else {
-                    fwd = Packet(headerType: .header2, packetType: packet.packetType, transportType: .transport,
-                                 destinationType: packet.destinationType, context: packet.context,
-                                 contextFlag: packet.contextFlag, hops: packet.hops + 1,
-                                 destinationHash: packet.destinationHash, transportId: entry.nextHop,
-                                 payload: packet.payload)
                 }
                 return try? fwd.packed()
             }
@@ -1048,13 +1050,14 @@ public struct Transport {
                 }
                 let ciphertext = entry.identity.encrypt(plaintext, ratchet: entry.ratchet)
                 let packet: Packet
-                if let nh = entry.nextHop, nh != destinationHash {
+                if let nh = entry.relayNextHop(toward: destinationHash) {
                     // Destination is reached via a relay → send HEADER_2 to the next hop.
                     packet = Packet(headerType: .header2, packetType: .data, transportType: .transport,
                                     destinationType: .single, context: .none, contextFlag: false, hops: 0,
                                     destinationHash: destinationHash, transportId: nh, payload: ciphertext)
                 } else {
-                    // Directly reachable → HEADER_1 as before.
+                    // Directly reachable, or a local client of the next hop → HEADER_1
+                    // (`LearnedDestination.relayNextHop`).
                     packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                                     destinationType: .single, context: .none, contextFlag: false, hops: 0,
                                     destinationHash: destinationHash, transportId: nil, payload: ciphertext)

@@ -833,6 +833,80 @@ private func relayStoreKnowingDestViaAnotherRelay() async -> (TestStore<Transpor
     #expect(p.transportId == nil)
 }
 
+/// A store that learned `dest` from a HEADER_2 announce carrying `nextHop` at on-wire `hops`;
+/// in relay mode when `relay` is given.
+@MainActor
+private func storeWithPathAnnouncedVia(_ nextHop: Data, hops: UInt8, relay: Identity? = nil) async
+    -> (TestStore<Transport.State, Transport.Action>, Data) {
+    let ifID = InterfaceID("i1")
+    let (raw, destHash) = makeHeader2AnnouncePacket(identity: Identity(), appName: "app",
+                                                     aspects: ["via-\(hops)"], hops: hops,
+                                                     emitted: 1000, transportId: nextHop)
+    let store = TestStore(initialState: Transport.State()) { Transport() }
+    store.exhaustivity = .off
+    await store.send(.interfaceConnected(ifID))
+    if let relay { await store.send(.setTransportIdentity(relay)) }
+    await store.send(.received(ifID, raw))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    #expect(store.state.learned[destHash]?.nextHop == nextHop)
+    #expect(store.state.learned[destHash]?.hops == hops)
+    return (store, destHash)
+}
+
+@MainActor
+private func sentPacket(_ store: TestStore<Transport.State, Transport.Action>, _ destHash: Data) async -> Packet {
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.send(destinationHash: destHash, plaintext: Data("hi".utf8)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    return Packet(raw: captured.value!)!
+}
+
+/// A local client of the next hop (a propagation node behind a shared rnsd): rnsd passes its
+/// announce on as HEADER_2, transport_id = rnsd, on-wire hops 0 — reference hops 1. Reference
+/// inserts a transport header only for hops > 1 (`Transport.outbound`), so it is HEADER_1.
+@Test @MainActor func originatorSendsHeader1ToALocalClientOfTheNextHop() async {
+    let (store, destHash) = await storeWithPathAnnouncedVia(Data(repeating: 0xB4, count: 16), hops: 0)
+    let p = await sentPacket(store, destHash)
+    #expect(p.headerType == .header1)
+    #expect(p.transportType == .broadcast)
+    #expect(p.transportId == nil)
+    #expect(p.destinationHash == destHash)
+}
+
+/// One on-wire hop (reference hops 2) is a real relay: HEADER_2 to the next hop, unchanged.
+@Test @MainActor func originatorSendsHeader2AtOneOnWireHop() async {
+    let relayHash = Data(repeating: 0x43, count: 16)
+    let (store, destHash) = await storeWithPathAnnouncedVia(relayHash, hops: 1)
+    let p = await sentPacket(store, destHash)
+    #expect(p.headerType == .header2)
+    #expect(p.transportId == relayHash)
+}
+
+/// The relay's half of the same rule (reference `Transport.inbound`, remaining_hops == 1 strips
+/// the transport header): a destination this relay learned at on-wire hops 0 behind another
+/// transport instance is the final hop, so the packet goes out HEADER_1.
+@Test @MainActor func relayForwardsAsHeader1ToALocalClientOfTheNextHop() async {
+    let relay = Identity()
+    let (store, destHash) = await storeWithPathAnnouncedVia(Data(repeating: 0xB4, count: 16), hops: 0,
+                                                            relay: relay)
+    let inbound = makeHeader2DataPacket(transportId: relay.hash, destHash: destHash, hops: 1,
+                                        payload: Data([4, 2]))
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.received(InterfaceID("in"), inbound))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    let f = Packet(raw: captured.value!)!
+    #expect(f.headerType == .header1)
+    #expect(f.transportId == nil)
+    #expect(f.hops == 2)
+    #expect(f.payload == Data([4, 2]))
+}
+
 @Test @MainActor func relayForwardsFinalHopAsHeader1() async {
     let (store, relay, destHash, outIf) = await relayStoreKnowingDestDirectly()
     let inbound = makeHeader2DataPacket(transportId: relay.hash, destHash: destHash, hops: 1,

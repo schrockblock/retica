@@ -202,9 +202,11 @@ public struct TransportEndpoint {
                 guard state.transport.reachableLearned(destinationHash) != nil else {
                     return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .pathStale)))
                 }
-                // Via a relay (learned nextHop != the destination) → HEADER_2 LINKREQUEST to the
-                // relay. The learned entry records which interface the destination was heard on.
-                let relayNextHop: Data? = learned.nextHop == destinationHash ? nil : learned.nextHop
+                // Via a relay (a next hop that is not the destination, at on-wire hops >= 1) →
+                // HEADER_2 LINKREQUEST to the relay; otherwise HEADER_1, including to a local client
+                // of the next hop (`LearnedDestination.relayNextHop`, the same rule `Transport.send`
+                // uses). The learned entry records which interface the destination was heard on.
+                let relayNextHop = learned.relayNextHop(toward: destinationHash)
                 // Contract 4: the deadline follows the next hop's bitrate and the path's length,
                 // read NOW, so a re-registered interface's new bitrate applies to the next link.
                 let timeout = LinkTiming.initiatorEstablishmentTimeout(
