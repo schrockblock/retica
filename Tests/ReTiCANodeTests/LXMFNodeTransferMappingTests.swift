@@ -214,7 +214,7 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
     }
     let m = LXMessage.create(source: Identity(), destinationHash: dest, timestamp: 1700000000.5,
                              title: Data(), content: Data("x".utf8))
-    await store.send(.sendMessage(message: m, alsoViaPropagation: false))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: false))
     #expect(store.state.inFlightDeliveryStamps == [m.hash])
     await store.send(.cancelOutbound(messageHash: m.hash))
     #expect(store.state.inFlightDeliveryStamps.isEmpty)
@@ -239,7 +239,7 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
                                                         learnedAt: Date(timeIntervalSince1970: 1700000000))
         state.router.succeededMessages.insert(m.hash)          // the propagated copy was accepted
     }
-    await store.send(.sendMessage(message: m, alsoViaPropagation: false))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: false))
     #expect(store.state.inFlightDeliveryStamps == [m.hash])
     #expect(store.state.router.succeededMessages.contains(m.hash))
     store.exhaustivity = .on
@@ -253,7 +253,8 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
 
 @Test(.timeLimit(.minutes(1))) @MainActor func nodeTransferCancelOutboundStopsThePropagationStampSearch() async {
     let recipient = Identity()
-    let store = mappingNode { state in
+    let clock = TestClock()
+    let store = mappingNode(clock: clock) { state in
         state.router.outboundPropagationNode = pn
         state.endpoint.transport.learned[dest] = LearnedDestination(
             identity: recipient, appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),
@@ -267,7 +268,13 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
     }
     let m = LXMessage.create(source: Identity(), destinationHash: dest, timestamp: 1700000000.5,
                              title: Data(), content: Data("x".utf8))
-    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    // The delivery copy stalls, so the propagated copy's stamp search starts.
+    for _ in 0..<(LXMFDelivery.propagationFallbackAfterAttempts - 1) {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    }
+    await store.receive(.router(.delegate(.propagationFallbackDue(messageHash: m.hash))))
+    #expect(store.state.pendingFallbacks.isEmpty)              // taken up: its stamp search is running
     await store.skipReceivedActions(strict: false)
     await store.send(.cancelOutbound(messageHash: m.hash))
     // Exhaustive from here, with nothing drained first: the router reports the cancel (it holds the

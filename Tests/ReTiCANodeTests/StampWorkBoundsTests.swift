@@ -81,17 +81,18 @@ private func makePropagationClient(advertisedStampCost: Int) -> TestStore<LXMFNo
     await store.finish(timeout: .seconds(2))
 }
 
-/// The same refusal on the `.sendMessage(alsoViaPropagation:)` path, which builds its own effect:
-/// the opportunistic copy must still go out, and only the propagation copy is skipped.
+/// The same refusal on the `.sendMessage(fallbackToPropagation:)` path, which builds its own effect:
+/// the opportunistic copy must still go out, and the propagation copy is not even kept as a fallback.
 @MainActor @Test func lxmfNodeSendMessageRefusesAnAbsurdAdvertisedPropagationStampCost() async {
     let store = makePropagationClient(advertisedStampCost: 64)
     let me = Identity()
     let msg = LXMessage.create(source: me, destinationHash: recipientDest, timestamp: 1700000000,
                                title: Data(), content: Data("x".utf8))
-    await store.send(.sendMessage(message: msg, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: msg, fallbackToPropagation: true))
     await store.receive { if case let .router(.send(m, _)) = $0 { return m == msg }; return false }
     await store.skipReceivedActions(strict: false)
     #expect(store.state.router.propagationQueue.isEmpty)
+    #expect(store.state.router.fallbackEligible.isEmpty)
     // The queue being empty proves nothing on its own — an unrefused cost-64 search never delivers
     // either. What distinguishes the two is whether a stamp effect was *started*, so cancel the
     // opportunistic side (its retry timer is a legitimate long-lived effect) and require that nothing

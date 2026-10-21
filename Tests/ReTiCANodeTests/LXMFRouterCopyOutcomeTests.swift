@@ -179,7 +179,7 @@ private func advanceToTheFinalRetry(_ store: TestStore<LXMFRouter.State, LXMFRou
     }
 }
 
-/// `sendMessage(alsoViaPropagation: true)` with no propagation node configured: the propagated copy
+/// `sendMessage(fallbackToPropagation: true)`'s hand-off with no propagation node configured: the propagated copy
 /// fails at once, but the delivery copy is pending, so nothing is reported.
 @Test @MainActor func copyOutcomeNoPropagationNodeDoesNotFailAPendingDeliveryCopy() async {
     let msg = makeMessage()

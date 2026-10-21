@@ -178,7 +178,7 @@ private final class TransferPair {
     let msg = p.attachmentMessage(bytes: transferIncompressible(count: 3_000_000))
     #expect(msg.packed.count > 2 * LinkSession.maxEfficientSize)          // three segments
     let key = LXMFRouter.DeliveryKey.delivery(msg.hash)
-    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    await p.a.send(.sendMessage(message: msg, fallbackToPropagation: false))
     var outbound: [Double] = []
     var inbound: [Double] = []
     var attempts = 0
@@ -254,7 +254,7 @@ private final class TransferPair {
     await p.connectAndIntroduce()
     let msg = p.attachmentMessage(bytes: transferIncompressible(count: 1_100_000))
     let key = LXMFRouter.DeliveryKey.delivery(msg.hash)
-    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    await p.a.send(.sendMessage(message: msg, fallbackToPropagation: false))
     var outbound: [Double] = []
     var attempts = 0
     func sample() {
@@ -293,7 +293,7 @@ private final class TransferPair {
     await p.connectAndIntroduce()
     let msg = p.attachmentMessage(bytes: transferIncompressible(count: 200_000))
     let key = LXMFRouter.DeliveryKey.delivery(msg.hash)
-    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    await p.a.send(.sendMessage(message: msg, fallbackToPropagation: false))
     // DEVIATION (documented in the task report): the brief's `p.pump(until: ...)` calls below use
     // the harness's default `skipEvery: 50`. Empirically that is too coarse for this 200 KB
     // transfer: `p.a.state`/`p.b.state` only advance when a periodic `skipReceivedActions` syncs
@@ -336,7 +336,7 @@ private final class TransferPair {
     await p.connectAndIntroduce()
     let msg = p.attachmentMessage(bytes: transferIncompressible(count: 200_000))
     let key = LXMFRouter.DeliveryKey.delivery(msg.hash)
-    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    await p.a.send(.sendMessage(message: msg, fallbackToPropagation: false))
     let started = await p.pump(skipEvery: 5, until: { (p.a.state.transferProgress[key] ?? 0) >= 0.2 })
     #expect(started, "the first transfer never got going")
     await p.a.skipReceivedActions(strict: false)
@@ -374,9 +374,11 @@ private final class TransferPair {
     await p.stop()
 }
 
-/// With a propagation node configured, both copies report their own success and nothing reports a
-/// failure. The node's side of its transfer is played by the delegates the endpoint would emit.
-@Test(.timeLimit(.minutes(5))) @MainActor func transferEndToEndWithAPropagationNodeBothCopiesSucceed() async {
+/// With a propagation node configured and the recipient offline, the propagated copy is NOT sent
+/// with the delivery copy: it starts only when the delivery copy's third attempt is spent (spec A2),
+/// and its acceptance is the message's success. The node's side of its transfer is played by the
+/// delegates the endpoint would emit; nothing A writes ever reaches B.
+@Test(.timeLimit(.minutes(5))) @MainActor func transferEndToEndWithAPropagationNodeFallsBackAfterTheThirdAttempt() async {
     let pn = Data(repeating: 0xBB, count: 16)
     let pnLink = Data(repeating: 0xC0, count: 16)
     let p = TransferPair(configureA: { state in
@@ -391,31 +393,39 @@ private final class TransferPair {
     })
     await p.connectAndIntroduce()
     let msg = p.attachmentMessage(bytes: transferIncompressible(count: 100_000))
+    let bDest = p.bDeliveryHash
     #expect(msg.packed.count < 1000 * 1000)                                 // under the node's limit
-    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: true))
-    #expect(p.a.state.router.pendingPropagatedCopies.contains(msg.hash))
-    await p.a.receive { if case let .router(.sendViaPropagation(m, _)) = $0 { return m.hash == msg.hash }; return false }
+    await p.a.send(.sendMessage(message: msg, fallbackToPropagation: true))
+    await p.a.skipReceivedActions(strict: false)
+    #expect(p.a.state.router.fallbackEligible.contains(msg.hash))
+    #expect(p.a.state.router.pendingPropagatedCopies.isEmpty)               // only the delivery copy is out
+    // B never answers, so each link attempt to it times out. Step the clock a second at a time and
+    // record how many attempts the delivery copy had spent while it was still only eligible.
+    var spentWhileEligible = 0
+    var handedOff = false
+    for _ in 0..<600 {
+        await p.clock.advance(by: .seconds(1))
+        await p.a.skipReceivedActions(strict: false)
+        if !p.a.state.router.fallbackEligible.contains(msg.hash) { handedOff = true; break }
+        spentWhileEligible = p.a.state.router.establishAttempts[bDest] ?? 0
+        #expect(p.a.state.router.pendingDeliveries[.propagated(msg.hash)] == nil)
+    }
+    #expect(handedOff, "the delivery copy never handed off")
+    #expect(spentWhileEligible == LXMFDelivery.propagationFallbackAfterAttempts - 1)
+    #expect(p.a.state.router.establishAttempts[bDest] == LXMFDelivery.propagationFallbackAfterAttempts)
+    // The propagated copy's stamp search runs off the main actor; wait for its hand-over.
+    for _ in 0..<1_000 where p.a.state.router.linkResourceInFlight[pnLink] != .propagated(msg.hash) {
+        await Task.megaYield()
+        await p.a.skipReceivedActions(strict: false)
+    }
     #expect(p.a.state.router.linkResourceInFlight[pnLink] == .propagated(msg.hash))
     let pnResource = Data(repeating: 0x9C, count: 32)
     await p.a.send(.endpoint(.delegate(.resourceProgress(linkID: pnLink, resourceHash: pnResource, role: .sender,
                                                          bytesDone: 0, bytesTotal: 10, segment: 1, segments: 1))))
     await p.a.send(.endpoint(.delegate(.resourceConcluded(linkID: pnLink, resourceHash: pnResource))))
     await p.a.receive(.delegate(.propagationAccepted(messageHash: msg.hash)))
-    // FIX ROUND 1 (documented in the task report, same reasoning as the monotonic-progress test):
-    // `keepA`/`until` both reading `pendingDeliveries[key] == nil` made `keepA` dead. Two-phase pump
-    // gated on B instead (`skipEvery: 5` throughout — this 100 KB direct copy is small enough to run
-    // its whole course inside one default 50-round window).
-    func bAlmostDone() -> Bool {
-        (p.b.state.inboundProgress.values.first ?? 0) >= 0.95 || p.b.state.router.seen.contains(msg.hash)
-    }
-    let phase1 = await p.pump(keepA: { bAlmostDone() }, skipEvery: 5, until: { bAlmostDone() })
-    #expect(phase1, "the direct transfer stalled before B was nearly done")
-    let phase2 = await p.pump(keepA: { true }, skipEvery: 5,
-                              until: { p.b.state.router.seen.contains(msg.hash) && p.forwardedB == p.sentB.value.count })
-    #expect(phase2, "B's proof never reached A")
-    await p.a.receive(.delegate(.deliveryConfirmed(messageHash: msg.hash)))
     #expect(p.a.state.router.succeededMessages.contains(msg.hash))
-    #expect(p.a.state.router.pendingDeliveries.isEmpty)
-    #expect(p.a.state.router.pendingPropagatedCopies.isEmpty)
+    #expect(p.a.state.pendingFallbacks.isEmpty)
+    #expect(!p.b.state.router.seen.contains(msg.hash))
     await p.stop()
 }

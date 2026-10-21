@@ -115,7 +115,7 @@ private final class Pair {
     let msg = p.message("prove me")
 
     let aFrames = p.sentA.value.count
-    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    await p.a.send(.sendMessage(message: msg, fallbackToPropagation: false))
     await p.a.receive(isTCPSend)
     let data = await nextFrame(p.sentA, after: aFrames)
     #expect(p.a.state.endpoint.transport.pendingReceipts.count == 1)
@@ -151,7 +151,7 @@ private final class Pair {
     let msg = p.message("resend me")
 
     var aFrames = p.sentA.value.count
-    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    await p.a.send(.sendMessage(message: msg, fallbackToPropagation: false))
     await p.a.receive(isTCPSend)
     let first = await nextFrame(p.sentA, after: aFrames)
 
@@ -197,8 +197,9 @@ private final class Pair {
 }
 
 /// With a propagation node, both copies report their own outcome and there is no false failure.
-/// The propagated copy is handed to the router directly, exactly as `sendMessage(alsoViaPropagation:)`
-/// does once its stamp search finishes; the PN's link receipt is injected as `packetDelivered`.
+/// The propagated copy is handed to the router directly, exactly as `sendMessage(fallbackToPropagation:)`
+/// does once its fallback is due and its stamp search finishes; the PN's link receipt is injected as
+/// `packetDelivered`.
 @Test @MainActor func proofEndToEndBothCopiesReportTheirOwnOutcomeWithNoFalseFailure() async {
     let pn = Data(repeating: 0xBB, count: 16)
     let pnLink = Data(repeating: 0xC0, count: 16)
@@ -210,7 +211,7 @@ private final class Pair {
     let msg = p.message("both ways")
 
     let aFrames = p.sentA.value.count
-    await p.a.send(.sendMessage(message: msg, alsoViaPropagation: false))     // the delivery copy
+    await p.a.send(.sendMessage(message: msg, fallbackToPropagation: false))     // the delivery copy
     await p.a.receive(isTCPSend)
     let data = await nextFrame(p.sentA, after: aFrames)
     await p.a.send(.router(.sendViaPropagation(message: msg, propagationPacked: Data("small-container".utf8))))

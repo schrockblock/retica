@@ -191,6 +191,23 @@ private func makeStore(_ state: LXMFRouter.State, clock: TestClock<Duration>) ->
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
 }
 
+/// `LXMFNode` fails a handed-off copy it cannot pack. A cancel that landed first already ended the
+/// message, so the late failure reports nothing.
+@Test @MainActor func fallbackCopyFailedAfterACancelIsSilent() async {
+    let h = makeMessage().hash
+    var state = LXMFRouter.State()
+    state.pendingPropagatedCopies = [h]
+    let store = TestStore(initialState: state) { LXMFRouter() } withDependencies: {
+        $0.continuousClock = TestClock()
+    }
+    await store.send(.cancelOutbound(messageHash: h)) {
+        $0.pendingPropagatedCopies = []
+        $0.cancelledMessages.insert(h)
+    }
+    await store.receive(.delegate(.deliveryCancelled(messageHash: h)))
+    await store.send(.propagatedCopyFailed(messageHash: h))     // exhaustive: a deliveryFailed would be unexpected
+}
+
 /// A send never marked eligible fails after its last retry, as before this change (~50 s on TCP).
 @Test @MainActor func fallbackIneligibleSendKeepsTodaysFailure() async {
     let msg = makeMessage()

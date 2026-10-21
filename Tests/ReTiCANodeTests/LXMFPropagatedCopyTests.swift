@@ -126,7 +126,7 @@ private let pnProbe = LXMFNode.Action.endpoint(.delegate(.resourceConcluded(link
                                                                             resourceHash: Data(repeating: 0x11, count: 32))))
 
 @MainActor
-private func pnNode(limitKB: Int, stampCost: Int,
+private func pnNode(limitKB: Int, stampCost: Int, clock: TestClock<Duration> = TestClock(),
                     deliveryStampCost: Int? = nil) -> (TestStore<LXMFNode.State, LXMFNode.Action>, Identity) {
     let recipient = Identity()
     var state = LXMFNode.State(identity: Identity(),
@@ -147,7 +147,7 @@ private func pnNode(limitKB: Int, stampCost: Int,
     state.router.outboundPropagationNode = pn
     state.router.knownPaths.insert(dest)
     let store = TestStore(initialState: state) { LXMFNode() } withDependencies: {
-        $0.continuousClock = TestClock()
+        $0.continuousClock = clock
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
         $0.uuid = .incrementing
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
@@ -156,12 +156,24 @@ private func pnNode(limitKB: Int, stampCost: Int,
     return (store, recipient)
 }
 
+/// Retry the (opportunistic, path known) delivery copy until it hands off to the propagation node:
+/// the propagated copy of a `fallbackToPropagation` send starts there, not at the send.
+@MainActor
+private func stallTheDeliveryCopy(_ store: TestStore<LXMFNode.State, LXMFNode.Action>,
+                                  _ clock: TestClock<Duration>, _ m: LXMessage) async {
+    #expect(store.state.router.pendingPropagatedCopies.isEmpty)
+    for _ in 0..<(LXMFDelivery.propagationFallbackAfterAttempts - 1) {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    }
+    await store.receive(.router(.delegate(.propagationFallbackDue(messageHash: m.hash))))
+}
+
 @Test @MainActor func pnCopyNodeRefusesAnOversizeMessageUpFront() async {
     let (store, _) = pnNode(limitKB: 1, stampCost: 4)
     let m = LXMessage.create(source: Identity(), destinationHash: dest, timestamp: 1700000000.5,
                              title: Data(), content: Data(repeating: 0x41, count: 2000))
     #expect(m.packed.count > 1000)
-    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
     await store.receive(.router(.propagatedCopyRefused(messageHash: m.hash, reason: .tooLargeForNode)))
     await store.receive(.delegate(.propagationRefused(messageHash: m.hash, reason: .tooLargeForNode)))
     #expect(store.state.router.pendingPropagatedCopies.isEmpty)      // no search was started for it
@@ -171,9 +183,11 @@ private func pnNode(limitKB: Int, stampCost: Int,
 /// Review Focus 7: every existing fixture announces `perTransferLimit: 0`. That is "unknown", not
 /// "nothing fits": the copy is attempted, and marked pending while its stamp is searched.
 @Test @MainActor func pnCopyNodeMarksTheCopyPendingWhileItsStampIsSearched() async {
-    let (store, _) = pnNode(limitKB: 0, stampCost: 4)
+    let clock = TestClock()
+    let (store, _) = pnNode(limitKB: 0, stampCost: 4, clock: clock)
     let m = note()
-    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await stallTheDeliveryCopy(store, clock, m)
     #expect(store.state.router.pendingPropagatedCopies == [m.hash])
     await store.receive { if case let .router(.sendViaPropagation(sent, _)) = $0 { return sent.hash == m.hash }; return false }
     #expect(store.state.router.pendingPropagatedCopies.isEmpty)
@@ -181,16 +195,20 @@ private func pnNode(limitKB: Int, stampCost: Int,
 }
 
 @Test @MainActor func pnCopyNodeAttemptsAMessageWithinTheLimit() async {
-    let (store, _) = pnNode(limitKB: 1000, stampCost: 4)
+    let clock = TestClock()
+    let (store, _) = pnNode(limitKB: 1000, stampCost: 4, clock: clock)
     let m = note()
-    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await stallTheDeliveryCopy(store, clock, m)
     await store.receive { if case let .router(.sendViaPropagation(sent, _)) = $0 { return sent.hash == m.hash }; return false }
 }
 
 @Test @MainActor func pnCopyNodeCancelPropagationStampsFailsTheMarkedCopy() async {
-    let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost)
+    let clock = TestClock()
+    let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost, clock: clock)
     let m = note()
-    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await stallTheDeliveryCopy(store, clock, m)
     #expect(store.state.router.pendingPropagatedCopies == [m.hash])
     await store.send(.cancelPropagationStamps)
     await store.receive(.router(.abandonPendingPropagatedCopies(stillSearching: [])))
@@ -199,44 +217,48 @@ private func pnNode(limitKB: Int, stampCost: Int,
 }
 
 @Test @MainActor func pnCopyNodeChangingThePropagationNodeFailsTheMarkedCopy() async {
-    let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost)
+    let clock = TestClock()
+    let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost, clock: clock)
     let m = note()
-    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await stallTheDeliveryCopy(store, clock, m)
     await store.send(.setPropagationNode(destinationHash: Data(repeating: 0xC1, count: 16)))
     await store.receive(.router(.abandonPendingPropagatedCopies(stillSearching: [])))
     #expect(store.state.router.pendingPropagatedCopies.isEmpty)
 }
 
 /// Final review F2: the app deliberately re-sending a message it cancelled earlier is a FRESH send.
-/// The node forgets the cancel first, so the propagated copy is marked and the delivery copy is
-/// armed — before, both were swallowed by the cancelled-message guards and the row stayed on
-/// "sending" for good. (A LATE hand-over from the cancelled attempt is still refused by the router:
-/// `routerCancelLateCopyOfACancelledMessageArmsNothing`.)
+/// The node forgets the cancel first, so the propagated copy is marked a fallback and the delivery
+/// copy is armed — before, both were swallowed by the cancelled-message guards and the row stayed
+/// on "sending" for good. (A LATE hand-over from the cancelled attempt is still refused by the
+/// router: `routerCancelLateCopyOfACancelledMessageArmsNothing`.)
 @Test @MainActor func pnCopyResendOfACancelledMessageIsAFreshSend() async {
     let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost)
     let m = note()
     await store.send(.cancelOutbound(messageHash: m.hash))
     #expect(store.state.router.cancelledMessages.contains(m.hash))
-    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
     #expect(!store.state.router.cancelledMessages.contains(m.hash))
-    #expect(store.state.router.pendingPropagatedCopies == [m.hash])
+    await store.receive(.router(.markFallbackEligible(messageHash: m.hash)))
     await store.receive(.router(.send(message: m, desiredMethod: .opportunistic)))
     await store.skipReceivedActions(strict: false)
+    #expect(store.state.router.fallbackEligible == [m.hash])
     #expect(store.state.router.pendingDeliveries[.delivery(m.hash)] != nil)   // the delivery copy is armed
-    await store.send(.cancelPropagationStamps)                                // stop the cost-20 search
 }
 
 /// Final review F3: abandoning the propagated copies while a message's DELIVERY copy is still in
 /// its delivery-stamp search (so the router holds nothing for it) must not fail the message — that
 /// copy can still succeed, and did: failing here gave `deliveryFailed` and then a confirmation.
 @Test(.timeLimit(.minutes(1))) @MainActor func pnCopyAbandonWhileTheDeliveryStampIsSearchedDoesNotFailTheMessage() async {
-    // Both stamps at cost 20: neither search can finish during the test, so the delivery search is
-    // deterministically in flight when the abandon lands. Its eventual hand-over is then played by
-    // sending the `.router(.send)` it would deliver.
+    // The delivery stamp at cost 20 cannot finish during the test, so its search is deterministically
+    // in flight when the abandon lands. Its eventual hand-over is then played by sending the
+    // `.router(.send)` it would deliver. A fallback cannot start while that search runs, so the
+    // pending propagated copy (from an earlier attempt's hand-off, say) is marked directly.
     let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost,
                             deliveryStampCost: LXMFNode.maxDeliveryStampCost)
     let m = note()
-    await store.send(.sendMessage(message: m, alsoViaPropagation: true))
+    await store.send(.sendMessage(message: m, fallbackToPropagation: false))
+    await store.send(.router(.propagatedCopyPending(messageHash: m.hash)))
     #expect(store.state.inFlightDeliveryStamps == [m.hash])
     #expect(store.state.router.pendingPropagatedCopies == [m.hash])
     store.exhaustivity = .on

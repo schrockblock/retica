@@ -45,7 +45,7 @@ public struct LXMFRouter {
         /// destinationHash → messages queued until a direct link to it becomes active.
         var outboundQueue: [Data: [LXMessage]] = [:]
         /// (message.hash, copy) → in-flight send awaiting a delivery outcome (with its resend info +
-        /// attempts). Keyed per COPY because `LXMFNode.sendMessage(alsoViaPropagation:)` arms a
+        /// attempts). Keyed per COPY because `LXMFNode.sendMessage(fallbackToPropagation:)` can arm a
         /// delivery copy and a propagated copy of one message; under one key the second overwrote
         /// the first and its outcome was reported as the other's.
         public var pendingDeliveries: [DeliveryKey: PendingDelivery] = [:]
@@ -263,6 +263,12 @@ public struct LXMFRouter {
         /// This message's propagated copy is a fallback: it is requested with `propagationFallbackDue`
         /// only if the delivery copy stalls. Send before the delivery copy is handed over.
         case markFallbackEligible(messageHash: Data)
+        /// The message ended outside this router (`LXMFNode`'s `.cancelDeliveryStamps`): its fallback
+        /// must never be asked for.
+        case clearFallbackEligible(messageHash: Data)
+        /// `LXMFNode` could not pack the propagated copy `propagationFallbackDue` asked for: that
+        /// copy has failed, through `fail`. Ignored unless the copy is still pending.
+        case propagatedCopyFailed(messageHash: Data)
         /// `LXMFNode` did not start this message's propagated copy at all (spec §6).
         case propagatedCopyRefused(messageHash: Data, reason: RefusalReason)
         /// Every propagated-copy stamp search was cancelled: those copies have failed. A message in
@@ -969,6 +975,15 @@ public struct LXMFRouter {
                 state.fallbackEligible.insert(hash)
                 return .none
 
+            case let .clearFallbackEligible(hash):
+                state.fallbackEligible.remove(hash)
+                return .none
+
+            case let .propagatedCopyFailed(hash):
+                // A cancel (or an abandon) that got here first already settled this copy.
+                guard state.pendingPropagatedCopies.contains(hash) else { return .none }
+                return fail(&state, .propagated(hash))
+
             case let .propagatedCopyRefused(hash, reason):
                 // Never started, so there is nothing to fail: the delivery copy's own outcome decides
                 // the message. Running `fail` here could report `deliveryFailed` while the delivery copy
@@ -1052,9 +1067,9 @@ extension LXMFRouter.State {
     /// `hasOutboundState` report work that doesn't exist, and a later `abandonPendingPropagatedCopies`
     /// would `fail` it into a stray `deliveryFailed` with no preceding send).
     ///
-    /// The ONE place this rule is applied: both the router's own `.propagatedCopyPending` action and
-    /// `LXMFNode.sendMessage`'s synchronous write (Ruling P11 — the marker must be visible within the
-    /// same reduce cycle) go through here, so the guard cannot be forgotten at either call site.
+    /// The ONE place this rule is applied: the router's own `.propagatedCopyPending` action goes
+    /// through here, and so must any synchronous write from `LXMFNode` (Ruling P11 — the marker
+    /// must be visible within the same reduce cycle), so the guard cannot be forgotten.
     mutating func markPropagatedCopyPending(_ hash: Data) {
         guard !cancelledMessages.contains(hash) else { return }
         pendingPropagatedCopies.insert(hash)

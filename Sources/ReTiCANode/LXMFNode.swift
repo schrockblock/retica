@@ -169,6 +169,11 @@ public struct LXMFNode {
         /// message onward, so a search that already completed is never failed retroactively.
         public internal(set) var inFlightDeliveryStamps: [Data] = []
 
+        /// Messages sent with `fallbackToPropagation` whose propagated copy has not started: it is
+        /// packed only when the router reports `propagationFallbackDue` (spec Amendment A2). Dropped
+        /// at the hand-off and when the message ends any other way.
+        public internal(set) var pendingFallbacks: [Data: LXMessage] = [:]
+
         /// linkID → the resource hash of OUR Resource in flight on that link, learned from the first
         /// sender-role `resourceProgress` after the router starts a copy there. A conclusion or
         /// failure naming any other hash on that link is not our copy's: an inbound transfer's, or a
@@ -249,7 +254,10 @@ public struct LXMFNode {
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
         case setPropagationNode(destinationHash: Data)
         case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
-        case sendMessage(message: LXMessage, alsoViaPropagation: Bool)
+        /// Send `message` directly. With `fallbackToPropagation`, a copy goes to the propagation node
+        /// only if the direct copy stalls (its third attempt) or fails; a copy the node would refuse
+        /// for size is reported `propagationRefused` at once instead.
+        case sendMessage(message: LXMessage, fallbackToPropagation: Bool)
         case syncFromPropagationNode
         case cancelPropagationStamps
         /// Cancel any in-flight delivery-stamp searches. Call when the app backgrounds, the user
@@ -604,13 +612,13 @@ public struct LXMFNode {
                 }
                 .cancellable(id: CancelID.propagationStamp)
 
-            case let .sendMessage(message, alsoViaPropagation):
+            case let .sendMessage(message, fallbackToPropagation):
                 // The delivery copy is stamped on exactly the same terms as `.send` — this is the
                 // path ReTiCaMsgr actually calls, so leaving it unstamped would have defeated the
-                // whole point of bounding the cost elsewhere. The propagation copy below keeps its
-                // OWN, separate stamp: different workblock (1000 rounds vs 3000), different material
-                // (transient_id vs message hash), different CancelID. See `deliverySend` for why a
-                // caller-supplied stamp is never overwritten.
+                // whole point of bounding the cost elsewhere. The propagated copy keeps its OWN,
+                // separate stamp (`startPropagatedCopy`): different workblock (1000 rounds vs 3000),
+                // different material (transient_id vs message hash), different CancelID. See
+                // `deliverySend` for why a caller-supplied stamp is never overwritten.
                 //
                 // A re-send of a message the app cancelled earlier is a FRESH send: forget the
                 // cancel first, synchronously, before anything below consults it. The router's
@@ -618,53 +626,25 @@ public struct LXMFNode {
                 // (whose per-message stamp effects were cancelled with it), and would otherwise
                 // swallow this deliberate re-send and leave its row on "sending" for good.
                 state.router.uncancel(message.hash)
-                var effects: [Effect<Action>] = [
-                    deliverySend(&state, message: message, method: .opportunistic)
-                ]
-                // KNOWN GAP, deliberately deferred: the propagation copy packs the ORIGINAL,
-                // UNSTAMPED `message`, so a recipient who enforces delivery stamps drops it even
-                // though the opportunistic copy above carries one. Same failure class as the
-                // `.sendMessage`-had-no-stamp gap this task just closed, one layer down.
-                //
-                // The barrier is EFFECT SEQUENCING, not `transient_id` stability — an earlier note
-                // here said the latter and a re-review corrected it, so it is recorded rather than
-                // silently replaced. It is true that stamping first changes `message.packed` and
-                // therefore the `transient_id` that `LXMFPropagation.pack` derives from it. But that
-                // does NOT destabilise retries: `ResendInfo.propagated` re-sends the already-packed
-                // `propagationPacked` bytes and never re-calls `pack`, so stamping once and packing
-                // once would still give a stable id. The real cost is that both the delivery-stamp
-                // search and `pack`'s own propagation-stamp search are async and potentially
-                // minutes long, so doing both means turning these two CONCURRENT effects into a
-                // sequential chain — with its own cancellation ordering and partial-failure cases.
-                // That deserves its own design and tests; it is not a line to slip in here.
-                if alsoViaPropagation,
-                   let recipient = state.endpoint.learned[message.destinationHash]?.identity,
-                   let cost = propagationStampCost(state) {
+                // Direct first (spec Amendment A2): the propagated copy is only remembered here, and
+                // packed when the router reports `propagationFallbackDue`. The router must know the
+                // message is eligible BEFORE the delivery copy reaches it — a destination whose link
+                // budget is already spent gives up inside `.send`, and that is a hand-off too — so
+                // the two effects are concatenated, not merged.
+                var fallback: Effect<Action> = .none
+                if fallbackToPropagation,
+                   state.endpoint.learned[message.destinationHash]?.identity != nil,
+                   propagationStampCost(state) != nil {
                     if let limit = propagationTransferLimitBytes(state), message.packed.count > limit {
                         // Spec §6: the node would refuse it, so the copy is not attempted at all.
-                        effects.append(.send(.router(.propagatedCopyRefused(messageHash: message.hash,
-                                                                            reason: .tooLargeForNode))))
+                        fallback = .send(.router(.propagatedCopyRefused(messageHash: message.hash,
+                                                                        reason: .tooLargeForNode)))
                     } else {
-                        // Outstanding from now on, although the router only gets the copy once its
-                        // stamp is found (spec §6). Marked synchronously, in this same reduce, so a
-                        // `.cancelPropagationStamps` or `.setPropagationNode` later in the same cycle
-                        // already sees it (Ruling P11) — routed through the router's own
-                        // `markPropagatedCopyPending` so the cancelled-message guard is applied in
-                        // exactly one place, not duplicated here.
-                        state.router.markPropagatedCopyPending(message.hash)
-                        refreshOutboundPropagationNodeRetryWait(&state)
-                        let ts = date.now.timeIntervalSince1970
-                        effects.append(.run { send in
-                            guard let (packed, _) = await LXMFPropagation.pack(
-                                message: message, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
-                            else { return }                          // cancelled mid-search
-                            await send(.router(.sendViaPropagation(message: message, propagationPacked: packed)))
-                        }
-                        .cancellable(id: CancelID.propagationStampFor(message.hash))
-                        .cancellable(id: CancelID.propagationStamp))
+                        state.pendingFallbacks[message.hash] = message
+                        fallback = .send(.router(.markFallbackEligible(messageHash: message.hash)))
                     }
                 }
-                return .merge(effects)
+                return .concatenate(fallback, deliverySend(&state, message: message, method: .opportunistic))
 
             case .syncFromPropagationNode:
                 return .send(.router(.syncFromPropagationNode))
@@ -699,10 +679,19 @@ public struct LXMFNode {
                 // case is dropped by the same guard that necessitates this code.
                 //
                 // `.cancel(id:)` cancels when it is CONSTRUCTED, so it stays on this branch (86ee622).
+                //
+                // The failure bypasses the router's `fail`, so a fallback the message was waiting on
+                // is dropped here and in the router: a later hand-off would revive a failed message.
                 let abandoned = state.inFlightDeliveryStamps
                 state.inFlightDeliveryStamps = []
-                return .merge([Effect<Action>.cancel(id: CancelID.deliveryStamp)]
-                              + abandoned.map { .send(.delegate(.deliveryFailed(messageHash: $0))) })
+                var effects: [Effect<Action>] = [.cancel(id: CancelID.deliveryStamp)]
+                for hash in abandoned {
+                    if state.pendingFallbacks.removeValue(forKey: hash) != nil {
+                        effects.append(.send(.router(.clearFallbackEligible(messageHash: hash))))
+                    }
+                    effects.append(.send(.delegate(.deliveryFailed(messageHash: hash))))
+                }
+                return .merge(effects)
 
             case let .cancelOutbound(hash):
                 // Stop the stamp work for this message (reference `LXStamper.cancel_work`, keyed per
@@ -711,6 +700,7 @@ public struct LXMFNode {
                 // nothing else for the message the cancel is reported here — once either way.
                 let wasSearching = state.inFlightDeliveryStamps.contains(hash)
                 state.inFlightDeliveryStamps.removeAll { $0 == hash }
+                state.pendingFallbacks[hash] = nil      // the router drops its eligibility below
                 let routerReports = state.router.hasOutboundState(for: hash)
                 var effects: [Effect<Action>] = [
                     .cancel(id: CancelID.deliveryStampFor(hash)),
@@ -929,21 +919,35 @@ public struct LXMFNode {
                 state.inFlightDeliveryStamps.removeAll { $0 == handedOn.hash }
                 return .none
 
+            // The message is over, so a fallback it was waiting on is not needed (a rejected
+            // delivery copy ends the message without a hand-off).
             case let .router(.delegate(.deliveryFailed(hash))):
                 clearProgress(&state, hash)
+                state.pendingFallbacks[hash] = nil
                 return .send(.delegate(.deliveryFailed(messageHash: hash)))
 
             case let .router(.delegate(.deliveryRejected(hash))):
                 clearProgress(&state, hash)
+                state.pendingFallbacks[hash] = nil
                 return .send(.delegate(.deliveryRejected(messageHash: hash)))
 
             case let .router(.delegate(.deliveryCancelled(hash))):
                 clearProgress(&state, hash)
+                state.pendingFallbacks[hash] = nil
                 return .send(.delegate(.deliveryCancelled(messageHash: hash)))
 
             case let .router(.delegate(.deliveryConfirmed(hash))):
+                state.pendingFallbacks[hash] = nil
                 let done = finishProgress(&state, .delivery(hash))
                 return .merge(done, .send(.delegate(.deliveryConfirmed(messageHash: hash))))
+
+            case let .router(.delegate(.propagationFallbackDue(hash))):
+                // The delivery copy stalled: the router already counts the propagated copy as
+                // pending (spec A2). With no message left to pack, that copy fails there instead.
+                guard let message = state.pendingFallbacks.removeValue(forKey: hash) else {
+                    return .send(.router(.propagatedCopyFailed(messageHash: hash)))
+                }
+                return startPropagatedCopy(&state, message: message)
 
             case let .router(.delegate(.propagationAccepted(hash))):
                 let done = finishProgress(&state, .propagated(hash))
@@ -1159,6 +1163,42 @@ public struct LXMFNode {
     private func abandonPendingPropagatedCopies(_ state: State) -> Effect<Action> {
         guard !state.router.pendingPropagatedCopies.isEmpty else { return .none }
         return .send(.router(.abandonPendingPropagatedCopies(stillSearching: Set(state.inFlightDeliveryStamps))))
+    }
+
+    /// Start the propagated copy the router handed off with `propagationFallbackDue`: search its
+    /// propagation stamp, pack it, and give it to the router. The router already counts it as
+    /// pending, so a copy that can no longer be packed (the recipient's identity is gone, or the node
+    /// now advertises a cost we refuse) is failed through the router's `fail` — the message still
+    /// gets its terminal outcome.
+    ///
+    /// KNOWN GAP, deliberately deferred: this packs the ORIGINAL, UNSTAMPED `message`, so a recipient
+    /// who enforces delivery stamps drops it even though the delivery copy carries one. Same failure
+    /// class as the `.sendMessage`-had-no-stamp gap closed earlier, one layer down.
+    ///
+    /// The barrier is EFFECT SEQUENCING, not `transient_id` stability — an earlier note here said the
+    /// latter and a re-review corrected it, so it is recorded rather than silently replaced. It is
+    /// true that stamping first changes `message.packed` and therefore the `transient_id` that
+    /// `LXMFPropagation.pack` derives from it. But that does NOT destabilise retries:
+    /// `ResendInfo.propagated` re-sends the already-packed `propagationPacked` bytes and never
+    /// re-calls `pack`, so stamping once and packing once would still give a stable id. The real cost
+    /// is that both the delivery-stamp search and `pack`'s own propagation-stamp search are async and
+    /// potentially minutes long, so doing both means turning these two CONCURRENT effects into a
+    /// sequential chain — with its own cancellation ordering and partial-failure cases. That deserves
+    /// its own design and tests; it is not a line to slip in here.
+    private func startPropagatedCopy(_ state: inout State, message: LXMessage) -> Effect<Action> {
+        guard let recipient = state.endpoint.learned[message.destinationHash]?.identity,
+              let cost = propagationStampCost(state)
+        else { return .send(.router(.propagatedCopyFailed(messageHash: message.hash))) }
+        refreshOutboundPropagationNodeRetryWait(&state)
+        let ts = date.now.timeIntervalSince1970
+        return .run { send in
+            guard let (packed, _) = await LXMFPropagation.pack(
+                message: message, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+            else { return }                          // cancelled mid-search
+            await send(.router(.sendViaPropagation(message: message, propagationPacked: packed)))
+        }
+        .cancellable(id: CancelID.propagationStampFor(message.hash))
+        .cancellable(id: CancelID.propagationStamp)
     }
 
     /// Copy Transport's CURRENT next hop for `destinationHash` into the router's retry-wait table

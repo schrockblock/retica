@@ -327,7 +327,7 @@ private func makeDeliveryStampStore(
                                title: Data("t".utf8), content: Data("c".utf8))
     #expect(msg.stamp == nil)          // precondition: create() never stamps
     let captured = LockIsolated<LXMessage?>(nil)
-    await store.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    await store.send(.sendMessage(message: msg, fallbackToPropagation: false))
     await store.receive { action in
         if case let .router(.send(m, _)) = action {
             captured.setValue(m)
@@ -355,7 +355,7 @@ private func makeDeliveryStampStore(
     let msg = LXMessage.create(source: sender, destinationHash: peerDestHash, timestamp: 1700000000,
                                title: Data("t".utf8), content: Data("c".utf8)).withStamp(sentinel)
     let captured = LockIsolated<LXMessage?>(nil)
-    await store.send(.sendMessage(message: msg, alsoViaPropagation: false))
+    await store.send(.sendMessage(message: msg, fallbackToPropagation: false))
     await store.receive { action in
         if case let .router(.send(m, _)) = action {
             captured.setValue(m)

@@ -251,7 +251,9 @@ private func sendViaPN(_ store: TestStoreOf<LXMFNode>, from me: Identity, to des
         let (store, pnHash, recipientDest) = await makePropagatedNode(me, clock, pn: pn, recipient: recipient)
         let msg = LXMessage.create(source: me, destinationHash: recipientDest, timestamp: sentAt,
                                    title: Data("t".utf8), content: Data("hi".utf8))
-        await store.send(.sendMessage(message: msg, alsoViaPropagation: true))
+        await store.send(.sendMessage(message: msg, fallbackToPropagation: true))
+        // The router's hand-off, played directly: this test is about the wait, not the trigger.
+        await store.send(.router(.delegate(.propagationFallbackDue(messageHash: msg.hash))))
         await store.receive({ if case .router(.sendViaPropagation) = $0 { return true } else { return false } },
                             timeout: .seconds(60))
         #expect(store.state.router.nextHopRetryWaits[pnHash] == 80)
