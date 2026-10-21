@@ -125,6 +125,11 @@ public struct LXMFRouter {
         /// ABSENT means `LXMFDelivery.retryWaitSeconds`: fast paths are never stored, so on TCP/BLE
         /// this map stays empty. Written by `LXMFNode`, which can read Transport; the router only reads it.
         public var nextHopRetryWaits: [Data: Int] = [:]
+        /// Outbound retries are held (`setHold`): the app is suspended and its sockets are closed
+        /// (spec Amendment A3). Retry and park timers re-arm without counting an attempt or sending,
+        /// new copies are armed but not sent, and establishment is deferred. So nothing fails, and no
+        /// fallback hands off, while held.
+        public var held = false
         public init() {}
     }
 
@@ -278,6 +283,10 @@ public struct LXMFRouter {
         case retryDue(messageHash: Data, leg: Leg)
         case idleDeadline(destinationHash: Data, linkID: Data)
         case pathRequestDeadline(destinationHash: Data)
+        /// Hold (`true`) or release outbound retries; see `State.held`. Releasing a hold fires `.retryDue`
+        /// at once for every retrying copy, from its stored attempt count, and re-establishes every
+        /// destination with work waiting on a link.
+        case setHold(Bool)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -347,6 +356,12 @@ public struct LXMFRouter {
             func arm(_ state: inout State, _ key: DeliveryKey, _ resend: ResendInfo) {
                 state.pendingDeliveries[key] = PendingDelivery(resend: resend, attempts: 1)
             }
+            /// `arm` while held: nothing is sent, so no attempt is counted. The retry timer re-arms
+            /// until the release fires it, and that `.retryDue` counts and sends the first attempt.
+            func armHeld(_ state: inout State, _ key: DeliveryKey, _ resend: ResendInfo) -> Effect<Action> {
+                state.pendingDeliveries[key] = PendingDelivery(resend: resend, attempts: 0)
+                return deliveryRetryTimer(state, key)
+            }
             /// The destination whose ACTIVE link is `linkID`, if any.
             func destination(ofLink linkID: Data, _ state: State) -> Data? {
                 state.directLinks.first { $0.value == .active(linkID: linkID) }?.key
@@ -394,12 +409,13 @@ public struct LXMFRouter {
             /// transfers without reporting them, so this IS that transfer's failure: back to
             /// `.retrying` with one retry timer, exactly as `.resourceFailedOnLink` would — UNLESS
             /// this copy already used its last transfer (Ruling P6): a lost link is a failed attempt
-            /// too, so at `maxAttempts` it fails the copy outright rather than arming a sixth.
+            /// too, so at `maxAttempts` it fails the copy outright rather than arming a sixth. While
+            /// held it retries instead, and that retry, due at the release, fails it.
             func orphanTransfer(_ state: inout State, linkID: Data) -> Effect<Action> {
                 guard let key = state.linkResourceInFlight.removeValue(forKey: linkID),
                       state.pendingDeliveries[key]?.phase == .transferring else { return .none }
                 guard let attempts = state.pendingDeliveries[key]?.attempts,
-                      attempts < LXMFDelivery.maxAttempts else {
+                      attempts < LXMFDelivery.maxAttempts || state.held else {
                     return fail(&state, key)
                 }
                 state.pendingDeliveries[key]?.phase = .retrying
@@ -558,6 +574,9 @@ public struct LXMFRouter {
                 }
             }
             func establish(_ state: inout State, _ dest: Data) -> Effect<Action> {
+                // Held: no link or path request, and no attempt counted. The release re-establishes
+                // every destination that still has work (`destinationsAwaitingLinks`).
+                guard !state.held else { return .none }
                 if state.knownPaths.contains(dest) {
                     let attempts = (state.establishAttempts[dest] ?? 0) + 1
                     if attempts > LXMFDelivery.maxAttempts {
@@ -591,23 +610,7 @@ public struct LXMFRouter {
             /// takes.
             func closed(_ state: inout State, _ dest: Data) -> Effect<Action> {
                 let orphaned = clearDirectLink(&state, dest)
-                let hasPending = state.pendingDeliveries.values.contains {
-                    switch $0.resend {
-                    case let .direct(d, _, _): return d == dest
-                    case let .propagated(d, _): return d == dest
-                    case .opportunistic: return false
-                    }
-                }
-                let hasQueued = !(state.outboundQueue[dest]?.isEmpty ?? true)
-                    || !(state.propagationQueue[dest]?.isEmpty ?? true)
-                // An outstanding sync is work too. `pendingDownloadFromPN` is only cleared when the
-                // `.linkEstablished` case actually drains it into `requestMessageList` (see that
-                // case; deliberately not a line number — this citation has drifted three times), so
-                // if it is still set here the sync never happened — without this the PN link would un-wedge
-                // but never retry, since a bare `syncFromPropagationNode` queues no message and arms
-                // no timer. Bounded by `establish()`'s budget like any other destination.
-                let hasPendingSync = dest == state.outboundPropagationNode && state.pendingDownloadFromPN
-                if hasPending || hasQueued || hasPendingSync {
+                if state.hasLinkWork(for: dest) {
                     return .merge(orphaned, establish(&state, dest))
                 }
                 // No work left for this destination: the establishment saga is OVER, so its budget
@@ -686,6 +689,7 @@ public struct LXMFRouter {
                     let key = DeliveryKey.delivery(message.hash)
                     let resend = ResendInfo.opportunistic(destinationHash: message.destinationHash,
                                                           payload: message.opportunisticPayload)
+                    if state.held { return armHeld(&state, key, resend) }
                     arm(&state, key, resend)
                     return .merge(.send(.delegate(.sendOpportunistic(destinationHash: message.destinationHash,
                                                                      payload: message.opportunisticPayload,
@@ -696,7 +700,9 @@ public struct LXMFRouter {
                     if case let .active(linkID) = state.directLinks[dest] {
                         let key = DeliveryKey.delivery(message.hash)
                         let asResource = message.directRepresentation == .resource
-                        arm(&state, key, .direct(destinationHash: dest, data: message.packed, asResource: asResource))
+                        let resend = ResendInfo.direct(destinationHash: dest, data: message.packed, asResource: asResource)
+                        if state.held { return .merge(armHeld(&state, key, resend), idleTimer(dest, linkID)) }
+                        arm(&state, key, resend)
                         if asResource {
                             return .merge(startOrQueueResource(&state, key, dest: dest, linkID: linkID),
                                           idleTimer(dest, linkID))
@@ -730,7 +736,9 @@ public struct LXMFRouter {
                 }
                 if case let .active(linkID) = state.directLinks[pn] {
                     let key = DeliveryKey.propagated(message.hash)
-                    arm(&state, key, .propagated(destinationHash: pn, data: propagationPacked))
+                    let resend = ResendInfo.propagated(destinationHash: pn, data: propagationPacked)
+                    if state.held { return .merge(armHeld(&state, key, resend), idleTimer(pn, linkID)) }
+                    arm(&state, key, resend)
                     if propagationPacked.count <= Link.mdu {
                         // Small container: send as a proof-requesting link packet. token = message.hash,
                         // and LXMFNode maps its packetDelivered back to THIS copy (leg .propagated).
@@ -908,8 +916,9 @@ public struct LXMFRouter {
                 if let dest = destination(ofLink: linkID, state) {
                     close = .merge(clearDirectLink(&state, dest), .send(.delegate(.closeLink(destinationHash: dest))))
                 }
-                // `attempts` counts transfers started: the `maxAttempts`-th failure is the last.
-                guard pending.attempts < LXMFDelivery.maxAttempts else {
+                // `attempts` counts transfers started: the `maxAttempts`-th failure is the last —
+                // unless held, when the retry due at the release fails it instead.
+                guard pending.attempts < LXMFDelivery.maxAttempts || state.held else {
                     return .merge(close, fail(&state, key))
                 }
                 pending.phase = .retrying
@@ -1009,6 +1018,8 @@ public struct LXMFRouter {
                 // Only a `.retrying` copy has a timer. One whose Resource is in flight (or queued
                 // behind one) is decided by its transfer, so a stray retry must not count or resend.
                 guard pending.phase == .retrying else { return .none }
+                // Held: wait again, counting and sending nothing. The release fires this at once.
+                guard !state.held else { return deliveryRetryTimer(state, key) }
                 pending.attempts += 1
                 if pending.attempts > LXMFDelivery.maxAttempts {
                     return fail(&state, key)
@@ -1034,6 +1045,8 @@ public struct LXMFRouter {
                 // establishment saga, so the destination cannot get a fresh budget by alternating
                 // between the requestLink branch and the awaitingPath branch.
                 guard state.directLinks[dest] == .awaitingPath else { return .none }
+                // Held: park again, counting and requesting nothing. The release re-establishes.
+                guard !state.held else { return pathRequestTimer(dest) }
                 let attempts = (state.establishAttempts[dest] ?? 0) + 1
                 if attempts > LXMFDelivery.maxAttempts {
                     return giveUp(&state, dest)
@@ -1041,6 +1054,27 @@ public struct LXMFRouter {
                 state.establishAttempts[dest] = attempts
                 return .merge(startFallbackForQueued(&state, dest, attempts: attempts),
                               .send(.delegate(.requestPath(destinationHash: dest))), pathRequestTimer(dest))
+
+            case let .setHold(held):
+                let wasHeld = state.held
+                state.held = held
+                // Only a release ends a hold. The app may release on every reconnect, and firing
+                // every retry then would resend early and spend an attempt each time.
+                guard wasHeld, !held else { return .none }
+                // Resume where the hold stopped: establishment the hold deferred, then every retry
+                // now, each from its stored attempt count (spec Amendment A3).
+                var effects: [Effect<Action>] = []
+                for dest in state.destinationsAwaitingLinks { effects.append(establish(&state, dest)) }
+                let due = state.pendingDeliveries.filter { $0.value.phase == .retrying }.keys.sorted {
+                    $0.messageHash == $1.messageHash
+                        ? $0.leg == .delivery
+                        : $0.messageHash.lexicographicallyPrecedes($1.messageHash)
+                }
+                for key in due {
+                    effects.append(.concatenate(.cancel(id: CancelID.retry(key)),
+                                                .send(.retryDue(messageHash: key.messageHash, leg: key.leg))))
+                }
+                return .merge(effects)
 
             case .delegate:
                 return .none
@@ -1058,6 +1092,39 @@ extension LXMFRouter.State {
             || outboundQueue.values.contains { $0.contains { $0.hash == messageHash } }
             || propagationQueue.values.contains { $0.contains { $0.messageHash == messageHash } }
             || pendingPropagatedCopies.contains(messageHash)
+    }
+
+    /// Whether `dest` has work that needs a link to it: a pending direct or propagated copy, a queued
+    /// message, or an outstanding sync. A closed link with work re-establishes; without, its budget ends.
+    func hasLinkWork(for dest: Data) -> Bool {
+        let hasPending = pendingDeliveries.values.contains {
+            switch $0.resend {
+            case let .direct(d, _, _): return d == dest
+            case let .propagated(d, _): return d == dest
+            case .opportunistic: return false
+            }
+        }
+        let hasQueued = !(outboundQueue[dest]?.isEmpty ?? true)
+            || !(propagationQueue[dest]?.isEmpty ?? true)
+        // An outstanding sync is work too. `pendingDownloadFromPN` is only cleared when the
+        // `.linkEstablished` case actually drains it into `requestMessageList` (see that
+        // case; deliberately not a line number — this citation has drifted three times), so
+        // if it is still set here the sync never happened — without this the PN link would un-wedge
+        // but never retry, since a bare `syncFromPropagationNode` queues no message and arms
+        // no timer. Bounded by `establish()`'s budget like any other destination.
+        let hasPendingSync = dest == outboundPropagationNode && pendingDownloadFromPN
+        return hasPending || hasQueued || hasPendingSync
+    }
+
+    /// Destinations with link work and no link under way (none, or parked awaiting a path): those a
+    /// hold deferred, which its release re-establishes. Sorted, so the release's effects are ordered.
+    var destinationsAwaitingLinks: [Data] {
+        var candidates = Set(outboundQueue.keys).union(propagationQueue.keys)
+        candidates.formUnion(pendingDeliveries.values.map(\.resend.destinationHash))
+        if pendingDownloadFromPN, let pn = outboundPropagationNode { candidates.insert(pn) }
+        return candidates
+            .filter { (directLinks[$0] == nil || directLinks[$0] == .awaitingPath) && hasLinkWork(for: $0) }
+            .sorted { $0.lexicographicallyPrecedes($1) }
     }
 
     /// Mark `hash`'s propagated copy pending — UNLESS the message is cancelled, in which case there

@@ -277,6 +277,11 @@ public struct LXMFNode {
         /// `.delegate(.deliveryCancelled)` once; nothing else is reported for it afterwards.
         /// Reference `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744).
         case cancelOutbound(messageHash: Data)
+        /// Hold (`true`) outbound retries when the app is suspended and its sockets close, and release
+        /// them (`false`) when an interface reconnects. While held no attempt is counted and nothing
+        /// is sent, so no message fails or falls back; the release resumes each from where it stood.
+        /// Packing a propagated copy goes on regardless. Spec Amendment A3; see `LXMFRouter.State.held`.
+        case holdOutbound(Bool)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -648,6 +653,9 @@ public struct LXMFNode {
 
             case .syncFromPropagationNode:
                 return .send(.router(.syncFromPropagationNode))
+
+            case let .holdOutbound(held):
+                return .send(.router(.setHold(held)))
 
             case .cancelPropagationStamps:
                 // The app's explicit reclaim: backgrounding, sign-out, or abandoning a send. Even an
