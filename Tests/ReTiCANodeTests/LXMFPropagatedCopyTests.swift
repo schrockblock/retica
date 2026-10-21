@@ -227,6 +227,24 @@ private func stallTheDeliveryCopy(_ store: TestStore<LXMFNode.State, LXMFNode.Ac
     #expect(store.state.router.pendingPropagatedCopies.isEmpty)
 }
 
+/// The delivery copy confirms while its fallback's stamp is searched: the search is stopped, so the
+/// copy can never be handed over late. At cost 20 the search runs for minutes, so the store can only
+/// finish because it was cancelled. (The router's half: `successDropsAPropagatedCopyStillInItsStampSearch`.)
+@Test(.timeLimit(.minutes(1))) @MainActor func successStopsTheFallbacksStampSearch() async {
+    let clock = TestClock()
+    let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost, clock: clock)
+    let m = note()
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await stallTheDeliveryCopy(store, clock, m)
+    await store.send(.router(.opportunisticDelivered(messageHash: m.hash)))
+    await store.receive(.delegate(.deliveryConfirmed(messageHash: m.hash)))
+    #expect(store.state.router.pendingPropagatedCopies.isEmpty)
+    await store.skipReceivedActions(strict: false)
+    store.exhaustivity = .on
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
+    await store.finish(timeout: .seconds(10))
+}
+
 /// Final review F2: the app deliberately re-sending a message it cancelled earlier is a FRESH send.
 /// The node forgets the cancel first, so the propagated copy is marked a fallback and the delivery
 /// copy is armed — before, both were swallowed by the cancelled-message guards and the row stayed

@@ -134,6 +134,14 @@ public struct LXMFRouter {
         /// Paths that run only on live connectivity still transmit while held — `.linkEstablished`
         /// draining its queues, a sync over an active link, `startNextQueued` — and every attempt
         /// they count is real. A transfer the suspension kills is not one: it is refunded.
+        ///
+        /// The contract with the app (`LXMFNode.Action.holdOutbound`):
+        ///  • Hold BEFORE closing the sockets. `refundIfHeld` and `establish`'s held guard read this
+        ///    flag when the closure's `linkClosed` / `resourceFailedOnLink` arrive; set after them, the
+        ///    killed transfer is charged and the link is re-requested at once.
+        ///  • Release on returning to the foreground as well as on an interface reconnecting. A hold
+        ///    left on while the app is open with no connectivity keeps every send "sending": nothing
+        ///    fails and nothing falls back to the propagation node.
         public var held = false
         public init() {}
     }
@@ -435,16 +443,39 @@ public struct LXMFRouter {
             }
             /// One copy of a message was confirmed: settle that copy only, stop its retries, remember
             /// the success, and report the outcome that copy stands for. A receipt for a copy no
-            /// longer pending is ignored.
+            /// longer pending is ignored. A confirmed delivery copy also drops the propagated copy
+            /// if it has not gone out yet (`dropUnsentPropagatedCopy`).
             func succeed(_ state: inout State, _ key: DeliveryKey) -> Effect<Action> {
                 guard state.pendingDeliveries[key] != nil else { return .none }
                 state.pendingDeliveries[key] = nil
                 state.succeededMessages.insert(key.messageHash)
-                if key.leg == .delivery { state.fallbackEligible.remove(key.messageHash) }
+                var dropped: Effect<Action> = .none
+                if key.leg == .delivery {
+                    state.fallbackEligible.remove(key.messageHash)
+                    dropped = dropUnsentPropagatedCopy(&state, key.messageHash)
+                }
                 let outcome: Action.Delegate = key.leg == .propagated
                     ? .propagationAccepted(messageHash: key.messageHash)
                     : .deliveryConfirmed(messageHash: key.messageHash)
-                return .merge(.cancel(id: CancelID.retry(key)), .send(.delegate(outcome)))
+                return .merge(.cancel(id: CancelID.retry(key)), dropped, .send(.delegate(outcome)))
+            }
+            /// The delivery copy of `hash` succeeded: its propagated copy is not needed, so one that has
+            /// not gone out is dropped silently — still in its stamp search (`LXMFNode` stops that
+            /// search on `deliveryConfirmed`), queued behind the node's link, or armed but never sent
+            /// (attempts 0: armed while held). Otherwise it would go out long after the message
+            /// arrived, perhaps at a hold's release, and reach the recipient twice. A copy already
+            /// transmitted is left to finish: its `propagationAccepted` is a second success, not a
+            /// contradiction.
+            func dropUnsentPropagatedCopy(_ state: inout State, _ hash: Data) -> Effect<Action> {
+                state.pendingPropagatedCopies.remove(hash)
+                for (dest, items) in state.propagationQueue where items.contains(where: { $0.messageHash == hash }) {
+                    let rest = items.filter { $0.messageHash != hash }
+                    state.propagationQueue[dest] = rest.isEmpty ? nil : rest
+                }
+                let key = DeliveryKey.propagated(hash)
+                guard state.pendingDeliveries[key]?.attempts == 0 else { return .none }
+                state.pendingDeliveries[key] = nil
+                return .cancel(id: CancelID.retry(key))
             }
             /// Whether the `leg` copy of `hash` can still succeed: armed with a retry timer, or queued
             /// behind its link (not yet armed, but it will be when the link comes up).
@@ -1040,7 +1071,7 @@ public struct LXMFRouter {
                 state.pendingDeliveries[key] = pending
                 // A stalled delivery copy hands off to the propagation node, and keeps retrying (A2).
                 let handOff = leg == .delivery && pending.attempts >= LXMFDelivery.propagationFallbackAfterAttempts
-                    ?startFallbackIfEligible(&state, hash) : .none
+                    ? startFallbackIfEligible(&state, hash) : .none
                 return .merge(handOff, resend(&state, key, pending.resend))
 
             case let .idleDeadline(dest, linkID):
@@ -1158,9 +1189,8 @@ extension LXMFRouter.State {
     /// `hasOutboundState` report work that doesn't exist, and a later `abandonPendingPropagatedCopies`
     /// would `fail` it into a stray `deliveryFailed` with no preceding send).
     ///
-    /// The ONE place this rule is applied: the router's own `.propagatedCopyPending` action goes
-    /// through here, and so must any synchronous write from `LXMFNode` (Ruling P11 — the marker
-    /// must be visible within the same reduce cycle), so the guard cannot be forgotten.
+    /// The ONE place this rule is applied: `.propagatedCopyPending` goes through here. (A fallback's
+    /// copy is marked by `startFallbackIfEligible` instead, which a cancel has already disarmed.)
     mutating func markPropagatedCopyPending(_ hash: Data) {
         guard !cancelledMessages.contains(hash) else { return }
         pendingPropagatedCopies.insert(hash)

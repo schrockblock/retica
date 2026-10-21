@@ -376,7 +376,7 @@ exactly the class Tier 1 just closed.*
         value above 20 — an uncommon but legitimate configuration, not a hostile one.
 
       - **No propagation-bound message carries a delivery stamp — via EITHER path.**
-        `.sendMessage(alsoViaPropagation: true)` packs the unstamped message into the propagation
+        `.sendMessage(fallbackToPropagation: true)` packs the unstamped message into the propagation
         container (`LXMFPropagation.pack` is called on the original `LXMessage`), and so does
         **`.sendViaPropagation(destinationHash:title:content:)`**, which builds its own message with
         `LXMessage.create` (never stamped) and hands it straight to `pack`. The bullet previously
@@ -608,6 +608,17 @@ exactly the class Tier 1 just closed.*
       (`LXMFNode.sendViaPropagation(destinationHash:title:content:)`) gets neither the size refusal
       nor the pending marker, and the size check compares the packed message, not the larger
       propagation container, so a message just under the limit can still be rejected by the node.
+- [x] **Direct first, the propagation node as fallback** — `.sendMessage(message:fallbackToPropagation:)`
+      (2026-10-21 propagation-push spec, Amendments A2/A3; it replaced `alsoViaPropagation`, which
+      sent the delivery copy and the propagated copy at once). **Deliberate divergence:** reference
+      LXMF goes to the propagation node only once direct delivery has failed for good. We start the
+      propagated copy after the delivery copy's **third** attempt
+      (`LXMFDelivery.propagationFallbackAfterAttempts`, a retry or a link/path attempt), or at its
+      terminal failure if that comes first, and the delivery copy keeps retrying meanwhile. So a
+      late direct proof can mean both copies arrive (`deliveryConfirmed` and `propagationAccepted`);
+      a propagated copy not yet transmitted when the direct proof arrives is dropped. A rejected
+      delivery copy is the peer's answer and never falls back. `holdOutbound` defers retries while
+      the app is suspended, so nothing fails or falls back then (no reference equivalent).
 - [ ] **Resource window capped at the slow ceiling** — `ResourceWindow.swift`: `maxWindowSlow = 10`
       vs reference's `WINDOW_MAX_FAST = 75`. A **7.5× throughput ceiling** on any link fast enough
       to qualify — every TCP link and most BLE.
@@ -668,7 +679,7 @@ exactly the class Tier 1 just closed.*
       passes an `LXMessage.create` product, so the receive→re-send path — the one the Tier 2b fix
       exists for — is unexercised end to end. Wanted: drive
       `.router(.received(method: .direct, …, data: nonCanonicalWire))`, take the message off
-      `.delegate(.messageReceived)`, feed it to `.sendMessage(message:alsoViaPropagation: false)`,
+      `.delegate(.messageReceived)`, feed it to `.sendMessage(message:fallbackToPropagation: false)`,
       and assert the emitted `.endpoint(.send(plaintext:))` equals `nonCanonicalWire.dropFirst(16)`.
       **Trap for whoever writes it:** `LXMessage.==` deliberately excludes `receivedBytes`, so a
       TestStore *state* assertion on `outboundQueue` compares equal no matter which bytes are
@@ -696,7 +707,7 @@ exactly the class Tier 1 just closed.*
       1.04 s**. And **there is no timeout** — only the app calling `.cancelDeliveryStamps` (which now
       fails those messages, see Tier 3) ever ends a search that has not succeeded.
       *Filed 2026-08-16 (whole-branch review of the delivery-stamps slice); not fixed in it.*
-- [ ] **`.sendMessage(alsoViaPropagation: true)` races on `pendingDeliveries[hash]`, and the
+- [ ] **`.sendMessage(fallbackToPropagation: true)` races on `pendingDeliveries[hash]`, and the
       delivery-stamps slice changed who wins.** Both `LXMFRouter`'s `.send` (`LXMFRouter.swift:332`
       opportunistic, `:340` direct) and `.sendViaPropagation` (`:363`) call
       `arm(&state, message.hash, …)`, which overwrites `state.pendingDeliveries[hash]`
@@ -709,7 +720,7 @@ exactly the class Tier 1 just closed.*
       immediate `.send`, so propagation — always an async `LXMFPropagation.pack` search — reliably
       arrived second and `.propagationAccepted` reliably won. Now the delivery copy is *also* an
       async search whenever the recipient advertised an in-range cost, so the winner is whichever
-      proof-of-work finishes first. **Exact reachability condition:** `alsoViaPropagation` is true
+      proof-of-work finishes first. **Exact reachability condition:** `fallbackToPropagation` is true
       (`!state.propagationNodeHex.isEmpty`, ReTiCaMsgr `AppFeature.swift:168`) **and** the recipient
       is in `learnedPeers` with a `stampCost` in 1…`maxDeliveryStampCost` — `deliverySend`'s guard
       falls back to a synchronous `.send` in every other case, so an unstamped send keeps the old

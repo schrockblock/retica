@@ -281,9 +281,25 @@ public struct LXMFNode {
         /// them (`false`) when an interface reconnects. While held no attempt is counted and nothing
         /// is sent, so no message fails or falls back; the release resumes each from where it stood.
         /// Packing a propagated copy goes on regardless. Spec Amendment A3; see `LXMFRouter.State.held`.
+        ///
+        /// **Order matters.** Send `holdOutbound(true)` BEFORE closing the sockets: the hold refunds a
+        /// transfer the closure kills, and defers re-establishing its link, only if it is already in
+        /// place when the resulting `linkClosed` / `resourceFailedOnLink` reach the router.
+        ///
+        /// **Release on foreground too**, not only when an interface reconnects. Otherwise, with the
+        /// app open and no connectivity, the hold stays on and no send ever fails or falls back.
         case holdOutbound(Bool)
         case delegate(Delegate)
 
+        /// **Terminal outcomes of an outbound message**: `deliveryConfirmed`, `propagationAccepted`,
+        /// `deliveryFailed`, `deliveryRejected`, `deliveryCancelled`.
+        ///  • Every message sent gets at least one.
+        ///  • It may get two: `deliveryConfirmed` AND `propagationAccepted`, in either order, when
+        ///    both its copies succeed (a fallback copy already handed to the node goes on after the
+        ///    delivery copy is confirmed).
+        ///  • A failure (`deliveryFailed`, `deliveryRejected`) or `deliveryCancelled` never follows
+        ///    a success.
+        /// So consumers must handle terminals idempotently: a second success changes nothing.
         public enum Delegate: Equatable {
             /// `method` is how the message arrived: a single packet, a link, or a propagation node
             /// download. With duplicates the first arrival wins (the router's dedup is unchanged).
@@ -945,9 +961,12 @@ public struct LXMFNode {
                 return .send(.delegate(.deliveryCancelled(messageHash: hash)))
 
             case let .router(.delegate(.deliveryConfirmed(hash))):
+                // The propagated copy is not needed: drop one not yet started, and stop one still in
+                // its stamp search (the router has already dropped its pending marker).
                 state.pendingFallbacks[hash] = nil
                 let done = finishProgress(&state, .delivery(hash))
-                return .merge(done, .send(.delegate(.deliveryConfirmed(messageHash: hash))))
+                return .merge(.cancel(id: CancelID.propagationStampFor(hash)), done,
+                              .send(.delegate(.deliveryConfirmed(messageHash: hash))))
 
             case let .router(.delegate(.propagationFallbackDue(hash))):
                 // The delivery copy stalled: the router already counts the propagated copy as

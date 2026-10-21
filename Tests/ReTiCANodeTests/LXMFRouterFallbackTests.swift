@@ -184,10 +184,10 @@ private func makeStore(_ state: LXMFRouter.State, clock: TestClock<Duration>) ->
     await store.receive(.delegate(.deliveryConfirmed(messageHash: h)))
     await store.skipReceivedActions(strict: false)
     store.exhaustivity = .on
-    // The propagated copy fails at once (no node). Exhaustive: a deliveryFailed would be unexpected.
-    await store.send(.sendViaPropagation(message: msg, propagationPacked: Data("container".utf8))) {
-        $0.pendingPropagatedCopies.remove(h)
-    }
+    // The confirmation already dropped the copy's marker. A copy handed over anyway fails at once
+    // (no node). Exhaustive: a deliveryFailed would be unexpected.
+    #expect(store.state.pendingPropagatedCopies.isEmpty)
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: Data("container".utf8)))
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
 }
 
@@ -206,6 +206,133 @@ private func makeStore(_ state: LXMFRouter.State, clock: TestClock<Duration>) ->
     }
     await store.receive(.delegate(.deliveryCancelled(messageHash: h)))
     await store.send(.propagatedCopyFailed(messageHash: h))     // exhaustive: a deliveryFailed would be unexpected
+}
+
+// MARK: - A confirmed delivery copy drops the propagated copy that has not gone out
+
+private let pn = Data(repeating: 0xB7, count: 16)
+private let pnLink = Data(repeating: 0xC0, count: 16)
+private let container = Data("container".utf8)
+/// An exhaustive no-op (activity on a link we do not have): sent only after every received action
+/// is accounted for, so a late `propagationAccepted` / `deliveryFailed` fails the test there.
+@MainActor
+private let probe = LXMFRouter.Action.linkActivity(linkID: Data(repeating: 0x99, count: 16))
+
+/// Stall the (opportunistic) delivery copy until the hand-off, with a propagation node configured.
+@MainActor
+private func handedOff(_ msg: LXMessage, _ state: LXMFRouter.State,
+                       clock: TestClock<Duration>) async -> TestStore<LXMFRouter.State, LXMFRouter.Action> {
+    var state = state
+    state.knownPaths.insert(msg.destinationHash)
+    state.outboundPropagationNode = pn
+    let store = makeStore(state, clock: clock)
+    await store.send(.markFallbackEligible(messageHash: msg.hash))
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    for _ in 0..<(LXMFDelivery.propagationFallbackAfterAttempts - 1) {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    }
+    await store.receive(.delegate(.propagationFallbackDue(messageHash: msg.hash)))
+    await store.skipReceivedActions(strict: false)
+    return store
+}
+
+/// The confirmation, exhaustively: one `deliveryConfirmed`, and the delivery copy's retries stop.
+@MainActor
+private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>, _ h: Data,
+                         _ update: @escaping (inout LXMFRouter.State) -> Void) async {
+    store.exhaustivity = .on
+    await store.send(.opportunisticDelivered(messageHash: h)) {
+        $0.pendingDeliveries[.delivery(h)] = nil
+        $0.succeededMessages.insert(h)
+        update(&$0)
+    }
+    await store.receive(.delegate(.deliveryConfirmed(messageHash: h)))
+}
+
+/// Still in `LXMFNode`'s stamp search: the pending marker goes, silently. (The node stops the
+/// search itself: `successStopsTheFallbacksStampSearch`.)
+@Test @MainActor func successDropsAPropagatedCopyStillInItsStampSearch() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let clock = TestClock()
+    let store = await handedOff(msg, LXMFRouter.State(), clock: clock)
+    #expect(store.state.pendingPropagatedCopies == [h])
+    await confirmOnce(store, h) { $0.pendingPropagatedCopies.remove(h) }
+    // Exhaustive: nothing more — no propagationAccepted, no deliveryFailed.
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
+    await store.send(probe)
+}
+
+/// Queued behind the node's link: it is dequeued, so the link coming up sends nothing.
+@Test @MainActor func successDropsAQueuedPropagatedCopy() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let clock = TestClock()
+    var state = LXMFRouter.State()
+    state.knownPaths.insert(pn)
+    let store = await handedOff(msg, state, clock: clock)
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: container))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.propagationQueue[pn]?.count == 1)
+    await confirmOnce(store, h) { $0.propagationQueue[pn] = nil }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
+    // The link comes up with nothing to send: no sendPropagatedPacket, so no propagationAccepted.
+    await store.send(.linkEstablished(destinationHash: pn, linkID: pnLink)) {
+        $0.directLinks[pn] = .active(linkID: pnLink)
+        $0.establishAttempts[pn] = nil
+    }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
+    await store.send(probe)
+    store.exhaustivity = .off   // the PN link's idle timer runs on by design
+}
+
+/// Already transmitted: left to finish. It keeps retrying, and running out after the success is
+/// silent — the one terminal stays `deliveryConfirmed`.
+@Test @MainActor func successKeepsAPropagatedCopyAlreadyTransmitted() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let clock = TestClock()
+    var state = LXMFRouter.State()
+    state.directLinks[pn] = .active(linkID: pnLink)
+    let store = await handedOff(msg, state, clock: clock)
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: container))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.pendingDeliveries[.propagated(h)]?.attempts == 1)
+    await confirmOnce(store, h) { _ in }
+    for attempt in 2...LXMFDelivery.maxAttempts {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+        await store.receive(.retryDue(messageHash: h, leg: .propagated)) {
+            $0.pendingDeliveries[.propagated(h)]?.attempts = attempt
+        }
+        await store.receive(.delegate(.sendPropagatedPacket(linkID: pnLink, propagationPacked: container,
+                                                            messageHash: h)))
+    }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.receive(.retryDue(messageHash: h, leg: .propagated)) {
+        $0.pendingDeliveries[.propagated(h)] = nil
+    }
+    await store.send(probe)
+    store.exhaustivity = .off   // the PN link's idle timer runs on by design
+}
+
+/// Armed while held, so never sent (attempts 0): dropped with its timer, and the release sends
+/// nothing — the stale copy that would otherwise go out long after the message arrived.
+@Test @MainActor func successDropsAHeldUnsentPropagatedCopy() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let clock = TestClock()
+    var state = LXMFRouter.State()
+    state.directLinks[pn] = .active(linkID: pnLink)
+    let store = await handedOff(msg, state, clock: clock)
+    await store.send(.setHold(true))
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: container))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.pendingDeliveries[.propagated(h)]?.attempts == 0)
+    await confirmOnce(store, h) { $0.pendingDeliveries[.propagated(h)] = nil }
+    await store.send(.setHold(false)) { $0.held = false }
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
+    await store.send(probe)
+    store.exhaustivity = .off   // the PN link's idle timer runs on by design
 }
 
 /// A send never marked eligible fails after its last retry, as before this change (~50 s on TCP).
