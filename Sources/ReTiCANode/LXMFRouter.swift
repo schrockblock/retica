@@ -128,7 +128,12 @@ public struct LXMFRouter {
         /// Outbound retries are held (`setHold`): the app is suspended and its sockets are closed
         /// (spec Amendment A3). Retry and park timers re-arm without counting an attempt or sending,
         /// new copies are armed but not sent, and establishment is deferred. So nothing fails, and no
-        /// fallback hands off, while held.
+        /// fallback hands off, while held. A held retry re-arms at `deliveryRetryTimer`'s wait, even
+        /// one first armed at the path-request wait: the release decides when it next runs.
+        ///
+        /// Paths that run only on live connectivity still transmit while held — `.linkEstablished`
+        /// draining its queues, a sync over an active link, `startNextQueued` — and every attempt
+        /// they count is real. A transfer the suspension kills is not one: it is refunded.
         public var held = false
         public init() {}
     }
@@ -410,16 +415,23 @@ public struct LXMFRouter {
             /// `.retrying` with one retry timer, exactly as `.resourceFailedOnLink` would — UNLESS
             /// this copy already used its last transfer (Ruling P6): a lost link is a failed attempt
             /// too, so at `maxAttempts` it fails the copy outright rather than arming a sixth. While
-            /// held it retries instead, and that retry, due at the release, fails it.
+            /// held the suspension killed it, so it is refunded (`refundIfHeld`) and retries.
             func orphanTransfer(_ state: inout State, linkID: Data) -> Effect<Action> {
                 guard let key = state.linkResourceInFlight.removeValue(forKey: linkID),
-                      state.pendingDeliveries[key]?.phase == .transferring else { return .none }
-                guard let attempts = state.pendingDeliveries[key]?.attempts,
-                      attempts < LXMFDelivery.maxAttempts || state.held else {
+                      var pending = state.pendingDeliveries[key],
+                      pending.phase == .transferring else { return .none }
+                refundIfHeld(state, &pending)
+                guard pending.attempts < LXMFDelivery.maxAttempts else {
                     return fail(&state, key)
                 }
-                state.pendingDeliveries[key]?.phase = .retrying
+                pending.phase = .retrying
+                state.pendingDeliveries[key] = pending
                 return deliveryRetryTimer(state, key)
+            }
+            /// A transfer lost while held was killed by the suspension, not by the peer or the path:
+            /// it does not count, so the copy cannot fail at the release because of the suspension.
+            func refundIfHeld(_ state: State, _ pending: inout PendingDelivery) {
+                if state.held { pending.attempts = max(0, pending.attempts - 1) }
             }
             /// One copy of a message was confirmed: settle that copy only, stop its retries, remember
             /// the success, and report the outcome that copy stands for. A receipt for a copy no
@@ -916,9 +928,9 @@ public struct LXMFRouter {
                 if let dest = destination(ofLink: linkID, state) {
                     close = .merge(clearDirectLink(&state, dest), .send(.delegate(.closeLink(destinationHash: dest))))
                 }
-                // `attempts` counts transfers started: the `maxAttempts`-th failure is the last —
-                // unless held, when the retry due at the release fails it instead.
-                guard pending.attempts < LXMFDelivery.maxAttempts || state.held else {
+                // `attempts` counts transfers started: the `maxAttempts`-th failure is the last.
+                refundIfHeld(state, &pending)
+                guard pending.attempts < LXMFDelivery.maxAttempts else {
                     return .merge(close, fail(&state, key))
                 }
                 pending.phase = .retrying
@@ -1018,7 +1030,8 @@ public struct LXMFRouter {
                 // Only a `.retrying` copy has a timer. One whose Resource is in flight (or queued
                 // behind one) is decided by its transfer, so a stray retry must not count or resend.
                 guard pending.phase == .retrying else { return .none }
-                // Held: wait again, counting and sending nothing. The release fires this at once.
+                // Held: wait again (at `deliveryRetryTimer`'s wait), counting and sending nothing.
+                // The release fires this at once if the copy can transmit.
                 guard !state.held else { return deliveryRetryTimer(state, key) }
                 pending.attempts += 1
                 if pending.attempts > LXMFDelivery.maxAttempts {
@@ -1061,18 +1074,29 @@ public struct LXMFRouter {
                 // Only a release ends a hold. The app may release on every reconnect, and firing
                 // every retry then would resend early and spend an attempt each time.
                 guard wasHeld, !held else { return .none }
-                // Resume where the hold stopped: establishment the hold deferred, then every retry
-                // now, each from its stored attempt count (spec Amendment A3).
+                // Resume where the hold stopped: establishment the hold deferred, then a retry now
+                // for every copy that can transmit, from its stored attempt count (spec Amendment A3).
+                // A link copy whose link is gone is re-armed at its normal wait instead: firing it
+                // would count an attempt that `resend` cannot send, once per suspension.
                 var effects: [Effect<Action>] = []
                 for dest in state.destinationsAwaitingLinks { effects.append(establish(&state, dest)) }
-                let due = state.pendingDeliveries.filter { $0.value.phase == .retrying }.keys.sorted {
+                let retrying = state.pendingDeliveries.filter { $0.value.phase == .retrying }
+                let due = retrying.keys.sorted {
                     $0.messageHash == $1.messageHash
                         ? $0.leg == .delivery
                         : $0.messageHash.lexicographicallyPrecedes($1.messageHash)
                 }
                 for key in due {
-                    effects.append(.concatenate(.cancel(id: CancelID.retry(key)),
-                                                .send(.retryDue(messageHash: key.messageHash, leg: key.leg))))
+                    guard let resend = retrying[key]?.resend else { continue }
+                    var canTransmit = false
+                    if case .opportunistic = resend { canTransmit = true }
+                    if case .active = state.directLinks[resend.destinationHash] { canTransmit = true }
+                    if canTransmit {
+                        effects.append(.concatenate(.cancel(id: CancelID.retry(key)),
+                                                    .send(.retryDue(messageHash: key.messageHash, leg: key.leg))))
+                    } else {
+                        effects.append(deliveryRetryTimer(state, key))
+                    }
                 }
                 return .merge(effects)
 

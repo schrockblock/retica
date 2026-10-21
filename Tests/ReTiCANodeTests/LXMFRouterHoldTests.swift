@@ -165,9 +165,9 @@ private func heldOpportunisticSend(_ msg: LXMessage, clock: TestClock<Duration>)
     await store.receive(.router(.setHold(false))) { $0.router.held = false }
 }
 
-/// A Resource copy that used its last transfer is not failed while held when that transfer is lost,
-/// whether the link goes or the transfer fails: it fails on release, when its retry is due.
-@Test(arguments: [true, false]) @MainActor func holdDefersAFinalTransferFailure(linkLost: Bool) async {
+/// A transfer the suspension killed — its link lost, or the transfer failed — is not an attempt: a
+/// copy on its last transfer is refunded, retries, and survives the release.
+@Test(arguments: [true, false]) @MainActor func holdRefundsATransferTheSuspensionKilled(linkLost: Bool) async {
     let msg = makeMessage()
     let h = msg.hash
     let dest = msg.destinationHash
@@ -187,9 +187,75 @@ private func heldOpportunisticSend(_ msg: LXMessage, clock: TestClock<Duration>)
     }
     await store.skipReceivedActions(strict: false)
     #expect(store.state.pendingDeliveries[.delivery(h)]?.phase == .retrying)
-    #expect(store.state.pendingDeliveries[.delivery(h)]?.attempts == LXMFDelivery.maxAttempts)
-    // The release also re-establishes the link, which this test does not follow.
+    #expect(store.state.pendingDeliveries[.delivery(h)]?.attempts == LXMFDelivery.maxAttempts - 1)
     await store.send(.setHold(false))
-    await store.receive(.delegate(.deliveryFailed(messageHash: h)))
-    #expect(store.state.pendingDeliveries[.delivery(h)] == nil)
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.pendingDeliveries[.delivery(h)]?.attempts == LXMFDelivery.maxAttempts - 1)
+}
+
+/// Each suspension closes the link. A link copy that transmitted once keeps one attempt through any
+/// number of hold/release cycles: with its link gone, the release re-arms it rather than counting a
+/// retry `resend` could not send.
+@Test @MainActor func holdCyclesDoNotGrowALinkCopysAttempts() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let dest = msg.destinationHash
+    var state = pathTo(dest)
+    state.directLinks[dest] = .active(linkID: link)
+    let clock = TestClock()
+    let store = makeStore(state, clock: clock)
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.receive(.delegate(.sendDirect(linkID: link, data: msg.packed, asResource: false)))
+    for _ in 0..<3 {
+        await store.send(.setHold(true))
+        await store.send(.linkClosed(destinationHash: dest))      // the sockets close
+        await clock.advance(by: .seconds(60))
+        await store.send(.setHold(false))
+        await store.receive(.delegate(.requestLink(destinationHash: dest)))
+        await store.send(.linkEstablished(destinationHash: dest, linkID: link))
+    }
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.pendingDeliveries[.delivery(h)]?.attempts == 1)
+}
+
+/// A link copy whose link survived the hold can transmit, so the release retries it at once.
+@Test @MainActor func holdReleaseFiresACopyWithALiveLink() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let dest = msg.destinationHash
+    var state = pathTo(dest)
+    state.directLinks[dest] = .active(linkID: link)
+    let clock = TestClock()
+    let store = makeStore(state, clock: clock)
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    await store.send(.setHold(true))
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    await store.skipReceivedActions(strict: false)
+    await store.send(.setHold(false))
+    // No clock advance: the release itself fires the retry.
+    await store.receive(.retryDue(messageHash: h, leg: .delivery))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.pendingDeliveries[.delivery(h)]?.attempts == 2)
+}
+
+/// A link the hold deferred is requested at the release, spending one establishment attempt.
+@Test @MainActor func holdReleaseReestablishesADeferredLink() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let packed = Data("container".utf8)
+    var state = pathTo(pn)
+    state.outboundPropagationNode = pn
+    state.held = true
+    let store = makeStore(state, clock: TestClock())
+    await store.send(.sendViaPropagation(message: msg, propagationPacked: packed)) {
+        $0.propagationQueue[pn] = [LXMFRouter.PropagationItem(messageHash: h, propagationPacked: packed)]
+    }
+    await store.send(.setHold(false)) {
+        $0.held = false
+        $0.establishAttempts[pn] = 1
+        $0.directLinks[pn] = .establishing
+    }
+    await store.receive(.delegate(.requestLink(destinationHash: pn)))
 }
