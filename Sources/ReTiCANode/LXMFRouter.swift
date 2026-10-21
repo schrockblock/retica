@@ -30,6 +30,11 @@ public struct LXMFRouter {
         /// reported `deliveryFailed` for a message whose propagated copy was about to go out
         /// (2026-09-26 single-packet proofs spec, Amendment 3).
         public var pendingPropagatedCopies: Set<Data> = []
+        /// Message hashes whose propagated copy starts only if the delivery copy stalls: at
+        /// `LXMFDelivery.propagationFallbackAfterAttempts`, or at its terminal failure, the hash moves
+        /// to `pendingPropagatedCopies` and `propagationFallbackDue` asks `LXMFNode` for the copy
+        /// (spec Amendment A2). `isOutstanding` counts them as a propagated copy to come.
+        public var fallbackEligible: Set<Data> = []
         /// sourceHash (sender's lxmf.delivery destination hash) → identity, for signature validation.
         public var knownIdentities: [Data: Identity] = [:]
         /// destinationHash → direct-link state (reuse an active link, or one being established).
@@ -255,6 +260,9 @@ public struct LXMFRouter {
         case linkActivity(linkID: Data)
         /// `LXMFNode` started the stamp search for this message's propagated copy.
         case propagatedCopyPending(messageHash: Data)
+        /// This message's propagated copy is a fallback: it is requested with `propagationFallbackDue`
+        /// only if the delivery copy stalls. Send before the delivery copy is handed over.
+        case markFallbackEligible(messageHash: Data)
         /// `LXMFNode` did not start this message's propagated copy at all (spec §6).
         case propagatedCopyRefused(messageHash: Data, reason: RefusalReason)
         /// Every propagated-copy stamp search was cancelled: those copies have failed. A message in
@@ -291,6 +299,9 @@ public struct LXMFRouter {
             case cancelResource(linkID: Data)
             /// The propagated copy was not attempted. Not terminal: the delivery copy decides.
             case propagationRefused(messageHash: Data, reason: RefusalReason)
+            /// A fallback-eligible message's delivery copy stalled: pack and hand over its propagated
+            /// copy (`.sendViaPropagation`). Already marked pending. For `LXMFNode`, not the app.
+            case propagationFallbackDue(messageHash: Data)
         }
     }
 
@@ -395,6 +406,7 @@ public struct LXMFRouter {
                 guard state.pendingDeliveries[key] != nil else { return .none }
                 state.pendingDeliveries[key] = nil
                 state.succeededMessages.insert(key.messageHash)
+                if key.leg == .delivery { state.fallbackEligible.remove(key.messageHash) }
                 let outcome: Action.Delegate = key.leg == .propagated
                     ? .propagationAccepted(messageHash: key.messageHash)
                     : .deliveryConfirmed(messageHash: key.messageHash)
@@ -412,6 +424,7 @@ public struct LXMFRouter {
                     return state.outboundQueue.values.contains { $0.contains { $0.hash == hash } }
                 case .propagated:
                     return state.pendingPropagatedCopies.contains(hash)
+                        || state.fallbackEligible.contains(hash)
                         || state.propagationQueue.values.contains { $0.contains { $0.messageHash == hash } }
                 }
             }
@@ -422,15 +435,41 @@ public struct LXMFRouter {
             func fail(_ state: inout State, _ key: DeliveryKey, reason: FailureReason = .exhausted) -> Effect<Action> {
                 state.pendingDeliveries[key] = nil
                 if key.leg == .propagated { state.pendingPropagatedCopies.remove(key.messageHash) }
+                // A delivery copy that ran out before its hand-off hands off now, and the propagated
+                // copy it starts keeps the message alive below. A REJECTED one was answered, not
+                // stalled: it ends the message as it always did.
+                var handOff: Effect<Action> = .none
+                if key.leg == .delivery {
+                    if reason == .rejected {
+                        state.fallbackEligible.remove(key.messageHash)
+                    } else {
+                        handOff = startFallbackIfEligible(&state, key.messageHash)
+                    }
+                }
                 let other: Leg = key.leg == .delivery ? .propagated : .delivery
                 guard !isOutstanding(state, key.messageHash, other),
                       !state.succeededMessages.contains(key.messageHash)
-                else { return .none }
+                else { return handOff }
                 // The terminal outcome carries the reason of the copy that ended the message.
                 let outcome: Action.Delegate = reason == .rejected
                     ? .deliveryRejected(messageHash: key.messageHash)
                     : .deliveryFailed(messageHash: key.messageHash)
-                return .send(.delegate(outcome))
+                return .merge(handOff, .send(.delegate(outcome)))
+            }
+            /// A fallback-eligible message's delivery copy has stalled: its propagated copy is now
+            /// pending, and `LXMFNode` is asked for it. The ONE place the hand-off happens; it fires
+            /// at most once per message, because it ends the eligibility (spec Amendment A2).
+            func startFallbackIfEligible(_ state: inout State, _ hash: Data) -> Effect<Action> {
+                guard state.fallbackEligible.remove(hash) != nil else { return .none }
+                state.pendingPropagatedCopies.insert(hash)
+                return .send(.delegate(.propagationFallbackDue(messageHash: hash)))
+            }
+            /// `dest`'s establishment budget reached `attempts`: an attempt for every copy queued
+            /// behind it, so each may be due its hand-off. Both establish branches charge the budget.
+            func startFallbackForQueued(_ state: inout State, _ dest: Data, attempts: Int) -> Effect<Action> {
+                guard attempts >= LXMFDelivery.propagationFallbackAfterAttempts else { return .none }
+                let queued = state.outboundQueue[dest] ?? []
+                return .merge(queued.map { startFallbackIfEligible(&state, $0.hash) })
             }
             // Tear down a direct link, reaping its in-flight Resource entry. `linkResourceInFlight`
             // is keyed on the linkID carried by `.active`, so it can only be reaped BEFORE
@@ -466,6 +505,7 @@ public struct LXMFRouter {
                 // Guarded on the PN: an unrelated destination giving up says nothing about the sync.
                 if dest == state.outboundPropagationNode { state.pendingDownloadFromPN = false }
                 var effects: [Effect<Action>] = [orphaned, .cancel(id: CancelID.pathRequest(dest))]
+                // `fail` hands off a fallback-eligible copy whose earlier trigger never fired.
                 for message in queued { effects.append(fail(&state, .delivery(message.hash))) }
                 for item in propQueued { effects.append(fail(&state, .propagated(item.messageHash))) }
                 // Resource copies waiting for this destination's link have no timer of their own.
@@ -473,6 +513,43 @@ public struct LXMFRouter {
                     effects.append(fail(&state, key))
                 }
                 return .merge(effects)
+            }
+            /// `.retryDue`'s next attempt for `key`, already counted: resend it, or wait and re-check.
+            func resend(_ state: inout State, _ key: DeliveryKey, _ info: ResendInfo) -> Effect<Action> {
+                let hash = key.messageHash
+                switch info {
+                case let .opportunistic(destinationHash, payload):
+                    if !state.knownPaths.contains(destinationHash) {
+                        // Pathless opportunistic retry: request a path instead of resending, and wait longer.
+                        return .merge(.send(.delegate(.requestPath(destinationHash: destinationHash))),
+                                      retryTimer(key, LXMFDelivery.pathRequestWaitSeconds))
+                    }
+                    return .merge(.send(.delegate(.sendOpportunistic(destinationHash: destinationHash, payload: payload,
+                                                                     messageHash: hash))),
+                                  deliveryRetryTimer(state, key))
+                case let .direct(destinationHash, data, asResource):
+                    if case let .active(linkID) = state.directLinks[destinationHash] {
+                        if asResource { return startOrQueueResource(&state, key, dest: destinationHash, linkID: linkID) }
+                        return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: false))),
+                                      deliveryRetryTimer(state, key))
+                    }
+                    // Link is down or re-establishing: no live link to send on. Wait and re-check; the
+                    // attempt was already counted, so the saga stays bounded by maxAttempts.
+                    return deliveryRetryTimer(state, key)
+                case let .propagated(destinationHash, data):
+                    if case let .active(linkID) = state.directLinks[destinationHash] {
+                        if data.count <= Link.mdu {
+                            return .merge(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
+                                                                                propagationPacked: data,
+                                                                                messageHash: hash))),
+                                          deliveryRetryTimer(state, key))
+                        } else {
+                            return startOrQueueResource(&state, key, dest: destinationHash, linkID: linkID)
+                        }
+                    }
+                    // Link down/re-establishing: no live link; wait and re-check (bounded by maxAttempts).
+                    return deliveryRetryTimer(state, key)
+                }
             }
             func establish(_ state: inout State, _ dest: Data) -> Effect<Action> {
                 if state.knownPaths.contains(dest) {
@@ -486,7 +563,9 @@ public struct LXMFRouter {
                     state.establishAttempts[dest] = attempts
                     let wasAwaitingPath = state.directLinks[dest] == .awaitingPath
                     state.directLinks[dest] = .establishing
-                    let requestLink = Effect<Action>.send(.delegate(.requestLink(destinationHash: dest)))
+                    let requestLink = Effect<Action>.merge(
+                        startFallbackForQueued(&state, dest, attempts: attempts),
+                        .send(.delegate(.requestLink(destinationHash: dest))))
                     // Leaving `.awaitingPath` ends the park, so the park timer must die with it.
                     // Cancelling HERE rather than in the calling case keeps the cancel adjacent to
                     // the state transition it pairs with, so any future caller that reaches
@@ -835,6 +914,7 @@ public struct LXMFRouter {
                 let hadWork = state.hasOutboundState(for: hash)
                 state.cancelledMessages.insert(hash)
                 state.pendingPropagatedCopies.remove(hash)
+                state.fallbackEligible.remove(hash)
                 guard hadWork else { return .none }
                 var effects: [Effect<Action>] = []
                 var freed: [Data] = []
@@ -885,6 +965,10 @@ public struct LXMFRouter {
                 state.markPropagatedCopyPending(hash)
                 return .none
 
+            case let .markFallbackEligible(hash):
+                state.fallbackEligible.insert(hash)
+                return .none
+
             case let .propagatedCopyRefused(hash, reason):
                 // Never started, so there is nothing to fail: the delivery copy's own outcome decides
                 // the message. Running `fail` here could report `deliveryFailed` while the delivery copy
@@ -915,39 +999,10 @@ public struct LXMFRouter {
                     return fail(&state, key)
                 }
                 state.pendingDeliveries[key] = pending
-                switch pending.resend {
-                case let .opportunistic(destinationHash, payload):
-                    if !state.knownPaths.contains(destinationHash) {
-                        // Pathless opportunistic retry: request a path instead of resending, and wait longer.
-                        return .merge(.send(.delegate(.requestPath(destinationHash: destinationHash))),
-                                      retryTimer(key, LXMFDelivery.pathRequestWaitSeconds))
-                    }
-                    return .merge(.send(.delegate(.sendOpportunistic(destinationHash: destinationHash, payload: payload,
-                                                                     messageHash: hash))),
-                                  deliveryRetryTimer(state, key))
-                case let .direct(destinationHash, data, asResource):
-                    if case let .active(linkID) = state.directLinks[destinationHash] {
-                        if asResource { return startOrQueueResource(&state, key, dest: destinationHash, linkID: linkID) }
-                        return .merge(.send(.delegate(.sendDirect(linkID: linkID, data: data, asResource: false))),
-                                      deliveryRetryTimer(state, key))
-                    }
-                    // Link is down or re-establishing: no live link to send on. Wait and re-check; the
-                    // attempt was already counted, so the saga stays bounded by maxAttempts.
-                    return deliveryRetryTimer(state, key)
-                case let .propagated(destinationHash, data):
-                    if case let .active(linkID) = state.directLinks[destinationHash] {
-                        if data.count <= Link.mdu {
-                            return .merge(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
-                                                                                propagationPacked: data,
-                                                                                messageHash: hash))),
-                                          deliveryRetryTimer(state, key))
-                        } else {
-                            return startOrQueueResource(&state, key, dest: destinationHash, linkID: linkID)
-                        }
-                    }
-                    // Link down/re-establishing: no live link; wait and re-check (bounded by maxAttempts).
-                    return deliveryRetryTimer(state, key)
-                }
+                // A stalled delivery copy hands off to the propagation node, and keeps retrying (A2).
+                let handOff = leg == .delivery && pending.attempts >= LXMFDelivery.propagationFallbackAfterAttempts
+                    ?startFallbackIfEligible(&state, hash) : .none
+                return .merge(handOff, resend(&state, key, pending.resend))
 
             case let .idleDeadline(dest, linkID):
                 // Close ONLY the link this timer was armed for. A stale timer from a prior link on
@@ -969,7 +1024,8 @@ public struct LXMFRouter {
                     return giveUp(&state, dest)
                 }
                 state.establishAttempts[dest] = attempts
-                return .merge(.send(.delegate(.requestPath(destinationHash: dest))), pathRequestTimer(dest))
+                return .merge(startFallbackForQueued(&state, dest, attempts: attempts),
+                              .send(.delegate(.requestPath(destinationHash: dest))), pathRequestTimer(dest))
 
             case .delegate:
                 return .none

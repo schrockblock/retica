@@ -25,6 +25,11 @@ public enum LXMFDelivery {
     /// destination (`LXMFRouter.establish`), which has no counterpart in the reference constant —
     /// do not infer reference parity for that second use.
     public static let maxAttempts = 5
+    /// The delivery-copy attempt at which a fallback-eligible message hands off to the propagation
+    /// node (2026-10-21 propagation push spec, Amendment A2: about 20 s on TCP). Counts both the
+    /// copy's retry attempts and its destination's link-establishment attempts. No reference
+    /// counterpart: LXMF sends a message one way only.
+    public static let propagationFallbackAfterAttempts = 3
     /// Seconds to wait after requesting a path before the next opportunistic delivery attempt (RNS
     /// `LXMRouter.PATH_REQUEST_WAIT`; distinct from `retryWaitSeconds`).
     public static let pathRequestWaitSeconds = 7
