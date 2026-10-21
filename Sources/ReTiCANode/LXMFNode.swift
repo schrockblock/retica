@@ -606,6 +606,13 @@ public struct LXMFNode {
                 return deliverySend(&state, message: msg, method: method)
 
             case let .setPropagationNode(destinationHash):
+                // The node already set is NOT a change: the app re-applies it on every
+                // `interfaceConnected` (a listener client, a loopback slot, a TCP redial), and
+                // treating that as a change cancelled a fallback copy's stamp search mid-way and
+                // abandoned the copy — the message then failed when its delivery copy ran out,
+                // having never reached the node (the photo of 2026-10-21). Every stamp in flight
+                // was sized to THIS node's cost, so there is nothing to stop or redo.
+                guard destinationHash != state.router.outboundPropagationNode else { return .none }
                 // Every in-flight stamp was sized to the PREVIOUS node's advertised cost, and a stamp
                 // below a node's enforced minimum is dropped by its ingest — so finishing that search
                 // could only burn a core for a message the new node would reject. Constructed on this
