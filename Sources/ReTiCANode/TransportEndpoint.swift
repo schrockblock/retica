@@ -131,7 +131,12 @@ public struct TransportEndpoint {
         /// on it is closed — an established one at once (LINKCLOSE to the peer, `linkClosed`), one
         /// still in its handshake the moment it would go active, without ever surfacing
         /// `linkEstablished`. Reference leaves existing links up; closing them is deliberate here,
-        /// so that after deregistration nothing on the destination is still being served.
+        /// so that after deregistration nothing on the destination is still being served. Only
+        /// links to THIS destination are touched; other local destinations' links stay up.
+        ///
+        /// This stops this node serving the hash; it does not withdraw paths the network already
+        /// learned (Reticulum has no un-announce). Peers keep their path until it expires, and what
+        /// they still send here is dropped.
         case deregisterLocalDestination(destinationHash: Data)
         case announce(destinationHash: Data, appData: Data?)
         /// Announce on ONE interface only (nothing when it is not connected) — see

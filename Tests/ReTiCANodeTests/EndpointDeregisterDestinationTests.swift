@@ -11,11 +11,15 @@ private struct CountingEndpoint: Reducer {
     typealias State = TransportEndpoint.State
     typealias Action = TransportEndpoint.Action
     let established: LockIsolated<Int>
+    let closed: LockIsolated<[Data]>
 
     var body: some Reducer<State, Action> {
         Reduce<State, Action> { _, action in
             if case .delegate(.linkEstablished) = action {
                 established.withValue { $0 += 1 }
+            }
+            if case let .delegate(.linkClosed(linkID, _)) = action {
+                closed.withValue { $0.append(linkID) }
             }
             return .none
         }
@@ -31,6 +35,8 @@ private final class Pair {
     let sentA: LockIsolated<[Data]>
     let sentB: LockIsolated<[Data]>
     let bEstablished: LockIsolated<Int>
+    /// linkIDs of every `linkClosed` B surfaced.
+    let bClosed: LockIsolated<[Data]>
     let a: TestStoreOf<TransportEndpoint>
     let b: TestStoreOf<TransportEndpoint>
     let eventsA: AsyncStream<TCPEvent>.Continuation
@@ -39,17 +45,18 @@ private final class Pair {
     init() {
         let clock = TestClock()
         let sentA = LockIsolated<[Data]>([]), sentB = LockIsolated<[Data]>([]), bEstablished = LockIsolated(0)
-        self.sentA = sentA; self.sentB = sentB; self.bEstablished = bEstablished
-        (a, eventsA) = Pair.make("a", sentA, LockIsolated(0), clock)
-        (b, eventsB) = Pair.make("b", sentB, bEstablished, clock)
+        let bClosed = LockIsolated<[Data]>([])
+        self.sentA = sentA; self.sentB = sentB; self.bEstablished = bEstablished; self.bClosed = bClosed
+        (a, eventsA) = Pair.make("a", sentA, LockIsolated(0), LockIsolated([]), clock)
+        (b, eventsB) = Pair.make("b", sentB, bEstablished, bClosed, clock)
     }
 
     private static func make(_ host: String, _ sent: LockIsolated<[Data]>, _ established: LockIsolated<Int>,
-                             _ clock: TestClock<Duration>)
+                             _ closed: LockIsolated<[Data]>, _ clock: TestClock<Duration>)
             -> (TestStoreOf<TransportEndpoint>, AsyncStream<TCPEvent>.Continuation) {
             let events = AsyncStream<TCPEvent>.makeStream()
             let store = TestStore(initialState: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false)) {
-                CountingEndpoint(established: established)
+                CountingEndpoint(established: established, closed: closed)
             } withDependencies: {
                 $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                                  send: { d in sent.withValue { $0.append(d) } },
@@ -64,9 +71,14 @@ private final class Pair {
 
     func connectAndLearn() async {
         await a.send(.start); eventsA.yield(.connected); await a.receive(\.transport.interfaceConnected)
-        await b.send(.registerLocalDestination(dest))
         await b.send(.start); eventsB.yield(.connected); await b.receive(\.transport.interfaceConnected)
-        await b.send(.announce(destinationHash: dest.hash, appData: nil))
+        await registerAndLearn(dest)
+    }
+
+    /// B registers + announces `destination`; A learns it.
+    func registerAndLearn(_ destination: Destination) async {
+        await b.send(.registerLocalDestination(destination))
+        await b.send(.announce(destinationHash: destination.hash, appData: nil))
         eventsA.yield(.data(sentB.value.last!))
         await a.receive(\.transport.received)
         await a.receive(\.delegate.pathLearned)
@@ -74,8 +86,8 @@ private final class Pair {
 
     /// A opens a link; B answers the LINKREQUEST with its LRPROOF; A goes active and emits its LRRTT
     /// (NOT yet delivered to B — B's link is still half-open).
-    func handshakeUpToLRRTT() async {
-        await a.send(.openLink(destinationHash: dest.hash))
+    func handshakeUpToLRRTT(to destination: Destination? = nil) async {
+        await a.send(.openLink(destinationHash: (destination ?? dest).hash))
         await a.receive { if case .tcpClients(.element(id: _, action: .interface(.send))) = $0 { return true }; return false }
         eventsB.yield(.data(sentA.value.last!))                    // LINKREQUEST → B
         await b.receive(\.transport.received)
@@ -122,6 +134,36 @@ private final class Pair {
     await p.b.receive(\.transport.received)
     await p.b.skipReceivedActions(strict: false)
     #expect(p.b.state.links.isEmpty)
+
+    await p.a.send(.stop); await p.b.send(.stop)
+    await p.a.skipReceivedActions(strict: false); await p.b.skipReceivedActions(strict: false)
+}
+
+/// Deregistering one destination touches only ITS links: an inbound link to another local
+/// destination stays active and is never closed.
+@Test @MainActor func deregisteringOneDestinationLeavesAnotherDestinationsLinkUp() async {
+    let p = Pair()
+    let other = Destination(kind: .single, direction: .in, appName: "app", aspects: ["other"], identity: Identity())!
+    await p.connectAndLearn()
+    await p.registerAndLearn(other)
+    for d in [p.dest, other] {
+        await p.handshakeUpToLRRTT(to: d)
+        await p.deliverLRRTTToB()
+        await p.b.receive(\.delegate.linkEstablished)
+    }
+    await p.b.skipReceivedActions(strict: false)
+    let kept = p.b.state.links.first { $0.destinationHash == other.hash }
+    #expect(p.b.state.links.count == 2)
+    #expect(kept?.status == .active)
+
+    await p.b.send(.deregisterLocalDestination(destinationHash: p.dest.hash))
+    await p.b.receive(\.delegate.linkClosed)                          // the deregistered one's
+    await p.b.skipReceivedActions(strict: false)
+    #expect(p.b.state.links.count == 1)
+    #expect(p.b.state.links.first?.linkID == kept?.linkID)
+    #expect(p.b.state.links.first?.status == .active)
+    #expect(!p.bClosed.value.contains(kept?.linkID ?? Data()))
+    #expect(p.b.state.transport.localDestinations[other.hash] != nil)
 
     await p.a.send(.stop); await p.b.send(.stop)
     await p.a.skipReceivedActions(strict: false); await p.b.skipReceivedActions(strict: false)

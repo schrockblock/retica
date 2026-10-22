@@ -303,6 +303,10 @@ public struct Transport {
         /// not surfaced, path requests for it are not answered and `.announce` for it emits
         /// nothing; its sticky app data is forgotten. A hash that is not registered is a no-op.
         /// Links already open on it belong to the link plane: `TransportEndpoint` closes them.
+        ///
+        /// It stops THIS node serving the hash; it does not withdraw paths the network already
+        /// learned. Reticulum has no un-announce: peers and relays keep their path (and cached
+        /// announce) until it expires, so traffic may still arrive here for a while — and is dropped.
         case deregisterLocalDestination(destinationHash: Data)
         case setTransportIdentity(Identity?)
         case setRecursivePathRequests(Bool)
