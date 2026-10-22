@@ -45,6 +45,24 @@ public struct TransportEndpoint {
         /// Learned-destination table of the shared router (identity / appData / path).
         public var learned: [Data: LearnedDestination] { transport.learned }
 
+        /// Known-destination table of the shared router (every announced identity heard; outlives
+        /// the path) — see `Transport.State.knownDestinations`. Persist it and restore it with
+        /// `.transport(.rehydrateKnownDestinations(_:))` so recall survives a relaunch.
+        public var knownDestinations: [Data: KnownDestination] { transport.knownDestinations }
+
+        /// RNS `Identity.recall(destination_hash)` — see `Transport.State.recall(destinationHash:)`.
+        /// For an unknown hash, send `.requestPath(destinationHash:)` and recall again on
+        /// `.delegate(.pathLearned)`.
+        public func recall(destinationHash: Data) -> Identity? {
+            transport.recall(destinationHash: destinationHash)
+        }
+
+        /// RNS `Identity.recall(identity_hash, from_identity_hash=True)` — see
+        /// `Transport.State.recall(identityHash:)`.
+        public func recall(identityHash: Data) -> Identity? {
+            transport.recall(identityHash: identityHash)
+        }
+
         /// Connected interfaces of the shared router. Paired with `learned`: an entry in
         /// `learned` names an `interfaceID`, and only an id present HERE is still reachable —
         /// which is the test `Transport.reachableLearned` performs and `openLink` gates on.

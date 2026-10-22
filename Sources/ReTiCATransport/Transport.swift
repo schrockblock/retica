@@ -36,6 +36,12 @@ public struct Transport {
         /// divergence from reference's explicit `set_default_app_data`.
         public var localAppData: [Data: Data] = [:]
         public var learned: [Data: LearnedDestination] = [:]
+        /// Every remote destination a valid announce was heard for (reference
+        /// `Identity.known_destinations`) — what `recall(destinationHash:)` reads. Written on each
+        /// announce that passes the ingress gate (before the replay check, as reference's
+        /// `Identity.validate_announce` → `remember` runs), culled by `maintenanceTick` only once
+        /// pathless past `Transport.knownDestinationExpiry`, restored by `.rehydrateKnownDestinations`.
+        public var knownDestinations: [Data: KnownDestination] = [:]
         public var interfaces: [InterfaceID: InterfaceProfile] = [:]
         public var transportIdentity: Identity? = nil
         var seenPacketHashes = RingSet(capacity: Transport.seenPacketRingSize)
@@ -178,6 +184,49 @@ public struct Transport {
 
         public init() {}
 
+        /// The public identity behind `destinationHash`, or nil if this node has never heard it —
+        /// reference `Identity.recall(destination_hash)` (RNS/Identity.py:116-160). Looks in the
+        /// known destinations first, then the path table (a host may have restored `learned` alone
+        /// via `.rehydrateLearnedDestinations`), then — as reference does — this node's own
+        /// registered destinations. Always public-only.
+        ///
+        /// An unknown hash is answered by asking the network: `.requestPath(destinationHash:)`
+        /// solicits a path-response announce, and once it lands (`.delegate(.pathLearned)`) this
+        /// returns the identity. Reference has the same shape (`Transport.request_path`, then
+        /// `Identity.recall`).
+        public func recall(destinationHash: Data) -> Identity? {
+            if let known = knownDestinations[destinationHash] { return known.identity }
+            if let path = learned[destinationHash] { return path.identity }
+            if let local = localDestinations[destinationHash]?.identity {
+                return Identity(publicKey: local.publicKey)
+            }
+            return nil
+        }
+
+        /// The public identity whose identity hash (`Identity.hash`) is `identityHash`, from any
+        /// destination it has announced — reference `Identity.recall(.., from_identity_hash=True)`
+        /// (RNS/Identity.py:129-140), extended to the same fallbacks as `recall(destinationHash:)`.
+        /// A linear scan, as in reference.
+        public func recall(identityHash: Data) -> Identity? {
+            if let known = knownDestinations.values.first(where: { $0.identity.hash == identityHash }) {
+                return known.identity
+            }
+            if let path = learned.values.first(where: { $0.identity.hash == identityHash }) {
+                return path.identity
+            }
+            if let local = localDestinations.values.compactMap(\.identity).first(where: { $0.hash == identityHash }) {
+                return Identity(publicKey: local.publicKey)
+            }
+            return nil
+        }
+
+        /// The app data last announced by `destinationHash`, or nil — reference
+        /// `Identity.recall_app_data` (RNS/Identity.py:162-175).
+        public func recallAppData(destinationHash: Data) -> Data? {
+            if let known = knownDestinations[destinationHash] { return known.appData }
+            return learned[destinationHash]?.appData
+        }
+
         /// The learned path to `destinationHash`, but only when its interface is currently connected.
         ///
         /// `LearnedDestination.interfaceID` is captured at announce time and replaced only by a
@@ -300,6 +349,13 @@ public struct Transport {
         /// is no crash to catch — the test is the only guard. A future date would look unexpired
         /// forever; a NaN fails open (`now <= nan` is true). Drop both.
         case rehydrateLearnedDestinations([Data: LearnedDestination])
+        /// Restore `knownDestinations` from a previous session (reference
+        /// `Identity.load_known_destinations`, RNS/Identity.py:216-233), so `recall` answers for
+        /// destinations heard before the relaunch. Same guards as `.rehydrateLearnedDestinations`:
+        /// a row whose `lastHeard` is non-finite, in the future, or older than
+        /// `knownDestinationExpiry` is dropped, and a restored row never replaces a live entry heard
+        /// at least as recently. (Reference does not sweep on load; its cull runs every 5 minutes.)
+        case rehydrateKnownDestinations([Data: KnownDestination])
         case delegate(Delegate)
 
         @CasePathable
@@ -445,6 +501,18 @@ public struct Transport {
                 }
                 return .none
 
+            case let .rehydrateKnownDestinations(destinations):
+                let now = date.now
+                for (hash, candidate) in destinations {
+                    guard candidate.lastHeard.timeIntervalSinceReferenceDate.isFinite,
+                          candidate.lastHeard <= now,
+                          now.timeIntervalSince(candidate.lastHeard) <= Transport.knownDestinationExpiry
+                    else { continue }
+                    if let live = state.knownDestinations[hash], live.lastHeard >= candidate.lastHeard { continue }
+                    state.knownDestinations[hash] = candidate
+                }
+                return .none
+
             case let .received(interfaceID, data):
                 // C5 IFAC (RNS Transport.py:1442-1486). MUST happen here, not in an Endpoint: C4
                 // holds burst-limited announces by storing the VERBATIM `.received` payload and
@@ -583,6 +651,12 @@ public struct Transport {
                             return .none
                         }
                     }
+                    // Remember the announced identity for `recall` — reference `Identity.remember`,
+                    // reached from `validate_announce` for every signature-valid announce of a
+                    // non-local destination that got past ingress limiting (Transport.py:1772,
+                    // Identity.py:579), BEFORE the replay check, so a replay refreshes it too.
+                    state.knownDestinations[packet.destinationHash] = KnownDestination(
+                        identity: parsed.identity, appData: parsed.appData, lastHeard: icNow)
                     // Anti-replay: a previously-seen random-blob for this destination is a replay.
                     // RingSet.insert both tests and records; false → already present → drop.
                     // NOTE: we record the blob for EVERY fresh announce here. RNS only appends the
@@ -864,6 +938,14 @@ public struct Transport {
                     state.learned[dest] = nil
                     state.announceBlobs[dest] = nil          // blob GC piggybacks on path expiry
                     state.announceCache[dest] = nil          // cached announce GC piggybacks too
+                }
+                // Known destinations outlive their path; one goes only once it is pathless AND
+                // unheard for `knownDestinationExpiry` (reference `clean_known_destinations`,
+                // Identity.py:285-338 — see the constant for the divergence).
+                for (dest, known) in state.knownDestinations
+                where state.learned[dest] == nil
+                    && now.timeIntervalSince(known.lastHeard) > Transport.knownDestinationExpiry {
+                    state.knownDestinations[dest] = nil
                 }
                 for (link, entry) in Array(state.linkTable) {
                     let expired = entry.validated
@@ -1172,6 +1254,17 @@ public struct Transport {
     /// roaming (6 hours) interfaces. A host pruning at launch cannot use the mode-dependent form —
     /// interfaces are not connected yet — so this conservative value is the correct one there.
     public static let pathExpiry: TimeInterval = 60 * 60 * 24 * 7      // 604800
+
+    /// How long a PATHLESS known destination is kept after its last announce: reference
+    /// `DESTINATION_TIMEOUT * 1.25` (Identity.py:328), 8.75 days. `public` for the same reason as
+    /// `pathExpiry`: a host persisting `knownDestinations` prunes its copy on the same terms.
+    ///
+    /// DIVERGENCE: reference measures from the last USE (`_used_destination_data`, stamped by
+    /// `recall` and by traffic) and drops a never-used pathless entry after only
+    /// `UNUSED_DESTINATION_LINGER` (6 minutes). ReTiCA's `recall` is a pure read of reducer state and
+    /// cannot stamp a use, so it measures from the last announce for every entry — more retentive
+    /// for a hash heard once and recalled days later (the case recall exists for), never less.
+    public static let knownDestinationExpiry: TimeInterval = pathExpiry * 1.25
     /// Mode-dependent path lifetimes (RNS Transport.py:787-792).
     static let apPathExpiry: TimeInterval = 60 * 60 * 24       // AP_PATH_TIME, 1 day
     static let roamingPathExpiry: TimeInterval = 60 * 60 * 6   // ROAMING_PATH_TIME, 6 hours

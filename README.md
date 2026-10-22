@@ -114,6 +114,7 @@ The live `TCPConnection` + `TCPClientInterface` can be pointed at a real Reticul
 |--------|--------|--------------------|
 | `Transport` | `ReTiCATransport` | TCA reducer: announce ingest → path/known-destination table (recency + dedup), inbound DATA decrypt+deliver to local destinations, outbound routing to learned paths, self-announce |
 | `InterfaceID` / `LearnedDestination` | `ReTiCATransport` | Interface handle and the learned path+identity entry |
+| `KnownDestination` / `State.recall(destinationHash:)` / `recall(identityHash:)` / `recallAppData` | `ReTiCATransport` | Identity recall (RNS `Identity.recall` over `known_destinations`): every valid announce is remembered and outlives its path (`knownDestinationExpiry`, 8.75 days pathless); the host persists `knownDestinations` and restores it with `.rehydrateKnownDestinations`. For an unknown hash, `.requestPath` then recall on `pathLearned`. |
 
 `ReTiCATransport` is interface-agnostic (no Network.framework): interfaces are referenced by `InterfaceID`, inbound bytes arrive via `.received(InterfaceID, Data)`, and outbound bytes leave via `.delegate(.transmit(InterfaceID, Data))`, so an app layer wires Transport ↔ `ReTiCAInterfaces`. This is the endpoint (leaf) subset of RNS Transport; relaying, path requests, expiry/cull jobs, persistence, and links are future slices. Announce learning is cross-validated against a Python-RNS 1.3.8 announce packet.
 
