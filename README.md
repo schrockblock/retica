@@ -144,6 +144,11 @@ any of its in-flight timers (keepalive/inactivity) and outstanding request timer
 pending requests — so terminal state and timers do not accumulate. (Multiple interfaces per endpoint
 are future work.)
 
+`deregisterLocalDestination(destinationHash:)` (RNS `Transport.deregister_destination`) stops serving a
+local destination: the router forgets it (no more DATA delivery, LINKREQUEST hand-up, path-response
+or announce for it), established inbound links on it are closed, and one still in its handshake is
+closed when it would go active, never surfacing `linkEstablished`.
+
 ### Link identify & request/response (`Endpoint`)
 
 Over an established link, the initiator can prove its identity and either peer can make an

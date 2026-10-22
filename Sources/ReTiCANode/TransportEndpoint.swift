@@ -126,6 +126,13 @@ public struct TransportEndpoint {
         case start
         case stop
         case registerLocalDestination(Destination)
+        /// Stop serving a local destination (RNS `Transport.deregister_destination`): the shared
+        /// router forgets it (`Transport.Action.deregisterLocalDestination`) and every inbound link
+        /// on it is closed — an established one at once (LINKCLOSE to the peer, `linkClosed`), one
+        /// still in its handshake the moment it would go active, without ever surfacing
+        /// `linkEstablished`. Reference leaves existing links up; closing them is deliberate here,
+        /// so that after deregistration nothing on the destination is still being served.
+        case deregisterLocalDestination(destinationHash: Data)
         case announce(destinationHash: Data, appData: Data?)
         /// Announce on ONE interface only (nothing when it is not connected) — see
         /// `Transport.Action.announce(interface:)`. A separate case so existing
@@ -197,6 +204,17 @@ public struct TransportEndpoint {
                                  state.ble != nil ? .send(.ble(.stop)) : .none,
                                  state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none])
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
+            case let .deregisterLocalDestination(hash):
+                // Router first, so a LINKREQUEST racing this action is no longer handed up. Then
+                // close the ESTABLISHED responder links on the destination; `LinkSession.close` is
+                // a no-op before `.active`, so a half-open one is caught where it goes active (the
+                // `.linkPlane(.delegate(.linkEstablished))` arm below), as is one accepted from a
+                // request that was already in flight.
+                let open = state.linkPlane.links.filter {
+                    $0.role == .responder && $0.destinationHash == hash && $0.status == .active
+                }
+                return .merge([.send(.transport(.deregisterLocalDestination(destinationHash: hash)))]
+                              + open.map { .send(.closeLink(linkID: $0.linkID)) })
             case let .announce(h, a):               return .send(.transport(.announce(destinationHash: h, appData: a)))
             case let .announceOn(i, h, a):          return .send(.transport(.announce(destinationHash: h, appData: a,
                                                                                       interface: i)))
@@ -408,6 +426,13 @@ public struct TransportEndpoint {
                 return transmit(state, to: txID, masked: masked, unmasked: raw)
 
             case let .linkPlane(.delegate(.linkEstablished(linkID, destHash))):
+                // An inbound link exists only to serve a registered local destination. One that
+                // finishes its handshake after `.deregisterLocalDestination` is closed instead of
+                // surfaced, so nothing above ever starts serving it.
+                if state.transport.localDestinations[destHash] == nil,
+                   state.linkPlane.links.contains(where: { $0.linkID == linkID && $0.role == .responder }) {
+                    return .send(.closeLink(linkID: linkID))
+                }
                 return .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash)))
             case let .linkPlane(.delegate(.linkDataReceived(linkID, data, packetHash))):
                 return .send(.delegate(.linkDataReceived(linkID: linkID, data: data, packetHash: packetHash)))

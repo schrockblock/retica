@@ -298,6 +298,12 @@ public struct Transport {
         case interfaceConnected(InterfaceID, InterfaceProfile)
         case interfaceDisconnected(InterfaceID)
         case registerLocalDestination(Destination)
+        /// Remove a local destination — reference `Transport.deregister_destination`
+        /// (RNS/Transport.py:2520-2527). From then on its DATA is dropped, its LINKREQUESTs are
+        /// not surfaced, path requests for it are not answered and `.announce` for it emits
+        /// nothing; its sticky app data is forgotten. A hash that is not registered is a no-op.
+        /// Links already open on it belong to the link plane: `TransportEndpoint` closes them.
+        case deregisterLocalDestination(destinationHash: Data)
         case setTransportIdentity(Identity?)
         case setRecursivePathRequests(Bool)
         case registerLocalLink(Data)
@@ -445,14 +451,15 @@ public struct Transport {
             case let .registerLocalDestination(destination):
                 // Registering a destination clears any app data stickily remembered for it. This is
                 // ReTiCA's `Destination.clear_default_app_data()` (RNS/Destination.py:688-692), and
-                // it is the ONLY clear path: `.announce` never erases (see there), so without this
-                // a composition that stopped advertising app data could keep replaying the previous
-                // one's forever, in both announces and path responses.
+                // it is one of two clear paths (the other is `.deregisterLocalDestination`):
+                // `.announce` never erases (see there), so without this a composition that stopped
+                // advertising app data could keep replaying the previous one's forever, in both
+                // announces and path responses.
                 //
                 // Unconditional on purpose. The former `if localDestinations[hash] == nil` guard
-                // could never fire — nothing ever removes a `localDestinations` entry, so on a
-                // first registration `localAppData[hash]` is already nil, and on a re-registration
-                // the guard is false. Every in-repo caller registers and announces in one `.merge`
+                // could never fire — on a first registration `localAppData[hash]` is already nil
+                // (deregistration clears it with the entry), and on a re-registration the guard is
+                // false. Every in-repo caller registers and announces in one `.merge`
                 // (PNNode.swift `.registerPropagation`, LXMFServiceNode.swift `.registerPropagation`,
                 // LXMFNode.swift `.registerDelivery`), and `.merge` delivers in order, so the clear
                 // always precedes the announce that repopulates it. (Named by enclosing case rather
@@ -460,6 +467,17 @@ public struct Transport {
                 // :201 within one slice.)
                 state.localAppData[destination.hash] = nil
                 state.localDestinations[destination.hash] = destination
+                return .none
+
+            case let .deregisterLocalDestination(destinationHash):
+                // Every gate on a local destination reads `localDestinations` when a packet is
+                // handled — DATA delivery, the LINKREQUEST hand-up, the path-request answer and
+                // `.announce` — so removing the entry is the whole of it. Nothing is scheduled per
+                // local destination (an own announce goes out at once, never held), so there is no
+                // timer to cancel. The app data goes too, as `.registerLocalDestination` clears it,
+                // so a later re-registration starts clean.
+                state.localDestinations[destinationHash] = nil
+                state.localAppData[destinationHash] = nil
                 return .none
 
             case let .setTransportIdentity(identity):
