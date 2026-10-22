@@ -355,6 +355,8 @@ public struct Transport {
         /// a row whose `lastHeard` is non-finite, in the future, or older than
         /// `knownDestinationExpiry` is dropped, and a restored row never replaces a live entry heard
         /// at least as recently. (Reference does not sweep on load; its cull runs every 5 minutes.)
+        /// Rows are stored public-only, and a row keyed by one of this node's registered local
+        /// destinations is ignored.
         case rehydrateKnownDestinations([Data: KnownDestination])
         case delegate(Delegate)
 
@@ -508,8 +510,14 @@ public struct Transport {
                           candidate.lastHeard <= now,
                           now.timeIntervalSince(candidate.lastHeard) <= Transport.knownDestinationExpiry
                     else { continue }
+                    // Our own destinations are never remembered from announces (see `.received`),
+                    // so a stored row for one is foreign data: it must not shadow the local identity.
+                    guard state.localDestinations[hash] == nil else { continue }
                     if let live = state.knownDestinations[hash], live.lastHeard >= candidate.lastHeard { continue }
-                    state.knownDestinations[hash] = candidate
+                    // Public-only, whatever the host handed back: this table never holds a private key.
+                    guard let publicOnly = Identity(publicKey: candidate.identity.publicKey) else { continue }
+                    state.knownDestinations[hash] = KnownDestination(
+                        identity: publicOnly, appData: candidate.appData, lastHeard: candidate.lastHeard)
                 }
                 return .none
 

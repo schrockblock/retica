@@ -210,4 +210,66 @@ private func recallAnnounce(identity: Identity, appName: String = "app", aspects
     #expect(store.state.recallAppData(destinationHash: h(live)) == Data("live".utf8))
 }
 
+/// A restored row is stored public-only, even if the host handed back an identity with a private key.
+@Test @MainActor func rehydratedRowWithAPrivateKeyIsStoredPublicOnly() async {
+    let remote = Identity()                                           // carries a private key
+    let destHash = Destination.hash(identityHash: remote.hash, appName: "app", aspects: ["svc"])
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = DateGenerator { Date(timeIntervalSince1970: 2_000) }
+    }
+    store.exhaustivity = .off
+    await store.send(.rehydrateKnownDestinations([
+        destHash: KnownDestination(identity: remote, appData: nil, lastHeard: Date(timeIntervalSince1970: 1_000)),
+    ]))
+    #expect(store.state.knownDestinations[destHash]?.identity.publicKey == remote.publicKey)
+    #expect(store.state.knownDestinations[destHash]?.identity.privateKey == nil)
+    #expect(store.state.recall(destinationHash: destHash)?.privateKey == nil)
+}
+
+/// A restored row keyed by one of OUR registered destinations is ignored (announces for those are
+/// never remembered either), so it can never shadow the local identity in `recall`.
+@Test @MainActor func rehydratedRowForALocalDestinationIsIgnored() async {
+    let mine = Identity()
+    let dest = Destination(kind: .single, direction: .in, appName: "app", aspects: ["svc"], identity: mine)!
+    var initial = Transport.State()
+    initial.localDestinations[dest.hash] = dest
+    let store = TestStore(initialState: initial) { Transport() } withDependencies: {
+        $0.transportDate = DateGenerator { Date(timeIntervalSince1970: 2_000) }
+    }
+    store.exhaustivity = .off
+    let impostor = Identity()
+    await store.send(.rehydrateKnownDestinations([
+        dest.hash: KnownDestination(identity: Identity(publicKey: impostor.publicKey)!, appData: nil,
+                                    lastHeard: Date(timeIntervalSince1970: 1_000)),
+    ]))
+    #expect(store.state.knownDestinations[dest.hash] == nil)
+    #expect(store.state.recall(destinationHash: dest.hash)?.publicKey == mine.publicKey)
+}
+
+/// An announce held by ingress control (a burst on a young interface) is not remembered while held —
+/// reference remembers only past the `should_ingress_limit` gate (Transport.py:1760-1772).
+@Test @MainActor func aBurstHeldAnnounceIsNotRememberedWhileHeld() async {
+    let clock = LockIsolated(Date(timeIntervalSince1970: 1_000))
+    let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
+        $0.transportDate = DateGenerator { clock.value }
+        $0.continuousClock = TestClock()
+    }
+    store.exhaustivity = .off
+    let i = InterfaceID("i1")
+    await store.send(.interfaceConnected(i, .default))
+    var hashes: [Data] = []
+    for n in 0..<6 {                                                  // ~100 Hz on a new interface
+        clock.setValue(Date(timeIntervalSince1970: 1_000 + Double(n) * 0.01))
+        let (raw, h) = recallAnnounce(identity: Identity(), emitted: 1_000)
+        hashes.append(h)
+        await store.send(.received(i, raw))
+    }
+    let held = Set(store.state.heldAnnounces[i]?.keys.map { $0 } ?? [])
+    #expect(!held.isEmpty)
+    for h in hashes where held.contains(h) {
+        #expect(store.state.knownDestinations[h] == nil)
+    }
+    await store.skipInFlightEffects(strict: false)
+}
+
 }
