@@ -1,5 +1,6 @@
 import Foundation
 import ComposableArchitecture
+import OSLog
 import ReTiCA
 import ReTiCATransport
 
@@ -10,6 +11,9 @@ import ReTiCATransport
 /// propagation wiring are follow-ons.
 @Reducer
 public struct LXMFNode {
+    /// Inbound drops the app is never told about (`.messageRejected`).
+    static let log = Logger(subsystem: "com.retica", category: "lxmf")
+
     public enum SyncPhase: Equatable { case awaitingList, awaitingMessages }
 
     /// Data learned from a peer's delivery-destination announce (`lxmf.delivery` aspect).
@@ -946,9 +950,13 @@ public struct LXMFNode {
                 return .send(.delegate(.messageReceived(message: delivered, signatureValidated: validated,
                                                         method: method)))
 
-            case .router(.delegate(.messageRejected)):
+            case let .router(.delegate(.messageRejected(hash, reason))):
                 // A forgery-check drop is the router's business: the app is told nothing, as for a
-                // duplicate. A propagated copy is already marked downloaded.
+                // duplicate. A propagated copy is already marked downloaded. It is logged, so a
+                // rejection is not invisible when debugging delivery. `Data.hexString` is internal
+                // to ReTiCA, so the 8-byte prefix is formatted inline.
+                let prefix = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                Self.log.notice("rejected inbound message \(prefix, privacy: .public): \(String(describing: reason), privacy: .public)")
                 return .none
 
             case let .router(.send(handedOn, _)):
