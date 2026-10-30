@@ -796,7 +796,11 @@ public struct LXMFNode {
                         // NOT strip again here (that double-strip hashed served[:-32] → purge never matched).
                         tids.append(LXMFPropagation.transientId(lxmfData: blob))
                         if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity) {
-                            effects.append(.send(.router(.received(method: .propagated, destinationHash: Data(), data: packed))))
+                            // Our delivery hash: the router drops a download addressed to anyone else.
+                            // Its transient id is still marked downloaded below (spec settled detail 5).
+                            effects.append(.send(.router(.received(method: .propagated,
+                                                                   destinationHash: state.deliveryDestinationHash ?? Data(),
+                                                                   data: packed))))
                         }
                     }
                     effects.append(.send(.router(.messagesDownloaded(transientIds: tids))))
@@ -941,6 +945,11 @@ public struct LXMFNode {
                 }
                 return .send(.delegate(.messageReceived(message: delivered, signatureValidated: validated,
                                                         method: method)))
+
+            case .router(.delegate(.messageRejected)):
+                // A forgery-check drop is the router's business: the app is told nothing, as for a
+                // duplicate. A propagated copy is already marked downloaded.
+                return .none
 
             case let .router(.send(handedOn, _)):
                 // The search for this message is over — it is the router's problem now, so it can no
@@ -1098,17 +1107,21 @@ public struct LXMFNode {
                 // prove is needed for the `.resourceReceived` path.
                 let isDeliveryLink = state.deliveryDestinationHash != nil
                     && state.linkDestinations[linkID] == state.deliveryDestinationHash
+                // Our delivery hash, whichever link it came on: the router drops a message
+                // addressed to anyone else.
+                let ours = state.deliveryDestinationHash ?? Data()
                 if isDeliveryLink {
                     return .merge(
                         .send(.endpoint(.provePacketOverLink(linkID: linkID, packetHash: packetHash))),
-                        .send(.router(.received(method: .direct, destinationHash: Data(), data: data))))
+                        .send(.router(.received(method: .direct, destinationHash: ours, data: data))))
                 }
-                return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
+                return .send(.router(.received(method: .direct, destinationHash: ours, data: data)))
 
             case let .endpoint(.delegate(.resourceReceived(linkID, data))):
                 state.inboundProgress[linkID] = nil
                 guard !isServedPropagationLink(state, linkID) else { return .none }
-                return .send(.router(.received(method: .direct, destinationHash: Data(), data: data)))
+                return .send(.router(.received(method: .direct, destinationHash: state.deliveryDestinationHash ?? Data(),
+                                               data: data)))
 
             case let .endpoint(.delegate(.resourceConcluded(linkID, hash))):
                 // Only OUR transfer on that link resolves the copy (Review Focus 1).

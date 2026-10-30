@@ -30,9 +30,12 @@ import ComposableArchitecture
     func makeNode(_ host: String, _ identity: Identity, _ sent: LockIsolated<[Data]>)
         -> (TestStore<LXMFNode.State, LXMFNode.Action>, AsyncStream<TCPEvent>.Continuation) {
         let events = AsyncStream<TCPEvent>.makeStream()
-        let store = TestStore(initialState: LXMFNode.State(
+        var state = LXMFNode.State(
             identity: identity, endpoint: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false))
-        ) { LXMFNode() } withDependencies: {
+        // As `registerDelivery` sets it (without its announce on the wire): a propagated download
+        // is delivered only when addressed to our delivery destination.
+        state.deliveryDestinationHash = LXMessage.deliveryHash(identityHash: identity.hash)
+        let store = TestStore(initialState: state) { LXMFNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })
             $0.continuousClock = clock

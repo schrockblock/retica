@@ -49,7 +49,7 @@ private func expectDelivered(_ store: TestStore<LXMFRouter.State, LXMFRouter.Act
 @Test @MainActor func arrivalMethodRouterReportsDirect() async {
     let msg = makeMessage()
     let store = makeRouter()
-    await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))
+    await store.send(.received(method: .direct, destinationHash: msg.destinationHash, data: msg.packed))
     await expectDelivered(store, msg, via: .direct)
 }
 
@@ -57,7 +57,7 @@ private func expectDelivered(_ store: TestStore<LXMFRouter.State, LXMFRouter.Act
 @Test @MainActor func arrivalMethodRouterReportsPropagated() async {
     let msg = makeMessage()
     let store = makeRouter()
-    await store.send(.received(method: .propagated, destinationHash: Data(), data: msg.packed))
+    await store.send(.received(method: .propagated, destinationHash: msg.destinationHash, data: msg.packed))
     await expectDelivered(store, msg, via: .propagated)
 }
 
@@ -65,7 +65,7 @@ private func expectDelivered(_ store: TestStore<LXMFRouter.State, LXMFRouter.Act
 @Test @MainActor func arrivalMethodFirstArrivalWins() async {
     let msg = makeMessage()
     let store = makeRouter()
-    await store.send(.received(method: .propagated, destinationHash: Data(), data: msg.packed))
+    await store.send(.received(method: .propagated, destinationHash: msg.destinationHash, data: msg.packed))
     await expectDelivered(store, msg, via: .propagated)
     await store.send(.received(method: .opportunistic, destinationHash: msg.destinationHash, data: msg.opportunisticPayload))
     await store.receive(.delegate(.duplicateDropped(hash: msg.hash)))

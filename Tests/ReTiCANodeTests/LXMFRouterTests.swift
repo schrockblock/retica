@@ -37,7 +37,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
     store.exhaustivity = .off
     await store.send(.learnedIdentity(destinationHash: msg.sourceHash, identity: sender))
-    await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))
+    await store.send(.received(method: .direct, destinationHash: msg.destinationHash, data: msg.packed))
     await store.receive { action in
         if case let .delegate(.messageDelivered(m, validated, _)) = action {
             #expect(m.hash == msg.hash); #expect(validated == true); return true
@@ -51,7 +51,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
     store.exhaustivity = .off
     // No .learnedIdentity for the sender.
-    await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))
+    await store.send(.received(method: .direct, destinationHash: msg.destinationHash, data: msg.packed))
     await store.receive { action in
         if case let .delegate(.messageDelivered(m, validated, _)) = action {
             #expect(m.hash == msg.hash); #expect(validated == false); return true
@@ -73,9 +73,9 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
     store.exhaustivity = .off
     await store.send(.learnedIdentity(destinationHash: msg.sourceHash, identity: sender))
-    await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))
+    await store.send(.received(method: .direct, destinationHash: msg.destinationHash, data: msg.packed))
     await store.receive { if case .delegate(.messageDelivered) = $0 { return true }; return false }
-    await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))   // dup
+    await store.send(.received(method: .direct, destinationHash: msg.destinationHash, data: msg.packed))   // dup
     await store.receive { action in
         if case let .delegate(.duplicateDropped(h)) = action { #expect(h == msg.hash); return true }
         return false
@@ -96,7 +96,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
         if case let .delegate(.messageDelivered(m, _, _)) = action { #expect(m.hash == msg.hash); return true }
         return false
     }
-    await store.send(.received(method: .direct, destinationHash: Data(), data: msg.packed))   // same msg, other path
+    await store.send(.received(method: .direct, destinationHash: msg.destinationHash, data: msg.packed))   // same msg, other path
     await store.receive { action in
         if case let .delegate(.duplicateDropped(h)) = action { #expect(h == msg.hash); return true }
         return false
@@ -104,20 +104,20 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 }
 
 /// A tampered payload (byte flipped in the content region) still parses but fails signature validation
-/// against the known sender identity → delivered with signatureValidated == false.
-@Test @MainActor func routerDeliversTamperedMessageUnvalidated() async {
+/// against the known sender identity → dropped as `.badSignature`, never delivered (spec 2026-10-28;
+/// this test used to expect delivery with signatureValidated == false).
+@Test @MainActor func routerDropsTamperedMessageFromKnownSender() async {
     let sender = Identity()
     let msg = makeMessage(source: sender, content: "hello world")
     var bytes = Array(msg.packed)
     bytes[bytes.count - 2] ^= 0x01     // flip last content byte (before the trailing empty-map 0x80)
+    let tampered = LXMessage.unpack(Data(bytes))!   // flipping content changes the hash
     let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
     store.exhaustivity = .off
     await store.send(.learnedIdentity(destinationHash: msg.sourceHash, identity: sender))
-    await store.send(.received(method: .direct, destinationHash: Data(), data: Data(bytes)))
-    await store.receive { action in
-        if case let .delegate(.messageDelivered(_, validated, _)) = action { #expect(validated == false); return true }
-        return false
-    }
+    await store.send(.received(method: .direct, destinationHash: msg.destinationHash, data: Data(bytes)))
+    await store.receive(.delegate(.messageRejected(hash: tampered.hash, reason: .badSignature)))
+    store.exhaustivity = .on   // a stray `.messageDelivered` fails teardown
 }
 
 // MARK: - LXMF-4b outbound
@@ -256,13 +256,13 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let after = makeMessage(source: sender, content: "after")   // distinct hash → not a dup
     let store = TestStore(initialState: LXMFRouter.State()) { LXMFRouter() }
     store.exhaustivity = .off
-    await store.send(.received(method: .direct, destinationHash: Data(), data: before.packed))
+    await store.send(.received(method: .direct, destinationHash: before.destinationHash, data: before.packed))
     await store.receive { action in
         if case let .delegate(.messageDelivered(_, v, _)) = action { #expect(v == false); return true }; return false
     }
     // Both messages are from `sender`, so before.sourceHash == after.sourceHash.
     await store.send(.learnedIdentity(destinationHash: after.sourceHash, identity: sender))
-    await store.send(.received(method: .direct, destinationHash: Data(), data: after.packed))
+    await store.send(.received(method: .direct, destinationHash: after.destinationHash, data: after.packed))
     await store.receive { action in
         if case let .delegate(.messageDelivered(_, v, _)) = action { #expect(v == true); return true }; return false
     }

@@ -206,6 +206,14 @@ public struct LXMFRouter {
         /// Larger than the propagation node's announced per-transfer limit.
         case tooLargeForNode
     }
+    /// Why an inbound message was dropped before delivery (`.messageRejected`).
+    public enum RejectReason: Equatable, Sendable {
+        /// A `.direct` or `.propagated` message whose destination is not our delivery destination,
+        /// or one that arrived before any delivery destination was registered.
+        case notAddressedToUs
+        /// The sender's identity is known and the signature does not verify against it.
+        case badSignature
+    }
     public struct PropagationItem: Equatable { public var messageHash: Data; public var propagationPacked: Data }
 
     public enum Action: Equatable {
@@ -230,6 +238,9 @@ public struct LXMFRouter {
         /// large, or operational data showing a representative steady-state size.
         case rehydrateDedup(seenHashes: [Data], downloadedTransientIds: [Data])
         case learnedIdentity(destinationHash: Data, identity: Identity)
+        /// `destinationHash`: for `.opportunistic`, the packet's destination, from which the message
+        /// is rebuilt. For `.direct` and `.propagated`, OUR delivery destination hash (empty when none
+        /// is registered); the message's own destination must equal it.
         case received(method: DeliveryMethod, destinationHash: Data, data: Data)
         case send(message: LXMessage, desiredMethod: DeliveryMethod)
         case setOutboundPropagationNode(Data?)
@@ -305,6 +316,9 @@ public struct LXMFRouter {
         public enum Delegate: Equatable {
             case messageDelivered(message: LXMessage, signatureValidated: Bool, method: DeliveryMethod)
             case duplicateDropped(hash: Data)
+            /// The message was dropped by a forgery check and NOT marked seen, so a genuine copy with
+            /// the same hash is still delivered.
+            case messageRejected(hash: Data, reason: RejectReason)
             /// `messageHash` becomes the packet's receipt token, so a proof for ANY attempt of this
             /// message comes back as `.opportunisticDelivered(messageHash:)`.
             case sendOpportunistic(destinationHash: Data, payload: Data, messageHash: Data)
@@ -714,11 +728,35 @@ public struct LXMFRouter {
                     reconstructed = LXMessage.unpack(data)
                 }
                 guard let message = reconstructed else { return .none }   // malformed → drop
+                // Addressing: a link packet or Resource, and a propagated download, each carry the
+                // message's own destination hash, which must be ours; otherwise a link peer or a
+                // propagation node could hand us a validly-signed message meant for someone else.
+                // Reference `LXMRouter.lxmf_delivery` drops these only incidentally, when
+                // `self.delivery_destinations[message.destination_hash]` (LXMRouter.py:1861, LXMF
+                // 1.1.0) raises into its catch-all. An opportunistic message is rebuilt from the
+                // packet's destination, which Transport only decrypts for us.
+                if method != .opportunistic {
+                    guard !destinationHash.isEmpty, message.destinationHash == destinationHash else {
+                        return .send(.delegate(.messageRejected(hash: message.hash, reason: .notAddressedToUs)))
+                    }
+                }
+                // A known sender's signature must verify. Deliberate departure from reference
+                // `lxmf_delivery`, which delivers such a message flagged `signature_validated = False`:
+                // a forgery would then show as the contact's. Unknown senders cannot be checked, so
+                // they are delivered unvalidated (the app marks them). Both drops come BEFORE `seen`:
+                // a forged copy arriving first must not make the genuine one look like a duplicate.
+                let validated: Bool
+                if let identity = state.knownIdentities[message.sourceHash] {
+                    guard message.validateSignature(source: identity) else {
+                        return .send(.delegate(.messageRejected(hash: message.hash, reason: .badSignature)))
+                    }
+                    validated = true
+                } else {
+                    validated = false
+                }
                 guard state.seen.insert(message.hash) else {
                     return .send(.delegate(.duplicateDropped(hash: message.hash)))
                 }
-                let validated = state.knownIdentities[message.sourceHash]
-                    .map { message.validateSignature(source: $0) } ?? false
                 return .send(.delegate(.messageDelivered(message: message, signatureValidated: validated,
                                                          method: method)))
 
