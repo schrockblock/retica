@@ -11,10 +11,17 @@ public struct LearnedDestination: Equatable, Sendable {
     public var nextHop: Data?         // transport_id, or nil if directly heard
     public var announceEmitted: UInt64
     public var learnedAt: Date
+    /// The link-request stamp cost this destination announced, or nil. Read only from an announce whose
+    /// network stamp met the cost we demand (`Announce.Parsed.linkCost`, reference `lr_cost`).
+    public var linkCost: Double?
+    /// The value of the network stamp on the announce, valid or not, or nil when it carried none
+    /// (`Announce.Parsed.stampValue`, reference `stamp_value`).
+    public var stampValue: Double?
 
     public init(identity: Identity, appData: Data?, ratchet: Data?, interfaceID: InterfaceID,
                 hops: UInt8, nextHop: Data?, announceEmitted: UInt64,
-                learnedAt: Date = Date(timeIntervalSince1970: 0)) {
+                learnedAt: Date = Date(timeIntervalSince1970: 0),
+                linkCost: Double? = nil, stampValue: Double? = nil) {
         self.identity = identity
         self.appData = appData
         self.ratchet = ratchet
@@ -23,6 +30,8 @@ public struct LearnedDestination: Equatable, Sendable {
         self.nextHop = nextHop
         self.announceEmitted = announceEmitted
         self.learnedAt = learnedAt
+        self.linkCost = linkCost
+        self.stampValue = stampValue
     }
 
     /// The transport instance a packet for `destinationHash` (this entry's destination) must be

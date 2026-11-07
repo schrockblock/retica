@@ -28,6 +28,10 @@ public enum NetworkStamp {
     public static let stampLength = 14
     /// RNS.Identity.EXTPAYLOADMARKER, never used at msgpack object boundaries.
     public static let extensionMarker: UInt8 = 0xC1
+    /// RNS.Identity.EXTPAYLOADLENGTH: the announce extension is marker, flags byte, stamp, then the link
+    /// cost as two bytes, fractional byte first and the anchor (integer part, reserved flag in the MSB)
+    /// last (Destination.py:354).
+    public static let extensionLength = 2 + stampLength + 2
 
     // MARK: Defaults and caps
 
@@ -64,6 +68,15 @@ public enum NetworkStamp {
         let v = (cost * Double(costFixedPointScale) + 0.5).rounded(.down)
         let clamped = min(max(v, 0), Double(maxFixedPoint))
         return Int(clamped)
+    }
+
+    /// A cost from its two big-endian fixed-point bytes, `((b[0] << 8) | b[1]) / 256` (RNS
+    /// cost_from_bytes). Nil unless exactly two bytes. Not clamped: up to 255.996, as the reference reads.
+    public static func cost(fromBytes bytes: Data) -> Double? {
+        guard bytes.count == 2 else { return nil }
+        let high = Int(bytes[bytes.startIndex])
+        let low = Int(bytes[bytes.startIndex + 1])
+        return Double(high << costFixedPointBits | low) / Double(costFixedPointScale)
     }
 
     /// The 32-byte big-endian hash threshold for a fixed-point cost (RNS target_from_fp). Out-of-range

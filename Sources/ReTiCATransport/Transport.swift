@@ -700,7 +700,8 @@ public struct Transport {
                     let candidate = LearnedDestination(
                         identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
                         interfaceID: interfaceID, hops: packet.hops, nextHop: nextHop,
-                        announceEmitted: emitted, learnedAt: date.now)
+                        announceEmitted: emitted, learnedAt: date.now,
+                        linkCost: parsed.linkCost, stampValue: parsed.stampValue)
                     // A route whose interface is gone (a radio switched off, a BLE session ended)
                     // carries nothing, yet it is kept on purpose (see `reachableLearned`: TCP comes
                     // back under the same id). Kept, it must not outrank a live route: reference

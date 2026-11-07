@@ -48,7 +48,7 @@ let package = Package(
         .testTarget(
             name: "ReTiCATests",
             dependencies: ["ReTiCA"],
-            resources: [.process("Vectors/fixtures.json"), .process("Vectors/lxmf_fixtures.json"), .process("Vectors/lxmf_propagation_fixtures.json"), .process("Vectors/lxmf_rich_fixtures.json"), .process("Vectors/lxmf_stamp_fixtures.json"), .process("Vectors/lxmf_peering_fixtures.json"), .process("Vectors/lxmf_pn_announce_fixtures.json"), .process("Vectors/msgpack_signed_fixtures.json"), .process("Vectors/lxmf_signed_fixtures.json"), .process("Vectors/lxmf_announce_fixtures.json"), .process("Vectors/lxmf_stamped_announce_fixtures.json"), .process("Vectors/network_stamp_fixtures.json")]
+            resources: [.process("Vectors/fixtures.json"), .process("Vectors/lxmf_fixtures.json"), .process("Vectors/lxmf_propagation_fixtures.json"), .process("Vectors/lxmf_rich_fixtures.json"), .process("Vectors/lxmf_stamp_fixtures.json"), .process("Vectors/lxmf_peering_fixtures.json"), .process("Vectors/lxmf_pn_announce_fixtures.json"), .process("Vectors/msgpack_signed_fixtures.json"), .process("Vectors/lxmf_signed_fixtures.json"), .process("Vectors/lxmf_announce_fixtures.json"), .process("Vectors/lxmf_stamped_announce_fixtures.json"), .process("Vectors/network_stamp_fixtures.json"), .process("Vectors/stamped_announce_packet_fixtures.json")]
         ),
         .testTarget(
             name: "ReTiCAInterfacesTests",
@@ -82,7 +82,7 @@ let package = Package(
                 "ReTiCATransport",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
             ],
-            resources: [.process("Vectors/transport_fixtures.json"), .process("Vectors/proof_fixtures.json")]
+            resources: [.process("Vectors/transport_fixtures.json"), .process("Vectors/proof_fixtures.json"), .process("Vectors/stamped_announce_packet_fixtures.json")]
         ),
         .target(
             name: "ReTiCANode",
