@@ -180,6 +180,128 @@ private func stallTheDeliveryCopy(_ store: TestStore<LXMFNode.State, LXMFNode.Ac
     #expect(store.state.router.outboundQueue[dest]?.count == 1)      // the delivery copy proceeds
 }
 
+// MARK: - The propagated copy carries the recipient's delivery stamp
+//
+// A recipient enforcing stamps checks them on propagated messages too (`lxmf_propagation` passes
+// `no_stamp_enforcement=False` for all but paper messages, LXMRouter.py:2828-2861, LXMF 1.3.0), and
+// MeshChatX enforces by default. An unstamped copy reaches the node, is accepted, is synced, and is
+// then dropped. The assertions open the copy as the recipient would.
+
+/// Small enough that real searches take well under a second.
+private let cheapCost = 2
+/// MeshChatX's default. High enough that random bytes pass 1 time in 256: at `cheapCost` they pass 1
+/// in 4, and a garbage stamp survived these tests that way.
+private let deliveryCost = 8
+
+/// Wait for the copy handed to the router and open it with the recipient's key.
+@MainActor
+private func openedPropagatedCopy(_ store: TestStore<LXMFNode.State, LXMFNode.Action>, _ recipient: Identity,
+                                  of hash: Data) async throws -> LXMessage {
+    let packed = LockIsolated<Data?>(nil)
+    await store.receive({ action in
+        guard case let .router(.sendViaPropagation(sent, bytes)) = action, sent.hash == hash else { return false }
+        packed.setValue(bytes)
+        return true
+    }, timeout: .seconds(30))
+    let bytes = try #require(packed.value)
+    let container = try #require(LXMFPropagation.parseContainer(bytes))
+    let entry = try #require(container.entries.first)
+    #expect(LXStamper.validatePnStamp(transientData: entry, targetCost: cheapCost) != nil)
+    return try #require(LXMFPropagation.open(lxmfData: entry, recipientIdentity: recipient))
+}
+
+@Test @MainActor func aFallbackCopyCarriesTheDeliveryStampOfTheDeliveryCopy() async throws {
+    let clock = TestClock()
+    let (store, recipient) = pnNode(limitKB: 0, stampCost: cheapCost, clock: clock, deliveryStampCost: deliveryCost)
+    let m = note()
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    let handed = LockIsolated<LXMessage?>(nil)
+    await store.receive({ action in
+        guard case let .router(.send(sent, _)) = action else { return false }
+        handed.setValue(sent)
+        return true
+    }, timeout: .seconds(30))
+    await stallTheDeliveryCopy(store, clock, m)
+
+    let opened = try await openedPropagatedCopy(store, recipient, of: m.hash)
+    #expect(opened.validateStamp(targetCost: deliveryCost))
+    // The search is not repeated: at a high cost that would be minutes more on a phone.
+    #expect(opened.stamp == handed.value?.stamp)
+}
+
+/// The delivery copy went out before the peer's cost was known, and the cost arrived afterwards.
+@Test @MainActor func aFallbackCopyIsStampedWhenTheCostWasLearnedAfterTheDeliveryCopyLeft() async throws {
+    let clock = TestClock()
+    let (store, recipient) = pnNode(limitKB: 0, stampCost: cheapCost, clock: clock)
+    let m = note()
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await store.send(.rehydrateLearnedPeers([dest: LXMFNode.LearnedPeer(
+        displayName: nil, stampCost: deliveryCost, supportsCompression: false,
+        learnedAt: Date(timeIntervalSince1970: 1700000000))]))
+    await stallTheDeliveryCopy(store, clock, m)
+
+    let opened = try await openedPropagatedCopy(store, recipient, of: m.hash)
+    #expect(opened.validateStamp(targetCost: deliveryCost))
+}
+
+@Test @MainActor func aFallbackCopyStaysUnstampedWhenThePeerAsksForNoStamp() async throws {
+    let clock = TestClock()
+    let (store, recipient) = pnNode(limitKB: 0, stampCost: cheapCost, clock: clock)
+    let m = note()
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await stallTheDeliveryCopy(store, clock, m)
+    let opened = try await openedPropagatedCopy(store, recipient, of: m.hash)
+    #expect(opened.stamp == nil)
+}
+
+/// Refusing to do the work must not refuse to send, as on the delivery path.
+@Test @MainActor func aFallbackCopyGoesOutUnstampedWhenThePeersCostIsAboveTheCeiling() async throws {
+    let clock = TestClock()
+    let (store, recipient) = pnNode(limitKB: 0, stampCost: cheapCost, clock: clock,
+                                    deliveryStampCost: LXMFNode.maxDeliveryStampCost + 1)
+    let m = note()
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await stallTheDeliveryCopy(store, clock, m)
+    let opened = try await openedPropagatedCopy(store, recipient, of: m.hash)
+    #expect(opened.stamp == nil)
+}
+
+@Test @MainActor func sendViaPropagationCarriesADeliveryStamp() async throws {
+    let (store, recipient) = pnNode(limitKB: 0, stampCost: cheapCost, deliveryStampCost: deliveryCost)
+    await store.send(.sendViaPropagation(destinationHash: dest, title: Data("t".utf8), content: Data("c".utf8)))
+    let packed = LockIsolated<Data?>(nil)
+    await store.receive({ action in
+        guard case let .router(.sendViaPropagation(_, bytes)) = action else { return false }
+        packed.setValue(bytes)
+        return true
+    }, timeout: .seconds(30))
+    let bytes = try #require(packed.value)
+    let container = try #require(LXMFPropagation.parseContainer(bytes))
+    let entry = try #require(container.entries.first)
+    let opened = try #require(LXMFPropagation.open(lxmfData: entry, recipientIdentity: recipient))
+    #expect(opened.validateStamp(targetCost: deliveryCost))
+}
+
+/// A delivery stamp searched for the copy is part of that copy's work, so the same lever stops it.
+/// At the ceiling it runs for minutes, so the store can only finish because it was cancelled.
+@Test(.timeLimit(.minutes(1))) @MainActor func cancelPropagationStampsStopsADeliveryStampSearchForTheCopy() async {
+    let clock = TestClock()
+    let (store, _) = pnNode(limitKB: 0, stampCost: cheapCost, clock: clock)
+    let m = note()
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await store.send(.rehydrateLearnedPeers([dest: LXMFNode.LearnedPeer(
+        displayName: nil, stampCost: LXMFNode.maxDeliveryStampCost, supportsCompression: false,
+        learnedAt: Date(timeIntervalSince1970: 1700000000))]))
+    await stallTheDeliveryCopy(store, clock, m)
+    await store.send(.cancelPropagationStamps)
+    await store.receive(.router(.abandonPendingPropagatedCopies(stillSearching: [])))
+    await store.send(.router(.opportunisticDelivered(messageHash: m.hash)))
+    await store.skipReceivedActions(strict: false)
+    store.exhaustivity = .on       // with exhaustivity off, a `finish` that times out reports nothing
+    await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
+    await store.finish(timeout: .seconds(10))
+}
+
 /// Review Focus 7: every existing fixture announces `perTransferLimit: 0`. That is "unknown", not
 /// "nothing fits": the copy is attempted, and marked pending while its stamp is searched.
 @Test @MainActor func pnCopyNodeMarksTheCopyPendingWhileItsStampIsSearched() async {

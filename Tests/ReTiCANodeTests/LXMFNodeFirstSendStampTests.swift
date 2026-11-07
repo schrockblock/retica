@@ -17,8 +17,8 @@ import ComposableArchitecture
 
 private let iface = InterfaceID("first-send-iface")
 private let sentAt: TimeInterval = 1700000000.5
-/// Small enough that a real stamp search takes well under a second.
-private let cheapCost = 2
+/// MeshChatX's default. A real search stays quick, and random bytes pass only 1 time in 256.
+private let cheapCost = 8
 
 /// Counted in a reducer: with exhaustivity off, `store.send` skips actions before a later `receive`
 /// predicate could see them.

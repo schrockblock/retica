@@ -660,11 +660,13 @@ public struct LXMFNode {
                 state.router.uncancel(msg.hash)   // an app send is a fresh send (see `.sendMessage`)
                 refreshOutboundPropagationNodeRetryWait(&state)
                 let ts = date.now.timeIntervalSince1970
+                let deliveryCost = deliveryStampCost(state, destinationHash: destinationHash)
                 return .run { send in
-                    guard let (packed, _) = await LXMFPropagation.pack(
-                        message: msg, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                    guard let stamped = await LXMFNode.withDeliveryStamp(msg, cost: deliveryCost),
+                          let (packed, _) = await LXMFPropagation.pack(
+                              message: stamped, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
                     else { return }                                  // cancelled mid-search
-                    await send(.router(.sendViaPropagation(message: msg, propagationPacked: packed)))
+                    await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
                 }
                 .cancellable(id: CancelID.propagationStamp)
 
@@ -1007,6 +1009,10 @@ public struct LXMFNode {
                 // the unstamped fast path (which never appended) and the completed search. Removing an
                 // absent hash is a no-op, which is why no branch is needed here.
                 state.inFlightDeliveryStamps.removeAll { $0 == handedOn.hash }
+                // A fallback packs this copy, so it reuses the stamp rather than searching again.
+                if handedOn.stamp != nil, state.pendingFallbacks[handedOn.hash] != nil {
+                    state.pendingFallbacks[handedOn.hash] = handedOn
+                }
                 return .none
 
             // The message is over, so a fallback it was waiting on is not needed (a rejected
@@ -1268,31 +1274,25 @@ public struct LXMFNode {
     /// now advertises a cost we refuse) is failed through the router's `fail` — the message still
     /// gets its terminal outcome.
     ///
-    /// KNOWN GAP, deliberately deferred: this packs the ORIGINAL, UNSTAMPED `message`, so a recipient
-    /// who enforces delivery stamps drops it even though the delivery copy carries one. Same failure
-    /// class as the `.sendMessage`-had-no-stamp gap closed earlier, one layer down.
-    ///
-    /// The barrier is EFFECT SEQUENCING, not `transient_id` stability — an earlier note here said the
-    /// latter and a re-review corrected it, so it is recorded rather than silently replaced. It is
-    /// true that stamping first changes `message.packed` and therefore the `transient_id` that
-    /// `LXMFPropagation.pack` derives from it. But that does NOT destabilise retries:
-    /// `ResendInfo.propagated` re-sends the already-packed `propagationPacked` bytes and never
-    /// re-calls `pack`, so stamping once and packing once would still give a stable id. The real cost
-    /// is that both the delivery-stamp search and `pack`'s own propagation-stamp search are async and
-    /// potentially minutes long, so doing both means turning these two CONCURRENT effects into a
-    /// sequential chain — with its own cancellation ordering and partial-failure cases. That deserves
-    /// its own design and tests; it is not a line to slip in here.
+    /// **The copy carries the recipient's delivery stamp**, because a recipient enforcing stamps checks
+    /// them on propagated messages too (`lxmf_propagation`, LXMRouter.py:2826-2861, LXMF 1.3.0). The
+    /// delivery copy normally has one by now: a fallback only comes due after that copy reached the
+    /// router, and `.router(.send)` swapped the stamped message into `pendingFallbacks`. The search here
+    /// is for a cost learned since then. Retries stay stable because `ResendInfo.propagated` re-sends
+    /// the packed bytes and never packs again.
     private func startPropagatedCopy(_ state: inout State, message: LXMessage) -> Effect<Action> {
         guard let recipient = state.endpoint.learned[message.destinationHash]?.identity,
               let cost = propagationStampCost(state)
         else { return .send(.router(.propagatedCopyFailed(messageHash: message.hash))) }
         refreshOutboundPropagationNodeRetryWait(&state)
         let ts = date.now.timeIntervalSince1970
+        let deliveryCost = message.stamp == nil ? deliveryStampCost(state, destinationHash: message.destinationHash) : nil
         return .run { send in
-            guard let (packed, _) = await LXMFPropagation.pack(
-                message: message, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+            guard let stamped = await LXMFNode.withDeliveryStamp(message, cost: deliveryCost),
+                  let (packed, _) = await LXMFPropagation.pack(
+                      message: stamped, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
             else { return }                          // cancelled mid-search
-            await send(.router(.sendViaPropagation(message: message, propagationPacked: packed)))
+            await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
         }
         .cancellable(id: CancelID.propagationStampFor(message.hash))
         .cancellable(id: CancelID.propagationStamp)
@@ -1402,6 +1402,12 @@ public struct LXMFNode {
         }
         .cancellable(id: CancelID.deliveryStampFor(message.hash))
         .cancellable(id: CancelID.deliveryStamp)
+    }
+
+    /// `message` stamped at `cost`, or unchanged when `cost` is nil. Nil only if the search was cancelled.
+    private static func withDeliveryStamp(_ message: LXMessage, cost: Int?) async -> LXMessage? {
+        guard let cost else { return message }
+        return await LXStamper.generateStamp(messageId: message.hash, targetCost: cost).map(message.withStamp)
     }
 
     /// Park a first send and, for the first one to this destination, start asking for a path.
