@@ -54,6 +54,10 @@ public struct MeshCoreReassembler: Equatable, Sendable {
     public mutating func receive(
         src: Data, packetID: UInt16, index: UInt8, total: UInt8, body: Data, now: Date
     ) -> Data? {
+        guard total > 0, index < total else {
+            counters.malformed += 1
+            return nil
+        }
         purge(now: now)
 
         let key = Key(src: Data(src), packetID: packetID)

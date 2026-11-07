@@ -250,6 +250,33 @@ extension MeshCoreReassembler {
         #expect(sut.feedAll(p, at: t0.addingTimeInterval(-100)) == [packet])
     }
 
+    @Test func indexAtOrPastTotalCountsMalformed() {
+        var sut = MeshCoreReassembler()
+        let far = sut.receive(
+            src: sender(0), packetID: 1, index: 5, total: 2, body: bytes(10), now: t0)
+        #expect(far == nil)
+        #expect(sut.counters.malformed == 1)
+        #expect(sut.bufferCount == 0)
+        let first = sut.receive(
+            src: sender(0), packetID: 1, index: 0, total: 2, body: bytes(10), now: t0)
+        #expect(first == nil)
+        #expect(sut.counters.completed == 0)
+        let atTotal = sut.receive(
+            src: sender(0), packetID: 2, index: 2, total: 2, body: bytes(10), now: t0)
+        #expect(atTotal == nil)
+        #expect(sut.counters.malformed == 2)
+        #expect(sut.bufferCount == 1)
+    }
+
+    @Test func zeroTotalCountsMalformed() {
+        var sut = MeshCoreReassembler()
+        let result = sut.receive(
+            src: sender(0), packetID: 1, index: 0, total: 0, body: bytes(10), now: t0)
+        #expect(result == nil)
+        #expect(sut.counters.malformed == 1)
+        #expect(sut.bufferCount == 0)
+    }
+
     @Test func resetDropsEveryBuffer() {
         var sut = MeshCoreReassembler()
         _ = sut.feed(parts(bytes(300))[0])
