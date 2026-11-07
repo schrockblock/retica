@@ -120,6 +120,14 @@ cases = {
 hi.enable_ratchets(os.path.join(workdir, "hi_ratchets"))
 cases["ratchet_stripped"] = case(hi, MSGPACK)
 
+# An lxmf.delivery destination announcing link cost 20 (LinkPlane.maxLinkStampCost), whose key search
+# cannot finish inside a test: LinkPlaneStampedRequestTests stops an LXMFNode with a message queued to it.
+lxmf = RNS.Destination(RNS.Identity(), RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
+lxmf.set_value(25)
+lxmf.set_link_cost(20)
+assert lxmf._await_stamp()
+cases["lxmf_delivery_cost_20"] = case(lxmf, MSGPACK)
+
 cost_cases = [{"bytes": bytes(b).hex(), "fp": fp_from_bytes(bytes(b)), "cost": cost_from_bytes(bytes(b))}
               for b in ([0x00, 0x00], [0x03, 0x40], [0x0C, 0x80], [0x64, 0x00], [0x64, 0x01],
                         [0x7F, 0xFF], [0xFF, 0xFF])]
@@ -145,6 +153,7 @@ assert c["at_cap"]["lr_cost"] == 100.0 and c["at_cap"]["app_data"] == MSGPACK.he
 assert c["nonzero_flags"]["lr_cost"] == 3.25 and c["nonzero_flags"]["app_data"] == MSGPACK.hex()
 assert c["ratchet_stripped"]["context_flag"] and c["ratchet_stripped"]["lr_cost"] == 3.25
 assert c["ratchet_stripped"]["app_data"] == MSGPACK.hex()
+assert c["lxmf_delivery_cost_20"]["lr_cost"] == 20.0 and c["lxmf_delivery_cost_20"]["app_data"] == MSGPACK.hex()
 # The emission time is the last five bytes of the random hash (payload bytes 79..84). If the burst ever
 # straddles a second, run the generator again.
 assert len({bytes.fromhex(c[k]["payload"])[79:84] for k in ("stripped", "at_cap")}) == 1

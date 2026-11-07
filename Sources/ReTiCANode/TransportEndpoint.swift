@@ -205,8 +205,10 @@ public struct TransportEndpoint {
                                  state.meshtastic != nil ? .send(.meshtastic(.start)) : .none])
             case .stop:
                 // Link-request key searches are CPU work, not I/O, so no driver stopping ends them:
-                // cancel them here. Each one's link fails with `.stampFailure`, as reference's does
-                // when its search ends without a key.
+                // cancel them here, not when each interface reports its disconnect, because a
+                // Meshtastic radio reports offline only after `driver.stop()` returns. Each link
+                // fails with `.pathStale` (see `LinkPlane.failStampSearches` for why not
+                // `.stampFailure`).
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .disconnect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
                                  state.ble != nil ? .send(.ble(.stop)) : .none,

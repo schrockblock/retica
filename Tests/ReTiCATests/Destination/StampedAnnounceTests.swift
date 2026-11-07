@@ -175,13 +175,16 @@ private func expectMatchesReference(_ c: StampedAnnounceCase,
 @Test func theRequiredValueIsTheCallers() throws {
     let f = try Fixtures.load()
     let msgpack = Data(hexString: f.msgpack)!
-    // A value-27.7 stamp does not meet 28: kept in app data, cost ignored, value still reported.
-    let strict = try #require(parse(f["stripped"], requiredStampValue: 28))
+    // Thresholds come from the stamps the generator mined, which differ on every run.
+    let hiValue = try #require(f["stripped"].stamp_value)
+    let loValue = try #require(f["below_cost"].stamp_value)
+    // A stamp does not meet a value one above its own: kept in app data, cost ignored, value still reported.
+    let strict = try #require(parse(f["stripped"], requiredStampValue: hiValue + 1))
     #expect(strict.appData == Data(f["stripped"].payloadBytes.suffix(9 + 18)))
     #expect(strict.linkCost == nil)
     #expect(strict.stampValue == f["stripped"].stamp_value)
-    // A value-10.8 stamp meets 10: stripped, and the cost it carries is read.
-    let lenient = try #require(parse(f["below_cost"], requiredStampValue: 10))
+    // A stamp below the default 23.5 still meets a value one below its own: stripped, and its cost read.
+    let lenient = try #require(parse(f["below_cost"], requiredStampValue: loValue - 1))
     #expect(lenient.appData == msgpack)
     #expect(lenient.linkCost == 12.5)
 }

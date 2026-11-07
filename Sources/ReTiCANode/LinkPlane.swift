@@ -26,10 +26,10 @@ public enum LinkFailure: Equatable, Sendable {
     /// not help, because the path demonstrably works.
     case handshakeRejected
     /// The destination announced a link cost and we could not produce a LINKREQUEST key meeting it:
-    /// the cost is above `LinkPlane.maxLinkStampCost`, the search ran out its
-    /// `NetworkStamp.linkStampTimeout`, or it was cancelled because the endpoint stopped. Reference
-    /// `Link.STAMP_FAILURE` (Link.py:337-342). No packet left this node, so it says nothing about the
-    /// path or the peer.
+    /// the cost is above `LinkPlane.maxLinkStampCost`, or the search ran out its
+    /// `NetworkStamp.linkStampTimeout`. Reference `Link.STAMP_FAILURE` (Link.py:337-342). No packet
+    /// left this node, so it says nothing about the path or the peer. A search ended because its
+    /// interface went away, or the endpoint stopped, reports `.pathStale` instead.
     case stampFailure
 }
 
@@ -153,8 +153,9 @@ public struct LinkPlane {
         case stampedKeyFound(id: UUID, x25519PrivateKey: Data, x25519PublicKey: Data)
         /// A search for `stampingLinks[id]` ran out `NetworkStamp.linkStampTimeout`.
         case stampSearchTimedOut(id: UUID)
-        /// Cancel every in-flight key search and fail its link with `.stampFailure`. The host sends
-        /// this when it stops, so no search outlives the endpoint.
+        /// Cancel every in-flight key search and fail its link with `.pathStale`. The host sends this
+        /// when it stops, so no search outlives the endpoint. (`.interfaceDisconnected` does the same
+        /// for the searches bound to that one interface.)
         case cancelStampSearches
         /// Create a responder link for an inbound LINKREQUEST and accept it. `arrivalBitrate` is
         /// the bitrate of the interface the request arrived on (`nil` = unknown → 15 s); it sets the
@@ -216,6 +217,23 @@ public struct LinkPlane {
     @Dependency(\.continuousClock) var clock
 
     private enum CancelID: Hashable { case stampSearch(UUID) }
+
+    /// Cancel these key searches, drop them, and fail each link with `.pathStale`: the interface the
+    /// link would ride is gone or going (it disconnected, or the endpoint is stopping).
+    ///
+    /// Deliberately not `.stampFailure`. LXMFNode retries a stamp failure at once (`requestLink`),
+    /// and on a stopping endpoint whose interface outlives `.stop` (a Meshtastic radio reports
+    /// offline only after `driver.stop()` returns) that retry started a NEW 15 s search. A
+    /// path-shaped failure parks the destination for a fresh path instead, which is also the right
+    /// recovery when the interface really went away.
+    private func failStampSearches(_ searches: IdentifiedArrayOf<StampingLink>,
+                                   from state: inout State) -> Effect<Action> {
+        for pending in searches { state.stampingLinks.remove(id: pending.id) }
+        return .merge(searches.map { pending in
+            .merge(.cancel(id: CancelID.stampSearch(pending.id)),
+                   .send(.delegate(.linkFailed(destinationHash: pending.destinationHash, reason: .pathStale))))
+        })
+    }
 
     public var body: some ReducerOf<Self> {
         // LATE ACTIONS FOR A REMOVED LINK are dropped quietly. A link element is removed on its
@@ -319,13 +337,7 @@ public struct LinkPlane {
                 return .send(.delegate(.linkFailed(destinationHash: pending.destinationHash, reason: .stampFailure)))
 
             case .cancelStampSearches:
-                let cancelled = state.stampingLinks
-                state.stampingLinks.removeAll()
-                return .merge(cancelled.map { pending in
-                    .merge(.cancel(id: CancelID.stampSearch(pending.id)),
-                           .send(.delegate(.linkFailed(destinationHash: pending.destinationHash,
-                                                       reason: .stampFailure))))
-                })
+                return failStampSearches(state.stampingLinks, from: &state)
 
             case let .acceptLinkRequest(owner, destinationHash, interfaceID, data, arrivalBitrate):
                 // A responder cannot sign the LRPROOF without a private key: `Link.buildProof` →
@@ -431,7 +443,11 @@ public struct LinkPlane {
                 for id in state.links.ids where state.links[id: id]?.interfaceID == interfaceID {
                     state.links[id: id]?.rehomePermitted = true
                 }
-                return .none
+                // A key search, unlike a link, has sent nothing yet, so there is nothing to re-home:
+                // it would mint its link on this dead interface when it ends, up to 15 s from now,
+                // and the link would then sit out its establishment deadline. End it now instead.
+                let orphaned = state.stampingLinks.filter { $0.interfaceID == interfaceID }
+                return failStampSearches(orphaned, from: &state)
 
             case let .sendOverLink(linkID, data):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
