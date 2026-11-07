@@ -60,11 +60,7 @@ public struct ScotMeshRawCodec: MeshCoreTunnelCodec, Equatable {
         packetID: UInt16, canRoute: Bool
     ) -> [Data] {
         let data = Data(data)
-        let src = Data(src)
-        let dst = Data(dst)
-        guard !data.isEmpty,
-              src.count == Self.prefixSize, dst.count == Self.prefixSize
-        else { return [] }
+        guard src.count == Self.prefixSize, dst.count == Self.prefixSize else { return [] }
         let total = (data.count + Self.payloadSize - 1) / Self.payloadSize
         guard total <= Self.maxFragments else { return [] }
 
@@ -72,8 +68,8 @@ public struct ScotMeshRawCodec: MeshCoreTunnelCodec, Equatable {
         var datagrams: [Data] = []
         datagrams.reserveCapacity(total)
         for index in 0..<total {
-            let start = data.startIndex + index * Self.payloadSize
-            let end = min(start + Self.payloadSize, data.endIndex)
+            let start = index * Self.payloadSize
+            let end = min(start + Self.payloadSize, data.count)
             var datagram = Data()
             datagram.reserveCapacity(Self.headerSize + end - start)
             datagram.append(Self.magic)
