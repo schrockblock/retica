@@ -396,14 +396,14 @@ content. See that package's README and its `docs/server-contract.md`.
 |---|---|---|
 | RNS (Python) | **1.4.2** | Current fixtures and source comments (IFAC, proofs, transport, the link probe harness). |
 | RNS (Python) | 1.3.8 | The first fixtures (crypto, packets, links, resources); some source comments still cite it. |
-| LXMF (Python) | **1.1.0** | All LXMF fixtures and source comments. One comment cites 1.1.1 (the ignore list). |
+| LXMF (Python) | **1.1.0** | Almost all LXMF fixtures and source comments. One comment cites 1.1.1 (the ignore list). |
+| RNS 1.6.0 with LXMF 1.3.0 | The latest, partly covered | Stamped announce fixtures and the live stamp tests only, in the conda env `rns-latest`. |
 | ble-reticulum | a local checkout of torlando-tech/ble-reticulum, plus `ble_support.py` from a Reticulum fork | BLE fragmentation and greylist fixtures. The script calls the checkout pinned but does not record which commit. |
 | RNS_Over_Meshtastic | landandair, commit `e5eb5d23a619958ae0556c88fcbc4bf1d867ab0a` | Meshtastic fragment fixtures (an unmodified copy of the reference file is in the repo). |
 
 Source comments cite reference files and line numbers (`Transport.py:1442`, `LXMRouter.py:1034`)
-for those versions. Nothing in the repository tests against RNS 1.5.x or later, and the fixtures
-have not been regenerated against newer releases, so a change introduced after RNS 1.4.2 /
-LXMF 1.1.0 would not be caught.
+for those versions. Apart from that one row, the fixtures have not been regenerated against newer
+releases, so most changes introduced after RNS 1.4.2 / LXMF 1.1.0 would not be caught.
 
 ## Reticulum (RNS) features
 
@@ -448,9 +448,9 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Sync from a propagation node (`/get`) | Implemented | Identifies on the link first, as the reference node requires. |
 | Running a propagation node (serving clients) | Implemented | `LXMFServiceNode`, `PNNode`. In memory; the host persists. |
 | Propagation node peering (node-to-node sync, peering keys) | **Partial** | Offer/wanted exchange and peering-key generation and validation exist, and the keys are cross-validated. Stamp validation is not throttled (reference refuses with `ERROR_THROTTLED`), and peering has not been tested against a reference `lxmd` in this repo. |
-| Delivery announce app data (display name, stamp cost) | Implemented, cross-validated | |
-| Propagation node announces | Implemented, cross-validated | |
-| Delivery stamps | Implemented, cross-validated | Generated when a peer asks for a cost of 20 or less; above 20 ReTiCA sends unstamped (reference has no ceiling). Inbound validation once you set a cost; enforcement off by default, as in reference. |
+| Delivery announce app data (display name, stamp cost) | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | A fractional cost is read as its ceiling. |
+| Propagation node announces | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | Fractional costs are read as their ceiling, and float limits are accepted. |
+| Delivery stamps | Implemented, cross-validated, tested live against RNS 1.6.0 / LXMF 1.3.0 | Generated when a peer asks for a cost of 20 or less, on the delivery copy and on propagated copies; above 20 ReTiCA sends unstamped (reference has no ceiling). Inbound validation once you set a cost; enforcement off by default, as in reference. MeshChatX turns enforcement on with a default cost of 8. |
 | Propagation stamps | Implemented, cross-validated | Cost ceiling 20 (reference has none). |
 | Tickets | **Missing** | An inbound `FIELD_TICKET` is carried but never used; with stamp enforcement on, a ticket-holding peer that reference would accept is rejected. |
 | Paper messages (`lxm://`, QR) | **Missing** | |
@@ -466,6 +466,9 @@ These are choices, explained at the relevant place in the source:
 - **Stamp cost ceilings** of 20 for delivery and propagation stamps. Reference relies on
   cancellation alone; a phone should not spend minutes of CPU because an unauthenticated
   announce asked it to.
+- **A first message to a peer with no known path waits for its announce**, up to 21 seconds, so
+  it can carry the stamp that peer requires. Reference reads the cost once at send time, so its
+  first message goes out unstamped.
 - **One Resource per link**, the rest queued.
 - **An oversized propagated copy is refused up front** instead of being sent and rejected by the node.
 - **Outbound retries can be held** while the app is suspended (no reference equivalent).
@@ -489,6 +492,7 @@ byte-for-byte reproduces what the reference produced. Running the tests does not
 | Identity, Token, signatures, packets, destinations, announces, HDLC, link handshake, MsgPack, resources | `Tests/ReTiCATests/Vectors/generate_fixtures.py` | `fixtures.json` | `CrossValidationTests.swift`, `PacketDestinationCrossValidationTests.swift`, `HDLCCrossValidationTests.swift`, `LinkCrossValidationTests.swift`, `LinkRequestCrossValidationTests.swift`, `ResourceCrossValidationTests.swift`, `HmuCrossValidationTests.swift`, `LargeRequestCrossValidationTests.swift`, `ResourceTransferCrossValidationTests.swift` (all in `Tests/ReTiCATests/Vectors/`) |
 | MsgPack types the reference emits, in signed payloads | `generate_msgpack_signed_fixtures.py` | `msgpack_signed_fixtures.json` | `MsgPackSignedCrossValidationTests.swift` |
 | LXMF message format | `generate_lxmf_fixtures.py`, `generate_lxmf_rich_fixtures.py`, `generate_lxmf_signed_fixtures.py` | `lxmf_fixtures.json`, `lxmf_rich_fixtures.json`, `lxmf_signed_fixtures.json` | `LXMessageCrossValidationTests.swift`, `LXMFRichCrossValidationTests.swift`, `MsgPackSignedCrossValidationTests.swift` |
+| Announce app data as RNS 1.6.0 / LXMF 1.3.0 send it, with network stamps | `generate_lxmf_stamped_announce_fixtures.py` | `lxmf_stamped_announce_fixtures.json` | `LXMFStampedAnnounceCrossValidationTests.swift` |
 | LXMF stamps and peering keys | `generate_lxmf_stamp_fixtures.py`, `generate_lxmf_peering_fixtures.py` | `lxmf_stamp_fixtures.json`, `lxmf_peering_fixtures.json` | `LXStamperCrossValidationTests.swift`, `LXStamperPeeringCrossValidationTests.swift`, `LXMFStampMessageCrossValidationTests.swift` |
 | Propagation container | `generate_lxmf_propagation_fixtures.py` | `lxmf_propagation_fixtures.json` | `LXMFPropagationCrossValidationTests.swift` |
 | Delivery announce app data, propagation node announces | `generate_lxmf_announce_fixtures.py`, `generate_lxmf_pn_announce_fixtures.py` | `lxmf_announce_fixtures.json`, `lxmf_pn_announce_fixtures.json` | `Tests/ReTiCATests/LXMFAnnounceDataCrossValidationTests.swift`, `PNAnnounceCrossValidationTests.swift` |
@@ -564,6 +568,19 @@ Both are skipped unless an environment variable is set.
   RETICA_LIVE_PROBE=1 swift test --no-parallel --filter LiveLinkProbe
   ```
 
+- **Messages surviving a peer that enforces stamps**
+  (`Tests/ReTiCANodeTests/LiveStampInteropTests.swift`, peer `Scripts/stampprobe/peer.py`, RNS 1.6.0
+  and LXMF 1.3.0, peer configured as MeshChatX configures its router). Covers stamped announces, a
+  first message before any announce, a large message over a link, a message from the peer, and a
+  propagated message through a real node to a recipient that syncs. The tests start the peers
+  themselves and assert on what the peer logged, because an enforcing peer proves a packet before
+  it drops it, so `deliveryConfirmed` does not show receipt.
+
+  ```sh
+  python -m pip install rns==1.6.0 lxmf==1.3.0
+  RETICA_LIVE_STAMP_PYTHON="$(which python)" swift test --no-parallel --filter LiveStampInteropTests
+  ```
+
   The harness keeps its configs and identities under `/tmp/ReTiCA/linkprobe`.
 
 ### 5. By hand
@@ -612,7 +629,11 @@ So that nobody reads more into the tables than is there:
   `docs/superpowers/plans/2026-10-16-meshtastic-hardware-checklist.md`) have no recorded results.
   BLE compatibility is cross-validated only at the fragmentation level.
 - Propagation node peering has not been tested against a reference `lxmd`.
-- Nothing has been checked against RNS 1.5.x or LXMF releases after 1.1.0.
+- Against RNS 1.6.0 and LXMF 1.3.0, only announce parsing and the live stamp tests have been
+  checked. RNS network stamps are not implemented, so a network enforcing them will drop ReTiCA's
+  announces and path requests, and ignore its link requests to destinations with a link cost.
+  The real MeshChatX application has not been run against ReTiCA, only a router configured from
+  its source.
 
 ---
 
