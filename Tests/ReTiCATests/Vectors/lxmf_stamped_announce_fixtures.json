@@ -1,0 +1,90 @@
+{
+  "delivery_integer_cost": {
+    "packed": "94c405416c696365089100cb4020000000000000c100e97e04230097c0e1f3c1ee03b6a84003",
+    "display_name": "Alice",
+    "stamp_cost": 8.0,
+    "supports_compression": true
+  },
+  "delivery_fractional_cost": {
+    "packed": "94c403426f62099100cb4021000000000000c10042a5656f152751c949defdf350c54003",
+    "display_name": "Bob",
+    "stamp_cost": 8.5,
+    "supports_compression": true
+  },
+  "delivery_no_cost": {
+    "packed": "94c4054361726f6cc09100c0c1000b3e59d3518ee54ef183dc40d78f4003",
+    "display_name": "Carol",
+    "stamp_cost": null,
+    "supports_compression": true
+  },
+  "delivery_stamp_only": {
+    "packed": "c10089e857f307a1900d2fb29911d4044003",
+    "display_name": null,
+    "stamp_cost": null,
+    "supports_compression": true
+  },
+  "delivery_post_1_6_2": {
+    "packed": "93c40444617665cb40210000000000009100",
+    "display_name": "Dave",
+    "stamp_cost": 8.5,
+    "supports_compression": true
+  },
+  "pn_fractional_cost": {
+    "packed": "98c2ce6aef7cf2c3cd0100cd28009311031282ccfea46c786d6400a5312e332e3093cb4030800000000000cb4008000000000000cb4032000000000000c100b6b32c9c61aa5c72a21baab2e419800c",
+    "valid": true,
+    "stamp_cost": 16.5,
+    "transfer_limit": 256,
+    "sync_limit": 10240
+  },
+  "pn_float_limits": {
+    "packed": "98c2ce6aef7cf2c3cb4070000000000000cb40c40000000000009310031282ccfea46c786d6400a5312e332e3093100312c100f714160649f6eefa7e635aac1af0800c",
+    "valid": true,
+    "stamp_cost": 16,
+    "transfer_limit": 256,
+    "sync_limit": 10240
+  },
+  "pn_post_1_6_2": {
+    "packed": "97c2ce6553f100c3cd0100cd280093cb4030800000000000cb4008000000000000cb403200000000000080",
+    "valid": true,
+    "stamp_cost": 16.5,
+    "transfer_limit": 256,
+    "sync_limit": 10240
+  },
+  "pn_bad_fractional_element": {
+    "packed": "98c2ce6553f100c3cd0100cd28009311031280a3626164",
+    "valid": false,
+    "stamp_cost": null,
+    "transfer_limit": null,
+    "sync_limit": null
+  },
+  "delivery_element_3_wins": {
+    "packed": "94c4016e09910007",
+    "display_name": "n",
+    "stamp_cost": 7,
+    "supports_compression": true
+  },
+  "delivery_element_3_not_a_number": {
+    "packed": "94c4016e099100a178",
+    "display_name": "n",
+    "stamp_cost": 9,
+    "supports_compression": true
+  },
+  "pn_element_7_wins": {
+    "packed": "98c2ce6553f100c3cd0100cd2800931403128093cb4030800000000000cb4008000000000000cb4032000000000000",
+    "valid": true,
+    "stamp_cost": 16.5,
+    "transfer_limit": 256,
+    "sync_limit": 10240
+  },
+  "pn_bad_whole_costs_good_fractional": {
+    "packed": "98c2ce6553f100c3cd0100cd280093a17803128093cb4030800000000000cb4008000000000000cb4032000000000000",
+    "valid": false,
+    "stamp_cost": null,
+    "transfer_limit": null,
+    "sync_limit": null
+  },
+  "versions": {
+    "rns": "1.6.0",
+    "lxmf": "1.3.0"
+  }
+}

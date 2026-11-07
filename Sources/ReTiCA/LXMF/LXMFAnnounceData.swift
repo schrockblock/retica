@@ -203,7 +203,8 @@ public struct LXMFAnnounceData: Equatable {
 
     /// Parse the 0.5.0+ msgpack array format. Degrades gracefully on short arrays.
     private static func parseMsgpackFormat(_ data: Data) -> LXMFAnnounceData? {
-        guard case let .array(items)? = MsgPack.decodeValue(data) else { return nil }
+        // Leading value, not strict: a stamped RNS 1.6 announce has 18 more bytes after the array.
+        guard case let .array(items)? = MsgPack.decodeLeadingValue(data) else { return nil }
 
         let displayName = parseDisplayName(from: items)
         let stampCost   = parseStampCost(from: items)
@@ -251,9 +252,9 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// Parity is NOT total, and the two gaps both narrow what we surface:
     /// - a NEGATIVE cost — reference returns it verbatim (Python ints are signed and unbounded);
-    ///   we return nil for the `.int` branch when `i < 0`.
-    /// - a NON-INTEGER `peer_data[1]` (a string, a float, a list) — reference returns that object
-    ///   as-is and lets the caller trip over it; our `default` arm returns nil.
+    ///   we return nil.
+    /// - a NON-NUMERIC `peer_data[1]` (a string, a list) — reference returns that object as-is and
+    ///   lets the caller trip over it; `nonNegativeCeiling` returns nil.
     ///
     /// **These divergences became observable when delivery stamps were wired** (this note used to
     /// say "no caller acts on a parsed cost yet — revisit if one ever does"; that revisit trigger
@@ -279,21 +280,16 @@ public struct LXMFAnnounceData: Equatable {
     /// nothing here truncates. The resulting `Int` is bounded only by `Int.max`, so **callers
     /// must validate before acting on it** — see the note on the `stampCost` property, which
     /// explains why feeding an unvalidated value into stamp generation is an unbounded CPU burn.
+    ///
+    /// **LXMF 1.3.0 costs can be fractional.** Reference reads element [3] when it is a number and
+    /// falls back to [1] (`stamp_cost_from_app_data`, LXMF.py:192-196), and after the 1.6.2
+    /// transition [1] itself becomes the float (LXMRouter.py:1178-1180). We surface the ceiling,
+    /// which is the value reference publishes in [1] during the transition: a stamp at the ceiling
+    /// always meets the fractional target, at up to double the expected work.
     private static func parseStampCost(from items: [MsgPackValue]) -> Int? {
         guard items.count >= 2 else { return nil }
-        switch items[1] {
-        case let .uint(u):
-            // Int(exactly:) never traps — returns nil when u > Int.max.
-            // Allowlist entry: LXMFAnnounceData.parseStampCost — guarded by Int(exactly:)
-            // which returns nil for values > Int.max (a 64-bit Int). UInt64 -> Int narrowing.
-            return Int(exactly: u)
-        case let .int(i):
-            // Signed int: only meaningful if non-negative and in range.
-            guard i >= 0 else { return nil }
-            return Int(exactly: i)
-        default:
-            return nil
-        }
+        if items.count > 3, items[3].isNumber { return items[3].nonNegativeCeiling }
+        return items[1].nonNegativeCeiling
     }
 
     /// Determine compression support from `items[2]`.
