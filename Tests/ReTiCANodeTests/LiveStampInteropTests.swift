@@ -107,10 +107,13 @@ private final class LiveNode {
     let linkFailures = LockIsolated(0)
     let store: StoreOf<Harness>
 
-    init(port: Int) async throws {
+    /// `stampPathRequests` is the host's switch for RNS 1.6 path-request stamps, set at construction.
+    init(port: Int, stampPathRequests: Bool = false) async throws {
         let (inbound, accepted, linkFailures) = (self.inbound, self.accepted, self.linkFailures)
-        store = Store(initialState: Harness.State(node: LXMFNode.State(
-            identity: identity, endpoint: TCPEndpoint.State(host: "127.0.0.1", port: UInt16(port), reconnectOnDrop: true)))) {
+        var initial = Harness.State(node: LXMFNode.State(
+            identity: identity, endpoint: TCPEndpoint.State(host: "127.0.0.1", port: UInt16(port), reconnectOnDrop: true)))
+        initial.node.endpoint.transport.stampPathRequests = stampPathRequests
+        store = Store(initialState: initial) {
             Harness(inbound: inbound, accepted: accepted, linkFailures: linkFailures)
         } withDependencies: { $0.context = .live }
         store.send(.node(.endpoint(.start)))
@@ -244,6 +247,38 @@ private final class LiveNode {
         node.store.send(.node(.endpoint(.openLink(destinationHash: dest))))
         let up = await poll(seconds: 30) { ourLink()?.status == .active ? true : nil }
         #expect(up == true, "the same peer accepts a stamped request")
+    }
+
+    /// RNS 1.6 path-request stamps against a peer that enforces them: an enforcing 1.6.0 node drops a
+    /// path request without a stamp meeting its interface's `pr_cost` (15.8) at ingress
+    /// (Transport.py:2128-2129). The peer never announces on its own, so the only way we learn its
+    /// path is its answer to our stamped request.
+    @Test func aPathRequestFromReTiCAReachesAnEnforcingPeer() async throws {
+        let port = nextPort()
+        let peer = try Peer("enforce-pr", ["--listen", "\(port)", "--enforce-network"])
+        defer { peer.stop() }
+        let dest = try await peer.address()
+        let node = try await LiveNode(port: port, stampPathRequests: true)
+        defer { node.stop() }
+
+        #expect(node.store.state.node.endpoint.learned[dest] == nil)
+        node.store.send(.node(.endpoint(.requestPath(destinationHash: dest))))
+        #expect(await node.hears(dest, within: 30), "the enforcing peer must answer a stamped request")
+    }
+
+    /// The control for the test above: the same enforcing, silent peer, asked without a stamp, never
+    /// answers. A random 14 bytes would meet 15.8 about one time in 57,000, but an unstamped request
+    /// carries no extension at all.
+    @Test func aPathRequestToAnEnforcingPeerIsDroppedWhenItIsNotStamped() async throws {
+        let port = nextPort()
+        let peer = try Peer("enforce-pr-drop", ["--listen", "\(port)", "--enforce-network"])
+        defer { peer.stop() }
+        let dest = try await peer.address()
+        let node = try await LiveNode(port: port, stampPathRequests: false)
+        defer { node.stop() }
+
+        node.store.send(.node(.endpoint(.requestPath(destinationHash: dest))))
+        #expect(await node.hears(dest, within: 20) == false, "an enforcing peer must drop an unstamped request")
     }
 
     @Test func aMessageFromAReferencePeerArrives() async throws {

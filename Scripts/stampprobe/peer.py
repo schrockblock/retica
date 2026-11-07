@@ -73,6 +73,8 @@ import LXMF
 RNS.Reticulum(args.dir)
 # The config must have taken: a test that expects refusals proves nothing against a lenient peer.
 assert RNS.Transport.LR_STAMPS_ENFORCED == args.enforce_network
+# Path requests (and announces) are enforced by this one, at ingress (Transport.py:2128-2129).
+assert RNS.Transport.STAMPS_ENFORCED == args.enforce_network
 identity = RNS.Identity()
 # The lowest cost LXMF accepts from a node, so a debug build's search stays short.
 router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(args.dir, "lxmf"), autopeer=False,

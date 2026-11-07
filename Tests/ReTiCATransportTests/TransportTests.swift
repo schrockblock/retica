@@ -2657,7 +2657,9 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     #expect(p.destinationType == .plain)
     #expect(p.destinationHash == Transport.pathRequestDestinationHash)
     #expect(Data(p.payload.prefix(16)) == destHash)
-    #expect(Data(p.payload.dropFirst(16)) == tag)         // non-relay → no transport_id
+    // RNS 1.6.0: even a leaf carries a sender ID (Transport.py:3699).
+    #expect(Data(p.payload.dropFirst(16).prefix(16)) == store.state.pathRequestSenderID)
+    #expect(Data(p.payload.dropFirst(32)) == tag)
 }
 
 /// A relay's PATH_REQUEST includes its transport_id: destHash ‖ transportId ‖ tag.

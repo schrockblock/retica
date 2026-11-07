@@ -82,7 +82,8 @@ let package = Package(
                 "ReTiCATransport",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
             ],
-            resources: [.process("Vectors/transport_fixtures.json"), .process("Vectors/proof_fixtures.json"), .process("Vectors/stamped_announce_packet_fixtures.json")]
+            resources: [.process("Vectors/transport_fixtures.json"), .process("Vectors/proof_fixtures.json"), .process("Vectors/stamped_announce_packet_fixtures.json"),
+                        .process("Vectors/path_request_fixtures.json")]
         ),
         .target(
             name: "ReTiCANode",

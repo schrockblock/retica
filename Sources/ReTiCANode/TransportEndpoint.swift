@@ -208,12 +208,14 @@ public struct TransportEndpoint {
                 // cancel them here, not when each interface reports its disconnect, because a
                 // Meshtastic radio reports offline only after `driver.stop()` returns. Each link
                 // fails with `.pathStale` (see `LinkPlane.failStampSearches` for why not
-                // `.stampFailure`).
+                // `.stampFailure`). Path-request stamp searches likewise; a cancelled one sends nothing.
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .disconnect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
                                  state.ble != nil ? .send(.ble(.stop)) : .none,
                                  state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none,
-                                 state.linkPlane.stampingLinks.isEmpty ? .none : .send(.linkPlane(.cancelStampSearches))])
+                                 state.linkPlane.stampingLinks.isEmpty ? .none : .send(.linkPlane(.cancelStampSearches)),
+                                 state.transport.stampingPathRequests.isEmpty ? .none
+                                     : .send(.transport(.cancelPathRequestStamps))])
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
             case let .deregisterLocalDestination(hash):
                 // Router first, so a LINKREQUEST racing this action is no longer handed up. Then

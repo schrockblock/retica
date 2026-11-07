@@ -159,6 +159,28 @@ private func openedWithCost(_ store: TestStoreOf<TransportEndpoint>) async -> Do
         await store.finish()
     }
 
+    /// A path-request stamp search is CPU work too, so stopping the endpoint must end it.
+    @Test func stoppingTheEndpointCancelsAPathRequestStampSearch() async {
+        var initial = TransportEndpoint.State()
+        initial.transport.stampPathRequests = true
+        initial.transport.pathRequestValue = 100      // cannot finish here
+        let stopping = TestStore(initialState: initial) { TransportEndpoint() } withDependencies: {
+            $0.uuid = .incrementing
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+        }
+        stopping.exhaustivity = .off
+        await stopping.send(.requestPath(destinationHash: destHash))
+        await stopping.receive(.transport(.requestPath(destinationHash: destHash)))
+        #expect(stopping.state.transport.stampingPathRequests == [destHash])
+        await stopping.send(.stop)
+        await stopping.skipReceivedActions(strict: false)
+        #expect(stopping.state.transport.stampingPathRequests.isEmpty)
+        // A search still running (cost 100) would keep its effect alive past `finish`.
+        stopping.exhaustivity = .on
+        await stopping.finish()
+    }
+
     /// Endpoint wiring: the cost an announce carried reaches the plane, and the request meets it.
     @Test func anAnnouncedLinkCostStampsTheEndpointsLinkRequest() async throws {
         let stamped = try fixture("stripped")

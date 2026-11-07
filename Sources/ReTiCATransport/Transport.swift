@@ -102,6 +102,25 @@ public struct Transport {
         /// (RNS Transport.py:1759 checks BOTH tables). GC'd after pathRequestGateTimeout (120 s).
         public var pathRequests: [Data: Date] = [:]
 
+        /// Stamp our own path requests (RNS `Transport.STAMP_PRS`, `[stamps] stamp_path_requests`).
+        /// Off by default, as in 1.6.0. When on, `.requestPath` first searches for a stamp of
+        /// `pathRequestValue` over `destinationHash + tag`, up to `NetworkStamp.pathStampTimeout`, and
+        /// sends the 64-byte request only once one is found; a relay also marks unstamped requests it
+        /// forwards with the lenient extension (`Transport.lenientPathRequestExtension`). A host sets
+        /// it at construction, on `TransportEndpoint.State.transport`.
+        public var stampPathRequests = false
+        /// The stamp value our path requests carry when `stampPathRequests` is on (RNS `PR_VALUE`).
+        public var pathRequestValue: Double = NetworkStamp.defaultPathRequestValue
+        /// The sender ID a path request carries when this node has no `transportIdentity`. RNS 1.6.0
+        /// always sends `destination + transport ID + tag` (Transport.py:3699) and every reference
+        /// instance has a transport identity; a leaf here has none, so it sends 16 random bytes,
+        /// fixed per instance. A relay compares this field with its next hop (the loop guard), and a
+        /// random value matches no real next hop.
+        public var pathRequestSenderID: Data = SecureRandom.bytes(16)
+        /// Destinations whose path-request stamp search is in flight. A further `.requestPath` for one
+        /// of them is coalesced into it. Cleared when the search ends or `.cancelPathRequestStamps`.
+        public var stampingPathRequests: Set<Data> = []
+
         public struct PendingAnnounce: Equatable, Sendable {
             public var raw: Data
             public var arrivalInterface: InterfaceID
@@ -326,6 +345,11 @@ public struct Transport {
         /// and on nothing when it is not connected: never a silent fallback to every interface.
         case announce(destinationHash: Data, appData: Data?, interface: InterfaceID? = nil)
         case requestPath(destinationHash: Data)
+        /// A path-request stamp search for `destinationHash` ended: `request` is the stamped 64-byte
+        /// payload to send, or nil when the search ran out `NetworkStamp.pathStampTimeout`.
+        case pathRequestStampSearchEnded(destinationHash: Data, request: Data?)
+        /// Cancel every path-request stamp search; none of them sends. The host sends this when it stops.
+        case cancelPathRequestStamps
         /// Encrypt `plaintext` to a learned destination and send it as one packet. With a non-nil
         /// `receiptToken`, also record a `PendingReceipt` so a valid proof for this packet emits
         /// `.delegate(.singlePacketDelivered(token:))`. The token is opaque to Transport.
@@ -400,6 +424,7 @@ public struct Transport {
     private enum CancelID: Hashable {
         case announceRetransmit(Data); case maintenance; case announceDrain(InterfaceID)
         case ingressRelease(InterfaceID)
+        case pathRequestStamp(Data)
     }
 
     public init() {}
@@ -425,6 +450,18 @@ public struct Transport {
                                  destinationHash: packet.destinationHash, transportId: nil, payload: packet.payload)
                 }
                 return try? fwd.packed()
+            }
+
+            // A path request of our own (RNS request_path, Transport.py:3716-3717): DATA, BROADCAST,
+            // HEADER_1 to the well-known PLAIN control destination, on every given interface.
+            func transmitPathRequest(_ payload: Data, on interfaces: [InterfaceID]) -> Effect<Action> {
+                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                    destinationType: .plain, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
+                                    payload: payload)
+                guard let raw = try? packet.packed() else { return .none }
+                let sends = interfaces.map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
+                return sends.isEmpty ? .none : .merge(sends)
             }
 
             switch action {
@@ -811,18 +848,23 @@ public struct Transport {
                     // well-known control destination. If we OWN the requested destination, answer with
                     // a path-response announce on the arrival interface.
                     if packet.destinationHash == Transport.pathRequestDestinationHash {
-                        guard packet.payload.count >= 16 else { return .none }
-                        let requested = Data(packet.payload.prefix(16))
-                        // Entry gate (RNS path_request_handler:2905-2934). Parse the request tag;
-                        // ignore tagless requests and duplicate (destHash ‖ tag) requests.
-                        let tag: Data
-                        if packet.payload.count > 32 {
-                            tag = Data(packet.payload.dropFirst(32).prefix(16))   // after destHash + transport_id
-                        } else if packet.payload.count > 16 {
-                            tag = Data(packet.payload.dropFirst(16).prefix(16))   // after destHash
-                        } else {
-                            return .none                                          // tagless (== 16) → ignore
-                        }
+                        // RNS 1.6.0 ingress (Transport.py:2081-2093) and parse_path_request
+                        // (Transport.py:3983-4005). Only three sizes are accepted: 32 (legacy,
+                        // destHash + tag), 48 (destHash + sender ID + tag) and 64 (the 48 plus the
+                        // 16-byte stamp extension). Tagless (16), oversized and in-between sizes drop.
+                        let payload = packet.payload
+                        guard Transport.pathRequestLengths.contains(payload.count) else { return .none }
+                        let requested = Data(payload.prefix(16))
+                        let tag = payload.count == Transport.pathRequestLegacyLength
+                            ? Data(payload.dropFirst(16).prefix(16))          // after destHash
+                            : Data(payload.dropFirst(32).prefix(16))          // after destHash + sender ID
+                        let requestorTransportId: Data? = payload.count >= Transport.pathRequestLength
+                            ? Data(payload.dropFirst(16).prefix(16)) : nil
+                        // Carried through unchanged by a relay, whatever it holds (Transport.py:3940).
+                        // Not validated: 1.6.0 does not enforce path-request stamps by default.
+                        let extensionPayload: Data? = payload.count == Transport.pathRequestStampedLength
+                            ? Data(payload.dropFirst(Transport.pathRequestLength)) : nil
+                        // Entry gate: ignore duplicate (destHash ‖ tag) requests.
                         guard state.discoveryPrTags.insert(requested + tag) else { return .none }
                         // (1) We OWN the requested destination → answer with a fresh path-response.
                         if let dest = state.localDestinations[requested],
@@ -853,11 +895,10 @@ public struct Transport {
                            let cached = state.announceCache[requested],
                            let entry = state.learned[requested],
                            Int(entry.hops) + 1 < Int(Packet.maxHops) {
-                            // Loop guard: a relay requester carries its transport_id (48-byte payload).
-                            // If that equals our next hop toward the destination, the requester is
-                            // already on our path — do not answer (RNS Transport.py:2987).
-                            let requestorTransportId: Data? = packet.payload.count > 32
-                                ? Data(packet.payload.dropFirst(16).prefix(16)) : nil
+                            // Loop guard: the requester's sender ID (48- and 64-byte payloads). If that
+                            // equals our next hop toward the destination, the requester is already on
+                            // our path — do not answer (RNS Transport.py:3833). A leaf's random
+                            // `pathRequestSenderID` matches no real next hop.
                             guard requestorTransportId != entry.nextHop else { return .none }
                             // The flag comes from the CACHE, not from `entry.ratchet`. The payload is
                             // the original announce's bytes, so the flag must describe those bytes:
@@ -879,15 +920,17 @@ public struct Transport {
                            state.learned[requested] == nil,
                            state.discoveryPathRequests[requested] == nil {
                             state.discoveryPathRequests[requested] = date.now
-                            let fwd = Packet(
-                                headerType: .header1, packetType: .data, transportType: .broadcast,
-                                destinationType: .plain, context: .none, contextFlag: false, hops: 0,
-                                destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
-                                payload: requested + relayID.hash + tag)
-                            guard let raw = try? fwd.packed() else { return .none }
-                            let sends = state.interfaces.keys.filter { $0 != interfaceID }
-                                .map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
-                            return sends.isEmpty ? .none : .merge(sends)
+                            // The received extension rides along unchanged; a stamping relay marks an
+                            // unstamped request leniently instead of mining a stamp for someone else's
+                            // tag (Transport.py:3935-3936). No search here, so no added delay.
+                            var forwarded = requested + relayID.hash + tag
+                            if let extensionPayload {
+                                forwarded.append(extensionPayload)
+                            } else if state.stampPathRequests {
+                                forwarded.append(Transport.lenientPathRequestExtension)
+                            }
+                            return transmitPathRequest(forwarded,
+                                                       on: state.interfaces.keys.filter { $0 != interfaceID })
                         }
                         return .none
                     }
@@ -1250,22 +1293,62 @@ public struct Transport {
                 return .merge(targets.map { .send(.delegate(.transmit($0, raw))) })
 
             case let .requestPath(destinationHash):
-                // RNS request_path (Transport.py:2799): a DATA/BROADCAST/HEADER_1 packet to the
-                // well-known PLAIN control destination; payload = destHash [+ our transport_id] + tag.
-                // Record this request so that an arriving path-response announce for this destination
-                // is exempt from ingress-control holding (RNS Transport.path_requests, Transport.py:2899).
-                // This is the LOCAL gate entry (leaf+relay); discoveryPathRequests is relay-only.
+                // RNS 1.6.0 request_path (Transport.py:3685-3722): payload = destHash + sender ID + tag,
+                // always 48 bytes (Transport.py:3699). Record this request so that an arriving
+                // path-response announce for this destination is exempt from ingress-control holding
+                // (RNS Transport.path_requests). This is the LOCAL gate entry (leaf+relay);
+                // discoveryPathRequests is relay-only. It is set BEFORE any stamp search, as reference
+                // sets it before enqueueing one (Transport.py:3714).
                 state.pathRequests[destinationHash] = date.now
-                var payload = destinationHash
-                if let relayID = state.transportIdentity { payload.append(relayID.hash) }
-                payload.append(randomBytes(16))                        // request tag (RNS get_random_hash)
-                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
-                                    destinationType: .plain, context: .none, contextFlag: false, hops: 0,
-                                    destinationHash: Transport.pathRequestDestinationHash, transportId: nil,
-                                    payload: payload)
-                guard let raw = try? packet.packed() else { return .none }
-                let sends = state.interfaces.keys.map { Effect<Action>.send(.delegate(.transmit($0, raw))) }
-                return sends.isEmpty ? .none : .merge(sends)
+                let tag = randomBytes(16)                              // request tag (RNS get_random_hash)
+                let senderID = state.transportIdentity?.hash ?? state.pathRequestSenderID
+                let request = destinationHash + senderID + tag
+                // Stamping off (the default): sent at once, exactly as before.
+                guard state.stampPathRequests else {
+                    return transmitPathRequest(request, on: Array(state.interfaces.keys))
+                }
+                // Reference queues one stamp job per destination (enqueue_stamped_pr keys its queue
+                // by destination, Transport.py:1466-1468): a search already running for it answers
+                // this request too.
+                guard state.stampingPathRequests.insert(destinationHash).inserted else { return .none }
+                let material = destinationHash + tag                    // pr_stamp_material
+                let cost = state.pathRequestValue
+                return .run { send in
+                    // Whichever ends first: the search, or `pathStampTimeout` (reference's
+                    // `stamp_watchdog`, Transport.py:4028-4033). The loser is cancelled; `generate`
+                    // stops within its yield interval of that.
+                    let stamp = await withTaskGroup(of: Data?.self) { group in
+                        group.addTask { await NetworkStamp.generate(material: material, cost: cost)?.stamp }
+                        group.addTask {
+                            try? await clock.sleep(for: .seconds(NetworkStamp.pathStampTimeout))
+                            return nil
+                        }
+                        let first = await group.next() ?? nil
+                        group.cancelAll()
+                        return first
+                    }
+                    // Cancelled from outside (`.cancelPathRequestStamps`): nothing to report.
+                    guard !Task.isCancelled else { return }
+                    let stamped = stamp.flatMap { stamp in
+                        stamp.count == NetworkStamp.stampLength
+                            ? request + Data([NetworkStamp.extensionMarker, Transport.pathRequestStampFlags]) + stamp
+                            : nil
+                    }
+                    await send(.pathRequestStampSearchEnded(destinationHash: destinationHash, request: stamped))
+                }
+                .cancellable(id: CancelID.pathRequestStamp(destinationHash))
+
+            case let .pathRequestStampSearchEnded(destinationHash, request):
+                // Cancelled meanwhile (`.cancelPathRequestStamps`): the search no longer counts.
+                guard state.stampingPathRequests.remove(destinationHash) != nil else { return .none }
+                // Ran out `pathStampTimeout`: reference logs and sends nothing (Transport.py:4038-4041).
+                guard let request else { return .none }
+                return transmitPathRequest(request, on: Array(state.interfaces.keys))
+
+            case .cancelPathRequestStamps:
+                let cancelled = state.stampingPathRequests
+                state.stampingPathRequests = []
+                return .merge(cancelled.map { .cancel(id: CancelID.pathRequestStamp($0)) })
 
             case let .proveSingle(packetHash, interfaceID, identity):
                 guard identity.privateKey != nil, state.interfaces[interfaceID] != nil else { return .none }
@@ -1498,6 +1581,22 @@ public struct Transport {
     /// (Transport.py:61,256). Deterministic (no identity). Cross-validated against genuine RNS.
     static let pathRequestDestinationHash: Data =
         Destination.hash(identityHash: nil, appName: "rnstransport", aspects: ["path", "request"])
+
+    /// RNS PR_LEGACY_LENGTH: destination + tag, from a pre-1.6 leaf.
+    static let pathRequestLegacyLength = 32
+    /// RNS PR_LENGTH: destination + sender (transport) ID + tag.
+    static let pathRequestLength = 48
+    /// RNS PR_STAMPED_LENGTH: `pathRequestLength` plus the 16-byte extension (marker, flags, stamp).
+    static let pathRequestStampedLength = pathRequestLength + 2 + NetworkStamp.stampLength
+    /// The only path-request sizes reference accepts (Transport.py:2081-2093). Anything else is a
+    /// protocol violation and is dropped, a size above `pathRequestStampedLength` included.
+    static let pathRequestLengths: Set<Int> = [pathRequestLegacyLength, pathRequestLength, pathRequestStampedLength]
+    /// Extension flags for a real stamp (Transport.py:3721).
+    static let pathRequestStampFlags: UInt8 = 0x00
+    /// The extension a stamping relay puts on an unstamped request it forwards, so the next hop can
+    /// tell it came from a stamp-aware node: marker, flags `0xFF`, 14 zero bytes (Transport.py:3935-3936).
+    static let lenientPathRequestExtension =
+        Data([NetworkStamp.extensionMarker, 0xFF]) + Data(repeating: 0, count: NetworkStamp.stampLength)
 
     static let pathRequestTagRingSize = 32000      // RNS max_pr_tags (Transport.py:127)
     /// Packet-hash dedup window. Reference `hashlist_maxsize` is 1_000_000 with a two-generation
