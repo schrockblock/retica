@@ -47,35 +47,35 @@ private struct StampedFixtures: Decodable {
     let stamped = f["stripped"]
     await store.send(.received(InterfaceID("i0"), stamped.raw(hops: 2)))
     await store.receive(.delegate(.pathLearned(destinationHash: stamped.destinationHash, hops: 2)))
-    let entry = try #require(store.state.learned[stamped.destinationHash])
+    let entry = try #require(store.state.knownDestinations[stamped.destinationHash])
     #expect(entry.linkCost == 3.25)
+    #expect(store.state.recallLinkCost(destinationHash: stamped.destinationHash) == 3.25)
     #expect(entry.stampValue == stamped.stamp_value)
     #expect(entry.appData == Data(hexString: f.msgpack)!)
-    #expect(store.state.knownDestinations[stamped.destinationHash]?.appData == Data(hexString: f.msgpack)!)
+    #expect(store.state.learned[stamped.destinationHash]?.appData == Data(hexString: f.msgpack)!)
 
     // Below the cost: path learned all the same, no link cost, the extension left in app data.
     let low = f["below_cost"]
     await store.send(.received(InterfaceID("i0"), low.raw(hops: 2)))
     await store.receive(.delegate(.pathLearned(destinationHash: low.destinationHash, hops: 2)))
-    let lowEntry = try #require(store.state.learned[low.destinationHash])
+    let lowEntry = try #require(store.state.knownDestinations[low.destinationHash])
     #expect(lowEntry.linkCost == nil)
     #expect(lowEntry.stampValue == low.stamp_value)
     #expect(lowEntry.appData == Data(hexString: low.app_data!)!)
 }
 
-@Test @MainActor func aRehydratedPathKeepsItsLinkCost() async {
+@Test @MainActor func aRehydratedKnownDestinationKeepsItsLinkCost() async {
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
         $0.transportDate = .constant(Date(timeIntervalSince1970: 1_000))
     }
     store.exhaustivity = .off
     let hash = Data(repeating: 0x11, count: 16)
-    let entry = LearnedDestination(identity: Identity(), appData: nil, ratchet: nil,
-                                   interfaceID: InterfaceID("i"), hops: 1, nextHop: hash, announceEmitted: 0,
-                                   learnedAt: Date(timeIntervalSince1970: 900), linkCost: 7.5, stampValue: 24)
-    await store.send(.rehydrateLearnedDestinations([hash: entry]))
-    #expect(store.state.learned[hash] != nil)
-    #expect(store.state.learned[hash]?.linkCost == 7.5)
-    #expect(store.state.learned[hash]?.stampValue == 24)
+    let entry = KnownDestination(identity: Identity(), appData: nil, lastHeard: Date(timeIntervalSince1970: 900),
+                                 linkCost: 7.5, stampValue: 24)
+    await store.send(.rehydrateKnownDestinations([hash: entry]))
+    #expect(store.state.knownDestinations[hash] != nil)
+    #expect(store.state.recallLinkCost(destinationHash: hash) == 7.5)
+    #expect(store.state.knownDestinations[hash]?.stampValue == 24)
 }
 
 @Test @MainActor func aRelayForwardsTheOriginalBytes() async throws {

@@ -227,6 +227,13 @@ public struct Transport {
             return learned[destinationHash]?.appData
         }
 
+        /// The link-request stamp cost `destinationHash` last announced, or nil if it is unknown or
+        /// announced none — reference `Identity.recall_link_cost` (RNS 1.6.0 Identity.py:202-211).
+        /// Read from the known destinations only, which every valid announce refreshes.
+        public func recallLinkCost(destinationHash: Data) -> Double? {
+            knownDestinations[destinationHash]?.linkCost
+        }
+
         /// The learned path to `destinationHash`, but only when its interface is currently connected.
         ///
         /// `LearnedDestination.interfaceID` is captured at announce time and replaced only by a
@@ -539,7 +546,8 @@ public struct Transport {
                     // Public-only, whatever the host handed back: this table never holds a private key.
                     guard let publicOnly = Identity(publicKey: candidate.identity.publicKey) else { continue }
                     state.knownDestinations[hash] = KnownDestination(
-                        identity: publicOnly, appData: candidate.appData, lastHeard: candidate.lastHeard)
+                        identity: publicOnly, appData: candidate.appData, lastHeard: candidate.lastHeard,
+                        linkCost: candidate.linkCost, stampValue: candidate.stampValue)
                 }
                 return .none
 
@@ -685,8 +693,12 @@ public struct Transport {
                     // reached from `validate_announce` for every signature-valid announce of a
                     // non-local destination that got past ingress limiting (Transport.py:1772,
                     // Identity.py:579), BEFORE the replay check, so a replay refreshes it too.
+                    // The link cost and stamp value ride here too, as reference's `remember` stores
+                    // `lr_cost` and `stamp_value` (Identity.py:109-124): an announce that does not win
+                    // the path below still updates the cost a link to this destination must pay.
                     state.knownDestinations[packet.destinationHash] = KnownDestination(
-                        identity: parsed.identity, appData: parsed.appData, lastHeard: icNow)
+                        identity: parsed.identity, appData: parsed.appData, lastHeard: icNow,
+                        linkCost: parsed.linkCost, stampValue: parsed.stampValue)
                     // Anti-replay: a previously-seen random-blob for this destination is a replay.
                     // RingSet.insert both tests and records; false → already present → drop.
                     // NOTE: we record the blob for EVERY fresh announce here. RNS only appends the
@@ -700,8 +712,7 @@ public struct Transport {
                     let candidate = LearnedDestination(
                         identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
                         interfaceID: interfaceID, hops: packet.hops, nextHop: nextHop,
-                        announceEmitted: emitted, learnedAt: date.now,
-                        linkCost: parsed.linkCost, stampValue: parsed.stampValue)
+                        announceEmitted: emitted, learnedAt: date.now)
                     // A route whose interface is gone (a radio switched off, a BLE session ended)
                     // carries nothing, yet it is kept on purpose (see `reachableLearned`: TCP comes
                     // back under the same id). Kept, it must not outrank a live route: reference

@@ -204,10 +204,14 @@ public struct TransportEndpoint {
                                  state.ble != nil ? .send(.ble(.start)) : .none,
                                  state.meshtastic != nil ? .send(.meshtastic(.start)) : .none])
             case .stop:
+                // Link-request key searches are CPU work, not I/O, so no driver stopping ends them:
+                // cancel them here. Each one's link fails with `.stampFailure`, as reference's does
+                // when its search ends without a key.
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .disconnect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
                                  state.ble != nil ? .send(.ble(.stop)) : .none,
-                                 state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none])
+                                 state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none,
+                                 state.linkPlane.stampingLinks.isEmpty ? .none : .send(.linkPlane(.cancelStampSearches))])
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
             case let .deregisterLocalDestination(hash):
                 // Router first, so a LINKREQUEST racing this action is no longer handed up. Then
@@ -253,11 +257,15 @@ public struct TransportEndpoint {
                 let timeout = LinkTiming.initiatorEstablishmentTimeout(
                     bitrate: state.transport.nextHopInterfaceProfile(destinationHash)?.bitrate,
                     wireHops: learned.hops)
+                // RNS 1.6.0: a destination that announced a link cost gets a stamped LINKREQUEST
+                // (Link.py:310). Read from the known destinations, which every valid announce
+                // refreshes, not from `learned`, which only a better announce replaces.
                 return .send(.linkPlane(.openLink(initiatorTo: learned.identity,
                                                   destinationHash: destinationHash,
                                                   interfaceID: learned.interfaceID,
                                                   relayNextHop: relayNextHop,
-                                                  establishmentTimeout: timeout)))
+                                                  establishmentTimeout: timeout,
+                                                  linkCost: state.transport.recallLinkCost(destinationHash: destinationHash))))
 
             // The link verbs (`.sendOverLink`, `.closeLink`, `.registerRequestHandler`, …) are
             // NOT forwarded here: they are aliased straight into the shared `LinkPlane` by
@@ -585,7 +593,8 @@ extension TransportEndpoint.Action.AllCasePaths {
                     return .registerRequestHandler(path: path, policy: policy)
                 case let .deregisterRequestHandler(path):
                     return .deregisterRequestHandler(path: path)
-                case .openLink, .acceptLinkRequest, .routeLinkPacket, .interfaceDisconnected, .delegate:
+                case .openLink, .acceptLinkRequest, .routeLinkPacket, .interfaceDisconnected, .delegate,
+                     .stampedKeyFound, .stampSearchTimedOut, .cancelStampSearches:
                     return .linkPlane(plane)
                 }
             },

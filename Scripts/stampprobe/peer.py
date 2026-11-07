@@ -20,6 +20,15 @@ ap.add_argument("--connect", type=int, help="connect to a TCP server on this por
 ap.add_argument("--cost", type=int, default=8)
 ap.add_argument("--announce-every", type=float, default=0, help="0 = only answer path requests")
 ap.add_argument("--network-stamps", action="store_true", help="[stamps] stamp_destinations = yes")
+ap.add_argument("--destination-value", type=float, default=12,
+                help="with --network-stamps, the value of our own announce stamp. A receiver reads our link "
+                     "cost only from a stamp of 23.5 or more; 24 takes Python about half a minute to mine")
+ap.add_argument("--enforce-network", action="store_true",
+                help="[stamps] enforce_stamps = yes: drop link requests, announces and path requests "
+                     "whose network stamp falls short")
+ap.add_argument("--link-cost", type=float,
+                help="announce this link-request cost instead of LXMF's 3.25. A random key meets 3.25 about "
+                     "one time in ten, too often for a test of refusal; 12 is one in 4,096")
 ap.add_argument("--reply", action="store_true", help="message the first delivery destination heard")
 ap.add_argument("--propagation-node", action="store_true", help="also serve as a propagation node")
 ap.add_argument("--sync-from", help="file holding a propagation node's address, to sync from")
@@ -28,10 +37,15 @@ args = ap.parse_args()
 shutil.rmtree(args.dir, ignore_errors=True)
 os.makedirs(args.dir)
 
-stamps = ""
+# One [stamps] section, whichever flags fill it.
+stamp_options = []
 if args.network_stamps:
     # Low values keep generation fast. The value does not change the wire layout.
-    stamps = "[stamps]\n  stamp_destinations = yes\n  destination_value = 12\n  destination_cost = 10\n"
+    stamp_options += ["stamp_destinations = yes", f"destination_value = {args.destination_value}",
+                      "destination_cost = 10"]
+if args.enforce_network:
+    stamp_options.append("enforce_stamps = yes")
+stamps = "[stamps]\n" + "".join(f"  {o}\n" for o in stamp_options) if stamp_options else ""
 
 if args.listen:
     interface = f"type = TCPServerInterface\n    listen_ip = 127.0.0.1\n    listen_port = {args.listen}"
@@ -57,6 +71,8 @@ import RNS
 import LXMF
 
 RNS.Reticulum(args.dir)
+# The config must have taken: a test that expects refusals proves nothing against a lenient peer.
+assert RNS.Transport.LR_STAMPS_ENFORCED == args.enforce_network
 identity = RNS.Identity()
 # The lowest cost LXMF accepts from a node, so a debug build's search stays short.
 router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(args.dir, "lxmf"), autopeer=False,
@@ -65,6 +81,9 @@ source = router.register_delivery_identity(identity, display_name="Reference pee
                                            stamp_cost=args.cost if args.cost > 0 else None)
 if args.cost > 0:
     router.enforce_stamps()
+if args.link_cost is not None:
+    # register_delivery_identity sets DELIVERY_LINK_COST once (LXMRouter.py:422); this replaces it.
+    source.set_link_cost(args.link_cost)
 
 
 def record(name, line):

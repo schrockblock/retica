@@ -2,9 +2,13 @@
 # Run in the conda `rns-latest` env (rns 1.6.0) by absolute path, from anywhere:
 #   /Users/ell/opt/anaconda3/envs/rns-latest/bin/python generate_stamped_announce_packet_fixtures.py
 #
-# Writes stamped_announce_packet_fixtures.json to BOTH Tests/ReTiCATests/Vectors (Announce.parse) and
-# Tests/ReTiCATransportTests/Vectors (Transport ingest). A resource belongs to one test target, so the
-# two copies are written from one run here and must never be edited by hand.
+# Writes stamped_announce_packet_fixtures.json to Tests/ReTiCATests/Vectors (Announce.parse),
+# Tests/ReTiCATransportTests/Vectors (Transport ingest) and Tests/ReTiCANodeTests/Vectors (link costs
+# read when a link opens). A resource belongs to one test target, so the three copies are written from
+# one run here and must never be edited by hand.
+#
+# LinkPlaneStampedRequestTests relies on every "hi" case sharing one emission second (they are made in
+# one burst), so a later one heard over more hops does not replace the path.
 #
 # Every announce is a real Destination._announce(send=False) packet: genuine RNS signing over the
 # app data, and for the stamped cases the genuine 18-byte extension that _announce appends
@@ -30,7 +34,8 @@ from RNS.Stamps import cost_from_bytes, fp_from_bytes, stamp_valid, stamp_value
 
 here = os.path.dirname(os.path.abspath(__file__))
 outputs = [os.path.join(here, "stamped_announce_packet_fixtures.json"),
-           os.path.join(here, "..", "..", "ReTiCATransportTests", "Vectors", "stamped_announce_packet_fixtures.json")]
+           os.path.join(here, "..", "..", "ReTiCATransportTests", "Vectors", "stamped_announce_packet_fixtures.json"),
+           os.path.join(here, "..", "..", "ReTiCANodeTests", "Vectors", "stamped_announce_packet_fixtures.json")]
 
 workdir = tempfile.mkdtemp(prefix="retica-stamped-packet-fixtures-")
 configdir = os.path.join(workdir, "rns")
@@ -140,6 +145,9 @@ assert c["at_cap"]["lr_cost"] == 100.0 and c["at_cap"]["app_data"] == MSGPACK.he
 assert c["nonzero_flags"]["lr_cost"] == 3.25 and c["nonzero_flags"]["app_data"] == MSGPACK.hex()
 assert c["ratchet_stripped"]["context_flag"] and c["ratchet_stripped"]["lr_cost"] == 3.25
 assert c["ratchet_stripped"]["app_data"] == MSGPACK.hex()
+# The emission time is the last five bytes of the random hash (payload bytes 79..84). If the burst ever
+# straddles a second, run the generator again.
+assert len({bytes.fromhex(c[k]["payload"])[79:84] for k in ("stripped", "at_cap")}) == 1
 
 text = json.dumps(fixtures, indent=2) + "\n"
 for path in outputs:

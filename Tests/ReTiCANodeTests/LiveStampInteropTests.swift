@@ -78,6 +78,7 @@ private struct Harness {
     enum Action { case node(LXMFNode.Action) }
     let inbound: LockIsolated<[String]>
     let accepted: LockIsolated<Int>
+    let linkFailures: LockIsolated<Int>
 
     var body: some ReducerOf<Self> {
         Scope(state: \.node, action: \.node) { LXMFNode() }
@@ -91,6 +92,7 @@ private struct Harness {
                 inbound.withValue { $0.append(String(decoding: m.content, as: UTF8.self)) }
             }
             if case .delegate(.propagationAccepted) = a { accepted.withValue { $0 += 1 } }
+            if case .endpoint(.delegate(.linkFailed)) = a { linkFailures.withValue { $0 += 1 } }
             return .none
         }
     }
@@ -101,13 +103,15 @@ private final class LiveNode {
     let identity = Identity()
     let inbound = LockIsolated<[String]>([])
     let accepted = LockIsolated(0)
+    /// Every `linkFailed` the endpoint reported, whatever the reason.
+    let linkFailures = LockIsolated(0)
     let store: StoreOf<Harness>
 
     init(port: Int) async throws {
-        let (inbound, accepted) = (self.inbound, self.accepted)
+        let (inbound, accepted, linkFailures) = (self.inbound, self.accepted, self.linkFailures)
         store = Store(initialState: Harness.State(node: LXMFNode.State(
             identity: identity, endpoint: TCPEndpoint.State(host: "127.0.0.1", port: UInt16(port), reconnectOnDrop: true)))) {
-            Harness(inbound: inbound, accepted: accepted)
+            Harness(inbound: inbound, accepted: accepted, linkFailures: linkFailures)
         } withDependencies: { $0.context = .live }
         store.send(.node(.endpoint(.start)))
         let registered = await poll(seconds: 30) { self.store.state.node.deliveryDestinationHash }
@@ -179,6 +183,67 @@ private final class LiveNode {
         let log = try #require(await peer.received(containing: "large xxx"))
         #expect(log.contains("stamp_valid=True"))
         #expect(log.contains("method=2"), "2 is LXMessage.DIRECT")
+    }
+
+    /// RNS 1.6 link-request stamps against a peer that enforces them (`enforce_stamps = yes`), so an
+    /// unstamped LINKREQUEST is dropped (Link.py:195). The peer's own announce carries a stamp of value
+    /// 24, at least the 23.5 we demand before believing the link cost it announces.
+    ///
+    /// The peer announces cost 12, not LXMF's 3.25: a random key meets 3.25 about one time in ten, and
+    /// LXMF retries a failed link, so at 3.25 this test passed with stamping switched off. At 12 a
+    /// random key passes one time in 4,096, and the first link must come up with no failure before it.
+    @Test func aLinkRequestSurvivesAPeerEnforcingNetworkStamps() async throws {
+        let port = nextPort()
+        let peer = try Peer("enforce-link", ["--listen", "\(port)", "--announce-every", "3", "--network-stamps",
+                                             "--destination-value", "24", "--enforce-network", "--link-cost", "12"])
+        defer { peer.stop() }
+        let dest = try await peer.address()
+        let node = try await LiveNode(port: port)
+        defer { node.stop() }
+
+        #expect(await node.hears(dest, within: 240), "mining a value-24 stamp delays the peer's first announce")
+        #expect(node.store.state.node.endpoint.knownDestinations[dest]?.linkCost == 12)
+        node.send("enforced link " + String(repeating: "y", count: 2000), to: dest)
+        let log = try #require(await peer.received(containing: "enforced link yyy", within: 60))
+        #expect(log.contains("method=2"), "2 is LXMessage.DIRECT")
+        #expect(node.linkFailures.value == 0, "the first, stamped, link request must be the one accepted")
+    }
+
+    /// The control for the test above: the same enforcing peer, one link opened with an ordinary key
+    /// and one through the endpoint, which stamps it. Only the stamped one may come up. Cost 12, so an
+    /// ordinary key is refused 4,095 times in 4,096 (at 3.25 it would come up one time in ten).
+    @Test func anUnstampedLinkRequestIsIgnoredByAnEnforcingPeer() async throws {
+        let port = nextPort()
+        let peer = try Peer("enforce-refuse", ["--listen", "\(port)", "--announce-every", "3", "--network-stamps",
+                                               "--destination-value", "24", "--enforce-network", "--link-cost", "12"])
+        defer { peer.stop() }
+        let dest = try await peer.address()
+        let node = try await LiveNode(port: port)
+        defer { node.stop() }
+        #expect(await node.hears(dest, within: 240))
+        let learned = try #require(node.store.state.node.endpoint.learned[dest])
+        #expect(node.store.state.node.endpoint.knownDestinations[dest]?.linkCost == 12)
+
+        func ourLink() -> LinkSession.State? {
+            node.store.state.node.endpoint.linkPlane.links.first { $0.role == .initiator && $0.destinationHash == dest }
+        }
+        #expect(ourLink() == nil)
+        node.store.send(.node(.endpoint(.linkPlane(.openLink(initiatorTo: learned.identity, destinationHash: dest,
+                                                              interfaceID: learned.interfaceID, relayNextHop: nil,
+                                                              linkCost: nil)))))
+        #expect(ourLink() != nil, "an unstamped link starts at once")
+        // It must leave on its establishment deadline (15 s on TCP) without ever going active.
+        var wentActive = false
+        let gone = await poll(seconds: 30) { () -> Bool? in
+            if ourLink()?.status == .active { wentActive = true }
+            return ourLink() == nil ? true : nil
+        }
+        #expect(!wentActive, "the enforcing peer must not answer an unstamped request")
+        #expect(gone == true)
+
+        node.store.send(.node(.endpoint(.openLink(destinationHash: dest))))
+        let up = await poll(seconds: 30) { ourLink()?.status == .active ? true : nil }
+        #expect(up == true, "the same peer accepts a stamped request")
     }
 
     @Test func aMessageFromAReferencePeerArrives() async throws {

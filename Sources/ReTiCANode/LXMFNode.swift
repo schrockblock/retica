@@ -1141,6 +1141,13 @@ public struct LXMFNode {
                     // the handshake proof failed to validate. Requesting a fresh path would not
                     // help — retry the link instead, on the bounded `establishAttempts` budget.
                     return .send(.router(.linkClosed(destinationHash: dest)))
+                case .stampFailure:
+                    // No LINKREQUEST left this node: the destination announced a link cost we could
+                    // not meet (above `LinkPlane.maxLinkStampCost`, or the search timed out). The path
+                    // is not in question, so do not request one. Retry the link like `.handshakeRejected`:
+                    // a fresh search may still succeed in time, and `establishAttempts` bounds the
+                    // retries, each costing at most `NetworkStamp.linkStampTimeout` of search.
+                    return .send(.router(.linkClosed(destinationHash: dest)))
                 }
 
             case let .endpoint(.delegate(.linkDataReceived(linkID, data, packetHash))):
