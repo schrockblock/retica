@@ -100,6 +100,10 @@ these commits.
   neighbour's channel datagram can then fail a connect attempt. This must be fixed for us to receive at all.
 - Reconnect lacks what MeshtasticKit gained: first-connect retry, Bluetooth power-cycle handling, an
   epoch guard, a powered-on gate.
+- `sendDirectText` sends the 32-byte key, but firmware reads a 6-byte prefix and takes the rest as text
+  (`MyMesh.cpp:1139-1143`), so recipients get 26 key bytes before the message. Channel text is sent as `Name: text`,
+  and firmware adds the name itself (`BaseChatMesh.cpp:523`), so it's doubled. Lane A fixes both; they're exceptions
+  to its "keep current behaviour" rule.
 - It has never run on a real radio, as far as the docs record. Its reference targets v1.16.0 and has known
   errors (it says Meshtastic uses the same UUIDs; it does not).
 
@@ -205,13 +209,14 @@ Requirements:
 - Frames over 173 B throw `.frameTooLarge` before touching BLE.
 - The session owns the sync drain: on `0x83` it drains until `0x0A`, routing `0x1B`, `0x10` and `0x11`
   frames to events. A received frame of any kind must never stall or fail a command.
-- Handshake: `APP_START` → `DEVICE_QUERY` → set time (wait for its `OK`) → drain queued messages →
-  `.configured`. Contacts and channels are NOT fetched in the handshake; Meshtastified's adapter fetches
+- Handshake: `APP_START` → `DEVICE_QUERY` → set time (wait for any reply: firmware answers `01 06` when the
+  radio's clock is ahead, and that must not stop it connecting) → drain queued messages → `.configured`. Contacts and channels are NOT fetched in the handshake; Meshtastified's adapter fetches
   contacts itself.
 - `firmwareCode` below 11 (pre-v1.15, no channel data) makes `sendChannelData` throw `.firmwareTooOld`.
   The session still connects, because Meshtastified's text features work on older firmware.
-- `firmwareCode` below 3 keeps today's behaviour: the connection fails with `.firmwareTooOld` and does not
-  retry.
+- `firmwareCode` below 3 keeps today's behaviour: the connection fails and does not retry. `connect` returns
+  `Void`, so this surfaces as `.disconnected(reason:)` with the public constant
+  `MeshCoreSession.firmwareTooOldReason`, which consumers compare against rather than repeating the string.
 - **The kit stays transport-only (my call).** Contacts (including the multi-frame burst), text sends with their
   `0x06` and ack tracking, and battery all live in Meshtastified's adapter, built on `request` and `.frame`.
   Typed methods would pull MeshCore messaging into the kit, which §3 says stays in the app. `retrieveConnected`
@@ -276,6 +281,15 @@ queue (§2), so we remove it. A slot is ours if its secret matches a key we hold
 - Key changed: the old key goes on a persisted retired list, passed in `retiredChannelSecrets`, and is cleared at the
   next connection.
 - Clearing is `setChannel` with an empty name and an all-zero secret. Unverified on hardware (§8).
+- Turning the feature off acts immediately, unlike other radio settings that wait for the next Connect. Otherwise
+  toggle-off then Connect would never have the radio connected to remove the slot.
+- **Known limit:** choosing a different radio leaves the old radio's slot on that radio, since it's no longer
+  connected. Settings says so.
+- A slot policy failure (no free slot, firmware too old, or a refused channel read or write) disconnects the radio,
+  so the user can free a slot in the MeshCore app and we stop draining its queue. It also stops automatic restarts:
+  foreground and push wakes don't retry it, only an explicit Connect does, which drains again and is covered by the
+  Settings warning. This memory lasts for the session, so a fresh launch tries once.
+- Settings words the leftover-slot notice as "may stay", since the app can't always know.
 
 `firmwareCode < 11` maps to `.unavailable(.other("This radio's firmware is too old; update to v1.15 or
 later"))`. Keep that message's wording user-readable: the app displays it.
@@ -286,7 +300,17 @@ Same shape as Meshtastic's Contract 3, including the amended stop semantics, and
 that a slot must be stopped and confirmed offline before it is nil'd:
 - `TransportEndpoint.State.meshCore: MeshCoreEndpoint.State?`, action `.meshCore(MeshCoreEndpoint.Action)`.
 - `meshCoreInterfaceID(radio: UUID) -> InterfaceID` = `"meshcore:<uuid>"`.
-- Delegates: `.radioOnline(publicKey:, params:)`, `.radioOffline(reason:)`, `.adapterUnavailable(_)`.
+- Delegates: `.radioOnline(publicKey:, params:)`, `.radioOffline(reason:)`, `.adapterUnavailable(_)`,
+  `.channelRemoved(Bool)`, `.retiredChannelsCleared`.
+- Actions beyond `.start`/`.stop`: `.removeChannel`, and `.setCanRoute(Bool)`, because the Relay setting applies
+  immediately (`AppFeature.swift:2430-2450`). A `.stop` during a removal is held until `removeChannel` returns.
+  (Amended 2026-11-07 from lane B planning.)
+- **The channel key is never in reducer state or actions.** `config.channelSecret` holds `Data()` in state, so it
+  can't reach state dumps or Diagnostics; an app driver wrapper fills the key and retired list at `driver.start`.
+  Generating, pasting and sharing go through the key store, and actions carry only a signal. Lane B must not
+  validate the secret. (Amended from lane D planning.)
+- Radio name, firmware code and channel slot for Diagnostics reach the app through a defaulted `details` sink on
+  `.live(session:details:)`, outside the driver struct. (Amended from lane D planning.)
 - `MeshCoreCounters`: `malformed, notAddressed, evicted, timedOut, oversize, completed, queueFull,
   sendFailed, announcesLimited, pathRequestsLimited`.
 - `InterfaceProfile.meshCore(params:)`: `name "meshcore"`, `hwMTU 500`, IFAC size 8 when configured (same
@@ -405,6 +429,13 @@ mode, unchanged. But Meshtastic sends with hop limit 1, while a channel flood he
 it, so a relaying phone could otherwise feed a TCP backbone's announces onto a shared mesh. With the `hops > 2` cap,
 distant TCP destinations aren't advertised onto MeshCore; MeshCore users reach them on demand, through path requests.
 Relayed data and link traffic isn't capped beyond the sender's queue and pacing.
+
+Transport already paces relayed announces by bitrate before they reach the limiter (about 155 s for a 183 B announce at
+473 bps), so at most about 4 go out per 10 minutes and the relayed cap can't trip through Transport at these rates. It
+stays as the backstop, tested at limiter and endpoint level; lane E retunes it. A hop-capped announce still spends a
+pacing slot before it's dropped. Limiter state lives in `MeshCoreInterface.State`, survives reconnects and dies with the
+slot. Observing heard path requests needs inbound packets, so it runs in the `.packetReceived` arm behind Transport's IFAC
+gate.
 - All maps are bounded (512 entries, oldest evicted). Counts `announcesLimited`, `pathRequestsLimited`.
 
 ### 5.6 Reassembler
@@ -447,7 +478,9 @@ hostile input is assumed.
   Both radio types may be enabled at once; they're separate slots and separate interfaces.
 - Channel key: Generate (16 random bytes) or paste 32 hex characters, with copy/share. **No default key**, and no
   use of Public or of the secret hard-coded in other projects. The toggle can't take effect until a key is set.
-  Stored in the Keychain, since it's a shared secret. (My call.)
+  Stored in the Keychain, since it's a shared secret. (My call.) It uses the existing shared access group, so other team
+  apps in that group could read it; that group already holds the identity private key. Paste refuses all zeros, MeshCore's
+  Public key and ScotMesh's documented example.
 - Copy states plainly that this adds traffic to a shared radio network and that everyone on the tunnel needs this
   key.
 - **Message-loss warning, required (decided by the user).** The MeshCore section warns that text messages waiting on
@@ -481,13 +514,13 @@ is the last commit of lane E.
 - **B:** split at 1, 147, 148, 149, 296, 500, 508 B. Cross-validation drives ScotMesh's real `_Frame` from a committed
   generator script (conda `rns` env, pinned to `2167780`), both directions, as the Meshtastic lane did with landandair.
   Reassembler: interleaved senders, reordering, duplicates, conflicts, timeout, eviction, the 30 s dedupe. Sender on
-  `TestClock`. Limiter at each threshold, including with IFAC on, and each aggregate cap. Channel slot policy with a
-  mock, including removal and retired keys, and that a slot with any other secret is never cleared. Whole-slice probe.
+  `TestClock`. Limiter at each threshold, including with IFAC on, and each aggregate cap. Whole-slice probe.
   A relay probe: MeshCore ↔ TCP endpoints through a relaying `TransportEndpoint` deliver in both directions, and an
   announce past the caps doesn't reach the radio. Meshtastic has no such automated test today, so this is new coverage.
 - **C:** toggle and key persistence, no-key blocking, retired-key persistence, picker for both kinds, BLE pause and
   resume.
-- **D:** live-adapter loopback against `MeshCoreMock`, including the slot policy (existing match, empty slot, all full);
+- **D:** live-adapter loopback against `MeshCoreMock`, including the slot policy (existing match, empty slot, all full),
+  removal, retired keys, and proof that a slot with any other secret is never cleared;
   coexistence of a BLE driver, `MeshtasticSession` and `MeshCoreSession` on one FCB central.
 - **E (hardware checklist).** Record radio model, firmware and preset.
   1. Radio is found, connects, shows correct name and LoRa params. A BLE PIN radio pairs.
