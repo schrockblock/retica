@@ -85,8 +85,14 @@ private func makeDeliveryStampStore(
 ///
 /// Anti-vacuity: `try #require` fails the test if no message is ever received, so the assertions
 /// cannot pass by never running.
-@MainActor @Test func lxmfNodeSendsWithoutStampWhenNoCostIsKnown() async throws {
+///
+/// A peer we have never heard from is a different case: its cost is unknown, not absent, and the
+/// send waits. See `LXMFNodeFirstSendStampTests`.
+@MainActor @Test func lxmfNodeSendsWithoutStampWhenPeerAdvertisesNoCost() async throws {
     let store = makeDeliveryStampStore(advertisedStampCost: nil)
+    await store.send(.rehydrateLearnedPeers([peerDestHash: LXMFNode.LearnedPeer(
+        displayName: nil, stampCost: nil, supportsCompression: true,
+        learnedAt: Date(timeIntervalSince1970: 1700000000))]))
     let capturedMessage = LockIsolated<LXMessage?>(nil)
     await store.send(.send(destinationHash: peerDestHash, title: Data("t".utf8),
                            content: Data("c".utf8), method: .opportunistic))

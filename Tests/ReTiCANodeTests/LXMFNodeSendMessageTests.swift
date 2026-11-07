@@ -104,8 +104,9 @@ private func makeNode(identity: Identity, seedLearned: Identity?, dest: Data, pn
     let msg = LXMessage.create(source: me, destinationHash: dest, timestamp: 1700000000,
                                title: Data(), content: Data("x".utf8))
     await store.send(.sendMessage(message: msg, fallbackToPropagation: true))
-    await store.receive { if case let .router(.send(m, method)) = $0 { return m == msg && method == .opportunistic }; return false }
     await store.skipReceivedActions(strict: false)
+    // With no path it waits for the peer's cost, and that decision has already been made by then.
+    #expect(store.state.waitingForPeerCost[dest]?.map(\.message) == [msg])
     #expect(store.state.pendingFallbacks.isEmpty)
     #expect(store.state.router.fallbackEligible.isEmpty)
     #expect(store.state.router.propagationQueue.isEmpty)

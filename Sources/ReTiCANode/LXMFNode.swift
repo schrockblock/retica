@@ -171,7 +171,15 @@ public struct LXMFNode {
         ///
         /// Entries are appended when a search starts and removed when `.router(.send)` carries the
         /// message onward, so a search that already completed is never failed retroactively.
+        ///
+        /// A send in `waitingForPeerCost` is listed here too. It has not reached the router either,
+        /// so the same cancel and fallback handling applies to it.
         public internal(set) var inFlightDeliveryStamps: [Data] = []
+
+        /// First sends to a peer we have no path to and no cost for, by destination, oldest first.
+        /// The announce that brings the path also brings the cost, so they wait for it instead of
+        /// going out unstamped. See `deliverySend`.
+        public internal(set) var waitingForPeerCost: [Data: [WaitingSend]] = [:]
 
         /// Messages sent with `fallbackToPropagation` whose propagated copy has not started: it is
         /// packed only when the router reports `propagationFallbackDue` (spec Amendment A2). Dropped
@@ -281,6 +289,8 @@ public struct LXMFNode {
         /// `.delegate(.deliveryCancelled)` once; nothing else is reported for it afterwards.
         /// Reference `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744).
         case cancelOutbound(messageHash: Data)
+        /// Internal: a path-request interval has passed for sends in `waitingForPeerCost`.
+        case peerCostWaitElapsed(destinationHash: Data, requestsLeft: Int)
         /// Hold (`true`) outbound retries when the app is suspended and its sockets close, and release
         /// them (`false`) when an interface reconnects. While held no attempt is counted and nothing
         /// is sent, so no message fails or falls back; the release resumes each from where it stood.
@@ -435,9 +445,23 @@ public struct LXMFNode {
         case deliveryStamp
         case propagationStampFor(Data)
         case deliveryStampFor(Data)
+        case peerCostWait(Data)
     }
 
+    /// A first send waiting for its recipient's stamp cost.
+    public struct WaitingSend: Equatable {
+        let message: LXMessage
+        let method: LXMFRouter.DeliveryMethod
+    }
+
+    /// How many path requests a first send makes, `LXMFDelivery.pathRequestWaitSeconds` apart, before
+    /// it is handed to the router unstamped: 21 s in all. A compromise. Waiting is what gets the
+    /// stamp right, but the router only starts its own path budget and any propagation fallback once
+    /// it has the message, so a recipient that is really offline is delayed by this long.
+    static let peerCostPathRequests = 3
+
     @Dependency(\.date) var date
+    @Dependency(\.continuousClock) var clock
     public init() {}
 
     public var body: some ReducerOf<Self> {
@@ -720,6 +744,10 @@ public struct LXMFNode {
                 let abandoned = state.inFlightDeliveryStamps
                 state.inFlightDeliveryStamps = []
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.deliveryStamp)]
+                for dest in state.waitingForPeerCost.keys {
+                    effects.append(.cancel(id: CancelID.peerCostWait(dest)))
+                }
+                state.waitingForPeerCost = [:]
                 for hash in abandoned {
                     if state.pendingFallbacks.removeValue(forKey: hash) != nil {
                         effects.append(.send(.router(.clearFallbackEligible(messageHash: hash))))
@@ -742,12 +770,25 @@ public struct LXMFNode {
                     .cancel(id: CancelID.propagationStampFor(hash)),
                     .send(.router(.cancelOutbound(messageHash: hash))),
                 ]
+                for (dest, waiting) in state.waitingForPeerCost where waiting.contains(where: { $0.message.hash == hash }) {
+                    let remaining = waiting.filter { $0.message.hash != hash }
+                    state.waitingForPeerCost[dest] = remaining.isEmpty ? nil : remaining
+                    if remaining.isEmpty { effects.append(.cancel(id: CancelID.peerCostWait(dest))) }
+                }
                 // A message one of whose copies already succeeded has had its terminal outcome: the
                 // stamp search is still stopped above, but silently (the router is silent too, F1).
                 if wasSearching && !routerReports && !state.router.succeededMessages.contains(hash) {
                     effects.append(.send(.delegate(.deliveryCancelled(messageHash: hash))))
                 }
                 return .merge(effects)
+
+            case let .peerCostWaitElapsed(dest, requestsLeft):
+                guard state.waitingForPeerCost[dest] != nil else { return .none }
+                // Held, nothing can answer a request. As in the router, no attempt is counted.
+                if state.router.held { return peerCostWaitTimer(dest, requestsLeft: requestsLeft) }
+                guard requestsLeft > 0 else { return handOverWaitingSends(&state, destinationHash: dest) }
+                return .merge(.send(.endpoint(.requestPath(destinationHash: dest))),
+                              peerCostWaitTimer(dest, requestsLeft: requestsLeft - 1))
 
             // --- Propagation sync: phase-1 (IDENTIFY + list request) ---
             case let .router(.delegate(.requestMessageList(linkID))):
@@ -891,7 +932,8 @@ public struct LXMFNode {
                             learnedAt: date.now)
                     }
                 }
-                return .merge(effects)
+                // After the cost above is stored, and after the router has heard about the path.
+                return .concatenate(.merge(effects), handOverWaitingSends(&state, destinationHash: h))
 
             case let .router(.delegate(.messageDelivered(message, validated, method))):
                 // Ignore list, reference `LXMRouter.lxmf_delivery`'s `ignored_list` check: the
@@ -1331,11 +1373,23 @@ public struct LXMFNode {
     /// and the `else { stamped = message }` branch that appeared to implement it was dead code.
     /// The cancellation is reported instead by `.cancelDeliveryStamps`, which emits
     /// `.delegate(.deliveryFailed)` for every hash in `State.inFlightDeliveryStamps` — appended here.
-    private func deliverySend(_ state: inout State, message: LXMessage,
-                              method: LXMFRouter.DeliveryMethod) -> Effect<Action> {
+    ///
+    /// **A send with no path and no learned cost waits.** The cost arrives in the announce that
+    /// brings the path, so at this point "no cost" means "not known yet", not "none required".
+    /// Sending now would be unstamped, and a peer enforcing stamps proves the packet and then drops
+    /// it (LXMRouter.py:2263 and 2204, LXMF 1.3.0), so we would also report it delivered. MeshChatX
+    /// enforces by default. Deliberate divergence: reference reads the cost once in `handle_outbound`
+    /// (LXMRouter.py:2080-2084) and has this gap. A path we already hold means we did hear the
+    /// announce, so an absent cost really is absent and nothing waits.
+    private func deliverySend(_ state: inout State, message: LXMessage, method: LXMFRouter.DeliveryMethod,
+                              waitForUnknownCost: Bool = true) -> Effect<Action> {
         refreshNextHopRetryWait(&state, message.destinationHash)
+        let dest = message.destinationHash
+        if waitForUnknownCost, message.stamp == nil, state.learnedPeers[dest] == nil, state.endpoint.learned[dest] == nil {
+            return waitForPeerCost(&state, message: message, method: method)
+        }
         guard message.stamp == nil,
-              let cost = deliveryStampCost(state, destinationHash: message.destinationHash)
+              let cost = deliveryStampCost(state, destinationHash: dest)
         else { return .send(.router(.send(message: message, desiredMethod: method))) }
         if !state.inFlightDeliveryStamps.contains(message.hash) {
             state.inFlightDeliveryStamps.append(message.hash)
@@ -1348,5 +1402,40 @@ public struct LXMFNode {
         }
         .cancellable(id: CancelID.deliveryStampFor(message.hash))
         .cancellable(id: CancelID.deliveryStamp)
+    }
+
+    /// Park a first send and, for the first one to this destination, start asking for a path.
+    private func waitForPeerCost(_ state: inout State, message: LXMessage,
+                                 method: LXMFRouter.DeliveryMethod) -> Effect<Action> {
+        let dest = message.destinationHash
+        if !state.inFlightDeliveryStamps.contains(message.hash) {
+            state.inFlightDeliveryStamps.append(message.hash)
+        }
+        let alreadyAsking = state.waitingForPeerCost[dest] != nil
+        if !(state.waitingForPeerCost[dest]?.contains { $0.message.hash == message.hash } ?? false) {
+            state.waitingForPeerCost[dest, default: []].append(WaitingSend(message: message, method: method))
+        }
+        guard !alreadyAsking else { return .none }
+        return .merge(.send(.endpoint(.requestPath(destinationHash: dest))),
+                      peerCostWaitTimer(dest, requestsLeft: LXMFNode.peerCostPathRequests - 1))
+    }
+
+    private func peerCostWaitTimer(_ dest: Data, requestsLeft: Int) -> Effect<Action> {
+        .run { [clock] send in
+            try await clock.sleep(for: .seconds(LXMFDelivery.pathRequestWaitSeconds))
+            await send(.peerCostWaitElapsed(destinationHash: dest, requestsLeft: requestsLeft))
+        }
+        .cancellable(id: CancelID.peerCostWait(dest), cancelInFlight: true)
+    }
+
+    /// Send everything waiting on `dest`, stamped if a cost is now known. It does not wait again.
+    private func handOverWaitingSends(_ state: inout State, destinationHash dest: Data) -> Effect<Action> {
+        guard let waiting = state.waitingForPeerCost.removeValue(forKey: dest) else { return .none }
+        // `.cancel(id:)` cancels when constructed (86ee622); the guard above keeps this to a real hand-over.
+        var effects: [Effect<Action>] = [.cancel(id: CancelID.peerCostWait(dest))]
+        for send in waiting {
+            effects.append(deliverySend(&state, message: send.message, method: send.method, waitForUnknownCost: false))
+        }
+        return .merge(effects)
     }
 }
