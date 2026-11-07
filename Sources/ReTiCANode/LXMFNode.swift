@@ -573,7 +573,9 @@ public struct LXMFNode {
                 // control only the *contents* of the packed list, never whether to emit one.
                 let appData = LXMFAnnounceData.pack(displayName: state.displayName,
                                                     stampCost: state.deliveryStampCost)
-                return .merge(.send(.endpoint(.registerLocalDestination(d))),
+                // LXMF 1.3.0 announces a link cost of 3.25 on its delivery destination
+                // (LXMRouter.py:422); it is on the wire only when the host stamps announces.
+                return .merge(.send(.endpoint(.registerLocalDestination(d, linkCost: LXMFDelivery.deliveryLinkCost))),
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
 
             case let .setDisplayName(name, stampCost):

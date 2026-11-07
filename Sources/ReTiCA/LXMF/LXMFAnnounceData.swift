@@ -67,7 +67,15 @@ public struct LXMFAnnounceData: Equatable {
     ///   − fixed announce payload                  − 148  64-byte public key + 10-byte name hash
     ///                                                    + 10-byte random hash + 64-byte
     ///                                                    signature (`Announce.buildPayload`)
-    ///                                             = 333
+    ///   − RNS 1.6 network-stamp extension         − 18   `NetworkStamp.extensionLength`, which
+    ///                                                    `Transport` appends when the host stamps
+    ///                                                    its announces (`stampDestinations`)
+    ///                                             = 315
+    ///
+    /// **The extension is reserved whether or not stamping is on**, so a display name has the same
+    /// length either way and turning stamping on never makes an announce that used to fit unsendable
+    /// (nor truncates a name further). With a null stamp cost the name budget fell from 326 to 308
+    /// UTF-8 bytes, so a name of 309-326 bytes, which fitted before, is now cut to fit.
     ///
     /// **Assumes no ratchet.** `Transport`'s `.announce` case passes `ratchet: nil` today. A
     /// ratchet is a fifth fixed payload field of `Announce.ratchetSize` (32) bytes, so if ReTiCA
@@ -80,7 +88,7 @@ public struct LXMFAnnounceData: Equatable {
     /// stops a *new* unsendable value being captured, but nothing clears one already captured.
     /// `Transport.state.localAppData` is written in exactly two places — cleared on
     /// `.registerLocalDestination`, and set after a successful pack — so a name captured while it
-    /// fit (≤ 333 B) becomes unsendable the moment a ratchet adds 32 bytes, and from then on
+    /// fit (≤ 315 B) becomes unsendable the moment a ratchet adds 32 bytes, and from then on
     /// `announce(nil)` and local path responses go silent again with no self-heal. A re-review
     /// probe characterised exactly that state: seeded oversize sticky entry → zero transmits.
     /// So when ratchets land: drop this by 32 **and** re-validate or clear existing captures.
@@ -89,6 +97,7 @@ public struct LXMFAnnounceData: Equatable {
         - (Packet.addressLength + 3)
         - (Announce.keySize + Announce.nameHashLength + Announce.randomHashLength
            + Announce.signatureLength)
+        - NetworkStamp.extensionLength
 
     /// Pack delivery-destination announce app-data in the 0.5.0+ msgpack format.
     ///
@@ -106,8 +115,8 @@ public struct LXMFAnnounceData: Equatable {
     /// no length bound, and an over-long name there makes `RNS.Packet.pack` raise IOError
     /// (RNS 1.4.2 Packet.py:234-236) so the announce simply fails. ReTiCA's `Transport` `.announce`
     /// swallows that failure (`try?`), so an unbounded name here silently took the destination off
-    /// the network — a shortened name is strictly better than no announce. Names that already fit
-    /// are byte-identical to before, so the cross-validation vectors are untouched.
+    /// the network — a shortened name is strictly better than no announce. Names that fit the budget
+    /// are emitted unchanged, so the cross-validation vectors (all far shorter) are untouched.
     public static func pack(displayName: String?, stampCost: Int?) -> Data {
         let costValue: MsgPackValue
         if let cost = stampCost, cost > 0, cost < 255 {
@@ -139,7 +148,7 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// The extra `- 1` covers the bin header growing from bin8 (2 bytes) to bin16 (3 bytes) above
     /// 255 name bytes. It is unconditional because this budget only ever binds well above 255
-    /// (its smallest possible value here is 325), so reserving the byte costs nothing real.
+    /// (its smallest possible value here is 307), so reserving the byte costs nothing real.
     private static func displayNameBudget(costValue: MsgPackValue,
                                           functionalityValue: MsgPackValue) -> Int {
         let overhead = MsgPack.encode(.array([.bin(Data()), costValue, functionalityValue])).count

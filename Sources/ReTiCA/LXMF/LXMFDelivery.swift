@@ -4,6 +4,10 @@ import Foundation
 /// (which lives in the ReTiCA test target) can pin them against genuine LXMF; the LXMFRouter reducer
 /// (ReTiCANode) references them.
 public enum LXMFDelivery {
+    /// Link-request stamp cost the delivery destination announces (LXMF 1.3.0
+    /// `LXMRouter.DELIVERY_LINK_COST`, set at LXMRouter.py:422).
+    public static let deliveryLinkCost = 3.25
+
     /// Seconds between outbound delivery retries (RNS `LXMRouter.DELIVERY_RETRY_WAIT`).
     public static let retryWaitSeconds = 10
 

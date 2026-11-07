@@ -110,7 +110,8 @@ public struct PNNode {
                                          perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
                                          targetStampCost: state.node.store.minStampCost,
                                          stampCostFlexibility: 0, peeringCost: state.peeringCost).packed
-                return .merge(.send(.endpoint(.registerLocalDestination(d))),
+                // LXMF 1.3.0's propagation link cost (LXMRouter.py:634), on the wire when stamping.
+                return .merge(.send(.endpoint(.registerLocalDestination(d, linkCost: LXMFPropagation.propagationLinkCost))),
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
 
             case let .syncToPeer(destinationHash, peeringCost):

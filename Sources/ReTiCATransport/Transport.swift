@@ -121,6 +121,53 @@ public struct Transport {
         /// of them is coalesced into it. Cleared when the search ends or `.cancelPathRequestStamps`.
         public var stampingPathRequests: Set<Data> = []
 
+        /// Stamp our own announces (RNS `Transport.STAMP_DESTINATIONS`, `[stamps] stamp_destinations`).
+        /// Off by default, as in 1.6.0, and then announce bytes are exactly as before. When on, every
+        /// announce and local path response carries the 18-byte extension (`Transport.destinationStampExtension`)
+        /// with a stamp of `destinationValue` over `destinationHash + publicKey + nameHash`. The stamp is
+        /// mined once per destination (minutes on a phone at the default value) and reported with
+        /// `.delegate(.destinationStampGenerated)` so the host can persist it and hand it back with
+        /// `.rehydrateDestinationStamp` (reference persists it, Stamps.py:888-930). A host sets this at
+        /// construction, on `TransportEndpoint.State.transport`.
+        public var stampDestinations = false
+        /// The value our announce stamps are mined to (RNS `Transport.DESTINATION_VALUE`). Read through
+        /// `Transport.clampedDestinationValue`, which clamps it to 0...`NetworkStamp.stampCostCap` as
+        /// reference's config parser does (Reticulum.py:529-531).
+        public var destinationValue: Double = NetworkStamp.defaultDestinationValue
+        /// The stamp held for each local destination, generated or rehydrated. Checked against
+        /// `destinationValue` before each use; one that falls short is dropped and mined again.
+        public var destinationStamps: [Data: Data] = [:]
+        /// The link-request cost each local destination announces, already clamped to
+        /// 0...`NetworkStamp.linkCostCap` (reference `set_link_cost`, Destination.py:399-405). Absent
+        /// means `NetworkStamp.defaultLinkRequestCost` (reference `get_link_cost`, Destination.py:407-417).
+        public var localLinkCosts: [Data: Double] = [:]
+        /// Local destinations whose stamp search is in flight. One search per destination.
+        public var stampingDestinations: Set<Data> = []
+        /// Announces and path responses waiting for their destination's stamp (reference
+        /// `stamp_queues`, Transport.py:1453-1463). Bounded by `Transport.stampedAnnounceQueueLimit` and
+        /// `Transport.stampedPathResponseQueueLimit`; dropped if the search ends without a stamp.
+        public var pendingStampedAnnounces: [PendingStampedAnnounce] = []
+
+        /// An announce or path response held until its destination's stamp exists.
+        public struct PendingStampedAnnounce: Equatable, Sendable {
+            public enum Kind: Equatable, Sendable {
+                /// `.announce(destinationHash:appData:interface:)` as it was sent.
+                case announce(appData: Data?, interface: InterfaceID?)
+                /// A path response owed on the interface its request arrived on.
+                case pathResponse(interface: InterfaceID)
+            }
+            public var destinationHash: Data
+            public var kind: Kind
+            public var isPathResponse: Bool {
+                if case .pathResponse = kind { return true }
+                return false
+            }
+            public init(destinationHash: Data, kind: Kind) {
+                self.destinationHash = destinationHash
+                self.kind = kind
+            }
+        }
+
         public struct PendingAnnounce: Equatable, Sendable {
             public var raw: Data
             public var arrivalInterface: InterfaceID
@@ -323,7 +370,11 @@ public struct Transport {
     public enum Action: Equatable {
         case interfaceConnected(InterfaceID, InterfaceProfile)
         case interfaceDisconnected(InterfaceID)
-        case registerLocalDestination(Destination)
+        /// Register a local destination. `linkCost` is the link-request stamp cost it announces when
+        /// `stampDestinations` is on: nil means `NetworkStamp.defaultLinkRequestCost` (reference
+        /// `LR_COST`), and a value is clamped to 0...`NetworkStamp.linkCostCap`, NaN to 0, as reference
+        /// `set_link_cost` does (Destination.py:399-405). LXMF registers 3.25.
+        case registerLocalDestination(Destination, linkCost: Double? = nil)
         /// Remove a local destination — reference `Transport.deregister_destination`
         /// (RNS/Transport.py:2520-2527). From then on its DATA is dropped, its LINKREQUESTs are
         /// not surfaced, path requests for it are not answered and `.announce` for it emits
@@ -350,6 +401,18 @@ public struct Transport {
         case pathRequestStampSearchEnded(destinationHash: Data, request: Data?)
         /// Cancel every path-request stamp search; none of them sends. The host sends this when it stops.
         case cancelPathRequestStamps
+        /// Hand back a destination stamp the host persisted from `.delegate(.destinationStampGenerated)`.
+        /// One that is not `NetworkStamp.stampLength` bytes is discarded; the rest is checked against
+        /// `destinationValue` before use, and one that falls short is mined again (Stamps.py:907-930).
+        /// If a search for the destination is running and this stamp meets the value, it ends the
+        /// search and releases what was waiting.
+        case rehydrateDestinationStamp(destinationHash: Data, stamp: Data)
+        /// A destination stamp search ended with `stamp` (nil if it ended without one) of `value`.
+        case destinationStampSearchEnded(destinationHash: Data, stamp: Data?, value: Double)
+        /// Cancel every destination stamp search and drop what waited for it, as reference drops
+        /// announces whose stamp generation fails (Destination.py:349-351). The next announce searches
+        /// again. The host sends this when it stops.
+        case cancelDestinationStamps
         /// Encrypt `plaintext` to a learned destination and send it as one packet. With a non-nil
         /// `receiptToken`, also record a `PendingReceipt` so a valid proof for this packet emits
         /// `.delegate(.singlePacketDelivered(token:))`. The token is opaque to Transport.
@@ -414,6 +477,10 @@ public struct Transport {
             case linkRequest(destinationHash: Data, arrivalInterface: InterfaceID, data: Data)
             /// A valid proof arrived for a packet sent with `receiptToken`; the receipt is gone.
             case singlePacketDelivered(token: Data)
+            /// A stamp was mined for a local destination. Persist it and hand it back with
+            /// `.rehydrateDestinationStamp` after a relaunch: at the default value it takes minutes on
+            /// a phone (reference `store_destination_stamp`, Stamps.py:888-905).
+            case destinationStampGenerated(destinationHash: Data, stamp: Data, value: Double)
         }
     }
 
@@ -425,6 +492,7 @@ public struct Transport {
         case announceRetransmit(Data); case maintenance; case announceDrain(InterfaceID)
         case ingressRelease(InterfaceID)
         case pathRequestStamp(Data)
+        case destinationStamp(Data)
     }
 
     public init() {}
@@ -464,6 +532,120 @@ public struct Transport {
                 return sends.isEmpty ? .none : .merge(sends)
             }
 
+            // --- RNS 1.6.0 destination stamps on our own announces (Destination.py:266-379) ---
+
+            // The stamp `dest` can use now: held, `stampLength` bytes, and meeting `destinationValue`.
+            // One that falls short is dropped, so the caller mines a new one (reference `_await_stamp`
+            // re-mines below `target_value`, Destination.py:268; `load_destination_stamp` discards a
+            // wrong length, Stamps.py:917-919).
+            func usableStamp(_ dest: Destination, _ identity: Identity, _ state: inout State) -> Data? {
+                guard let stamp = state.destinationStamps[dest.hash] else { return nil }
+                guard stamp.count == NetworkStamp.stampLength,
+                      NetworkStamp.isValid(stamp: stamp, cost: Transport.clampedDestinationValue(state.destinationValue),
+                                           material: dest.hash + identity.publicKey + dest.nameHash)
+                else {
+                    state.destinationStamps[dest.hash] = nil
+                    return nil
+                }
+                return stamp
+            }
+
+            // An announce of `dest` as wire bytes. With a stamp, the 18-byte extension follows the app
+            // data and the signature covers it (Destination.py:353-362). Nil if it cannot be packed.
+            func announceBytes(_ dest: Destination, _ identity: Identity, appData: Data?, stamp: Data?,
+                               pathResponse: Bool, _ state: State) -> Data? {
+                var wireAppData = appData
+                if let stamp {
+                    let linkCost = state.localLinkCosts[dest.hash] ?? NetworkStamp.defaultLinkRequestCost
+                    wireAppData = (appData ?? Data()) + Transport.destinationStampExtension(stamp: stamp, linkCost: linkCost)
+                }
+                let now = UInt64(date.now.timeIntervalSince1970)
+                let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
+                let payload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
+                                                    nameHash: dest.nameHash, randomHash: randomHash,
+                                                    ratchet: nil, appData: wireAppData)
+                return try? Packet.announce(from: dest, payload: payload, pathResponse: pathResponse).packed()
+            }
+
+            // Emit an announce of `dest` (see `.announce` for the sticky app data rule, including why
+            // the capture follows a successful pack).
+            func emitAnnounce(_ dest: Destination, _ identity: Identity, appData: Data?, interface: InterfaceID?,
+                              stamp: Data?, _ state: inout State) -> Effect<Action> {
+                let announcedAppData = appData ?? state.localAppData[dest.hash]
+                guard let raw = announceBytes(dest, identity, appData: announcedAppData, stamp: stamp,
+                                              pathResponse: false, state) else { return .none }
+                if let appData { state.localAppData[dest.hash] = appData }
+                let targets: [InterfaceID] = interface.map { state.interfaces[$0] != nil ? [$0] : [] }
+                    ?? Array(state.interfaces.keys)
+                return .merge(targets.map { .send(.delegate(.transmit($0, raw))) })
+            }
+
+            // Answer a path request for our own `dest` on `interfaceID`. It replays the app data this
+            // destination last announced: a path response is stamped NOW, so it always wins
+            // `shouldReplace` on the requester, and sending nil would erase whatever richer entry the
+            // requester had learned from a normal announce (display name, PN metadata, ...).
+            //
+            // `ratchet` stays nil: ReTiCA has no own-ratchet lifecycle at all (it only honours a
+            // PEER's announced ratchet when encrypting), so there is nothing truthful to put here.
+            func emitPathResponse(_ dest: Destination, _ identity: Identity, on interfaceID: InterfaceID,
+                                  stamp: Data?, _ state: State) -> Effect<Action> {
+                guard let raw = announceBytes(dest, identity, appData: state.localAppData[dest.hash], stamp: stamp,
+                                              pathResponse: true, state) else { return .none }
+                return .send(.delegate(.transmit(interfaceID, raw)))
+            }
+
+            // One search per destination, no timeout (reference sets none for destination stamps; at
+            // the default value it takes minutes on a phone). Bounded by cancellation: the endpoint's
+            // stop, `.cancelDestinationStamps`, deregistration, or a rehydrated stamp.
+            func startDestinationStampSearch(_ dest: Destination, _ identity: Identity,
+                                             _ state: inout State) -> Effect<Action> {
+                guard state.stampingDestinations.insert(dest.hash).inserted else { return .none }
+                let hash = dest.hash
+                let material = dest.hash + identity.publicKey + dest.nameHash      // stamp_material()
+                let value = Transport.clampedDestinationValue(state.destinationValue)
+                return .run { send in
+                    let found = await NetworkStamp.generate(material: material, cost: value)
+                    // Cancelled from outside: nothing to report.
+                    guard !Task.isCancelled else { return }
+                    await send(.destinationStampSearchEnded(destinationHash: hash, stamp: found?.stamp,
+                                                            value: found?.value ?? 0))
+                }
+                .cancellable(id: CancelID.destinationStamp(hash))
+            }
+
+            // Hold `item` until its destination's stamp exists, within the reference queue lengths;
+            // past them the item is dropped, as reference drops it (Transport.py:1458-1461).
+            func waitForStamp(_ item: State.PendingStampedAnnounce, _ dest: Destination, _ identity: Identity,
+                              _ state: inout State) -> Effect<Action> {
+                let limit = item.isPathResponse ? Transport.stampedPathResponseQueueLimit
+                                                : Transport.stampedAnnounceQueueLimit
+                if state.pendingStampedAnnounces.filter({ $0.isPathResponse == item.isPathResponse }).count < limit {
+                    state.pendingStampedAnnounces.append(item)
+                }
+                return startDestinationStampSearch(dest, identity, &state)
+            }
+
+            // The stamp for `hash` exists: send everything that waited for it, path responses first
+            // (reference queues them at a higher priority, Transport.py:1455), then announces in order.
+            func releaseWaiting(_ hash: Data, stamp: Data, _ state: inout State) -> Effect<Action> {
+                let waiting = state.pendingStampedAnnounces.filter { $0.destinationHash == hash }
+                state.pendingStampedAnnounces.removeAll { $0.destinationHash == hash }
+                guard let dest = state.localDestinations[hash],
+                      let identity = dest.identity, identity.privateKey != nil else { return .none }
+                var effects: [Effect<Action>] = []
+                for item in waiting.filter(\.isPathResponse) + waiting.filter({ !$0.isPathResponse }) {
+                    switch item.kind {
+                    case let .pathResponse(interfaceID):
+                        guard state.interfaces[interfaceID] != nil else { continue }
+                        effects.append(emitPathResponse(dest, identity, on: interfaceID, stamp: stamp, state))
+                    case let .announce(appData, interface):
+                        effects.append(emitAnnounce(dest, identity, appData: appData, interface: interface,
+                                                    stamp: stamp, &state))
+                    }
+                }
+                return .merge(effects)
+            }
+
             switch action {
             case let .interfaceConnected(id, profile):
                 state.interfaces[id] = profile
@@ -496,7 +678,9 @@ public struct Transport {
                 return .merge(.cancel(id: CancelID.announceDrain(id)),
                               .cancel(id: CancelID.ingressRelease(id)))
 
-            case let .registerLocalDestination(destination):
+            case let .registerLocalDestination(destination, linkCost):
+                // The cost it announces: absent means `LR_COST`, a re-registration replaces it.
+                state.localLinkCosts[destination.hash] = linkCost.map(Transport.clampedLinkCost)
                 // Registering a destination clears any app data stickily remembered for it. This is
                 // ReTiCA's `Destination.clear_default_app_data()` (RNS/Destination.py:688-692), and
                 // it is one of two clear paths (the other is `.deregisterLocalDestination`):
@@ -520,13 +704,18 @@ public struct Transport {
             case let .deregisterLocalDestination(destinationHash):
                 // Every gate on a local destination reads `localDestinations` when a packet is
                 // handled — DATA delivery, the LINKREQUEST hand-up, the path-request answer and
-                // `.announce` — so removing the entry is the whole of it. Nothing is scheduled per
-                // local destination (an own announce goes out at once, never held), so there is no
-                // timer to cancel. The app data goes too, as `.registerLocalDestination` clears it,
-                // so a later re-registration starts clean.
+                // `.announce` — so removing the entry is the whole of it, apart from a destination
+                // stamp search (below), the one thing scheduled per local destination: with
+                // `stampDestinations` on, an announce can be held for its stamp. The app data goes
+                // too, as `.registerLocalDestination` clears it, so a later re-registration starts clean.
                 state.localDestinations[destinationHash] = nil
                 state.localAppData[destinationHash] = nil
-                return .none
+                state.localLinkCosts[destinationHash] = nil
+                // Its stamp search, and what waited for it, would only ever be dropped: stop it. The
+                // stamp itself is kept, so a re-registration need not mine again.
+                state.pendingStampedAnnounces.removeAll { $0.destinationHash == destinationHash }
+                guard state.stampingDestinations.remove(destinationHash) != nil else { return .none }
+                return .cancel(id: CancelID.destinationStamp(destinationHash))
 
             case let .setTransportIdentity(identity):
                 state.transportIdentity = identity
@@ -869,23 +1058,19 @@ public struct Transport {
                         // (1) We OWN the requested destination → answer with a fresh path-response.
                         if let dest = state.localDestinations[requested],
                            let identity = dest.identity, identity.privateKey != nil {
-                            let now = UInt64(date.now.timeIntervalSince1970)
-                            let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
-                            // Replay the app data this destination last announced. A path response
-                            // is stamped NOW, so it always wins `shouldReplace` on the requester —
-                            // sending nil here would erase whatever richer entry the requester had
-                            // learned from a normal announce (display name, PN metadata, ...).
-                            //
-                            // `ratchet` stays nil: ReTiCA has no own-ratchet lifecycle at all (it
-                            // only honours a PEER's announced ratchet when encrypting), so there is
-                            // nothing truthful to put here. Revisit when ratchets land.
-                            let respPayload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
-                                                                    nameHash: dest.nameHash, randomHash: randomHash,
-                                                                    ratchet: nil,
-                                                                    appData: state.localAppData[dest.hash])
-                            let response = Packet.announce(from: dest, payload: respPayload, pathResponse: true)
-                            guard let raw = try? response.packed() else { return .none }
-                            return .send(.delegate(.transmit(interfaceID, raw)))
+                            // App data and ratchet: see `emitPathResponse`.
+                            guard state.stampDestinations else {
+                                return emitPathResponse(dest, identity, on: interfaceID, stamp: nil, state)
+                            }
+                            // Stamping: the response carries the same extension as our announces. With
+                            // no stamp yet it waits for one, ahead of waiting announces (reference
+                            // queues it at a higher priority, Transport.py:1455).
+                            if let stamp = usableStamp(dest, identity, &state) {
+                                return emitPathResponse(dest, identity, on: interfaceID, stamp: stamp, state)
+                            }
+                            return waitForStamp(State.PendingStampedAnnounce(destinationHash: dest.hash,
+                                                                             kind: .pathResponse(interface: interfaceID)),
+                                                dest, identity, &state)
                         }
                         // (2) We are a relay that has learned + cached a path to the destination →
                         // re-emit the cached announce (verbatim payload, original signature) as a
@@ -1279,18 +1464,26 @@ public struct Transport {
                 // overflow (RNS 1.4.2 Packet.py:234-236) rather than failing silently, and its
                 // `default_app_data` is only ever written by an explicit `set_default_app_data()`,
                 // so there is no auto-capture to poison.
+                //
+                // Stamping off (the default): sent at once, byte for byte as before.
+                guard state.stampDestinations else {
+                    return emitAnnounce(dest, identity, appData: appData, interface: interface, stamp: nil, &state)
+                }
+                if let stamp = usableStamp(dest, identity, &state) {
+                    return emitAnnounce(dest, identity, appData: appData, interface: interface, stamp: stamp, &state)
+                }
+                // No stamp yet: the announce waits for one (reference `enqueue_stamped_announce`,
+                // Destination.py:297-301). Its sticky app data is captured NOW, so a path response
+                // released ahead of it replays it — but only if the stamped announce will pack, for
+                // the reason above. Any 14 bytes give the same length as the real stamp.
                 let announcedAppData = appData ?? state.localAppData[destinationHash]
-                let now = UInt64(date.now.timeIntervalSince1970)
-                let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
-                let payload = Announce.buildPayload(identity: identity, destinationHash: destinationHash,
-                                                    nameHash: dest.nameHash, randomHash: randomHash,
-                                                    ratchet: nil, appData: announcedAppData)
-                let packet = Packet.announce(from: dest, payload: payload)
-                guard let raw = try? packet.packed() else { return .none }
+                guard announceBytes(dest, identity, appData: announcedAppData,
+                                    stamp: Data(count: NetworkStamp.stampLength), pathResponse: false, state) != nil
+                else { return .none }
                 if let appData { state.localAppData[destinationHash] = appData }
-                let targets: [InterfaceID] = interface.map { state.interfaces[$0] != nil ? [$0] : [] }
-                    ?? Array(state.interfaces.keys)
-                return .merge(targets.map { .send(.delegate(.transmit($0, raw))) })
+                return waitForStamp(State.PendingStampedAnnounce(destinationHash: destinationHash,
+                                                                 kind: .announce(appData: appData, interface: interface)),
+                                    dest, identity, &state)
 
             case let .requestPath(destinationHash):
                 // RNS 1.6.0 request_path (Transport.py:3685-3722): payload = destHash + sender ID + tag,
@@ -1349,6 +1542,43 @@ public struct Transport {
                 let cancelled = state.stampingPathRequests
                 state.stampingPathRequests = []
                 return .merge(cancelled.map { .cancel(id: CancelID.pathRequestStamp($0)) })
+
+            case let .rehydrateDestinationStamp(destinationHash, stamp):
+                guard stamp.count == NetworkStamp.stampLength else { return .none }
+                state.destinationStamps[destinationHash] = stamp
+                // A search already running for it (the host's read landed after the first announce):
+                // if this stamp is good enough, it ends the search and releases what waited.
+                guard state.stampingDestinations.contains(destinationHash),
+                      let dest = state.localDestinations[destinationHash],
+                      let identity = dest.identity, identity.privateKey != nil,
+                      let usable = usableStamp(dest, identity, &state)
+                else { return .none }
+                state.stampingDestinations.remove(destinationHash)
+                return .merge(.cancel(id: CancelID.destinationStamp(destinationHash)),
+                              releaseWaiting(destinationHash, stamp: usable, &state))
+
+            case let .destinationStampSearchEnded(destinationHash, stamp, value):
+                // Cancelled meanwhile: the search no longer counts.
+                guard state.stampingDestinations.remove(destinationHash) != nil else { return .none }
+                // A search reports once, as its effect's last act; cancelling here only stops a stray.
+                let stop = Effect<Action>.cancel(id: CancelID.destinationStamp(destinationHash))
+                guard let stamp, stamp.count == NetworkStamp.stampLength else {
+                    // Ended without a stamp: what waited is dropped, as reference drops an announce
+                    // whose stamp generation fails (Destination.py:349-351).
+                    state.pendingStampedAnnounces.removeAll { $0.destinationHash == destinationHash }
+                    return stop
+                }
+                state.destinationStamps[destinationHash] = stamp
+                return .merge(stop,
+                              .send(.delegate(.destinationStampGenerated(destinationHash: destinationHash,
+                                                                         stamp: stamp, value: value))),
+                              releaseWaiting(destinationHash, stamp: stamp, &state))
+
+            case .cancelDestinationStamps:
+                let cancelled = state.stampingDestinations
+                state.stampingDestinations = []
+                state.pendingStampedAnnounces.removeAll { cancelled.contains($0.destinationHash) }
+                return .merge(cancelled.map { .cancel(id: CancelID.destinationStamp($0)) })
 
             case let .proveSingle(packetHash, interfaceID, identity):
                 guard identity.privateKey != nil, state.interfaces[interfaceID] != nil else { return .none }
@@ -1597,6 +1827,36 @@ public struct Transport {
     /// tell it came from a stamp-aware node: marker, flags `0xFF`, 14 zero bytes (Transport.py:3935-3936).
     static let lenientPathRequestExtension =
         Data([NetworkStamp.extensionMarker, 0xFF]) + Data(repeating: 0, count: NetworkStamp.stampLength)
+
+    /// Extension flags on our announce stamps (reference `get_ext_flags`, Destination.py:384-385).
+    static let destinationStampFlags: UInt8 = 0x00
+    /// RNS STAMPER_AN_QUEUE_LENGTH (Transport.py:210): announces that may wait for a stamp.
+    public static let stampedAnnounceQueueLimit = 32
+    /// RNS STAMPER_PR_QUEUE_LENGTH (Transport.py:209): path responses that may wait for a stamp.
+    public static let stampedPathResponseQueueLimit = 32
+
+    /// `destinationValue` as reference's config parser clamps `destination_value`
+    /// (Reticulum.py:529-531): 0...`NetworkStamp.stampCostCap`. NaN reads as 0, as Python's
+    /// `max(0, min(nan, cap))` does.
+    public static func clampedDestinationValue(_ value: Double) -> Double {
+        value.isNaN ? 0 : min(max(value, 0), Double(NetworkStamp.stampCostCap))
+    }
+
+    /// A local destination's link cost as reference `set_link_cost` clamps it (Destination.py:399-405):
+    /// 0...`NetworkStamp.linkCostCap`, NaN to 0.
+    static func clampedLinkCost(_ cost: Double) -> Double {
+        cost.isNaN ? 0 : min(max(cost, 0), Double(NetworkStamp.linkCostCap))
+    }
+
+    /// The 18-byte announce extension (Destination.py:353-354): marker, flags, the stamp, then the
+    /// link cost's fixed-point bytes REVERSED, fraction byte first and integer byte last, the order
+    /// `Announce.readStampExtension` (and reference `validate_announce`) reads them back in.
+    /// `fixedPoint(cost:)` clamps to 0...`stampCostCap` * 256, so both bytes fit without trapping.
+    static func destinationStampExtension(stamp: Data, linkCost: Double) -> Data {
+        let fp = NetworkStamp.fixedPoint(cost: linkCost)
+        return Data([NetworkStamp.extensionMarker, destinationStampFlags]) + stamp
+            + Data([UInt8(fp & 0xFF), UInt8((fp >> 8) & 0xFF)])
+    }
 
     static let pathRequestTagRingSize = 32000      // RNS max_pr_tags (Transport.py:127)
     /// Packet-hash dedup window. Reference `hashlist_maxsize` is 1_000_000 with a two-generation

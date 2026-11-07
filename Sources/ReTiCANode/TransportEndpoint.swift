@@ -125,7 +125,10 @@ public struct TransportEndpoint {
 
         case start
         case stop
-        case registerLocalDestination(Destination)
+        /// Register a local destination; `linkCost` as `Transport.Action.registerLocalDestination`.
+        case registerLocalDestination(Destination, linkCost: Double? = nil)
+        /// Hand back a persisted destination stamp — see `Transport.Action.rehydrateDestinationStamp`.
+        case rehydrateDestinationStamp(destinationHash: Data, stamp: Data)
         /// Stop serving a local destination (RNS `Transport.deregister_destination`): the shared
         /// router forgets it (`Transport.Action.deregisterLocalDestination`) and every inbound link
         /// on it is closed — an established one at once (LINKCLOSE to the peer, `linkClosed`), one
@@ -185,6 +188,9 @@ public struct TransportEndpoint {
             /// A single (non-link) packet sent with a receipt token was proved. Distinct from
             /// `packetDelivered(token:)`, which stays link-only.
             case singlePacketDelivered(token: Data)
+            /// A stamp was mined for one of our destinations: persist it and hand it back with
+            /// `.rehydrateDestinationStamp` after a relaunch. See `Transport.Action.Delegate`.
+            case destinationStampGenerated(destinationHash: Data, stamp: Data, value: Double)
         }
     }
 
@@ -209,14 +215,21 @@ public struct TransportEndpoint {
                 // Meshtastic radio reports offline only after `driver.stop()` returns. Each link
                 // fails with `.pathStale` (see `LinkPlane.failStampSearches` for why not
                 // `.stampFailure`). Path-request stamp searches likewise; a cancelled one sends nothing.
+                // So do destination stamp searches, and what waited for them is dropped; the next
+                // announce after a restart searches again (or uses the stamp the host rehydrates).
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .disconnect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
                                  state.ble != nil ? .send(.ble(.stop)) : .none,
                                  state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none,
                                  state.linkPlane.stampingLinks.isEmpty ? .none : .send(.linkPlane(.cancelStampSearches)),
                                  state.transport.stampingPathRequests.isEmpty ? .none
-                                     : .send(.transport(.cancelPathRequestStamps))])
-            case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
+                                     : .send(.transport(.cancelPathRequestStamps)),
+                                 state.transport.stampingDestinations.isEmpty ? .none
+                                     : .send(.transport(.cancelDestinationStamps))])
+            case let .registerLocalDestination(d, linkCost):
+                return .send(.transport(.registerLocalDestination(d, linkCost: linkCost)))
+            case let .rehydrateDestinationStamp(h, stamp):
+                return .send(.transport(.rehydrateDestinationStamp(destinationHash: h, stamp: stamp)))
             case let .deregisterLocalDestination(hash):
                 // Router first, so a LINKREQUEST racing this action is no longer handed up. Then
                 // close the ESTABLISHED responder links on the destination; `LinkSession.close` is
@@ -417,6 +430,8 @@ public struct TransportEndpoint {
                                                         packetHash: packetHash, interfaceID: interfaceID)))
             case let .transport(.delegate(.singlePacketDelivered(token))):
                 return .send(.delegate(.singlePacketDelivered(token: token)))
+            case let .transport(.delegate(.destinationStampGenerated(h, stamp, value))):
+                return .send(.delegate(.destinationStampGenerated(destinationHash: h, stamp: stamp, value: value)))
             case let .transport(.delegate(.pathLearned(h, hops))):
                 return .send(.delegate(.pathLearned(destinationHash: h, hops: hops)))
             case let .transport(.delegate(.sendFailed(h, r))):

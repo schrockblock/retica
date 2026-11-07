@@ -26,6 +26,9 @@ ap.add_argument("--destination-value", type=float, default=12,
 ap.add_argument("--enforce-network", action="store_true",
                 help="[stamps] enforce_stamps = yes: drop link requests, announces and path requests "
                      "whose network stamp falls short")
+ap.add_argument("--destination-cost", type=float,
+                help="[stamps] destination_cost: the stamp value an announce must carry to be accepted here. "
+                     "Default 10 with --network-stamps, otherwise the reference default of 23.5")
 ap.add_argument("--link-cost", type=float,
                 help="announce this link-request cost instead of LXMF's 3.25. A random key meets 3.25 about "
                      "one time in ten, too often for a test of refusal; 12 is one in 4,096")
@@ -41,8 +44,10 @@ os.makedirs(args.dir)
 stamp_options = []
 if args.network_stamps:
     # Low values keep generation fast. The value does not change the wire layout.
-    stamp_options += ["stamp_destinations = yes", f"destination_value = {args.destination_value}",
-                      "destination_cost = 10"]
+    stamp_options += ["stamp_destinations = yes", f"destination_value = {args.destination_value}"]
+destination_cost = args.destination_cost if args.destination_cost is not None else (10 if args.network_stamps else None)
+if destination_cost is not None:
+    stamp_options.append(f"destination_cost = {destination_cost}")
 if args.enforce_network:
     stamp_options.append("enforce_stamps = yes")
 stamps = "[stamps]\n" + "".join(f"  {o}\n" for o in stamp_options) if stamp_options else ""
@@ -75,6 +80,8 @@ RNS.Reticulum(args.dir)
 assert RNS.Transport.LR_STAMPS_ENFORCED == args.enforce_network
 # Path requests (and announces) are enforced by this one, at ingress (Transport.py:2128-2129).
 assert RNS.Transport.STAMPS_ENFORCED == args.enforce_network
+if destination_cost is not None:
+    assert RNS.Transport.DESTINATION_COST == destination_cost
 identity = RNS.Identity()
 # The lowest cost LXMF accepts from a node, so a debug build's search stays short.
 router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(args.dir, "lxmf"), autopeer=False,

@@ -207,7 +207,8 @@ public struct LXMFServiceNode {
                 else { return .none }
                 state.client.propagationDestinationHash = d.hash
                 return .merge(
-                    .send(.client(.endpoint(.registerLocalDestination(d)))),
+                    // LXMF 1.3.0's propagation link cost (LXMRouter.py:634), on the wire when stamping.
+                    .send(.client(.endpoint(.registerLocalDestination(d, linkCost: LXMFPropagation.propagationLinkCost)))),
                     .send(.client(.endpoint(.announce(
                         destinationHash: d.hash,
                         appData: pnAnnounceAppData(state, nodeState: true))))))

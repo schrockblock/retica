@@ -269,10 +269,15 @@ import Foundation
 
 // MARK: — Display-name length bound
 
-/// The name budget when the stamp cost is null: `maxAppDataBytes` (333) minus 6 bytes of non-name
-/// overhead (fixarray header + 2-byte bin8 header + null cost + 2-byte functionality array) minus
-/// the 1 byte the bin header grows by above 255 name bytes = 326 UTF-8 bytes.
-private let nameBudgetWithNullCost = 326
+/// The name budget when the stamp cost is null: `maxAppDataBytes` (315: 333 left in the packet, less
+/// the 18-byte RNS 1.6 stamp extension reserved for when the host stamps announces) minus 6 bytes of
+/// non-name overhead (fixarray header + 2-byte bin8 header + null cost + 2-byte functionality array)
+/// minus the 1 byte the bin header grows by above 255 name bytes = 308 UTF-8 bytes.
+private let nameBudgetWithNullCost = 308
+
+@Test func lxmfAnnounceDataReservesTheStampExtension() {
+    #expect(LXMFAnnounceData.maxAppDataBytes == 333 - NetworkStamp.extensionLength)
+}
 
 /// An over-budget display name must be TRUNCATED, not emitted whole. Emitting it whole produced a
 /// blob that `Packet.packed()` rejects, and `Transport`'s `.announce` swallows that failure — so an
@@ -330,13 +335,13 @@ private let nameBudgetWithNullCost = 326
 /// family emoji's ZWJ sequence, producing invalid UTF-8 that reference's `dn.decode("utf-8")`
 /// (LXMF.py:165) rejects — the peer would then see NO name rather than a shortened one.
 ///
-/// 320 ASCII bytes + a 25-byte emoji = 345, over the 326-byte budget; a byte-wise cut at 326 would
-/// keep 6 bytes of the emoji.
+/// 300 ASCII bytes + a 25-byte emoji = 325, over the 308-byte budget; a byte-wise cut at 308 would
+/// keep 8 bytes of the emoji.
 ///
 /// Anti-vacuity: `try #require` on the recovered name fails outright if the blob decodes to
 /// nothing, which is exactly what a mid-scalar cut produces.
 @Test func lxmfAnnounceDataPackTruncatesOnAGraphemeBoundary() throws {
-    let prefix = String(repeating: "D", count: 320)
+    let prefix = String(repeating: "D", count: 300)
     let family = "👩‍👩‍👧‍👦"
     #expect(family.utf8.count == 25)            // pins the arithmetic this test depends on
     let packed = LXMFAnnounceData.pack(displayName: prefix + family, stampCost: nil)
@@ -351,21 +356,22 @@ private let nameBudgetWithNullCost = 326
 /// above: here the cut point falls mid-scalar, the case that produces invalid UTF-8 directly.
 @Test func lxmfAnnounceDataPackDropsAStraddlingMultiByteScalarWhole() throws {
     // "é" is 2 UTF-8 bytes. One leading ASCII byte makes the boundary odd, so the scalar that would
-    // reach byte 326 starts at 325 — i.e. it straddles.
+    // reach byte 308 starts at 308 and ends at 309 — i.e. it straddles.
     let name = "E" + String(repeating: "é", count: 200)
     let packed = LXMFAnnounceData.pack(displayName: name, stampCost: nil)
 
     #expect(packed.count <= LXMFAnnounceData.maxAppDataBytes)
     let parsed = try #require(LXMFAnnounceData.parse(packed))
     let recovered = try #require(parsed.displayName, "a mid-scalar cut yields undecodable UTF-8")
-    // 1 + 2n <= 326 → n = 162, total 325 bytes; the 163rd "é" would have straddled 326.
-    #expect(recovered == "E" + String(repeating: "é", count: 162))
-    #expect(recovered.utf8.count == 325)
+    // 1 + 2n <= 308 → n = 153, total 307 bytes; the 154th "é" would have straddled 308.
+    #expect(recovered == "E" + String(repeating: "é", count: 153))
+    #expect(recovered.utf8.count == 307)
 }
 
-/// End-to-end: a 400-character name must produce an announce packet that actually PACKS. This is
-/// the property the bound exists for; the codec-level size assertions above are a proxy, and a
-/// wrong header/payload constant would satisfy them while still overflowing the MTU.
+/// End-to-end: a 400-character name must produce an announce packet that actually PACKS, with the
+/// 18-byte RNS 1.6 stamp extension that `Transport` appends when stamping. This is the property the
+/// bound exists for; the codec-level size assertions above are a proxy, and a wrong header/payload
+/// constant would satisfy them while still overflowing the MTU.
 ///
 /// Anti-vacuity: `Packet.packed()` THROWS `.exceedsMTU` on overflow, so a bad budget fails the test
 /// rather than passing quietly. The exact-equality check additionally rejects a budget that was far
@@ -375,10 +381,12 @@ private let nameBudgetWithNullCost = 326
     let dest = Destination(kind: .single, direction: .in, appName: "lxmf",
                            aspects: ["delivery"], identity: identity)!
     let appData = LXMFAnnounceData.pack(displayName: String(repeating: "F", count: 400), stampCost: 200)
+    let stampExtension = Data([NetworkStamp.extensionMarker, 0x00]) + Data(repeating: 0x01, count: 14)
+        + Data([0x40, 0x03])
     let payload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
                                         nameHash: dest.nameHash,
                                         randomHash: Data(repeating: 0x01, count: 10),
-                                        ratchet: nil, appData: appData)
+                                        ratchet: nil, appData: appData + stampExtension)
     let raw = try Packet.announce(from: dest, payload: payload).packed()
     #expect(raw.count == Packet.mtu)
 }
