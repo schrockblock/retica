@@ -79,10 +79,19 @@ private func data(_ index: UInt8, _ type: UInt16 = mappingType) -> MeshCoreEvent
         #expect(mapper.map(.rawData(payload: mappingPayload)) == .ignore)
     }
 
-    @Test func aDropForgetsTheSlot() {
+    /// Every way a link goes away forgets the slot, so nothing is delivered until the policy has
+    /// run again on the next handshake.
+    @Test(arguments: [
+        MeshCoreEvent.connection(.reconnecting(attempt: 1)),
+        .connection(.disconnected(reason: nil)),
+        .connection(.disconnected(reason: "radio not found")),
+        .adapterUnavailable(.poweredOff),
+    ])
+    func aDropForgetsTheSlot(drop: MeshCoreEvent) {
         var mapper = live(slot: 2)
-        #expect(mapper.map(.connection(.reconnecting(attempt: 1))) == .emit(.disconnected(reason: nil)))
+        #expect(mapper.map(drop) != .ignore, "precondition: the drop is reported")
         #expect(mapper.map(data(2)) == .ignore)
+        #expect(mapper.map(.rawData(payload: mappingPayload)) == .ignore)
     }
 
     @Test func aHandshakeForgetsTheSlotUntilThePolicyRuns() {
