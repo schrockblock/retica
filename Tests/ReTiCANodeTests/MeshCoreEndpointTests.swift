@@ -66,6 +66,32 @@ private func isOnlineDelegate(_ action: MeshCoreEndpoint.Action) -> Bool {
         #expect(state.registeredProfile(params: nil).mode == .roaming)
     }
 
+    @Test func registeredProfileTakesStampCostsFromTheEndpointProfile() {
+        var profile = InterfaceProfile.meshCore(params: nil)
+        profile.destinationCost = 9
+        profile.pathRequestCost = 12
+        let state = MeshCoreEndpoint.State(config: endpointConfig(), profile: profile)
+        #expect(state.registeredProfile(params: nil).destinationCost == 9)
+        #expect(state.registeredProfile(params: nil).pathRequestCost == 12)
+    }
+
+    /// Every host-settable field survives except the radio-derived name, bitrate and hardware MTU,
+    /// so a field added to `InterfaceProfile` later and forgotten by the driver fails this.
+    @Test func registeredProfileKeepsEveryHostFieldExceptTheRadioDerivedOnes() {
+        let profile = InterfaceProfile(name: "host", bitrate: 999, mode: .roaming, hwMTU: 1,
+                                       announceCap: 0.5, ifac: MeshCoreEndpoint.ifac(networkName: "mesh", passphrase: "pw"),
+                                       destinationCost: 9, pathRequestCost: 12)
+        let state = MeshCoreEndpoint.State(config: endpointConfig(), profile: profile)
+        let linkParams = params(8, 62_500, 8)
+        let radioDerived = InterfaceProfile.meshCore(params: linkParams)
+        var expected = profile
+        expected.name = radioDerived.name
+        expected.bitrate = radioDerived.bitrate
+        expected.hwMTU = radioDerived.hwMTU
+        #expect(state.registeredProfile(params: linkParams) == expected)
+        #expect(state.registeredProfile(params: linkParams).announceCap == 0.5)
+    }
+
     /// The endpoint's own profile bitrate is ignored: the radio's params decide it when it is online.
     @Test func registeredProfileTakesBitrateFromTheParams() {
         let profile = InterfaceProfile(name: "meshcore", bitrate: 999, hwMTU: 500)

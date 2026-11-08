@@ -52,6 +52,22 @@ private let radio = UUID(uuidString: "0000AAAA-0000-0000-0000-00000000BEEF")!
         #expect(state.registeredProfile(modemPreset: 8).pathRequestCost == 12)
     }
 
+    /// Every host-settable field survives except the radio-derived name, bitrate and hardware MTU,
+    /// so a field added to `InterfaceProfile` later and forgotten by the driver fails this.
+    @Test func registeredProfileKeepsEveryHostFieldExceptTheRadioDerivedOnes() {
+        let profile = InterfaceProfile(name: "host", bitrate: 999, mode: .roaming, hwMTU: 1,
+                                       announceCap: 0.5, ifac: MeshtasticEndpoint.ifac(networkName: "mesh", passphrase: "pw"),
+                                       destinationCost: 9, pathRequestCost: 12)
+        let state = MeshtasticEndpoint.State(config: MeshtasticDriverConfig(radio: radio), profile: profile)
+        let radioDerived = InterfaceProfile.meshtastic(modemPreset: 8)
+        var expected = profile
+        expected.name = radioDerived.name
+        expected.bitrate = radioDerived.bitrate
+        expected.hwMTU = radioDerived.hwMTU
+        #expect(state.registeredProfile(modemPreset: 8) == expected)
+        #expect(state.registeredProfile(modemPreset: 8).announceCap == 0.5)
+    }
+
     /// The endpoint's own profile bitrate is ignored: the radio's preset decides it at `.connected`.
     @Test func registeredProfileTakesBitrateFromThePreset() {
         let profile = InterfaceProfile(name: "meshtastic", bitrate: 999, hwMTU: 500)

@@ -66,6 +66,22 @@ private enum Call: Equatable {
         #expect(state.registeredProfile(params: sidebandParams).pathRequestCost == 12)
     }
 
+    /// Every host-settable field survives except the radio-derived name, bitrate and hardware MTU,
+    /// so a field added to `InterfaceProfile` later and forgotten by the driver fails this.
+    @Test func registeredProfileKeepsEveryHostFieldExceptTheRadioDerivedOnes() {
+        let profile = InterfaceProfile(name: "host", bitrate: 999, mode: .roaming, hwMTU: 1,
+                                       announceCap: 0.5, ifac: RNodeEndpoint.ifac(networkName: "mesh", passphrase: "pw"),
+                                       destinationCost: 9, pathRequestCost: 12)
+        let state = RNodeEndpoint.State(config: config, profile: profile)
+        let radioDerived = InterfaceProfile.rnode(params: sidebandParams)
+        var expected = profile
+        expected.name = radioDerived.name
+        expected.bitrate = radioDerived.bitrate
+        expected.hwMTU = radioDerived.hwMTU
+        #expect(state.registeredProfile(params: sidebandParams) == expected)
+        #expect(state.registeredProfile(params: sidebandParams).announceCap == 0.5)
+    }
+
     /// The endpoint's own profile bitrate is ignored: the params the radio echoed decide it.
     @Test func registeredProfileTakesBitrateFromTheReportedParams() {
         let profile = InterfaceProfile(name: "rnode", bitrate: 999, hwMTU: 508)

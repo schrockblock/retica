@@ -56,11 +56,13 @@ public struct MeshtasticEndpoint {
 
         /// The profile registered with the shared router when the radio comes online.
         public func registeredProfile(modemPreset: Int?) -> InterfaceProfile {
-            var registered = InterfaceProfile.meshtastic(modemPreset: modemPreset)
-            registered.mode = profile.mode
-            registered.ifac = profile.ifac
-            registered.destinationCost = profile.destinationCost
-            registered.pathRequestCost = profile.pathRequestCost
+            // Start from the host's profile so every field it sets survives; only what the radio
+            // decides (name, bitrate from the modem preset, hardware MTU) is overwritten.
+            let radio = InterfaceProfile.meshtastic(modemPreset: modemPreset)
+            var registered = profile
+            registered.name = radio.name
+            registered.bitrate = radio.bitrate
+            registered.hwMTU = radio.hwMTU
             return registered
         }
     }

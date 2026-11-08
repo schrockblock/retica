@@ -57,9 +57,13 @@ public struct MeshCoreEndpoint {
 
         /// The profile registered with the shared router when the radio comes online.
         public func registeredProfile(params: MeshCoreLinkParams?) -> InterfaceProfile {
-            var registered = InterfaceProfile.meshCore(params: params)
-            registered.mode = profile.mode
-            registered.ifac = profile.ifac
+            // Start from the host's profile so every field it sets survives; only what the radio
+            // decides (name, bitrate from the params, hardware MTU) is overwritten.
+            let radio = InterfaceProfile.meshCore(params: params)
+            var registered = profile
+            registered.name = radio.name
+            registered.bitrate = radio.bitrate
+            registered.hwMTU = radio.hwMTU
             return registered
         }
     }

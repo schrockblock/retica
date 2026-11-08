@@ -333,8 +333,9 @@ profile.pathRequestCost = nil       // path requests use transport.pathRequestCo
 let client = TCPEndpoint.State(host: host, port: port, profile: profile)
 ```
 
-A TCP server's accepted connections and a BLE driver's peers all take the driver's profile, and a
-Meshtastic radio keeps the costs of the profile it was given.
+A TCP server's accepted connections and a BLE driver's peers all take the driver's profile, and
+the Meshtastic, RNode and MeshCore radio drivers keep the costs of the profile they were given
+(and its other fields, except the name, bitrate and hardware MTU, which the radio decides).
 
 What it costs. Hash rates measured on a Mac (release build, about +/-15%) are in
 `NetworkStamp.swift`: about 790,000 stamp rounds a second and 14,000 link keys a second. From
