@@ -193,12 +193,12 @@ private func makeAnnounceStore(
 ///
 /// This matters because `State.deliveryStampCost` is what the *inbound* half validates against
 /// (`LXMFNode.swift`, the `messageDelivered` branch), while the *announce* applies its own
-/// `> 0 && < 255` gate (`LXMFAnnounceData.swift:113`). An unsanitised setter let the two disagree:
+/// `> 0` and below-the-cap gate (`LXMFAnnounceData.pack`). An unsanitised setter let the two disagree:
 /// see `lxmfNodeDoesNotEnforceStampsAfterACostOfZero` and
 /// `lxmfNodeDoesNotReportAStampValidAfterANegativeCost` for the two measured consequences.
 ///
-/// Anti-vacuity: every boundary is asserted individually and each of 0 / 255 is preceded by nil,
-/// so a setter that stored the raw value fails on the 0 case, the 255 case, or both. The 1 and 254
+/// Anti-vacuity: every boundary is asserted individually and each rejected case is preceded by nil,
+/// so a setter that stored the raw value fails on the 0 case, the 100 case, or both. The 1 and 99
 /// cases fail any over-eager sanitiser that clamped the range too tightly.
 @MainActor @Test func setDisplayNameStoresOnlyStampCostsInTheReferenceRange() async {
     let store = makeAnnounceStore(identity: Identity())
@@ -230,7 +230,7 @@ private func makeAnnounceStore(
 /// deliberately configured a cost.
 ///
 /// Anti-vacuity: asserts on the announce's `appData` bytes as well as on state. Without the setter
-/// sanitisation, 255 is stored and `LXMFAnnounceData.pack`'s own `> 0 && < 255` gate emits null —
+/// sanitisation, the rejected cost is stored and `LXMFAnnounceData.pack`'s own below-the-cap gate emits null —
 /// so the parsed cost would be nil and both assertions would fail.
 @MainActor @Test func setDisplayNameKeepsThePreviousStampCostWhenANewOneIsRejected() async throws {
     let store = makeAnnounceStore(identity: Identity())

@@ -134,8 +134,8 @@ public struct LXMFNode {
         public var displayName: String?
 
         /// Delivery stamp cost advertised in every delivery-destination announce.
-        /// Nil or out-of-range values (outside 1...254) are emitted as null per reference's
-        /// `> 0 and < 255` gate (LXMRouter.py:1044).
+        /// Nil or out-of-range values (outside 1...99) are emitted as null per reference's
+        /// `> 0 and < STAMP_COST_CAP` gate (LXMRouter.py:1172-1174, LXMF 1.3.0).
         public var deliveryStampCost: Int?
 
         /// Whether to DROP inbound messages whose stamp fails validation (or is absent) when a
@@ -603,8 +603,8 @@ public struct LXMFNode {
                 //         else:                  return False      # rejected, previous value KEPT
                 //
                 // Storing the raw value made the announce and the enforcement disagree, because
-                // `LXMFAnnounceData.pack` already applies reference's `> 0 and < 255` emit gate
-                // (LXMFAnnounceData.swift:113). Measured, on this reducer:
+                // `LXMFAnnounceData.pack` already applies reference's emit gate (`> 0` and below the
+                // cap, see below). Measured, on this reducer:
                 //   • cost 0  — announced as "no cost required", yet `validateStamp(targetCost: 0)`
                 //     is reached for every inbound message and returns false for an ABSENT stamp
                 //     (`guard let stamp else { return false }`, LXMessage.swift:167), so with
@@ -1390,7 +1390,8 @@ public struct LXMFNode {
     /// `LXMFNode.maxDeliveryStampCost` for the ceiling and why refusing beats clamping.
     ///
     /// A cost of 0 is treated as "no stamp required", matching reference's own emit gate at
-    /// `get_announce_app_data` (LXMRouter.py:1044): it only emits a stamp_cost when `> 0 and < 255`,
+    /// `get_announce_app_data` (LXMRouter.py:1172-1174, LXMF 1.3.0): it only emits a stamp_cost when
+    /// `> 0 and < STAMP_COST_CAP`,
     /// so 0 in `outbound_stamp_costs` means "peer said no cost", and `handle_outbound`
     /// (LXMRouter.py:1752-1757) only calls `get_stamp()` when `stamp_cost != None` — a 0 stored
     /// there would still trigger the search, but no conforming peer emits 0, so in practice 0 means
