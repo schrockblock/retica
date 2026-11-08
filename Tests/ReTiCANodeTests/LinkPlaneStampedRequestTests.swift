@@ -434,8 +434,6 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
         try await stopWithASearchRunning(store, searches: searches, ended: ended, interfaceID: id, clock: clock) { events.continuation.finish() }
     }
 
-    /// The radio reports offline only after `driver.stop()` returns, so its interface outlives the
-    /// endpoint's `.stop` by at least one effect hop.
     @Test func aTCPServerStopEndsTheSearchAndStartsNoOther() async throws {
         let searches = LockIsolated(0)
         let ended = LockIsolated(0)
@@ -468,6 +466,8 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
                                          interfaceGoesOffline: false, clock: clock) { events.continuation.finish() }
     }
 
+    /// The radio reports offline only after `driver.stop()` returns, so its interface outlives the
+    /// endpoint's `.stop` by at least one effect hop.
     @Test func aMeshtasticStopEndsTheSearchAndStartsNoOther() async throws {
         let searches = LockIsolated(0)
         let ended = LockIsolated(0)
