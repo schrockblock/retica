@@ -36,6 +36,10 @@ private struct PathRequestCountingNode: Reducer {
             if case let .endpoint(.send(dest, plaintext, _)) = action, state.endpoint.learned[dest] != nil {
                 transmitted.opportunistic.withValue { $0.append(plaintext) }
             }
+            if case .cancelDeliveryStamps = action { transmitted.handOvers.withValue { $0.append(nil) } }
+            if case let .router(.send(m, _)) = action, m.stamp != nil {
+                transmitted.handOvers.withValue { $0.append(m.hash) }
+            }
             if case let .router(.delegate(.sendDirect(_, data, _))) = action {
                 transmitted.overLink.withValue { $0.append(data) }
             }
@@ -60,6 +64,8 @@ private struct Transmitted {
     let overLink = LockIsolated<[Data]>([])
     /// Described, because `LXMFNode.Action.Delegate` is not `Sendable`.
     let terminals = LockIsolated<[String]>([])
+    /// Each stamped message handed to the router, in order, with nil where `.cancelDeliveryStamps` came.
+    let handOvers = LockIsolated<[Data?]>([])
 }
 
 private func described(_ outcome: LXMFNode.Action.Delegate) -> String { String(describing: outcome) }
@@ -67,12 +73,19 @@ private func described(_ outcome: LXMFNode.Action.Delegate) -> String { String(d
 /// High enough that the search is still running when the test cancels it (about 8 minutes on a
 /// Mac, see `maxDeliveryStampCost`), and within the ceiling, so it does start.
 private let slowCost = LXMFNode.maxDeliveryStampCost
+/// A few seconds of search on a Mac: long enough that a search just started is still running when
+/// the test acts on it, short enough that one the test failed to stop finishes, and shows, within
+/// the test's wait.
+private let quickButNotInstantCost = 14
 
 @MainActor
 private func makeNode(_ identity: Identity, _ clock: TestClock<Duration>,
                       countingPathRequestsIn pathRequests: LockIsolated<Int> = LockIsolated(0),
-                      recordingIn transmitted: Transmitted = Transmitted()) async -> TestStoreOf<LXMFNode> {
-    let store = TestStore(initialState: LXMFNode.State(identity: identity, endpoint: TransportEndpoint.State())) {
+                      recordingIn transmitted: Transmitted = Transmitted(),
+                      seed: (inout LXMFNode.State) -> Void = { _ in }) async -> TestStoreOf<LXMFNode> {
+    var initial = LXMFNode.State(identity: identity, endpoint: TransportEndpoint.State())
+    seed(&initial)
+    let store = TestStore(initialState: initial) {
         PathRequestCountingNode(pathRequests: pathRequests, transmitted: transmitted)
     } withDependencies: {
         $0.continuousClock = clock
@@ -371,6 +384,72 @@ private func isHandedOver(_ store: TestStoreOf<LXMFNode>, _ m: LXMessage) async 
         #expect(transmitted.terminals.value == [described(.deliveryFailed(messageHash: m.hash))])
         #expect(transmitted.opportunistic.value.isEmpty)
         #expect(!store.state.router.hasOutboundState(for: m.hash), "the router must stop counting the copy")
+    }
+
+    /// A second send to the same peer waits for its cost while the first, handed over unstamped
+    /// after the wait, is re-stamped at the announce. `.cancelDeliveryStamps` fails both, and neither
+    /// may go out afterwards. The second search used to be chained after the first, so it started
+    /// after the cancel, out of its reach, and the message was handed over after its failure.
+    @Test func cancelDeliveryStampsDuringAReStampAlsoStopsASendThatWasWaiting() async throws {
+        let me = Identity(), peer = Identity(), clock = TestClock()
+        let transmitted = Transmitted()
+        let store = await makeNode(me, clock, recordingIn: transmitted)
+        let first = message(from: me, to: peer, "first")
+        await store.send(.sendMessage(message: first, fallbackToPropagation: false))
+        await waitOutTheCostWait(store, clock)
+        let second = message(from: me, to: peer, "second")
+        await store.send(.sendMessage(message: second, fallbackToPropagation: false))
+        #expect(store.state.waitingForPeerCost[second.destinationHash]?.count == 1)
+
+        await hearAnnounce(store, of: peer, stampCost: quickButNotInstantCost)
+        await store.send(.cancelDeliveryStamps)
+        // A search the cancel missed finishes within this, and hands its message over.
+        try await Task.sleep(for: .seconds(20))
+        await store.skipReceivedActions(strict: false)
+
+        // Under load a search can finish before the cancel; that message is simply sent. What the
+        // cancel caught must be failed once, and nothing may be handed over after it.
+        let log = transmitted.handOvers.value
+        let cancelAt = try #require(log.firstIndex(of: nil))
+        let handedBefore = Set(log[..<cancelAt].compactMap { $0 })
+        #expect(log[(cancelAt + 1)...].isEmpty, "handed over after the cancel")
+        let caught = [first, second].filter { !handedBefore.contains($0.hash) }
+        // Both searches beat the cancel (heavy load): no race this run, and nothing to check.
+        guard !caught.isEmpty else { return }
+        #expect(transmitted.terminals.value.sorted() == caught.map { described(.deliveryFailed(messageHash: $0.hash)) }.sorted())
+        for m in caught {
+            #expect(!store.state.router.hasOutboundState(for: m.hash), "a failed message must not be handed over")
+        }
+    }
+
+    /// A message ends once. If a copy already succeeded, abandoning its delivery-stamp search
+    /// reports nothing more; if a propagated copy is still out, that copy decides the outcome.
+    /// Neither combination is reachable from the public actions today (a send that waits for its
+    /// cost is never fallback-eligible), so the router state is constructed.
+    @Test func cancelDeliveryStampsLeavesTheOutcomeToTheMessagesOtherCopy() async throws {
+        let me = Identity(), peer = Identity(), clock = TestClock()
+        let transmitted = Transmitted()
+        let succeeded = message(from: me, to: peer, "succeeded")
+        let stillOut = message(from: me, to: peer, "still out")
+        let store = await makeNode(me, clock, recordingIn: transmitted) { state in
+            state.router.succeededMessages.insert(succeeded.hash)
+            state.router.pendingPropagatedCopies.insert(stillOut.hash)
+        }
+        await store.send(.sendMessage(message: succeeded, fallbackToPropagation: false))
+        await store.send(.sendMessage(message: stillOut, fallbackToPropagation: false))
+        #expect(Set(store.state.inFlightDeliveryStamps) == [succeeded.hash, stillOut.hash])
+
+        await store.send(.cancelDeliveryStamps)
+        await store.skipReceivedActions(strict: false)
+        #expect(transmitted.terminals.value.isEmpty, "the other copy decides")
+
+        // A stamped delivery copy a search hands over after the cancel is refused.
+        await store.send(.router(.send(message: stillOut, desiredMethod: .opportunistic)))
+        #expect(store.state.router.pendingDeliveries[.delivery(stillOut.hash)] == nil)
+
+        await store.send(.router(.propagatedCopyFailed(messageHash: stillOut.hash)))
+        await store.skipReceivedActions(strict: false)
+        #expect(transmitted.terminals.value == [described(.deliveryFailed(messageHash: stillOut.hash))])
     }
 }
 

@@ -347,7 +347,8 @@ costs those hashes and nothing more.
 
 - **Stamp work.** Delivery and propagation stamps are proof-of-work searches that can take
   minutes. `.cancelDeliveryStamps` and `.cancelPropagationStamps` stop them; a message whose
-  search is cancelled is reported `deliveryFailed`, not sent unstamped.
+  search is cancelled is reported `deliveryFailed`, not sent unstamped, unless its propagated copy
+  is still out (that copy's outcome is reported instead) or a copy already succeeded.
   `.cancelOutbound(messageHash:)` cancels one message wherever it is. Network stamp searches
   (destination, path-request and link-request stamps) are cancelled by `.endpoint(.stop)`; a link
   waiting for its key fails with `.pathStale`, and an announce waiting for its stamp is dropped.

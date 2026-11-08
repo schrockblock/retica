@@ -163,8 +163,8 @@ public struct LXMFNode {
         /// Measured, not deduced: a probe emitting `.delegate(.deliveryFailed)` from the nil branch
         /// of `deliverySend` produced no action at all.
         ///
-        /// The failure is therefore emitted by the `.cancelDeliveryStamps` reducer branch, which is
-        /// not itself cancelled, over this list. Reference works the same way: `cancel_outbound`
+        /// The failure is therefore started by the `.cancelDeliveryStamps` reducer branch, which is
+        /// not itself cancelled, over this list (through the router's `fail`). Reference works the same way: `cancel_outbound`
         /// only flags the message and calls `LXStamper.cancel_work` (LXMRouter.py:1719-1725,
         /// LXMF 1.1.0); the `failed_callback` is invoked later by `process_deferred_stamps` on the
         /// router's own thread, once `get_stamp()` has returned None (LXMRouter.py:2620-2630).
@@ -284,7 +284,9 @@ public struct LXMFNode {
         ///
         /// **Every message still searching is FAILED, not sent unstamped.** One
         /// `.delegate(.deliveryFailed(messageHash:))` is emitted per entry in
-        /// `State.inFlightDeliveryStamps` — the app must treat those messages as not sent. Reference
+        /// `State.inFlightDeliveryStamps` — the app must treat those messages as not sent — unless
+        /// the message's propagated copy is still out (its outcome is the message's) or a copy
+        /// already succeeded (no second terminal). Reference
         /// does the same (`process_deferred_stamps` → `failed_callback`, LXMRouter.py:2620-2625,
         /// LXMF 1.1.0). The alternative — sending unstamped — is not available: the cancellation that
         /// ends the search also suppresses every action the search's effect could still emit, so
@@ -750,8 +752,11 @@ public struct LXMFNode {
                 //
                 // `.cancel(id:)` cancels when it is CONSTRUCTED, so it stays on this branch (86ee622).
                 //
-                // The failure bypasses the router's `fail`, so a fallback the message was waiting on
-                // is dropped here and in the router: a later hand-off would revive a failed message.
+                // The failure goes through the router's `fail` (`.deliveryCopyAbandoned`), so a message
+                // ends once: nothing is reported while its propagated copy is still out, or after a copy
+                // succeeded. The router drops a fallback the message was waiting on (a later hand-off
+                // would revive a failed message), and refuses a stamped copy that a search missed by
+                // this cancel hands over late.
                 let abandoned = state.inFlightDeliveryStamps
                 state.inFlightDeliveryStamps = []
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.deliveryStamp)]
@@ -760,12 +765,8 @@ public struct LXMFNode {
                 }
                 state.waitingForPeerCost = [:]
                 for hash in abandoned {
-                    // A copy taken back to be re-stamped ends here, so the router stops counting it.
-                    state.router.withdrawnDeliveryCopies.remove(hash)
-                    if state.pendingFallbacks.removeValue(forKey: hash) != nil {
-                        effects.append(.send(.router(.clearFallbackEligible(messageHash: hash))))
-                    }
-                    effects.append(.send(.delegate(.deliveryFailed(messageHash: hash))))
+                    state.pendingFallbacks[hash] = nil
+                    effects.append(.send(.router(.deliveryCopyAbandoned(messageHash: hash))))
                 }
                 return .merge(effects)
 
@@ -952,9 +953,11 @@ public struct LXMFNode {
                 // about the path. Once it has one, its next retry, or a link opened for its queue, would
                 // send them as they are.
                 let (withdraw, restamp) = restampUnsentHandOvers(&state, destinationHash: h)
-                // After the cost above is stored, and after the router has heard about the path.
-                return .concatenate(withdraw, .merge(effects), restamp,
-                                    handOverWaitingSends(&state, destinationHash: h))
+                // After the cost above is stored, and after the router has heard about the path. The
+                // searches run side by side: chained, the second started only when the first ended,
+                // after a `.cancelDeliveryStamps` meant for it.
+                return .concatenate(withdraw, .merge(effects),
+                                    .merge(restamp, handOverWaitingSends(&state, destinationHash: h)))
 
             case let .router(.delegate(.messageDelivered(message, validated, method))):
                 // Ignore list, reference `LXMRouter.lxmf_delivery`'s `ignored_list` check: the
@@ -1401,8 +1404,8 @@ public struct LXMFNode {
     /// implementable from in here — the substitute send would be swallowed exactly like the real one.
     /// This docstring previously claimed the opposite ("an unstamped send, not a dropped message"),
     /// and the `else { stamped = message }` branch that appeared to implement it was dead code.
-    /// The cancellation is reported instead by `.cancelDeliveryStamps`, which emits
-    /// `.delegate(.deliveryFailed)` for every hash in `State.inFlightDeliveryStamps` — appended here.
+    /// The cancellation is reported instead by `.cancelDeliveryStamps`, which fails every hash in
+    /// `State.inFlightDeliveryStamps` (appended here) through the router's `fail`.
     ///
     /// **A send with no path and no learned cost waits.** The cost arrives in the announce that
     /// brings the path, so at this point "no cost" means "not known yet", not "none required".
