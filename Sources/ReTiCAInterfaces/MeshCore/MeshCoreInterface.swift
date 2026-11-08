@@ -90,6 +90,9 @@ public struct MeshCoreInterface {
         /// A `.stop` arrived during a removal. It runs once the removal finishes, so the driver
         /// sees `removeChannel` then `stop`, and offline comes after `.channelRemoved`.
         var stopHeld = false
+        /// A `.start` arrived after a held stop. It runs right after that stop, once the removal
+        /// finishes, so it reaches the driver after the stop (Contract 3). A later `.stop` clears it.
+        var startHeld = false
 
         public init(config: MeshCoreDriverConfig, framing: MeshCoreFraming = .scotMeshRaw) {
             self.config = config
@@ -175,6 +178,12 @@ public struct MeshCoreInterface {
         Reduce { state, action in
             switch action {
             case .start:
+                if state.stopHeld {
+                    // The host's stop is waiting for the removal: this start must follow it, not
+                    // be lost to the still-online status or launch a driver the stop then ends.
+                    state.startHeld = true
+                    return .none
+                }
                 switch state.status {
                 case .stopped, .unavailable: break
                 case .connecting, .online: return .none
@@ -191,6 +200,8 @@ public struct MeshCoreInterface {
                     // Review Focus 5: the removal must finish first, so the driver sees
                     // `removeChannel` then `stop`, and offline comes after `.channelRemoved`.
                     state.stopHeld = true
+                    // Stop, start, stop: the last word is stop.
+                    state.startHeld = false
                     return .none
                 }
                 guard state.status != .stopped else {
@@ -258,7 +269,12 @@ public struct MeshCoreInterface {
                 state.removingChannel = false
                 guard state.stopHeld else { return .send(.delegate(.channelRemoved(ok))) }
                 state.stopHeld = false
-                return .concatenate(.send(.delegate(.channelRemoved(ok))), .send(.stop))
+                let restart = state.startHeld
+                state.startHeld = false
+                // The held start goes after the stop, so the stop's `restartPending` path defers
+                // it until `driver.stop()` returns and offline has been reported.
+                return .concatenate(.send(.delegate(.channelRemoved(ok))), .send(.stop),
+                                    restart ? .send(.start) : .none)
 
             case let .driverEvent(.connected(selfPrefix, publicKey, params)):
                 guard state.status != .stopped else { return .none }

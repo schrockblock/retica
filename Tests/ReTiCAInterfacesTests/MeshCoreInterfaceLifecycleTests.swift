@@ -448,6 +448,52 @@ private let foreignPrefix = Data([0xEE, 0xEE, 0xEE, 0xEE])
         }
         #expect(order == ["channelRemoved", "offline"])
     }
+
+    /// Feature off then on while `removeChannel` runs: the start reaches the driver after the
+    /// held stop, never lost to the still-online status.
+    @Test func startAfterAHeldStopRestartsTheDriver() async {
+        let h = await makeSlowRemovalMeshCoreInterface(holdStops: false)
+        await h.store.send(.removeChannel)
+        await h.waitForCall(.removeChannel)
+        await h.store.send(.stop)
+        await h.store.send(.start)
+        h.releaseRemoval()
+        await h.store.receive { $0 == .delegate(.offline(reason: nil)) }
+        await h.waitForStarts(2)
+        #expect(h.calls.value == [.start(meshCoreTestConfig), .removeChannel, .stop, .start(meshCoreTestConfig)],
+                "driver calls: \(h.calls.value)")
+        await h.shutdown()
+    }
+
+    @Test func stopStartStopDuringARemovalEndsStopped() async {
+        let h = await makeSlowRemovalMeshCoreInterface(holdStops: false)
+        await h.store.send(.removeChannel)
+        await h.waitForCall(.removeChannel)
+        await h.store.send(.stop)
+        await h.store.send(.start)
+        await h.store.send(.stop)
+        h.releaseRemoval()
+        await h.store.receive { $0 == .delegate(.offline(reason: nil)) }
+        for _ in 0..<50 { await Task.megaYield() }
+        await h.store.skipReceivedActions(strict: false)
+        #expect(h.calls.value == [.start(meshCoreTestConfig), .removeChannel, .stop], "driver calls: \(h.calls.value)")
+        #expect(h.store.state.isIdle)
+    }
+
+    /// The radio went `.unavailable` during the removal, so `.start` would otherwise launch the
+    /// driver at once, only for the held stop to tear it down.
+    @Test func startDuringAHeldStopWhileUnavailableDoesNotLaunchTheDriverEarly() async {
+        let h = await makeSlowRemovalMeshCoreInterface(holdStops: false)
+        await h.store.send(.removeChannel)
+        await h.waitForCall(.removeChannel)
+        h.yieldToLatest(.unavailable(.poweredOff))
+        await h.store.receive { $0 == .delegate(.adapterUnavailable(.poweredOff)) }
+        await h.store.send(.stop)
+        await h.store.send(.start)
+        for _ in 0..<10 { await Task.megaYield() }
+        #expect(h.startCount == 1, "driver calls while the stop is held: \(h.calls.value)")
+        await h.shutdown()
+    }
 }
 
 // MARK: - Packets for the limiter
@@ -541,11 +587,21 @@ private struct SlowRemovalMeshCoreHarness {
     let store: TestStore<MeshCoreInterface.State, MeshCoreInterface.Action>
     let calls: LockIsolated<[MeshCoreMockCall]>
     let delegates: LockIsolated<[MeshCoreInterface.Action.Delegate]>
+    /// One FRESH session per `start`; `stop` ends the latest.
+    let sessions: LockIsolated<[AsyncStream<MeshCoreDriverEvent>.Continuation]>
     let removalHeld: LockIsolated<Bool>
     let stopHeld: LockIsolated<Bool>
 
+    var startCount: Int { calls.value.meshCoreStartCount }
+
     func releaseRemoval() { removalHeld.setValue(false) }
     func releaseStop() { stopHeld.setValue(false) }
+
+    func yieldToLatest(_ event: MeshCoreDriverEvent) { sessions.value.last?.yield(event) }
+
+    func waitForStarts(_ count: Int) async {
+        for _ in 0..<200 where startCount < count { await Task.megaYield() }
+    }
 
     func waitForCall(_ call: MeshCoreMockCall) async {
         for _ in 0..<200 where !calls.value.contains(call) { await Task.megaYield() }
@@ -567,13 +623,15 @@ private func makeSlowRemovalMeshCoreInterface(holdStops: Bool) async -> SlowRemo
     let delegates = LockIsolated<[MeshCoreInterface.Action.Delegate]>([])
     let removalHeld = LockIsolated(true)
     let stopHeld = LockIsolated(holdStops)
-    let session = AsyncStream<MeshCoreDriverEvent>.makeStream()
+    let sessions = LockIsolated<[AsyncStream<MeshCoreDriverEvent>.Continuation]>([])
     let store = TestStore(initialState: MeshCoreInterface.State(config: meshCoreTestConfig)) {
         MeshCoreDelegateRecorder(delegates: delegates)
     } withDependencies: {
         $0.meshCoreDriver = MeshCoreDriver(
             start: { config in
+                let session = AsyncStream<MeshCoreDriverEvent>.makeStream()
                 calls.withValue { $0.append(.start(config)) }
+                sessions.withValue { $0.append(session.continuation) }
                 return session.stream
             },
             send: { _ in true },
@@ -585,7 +643,7 @@ private func makeSlowRemovalMeshCoreInterface(holdStops: Bool) async -> SlowRemo
             stop: {
                 calls.withValue { $0.append(.stop) }
                 while stopHeld.value { await Task.yield() }
-                session.continuation.finish()
+                sessions.value.last?.finish()
             }
         )
         $0.meshCoreClock = TestClock<Duration>()
@@ -594,8 +652,9 @@ private func makeSlowRemovalMeshCoreInterface(holdStops: Bool) async -> SlowRemo
     store.exhaustivity = .off
     store.timeout = .seconds(5)
     await store.send(.start)
-    session.continuation.yield(.connected(selfPrefix: meshCoreOwnPrefix, publicKey: meshCoreOwnKey, params: nil))
+    for _ in 0..<200 where sessions.value.isEmpty { await Task.megaYield() }
+    sessions.value.last?.yield(.connected(selfPrefix: meshCoreOwnPrefix, publicKey: meshCoreOwnKey, params: nil))
     await store.receive { if case .delegate(.online) = $0 { return true }; return false }
     return SlowRemovalMeshCoreHarness(store: store, calls: calls, delegates: delegates,
-                                      removalHeld: removalHeld, stopHeld: stopHeld)
+                                      sessions: sessions, removalHeld: removalHeld, stopHeld: stopHeld)
 }
