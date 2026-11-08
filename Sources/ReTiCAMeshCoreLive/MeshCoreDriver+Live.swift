@@ -160,6 +160,9 @@ final class MeshCoreLiveAdapter: Sendable {
         /// Bumped by every `start` and `stop`: a superseded pump never sets the slot.
         var generation: UInt64 = 0
         var slot: UInt8?
+        /// `removeChannel` succeeded during this start: no later policy pass may write our
+        /// channel back (a reconnect before the `stop` would otherwise rerun it).
+        var channelRemoved = false
     }
 
     /// How one policy pass ended.
@@ -182,6 +185,7 @@ final class MeshCoreLiveAdapter: Sendable {
         let generation = link.withValue { link -> UInt64 in
             link.generation &+= 1
             link.slot = nil
+            link.channelRemoved = false
             return link.generation
         }
         // Subscribe BEFORE connecting: the hub registers a subscriber synchronously, so this
@@ -220,14 +224,21 @@ final class MeshCoreLiveAdapter: Sendable {
                 continuation.yield(mapped)
             case let .configure(info):
                 forgetSlot(generation)
-                // A superseded start's pump never touches the radio.
-                guard isCurrent(generation) else { continue }
+                // A superseded start's pump never touches the radio, and after a removal the
+                // policy never runs again: it would write our channel back.
+                guard isCurrent(generation), !link.value.channelRemoved else { continue }
                 switch await runPolicy(info, config: config, generation: generation, continuation) {
                 case let .ready(index):
                     guard !Task.isCancelled, setSlot(index, generation) else { continue }
                     mapper.slotReady(index)
                     details(MeshCoreRadioDetails(name: info.name, firmwareCode: info.firmwareCode,
                                                  channelSlot: index))
+                    // A stop between `setSlot` and the sink has already sent its nil: don't
+                    // leave our stale details after it.
+                    guard isCurrent(generation) else {
+                        details(nil)
+                        continue
+                    }
                     continuation.yield(MeshCoreEventMapper.connected(info))
                 case .abandoned:
                     continue
@@ -294,7 +305,9 @@ final class MeshCoreLiveAdapter: Sendable {
         // A newer start owns the session now: leave its link alone.
         guard isCurrent(generation) else { return }
         await session.disconnect()
-        details(nil)
+        // Re-checked after the hop: a stop has already sent its own nil, and a newer start's
+        // details must not be wiped.
+        if isCurrent(generation) { details(nil) }
     }
 
     func send(_ frame: Data) async -> Bool {
@@ -309,7 +322,8 @@ final class MeshCoreLiveAdapter: Sendable {
 
     /// Re-reads the radio rather than trusting the remembered index (the person may have moved
     /// the channel), then clears every slot holding our key. Bounded by the session's command
-    /// timeouts.
+    /// timeouts. On success, sends stop (the slot is gone) and no later policy pass in this
+    /// start writes the channel back.
     func removeChannel() async -> Bool {
         guard let config = config.value else { return false }
         do {
@@ -317,6 +331,10 @@ final class MeshCoreLiveAdapter: Sendable {
             for channel in channels where channel.secret == config.channelSecret {
                 try await session.setChannel(index: channel.index, name: "",
                                              secret: MeshCoreChannelPolicy.clearedSecret)
+            }
+            link.withValue {
+                $0.slot = nil
+                $0.channelRemoved = true
             }
             return true
         } catch {
@@ -354,10 +372,11 @@ final class MeshCoreLiveAdapter: Sendable {
         link.withValue { if $0.generation == generation { $0.slot = nil } }
     }
 
-    /// Sets the slot `send` uses, unless a newer start or a stop has superseded `generation`.
+    /// Sets the slot `send` uses, unless a newer start or a stop has superseded `generation`, or
+    /// the channel was removed meanwhile.
     private func setSlot(_ index: UInt8, _ generation: UInt64) -> Bool {
         link.withValue { link -> Bool in
-            guard link.generation == generation else { return false }
+            guard link.generation == generation, !link.channelRemoved else { return false }
             link.slot = index
             return true
         }

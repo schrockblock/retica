@@ -528,8 +528,78 @@ extension FCBDriverAdapterCBMTests {
             let live = startLiveCore(radio, radio.config())
             #expect(await live.run.waitFor(isLiveCoreConnected), "precondition: connected")
             radio.device.errorReplies = [0x20: 6]
+            let clears = radio.frames(0x20)
             #expect(!(await live.driver.removeChannel()))
+            #expect(radio.frames(0x20) == clears + 1, "the refusal came from a clear the radio was asked for")
+            #expect(radio.device.channelSlots[1].secret == liveCoreKey, "our slot is still there")
             await live.end()
+        }
+
+        /// Review fix: once our channel is cleared, nothing more goes out on that slot.
+        @Test func liveCoreSendAfterARemovalReturnsFalse() async {
+            let radio = await makeLiveCoreRadio()
+            let live = startLiveCore(radio, radio.config())
+            #expect(await live.run.waitFor(isLiveCoreConnected), "precondition: connected")
+            #expect(await live.driver.removeChannel(), "precondition: removed")
+            #expect(!(await live.driver.send(Data([0x52, 0x0E]))))
+            #expect(radio.frames(0x3E) == 0)
+            await live.end()
+        }
+
+        /// Review fix: a reconnect between a removal and the stop must not rerun the policy,
+        /// which would write our channel back while the app records it as removed.
+        @Test func liveCoreReconnectAfterARemovalWritesNoChannel() async {
+            let radio = await makeLiveCoreRadio()
+            let live = startLiveCore(radio, radio.config())
+            #expect(await live.run.waitFor(isLiveCoreConnected), "precondition: connected")
+            #expect(await live.driver.removeChannel(), "precondition: removed")
+            let reads = radio.frames(0x1F)
+            let writes = radio.frames(0x20)
+            radio.spec.simulateDisconnection()
+            let dropped = await liveWaitUntil(timeout: .seconds(10)) { liveCoreDroppedAfterConnecting(live.run.events.value) }
+            #expect(dropped, "precondition: events: \(live.run.events.value)")
+            #expect(await liveCoreSessionIs(live.session, .connected, timeout: .seconds(10)), "precondition: reconnected")
+            // Bounded wait for a policy pass that must not happen (it would read the channels at once).
+            let reread = await liveWaitUntil(timeout: .seconds(1)) { radio.frames(0x1F) > reads }
+            #expect(!reread, "the policy ran again")
+            #expect(radio.frames(0x20) == writes)
+            #expect(radio.device.channelSlots[1] == liveCoreEmptySlot(1))
+            #expect(live.run.count(isLiveCoreConnected) == 1, "events: \(live.run.events.value)")
+            await live.end()
+        }
+
+        /// Review fix: a stop that lands between the policy finishing and the details sink being
+        /// called must still leave the sink at nil. The sink itself holds the pump inside that
+        /// window: it blocks on the first details until the test has stopped the driver, and
+        /// records each value only on its way out.
+        @Test func liveCoreStopDuringTheDetailsCallLeavesNoDetails() async {
+            let radio = await makeLiveCoreRadio()
+            let entered = DispatchSemaphore(value: 0)
+            let proceed = DispatchSemaphore(value: 0)
+            let blocked = LockIsolated(false)
+            let log = LockIsolated<[MeshCoreRadioDetails?]>([])
+            let live = startLiveCore(radio, radio.config(), details: { value in
+                let shouldBlock = value != nil && blocked.withValue { wasBlocked -> Bool in
+                    defer { wasBlocked = true }
+                    return !wasBlocked
+                }
+                if shouldBlock {
+                    entered.signal()
+                    _ = proceed.wait(timeout: .now() + 10)
+                }
+                log.withValue { $0.append(value) }
+            })
+            let inSink = await liveWaitUntil(timeout: .seconds(10)) { entered.wait(timeout: .now()) == .success }
+            #expect(inSink, "precondition: the pump is inside the details call")
+            await live.driver.stop()
+            proceed.signal()
+            // The pump has left the blocked call once a non-nil value is logged; the sink must
+            // then end at nil.
+            let settled = await liveWaitUntil {
+                log.value.contains { $0 != nil } && log.value.last == .some(nil)
+            }
+            #expect(settled, "sink calls: \(log.value)")
+            live.run.cancel()
         }
 
         @Test func liveCoreRemoveChannelReturnsWhenTheRadioIsSilent() async {
