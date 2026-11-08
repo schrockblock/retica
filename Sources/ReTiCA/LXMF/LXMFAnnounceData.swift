@@ -8,7 +8,7 @@ import Foundation
 /// **Wire format (0.5.0+):** msgpack array `[display_name, stamp_cost, [SF_COMPRESSION]]`
 /// where `display_name` is bin (Python `bytes`) or null, `stamp_cost` is a uint or null, and
 /// the third element is an array of supported functionality codes. `SF_COMPRESSION = 0x00`.
-/// Conforming peers emit a `stamp_cost` only in 1...254, but **that is a property of what
+/// Conforming peers emit a `stamp_cost` only in 1...99, but **that is a property of what
 /// reference sends, not of what it accepts** — nothing on the parse side enforces it, so do not
 /// read the range as a wire invariant. See `stampCost`.
 ///
@@ -28,9 +28,10 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// **The range is asymmetric between pack and parse. Read this before using the value.**
     ///
-    /// - **On pack** this is gated to 1...254: `pack` applies reference's strict
-    ///   `> 0 and < 255` (LXMRouter.py:1044), so 0, 255 and anything outside emit as null.
-    ///   Every value ReTiCA *emits* is therefore in 1...254 or absent.
+    /// - **On pack** this is gated to 1...99: `pack` applies reference's strict
+    ///   `> 0 and < STAMP_COST_CAP` (LXMF 1.3.0 LXMRouter.py:1173, cap 100), so 0, 100 and
+    ///   anything outside emit as null. Every value ReTiCA *emits* is therefore in 1...99 or
+    ///   absent. (Reference 1.6.0 `generate_stamp` raises above 100, RNS/Stamps.py:255.)
     ///
     /// - **On parse this range is NOT guaranteed.** Reference's `stamp_cost_from_app_data`
     ///   (LXMF.py:174-185) applies no gate at all — it returns `peer_data[1]` verbatim — so a
@@ -105,7 +106,8 @@ public struct LXMFAnnounceData: Equatable {
     /// `.encode("utf-8")` call in `get_announce_app_data` (LXMRouter.py:1040).
     ///
     /// `stampCost` is silently clamped to nil if outside the strict reference gate
-    /// (`> 0 and < 255`). 0 and 255 advertise as null.
+    /// (`> 0 and < STAMP_COST_CAP`, LXMF 1.3.0 LXMRouter.py:1173, cap 100). 0 and 100 or more
+    /// advertise as null.
     ///
     /// The functionality array always contains `SF_COMPRESSION` (0x00),
     /// mirroring `supported_functionality = [SF_COMPRESSION]` at LXMRouter.py:1047.
@@ -119,7 +121,7 @@ public struct LXMFAnnounceData: Equatable {
     /// are emitted unchanged, so the cross-validation vectors (all far shorter) are untouched.
     public static func pack(displayName: String?, stampCost: Int?) -> Data {
         let costValue: MsgPackValue
-        if let cost = stampCost, cost > 0, cost < 255 {
+        if let cost = stampCost, cost > 0, cost < NetworkStamp.stampCostCap {
             costValue = .uint(UInt64(cost))
         } else {
             costValue = .null
@@ -256,8 +258,11 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// That permissiveness is deliberate parity **on the range only**: reference's
     /// `stamp_cost_from_app_data` (LXMF.py:174-185) returns `peer_data[1]` verbatim with no gate.
-    /// The `> 0 && < 255` gate exists only on the emit side, in `get_announce_app_data`
-    /// (LXMRouter.py:1044), and ours lives correspondingly in `pack`.
+    /// The `> 0 && < STAMP_COST_CAP` gate exists only on the emit side, in `get_announce_app_data`
+    /// (LXMF 1.3.0 LXMRouter.py:1173; 1044 in 1.1.0), and ours lives correspondingly in `pack`.
+    /// LXMF 1.3.0's `stamp_cost_from_app_data` (LXMF.py:183-199) still applies no cap on the
+    /// peer's advertised cost, so a parsed 101 or more is surfaced, not rejected. The outbound
+    /// ceiling (`LXMFNode.maxDeliveryStampCost`) is what keeps us from searching for one.
     ///
     /// Parity is NOT total, and the two gaps both narrow what we surface:
     /// - a NEGATIVE cost — reference returns it verbatim (Python ints are signed and unbounded);
@@ -280,7 +285,7 @@ public struct LXMFAnnounceData: Equatable {
     /// This stays in the safe direction, and it is not a known deliverability loss: a negative cost
     /// is unreachable from a CONFORMING peer in the first place — `set_inbound_stamp_cost` coerces
     /// any cost `< 1` to `None` (LXMRouter.py:378-388) and `get_announce_app_data` emits a value
-    /// only when `> 0 and < 255` (LXMRouter.py:1044) — so a peer advertising one is already
+    /// only when `> 0 and < STAMP_COST_CAP` (LXMF 1.3.0 LXMRouter.py:1173) — so a peer advertising one is already
     /// non-conforming, and has no conforming route to then enforce a positive cost against us. The
     /// difference is only in how much free work each stack does for a malformed announce.
     ///

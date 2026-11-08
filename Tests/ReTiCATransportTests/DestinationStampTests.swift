@@ -610,7 +610,7 @@ private struct Fixtures: Decodable {
     }
 
     @Test func anOverlongNameStillFitsWithTheExtension() async throws {
-        let appData = LXMFAnnounceData.pack(displayName: String(repeating: "N", count: 400), stampCost: 200)
+        let appData = LXMFAnnounceData.pack(displayName: String(repeating: "N", count: 400), stampCost: 99)
         let dest = Destination(kind: .single, direction: .in, appName: "lxmf", aspects: ["delivery"],
                                identity: Identity())!
         var lengths: [Bool: Int] = [:]
@@ -627,8 +627,8 @@ private struct Fixtures: Decodable {
             let parsed = Announce.parse(payload: packet.payload, destinationHash: dest.hash,
                                         contextFlagSet: false, requiredStampValue: 0)
             #expect(parsed?.appData == appData, "stamping \(on): the same name either way")
-            #expect(LXMFAnnounceData.parse(appData)?.displayName?.utf8.count == 307,
-                    "the name budget with a two-byte cost is 315 - 7 - 1")
+            #expect(LXMFAnnounceData.parse(appData)?.displayName?.utf8.count == 308,
+                    "the name budget with the highest emittable (one-byte) cost is 315 - 7")
         }
         #expect(lengths[true] == Packet.mtu, "the budget is exact with the extension")
         #expect(lengths[false] == Packet.mtu - 18)

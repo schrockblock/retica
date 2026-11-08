@@ -187,8 +187,9 @@ private func makeAnnounceStore(
 
 // MARK: - The stamp cost is range-sanitised at the setter
 
-/// The setter stores a cost only in **1...254** — reference's `set_inbound_stamp_cost` range
-/// (LXMRouter.py:378-392, LXMF 1.1.0): `< 1` becomes None, `< 255` is stored, `>= 255` is rejected.
+/// The setter stores a cost only in **1...99** — reference's `set_inbound_stamp_cost` range
+/// (LXMRouter.py:444-462, LXMF 1.3.0): `< 1` becomes None, `< STAMP_COST_CAP` (100) is stored,
+/// `>= 100` is rejected. 100 itself is rejected, because the comparison is strict.
 ///
 /// This matters because `State.deliveryStampCost` is what the *inbound* half validates against
 /// (`LXMFNode.swift`, the `messageDelivered` branch), while the *announce* applies its own
@@ -204,8 +205,8 @@ private func makeAnnounceStore(
 
     await store.send(.setDisplayName(nil, stampCost: 1))
     #expect(store.state.deliveryStampCost == 1)          // lower bound: accepted
-    await store.send(.setDisplayName(nil, stampCost: 254))
-    #expect(store.state.deliveryStampCost == 254)        // upper bound: accepted
+    await store.send(.setDisplayName(nil, stampCost: 99))
+    #expect(store.state.deliveryStampCost == 99)         // upper bound: accepted
 
     await store.send(.setDisplayName(nil, stampCost: nil))
     #expect(store.state.deliveryStampCost == nil)        // clean slate
@@ -213,15 +214,18 @@ private func makeAnnounceStore(
     #expect(store.state.deliveryStampCost == nil)        // < 1 → None
     await store.send(.setDisplayName(nil, stampCost: -1))
     #expect(store.state.deliveryStampCost == nil)        // < 1 → None
-    await store.send(.setDisplayName(nil, stampCost: 255))
-    #expect(store.state.deliveryStampCost == nil)        // >= 255 → rejected, nothing to keep
+    for rejected in [100, 101, 254, 255] {
+        await store.send(.setDisplayName(nil, stampCost: rejected))
+        #expect(store.state.deliveryStampCost == nil,    // >= cap → rejected, nothing to keep
+                "cost \(rejected) must be rejected")
+    }
 }
 
-/// A rejected (`>= 255`) cost leaves the previously configured cost in place — and the next
+/// A rejected (`>= 100`) cost leaves the previously configured cost in place — and the next
 /// announce still carries that previous cost.
 ///
-/// This is reference's exact shape: `set_inbound_stamp_cost` returns False on `>= 255` **without
-/// assigning** (LXMRouter.py:389-390, LXMF 1.1.0), so the destination keeps the cost it had.
+/// This is reference's exact shape: `set_inbound_stamp_cost` returns False on `>= cap` **without
+/// assigning** (LXMRouter.py:453-454, LXMF 1.3.0), so the destination keeps the cost it had.
 /// Clearing instead would let one out-of-range settings value silently downgrade a node that had
 /// deliberately configured a cost.
 ///
@@ -234,7 +238,7 @@ private func makeAnnounceStore(
     await store.skipReceivedActions(strict: false)
 
     await store.send(.setDisplayName("Frank", stampCost: 12))
-    await store.send(.setDisplayName("Frank", stampCost: 255))
+    await store.send(.setDisplayName("Frank", stampCost: 101))
     #expect(store.state.deliveryStampCost == 12)
 
     let capturedAppData = LockIsolated<Data?>(nil)

@@ -613,15 +613,22 @@ public struct LXMFNode {
                 //     and a bit count is never negative, so an all-0xFF stamp validated. We reported
                 //     `stampValid == true` to the app: a false trust signal, the worst outcome here.
                 //
-                // The `>= 255` case keeps the previous cost rather than clearing it, exactly as
+                // The upper bound is RNS 1.6.0's `Transport.STAMP_COST_CAP` (100), and LXMF 1.3.0's
+                // `set_inbound_stamp_cost` (LXMRouter.py:444-462) compares STRICTLY:
+                // `elif stamp_cost < cap: ... else: return False`. So 99 is the highest accepted
+                // cost and 100 itself is rejected. (The 255 bound above was LXMF 1.1.0's.) A host
+                // advertising 101...254 made every reference sender fail: `generate_stamp` raises
+                // ValueError above the cap (RNS/Stamps.py:255).
+                //
+                // A rejected cost keeps the previous cost rather than clearing it, exactly as
                 // reference's `return False` leaves `delivery_destination.stamp_cost` untouched.
                 // Silently disabling a configured cost because a later call was out of range would
                 // be a downgrade an attacker-influenced settings value could trigger.
                 switch stampCost {
-                case .none:                             state.deliveryStampCost = nil
-                case let .some(c) where c < 1:          state.deliveryStampCost = nil
-                case let .some(c) where c < 255:        state.deliveryStampCost = c
-                default:                                break    // rejected; previous value kept
+                case .none:                                                  state.deliveryStampCost = nil
+                case let .some(c) where c < 1:                               state.deliveryStampCost = nil
+                case let .some(c) where c < NetworkStamp.stampCostCap:       state.deliveryStampCost = c
+                default:                                                     break    // rejected; previous value kept
                 }
                 return .none
 

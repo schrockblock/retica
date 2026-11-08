@@ -51,15 +51,33 @@ import Foundation
     }
 }
 
-/// Cost 1 is inside the gate; cost 254 is inside the gate.
+/// Cost 1 is inside the gate; cost 99 (one under the cap of 100) is inside the gate.
 @Test func lxmfAnnounceDataStampCostEdgeValuesInside() {
     let lo = LXMFAnnounceData.parse(LXMFAnnounceData.pack(displayName: nil, stampCost: 1))
     #expect(lo != nil)
     if let lo { #expect(lo.stampCost == 1) }
 
-    let hi = LXMFAnnounceData.parse(LXMFAnnounceData.pack(displayName: nil, stampCost: 254))
+    let hi = LXMFAnnounceData.parse(LXMFAnnounceData.pack(displayName: nil, stampCost: 99))
     #expect(hi != nil)
-    if let hi { #expect(hi.stampCost == 254) }
+    if let hi { #expect(hi.stampCost == 99) }
+}
+
+/// LXMF 1.3.0 emits a cost only when `> 0 and < STAMP_COST_CAP` (cap 100, LXMRouter.py:1173), so
+/// 100 and above advertise as nil. A reference sender cannot stamp at a cost above 100
+/// (`generate_stamp` raises), so advertising one would make us undeliverable.
+@Test func lxmfAnnounceDataStampCostAtAndAboveTheCapAdvertisesAsNil() {
+    for cost in [100, 101, 254] {
+        let parsed = LXMFAnnounceData.parse(LXMFAnnounceData.pack(displayName: nil, stampCost: cost))
+        #expect(parsed != nil)
+        #expect(parsed?.stampCost == nil, "cost \(cost) must not be advertised")
+    }
+}
+
+/// The parser applies no cap to a PEER's advertised cost, as LXMF 1.3.0's `stamp_cost_from_app_data`
+/// (LXMF.py:183-199) returns `peer_data[1]` verbatim. A hand-built 101 survives parsing.
+@Test func lxmfAnnounceDataParseDoesNotCapAPeersAdvertisedCost() {
+    let blob = MsgPack.encode(.array([.null, .uint(101), .array([.uint(0)])]))
+    #expect(LXMFAnnounceData.parse(blob)?.stampCost == 101)
 }
 
 // MARK: — Pre-0.5.0 legacy format (first byte outside 0x90-0x9F / 0xDC)
@@ -314,21 +332,22 @@ private let nameBudgetWithNullCost = 308
     #expect(parsed.displayName == name)
 }
 
-/// A two-byte stamp cost costs one more wire byte than a null one, so the name budget must shrink
-/// by exactly one. A budget that ignored the cost encoding would overflow by a byte for any cost
-/// above 127 — invisible to every test that packs a name with no cost.
+/// The largest cost `pack` emits is 99 (cap 100, strict), which msgpack encodes in one byte, as
+/// null does. So the name budget with the highest emittable cost equals the null-cost budget. (A
+/// cost above 127 would take two bytes, but `pack` no longer emits one; `displayNameBudget` still
+/// measures the encoding rather than assuming it.)
 ///
-/// Anti-vacuity: asserts the packed size fits AND that one fewer name byte survived than in the
-/// null-cost case AND that the cost itself round-trips.
-@Test func lxmfAnnounceDataPackShrinksTheNameBudgetForATwoByteStampCost() throws {
+/// Anti-vacuity: asserts the packed size fits AND that exactly the null-cost budget of name bytes
+/// survived AND that the cost itself round-trips.
+@Test func lxmfAnnounceDataPackKeepsTheNullCostNameBudgetForTheHighestEmittableCost() throws {
     let name = String(repeating: "C", count: 400)
-    let packed = LXMFAnnounceData.pack(displayName: name, stampCost: 200)   // 200 > 127 → uint8, 2 bytes
+    let packed = LXMFAnnounceData.pack(displayName: name, stampCost: 99)
 
     #expect(packed.count <= LXMFAnnounceData.maxAppDataBytes)
     let parsed = try #require(LXMFAnnounceData.parse(packed))
     let recovered = try #require(parsed.displayName)
-    #expect(recovered.utf8.count == nameBudgetWithNullCost - 1)
-    #expect(parsed.stampCost == 200)
+    #expect(recovered.utf8.count == nameBudgetWithNullCost)
+    #expect(parsed.stampCost == 99)
 }
 
 /// Truncation must cut on an extended grapheme cluster boundary. A byte-wise cut lands inside the

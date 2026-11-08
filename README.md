@@ -197,7 +197,10 @@ What the example relies on:
 - **Your address** is `state.node.deliveryDestinationHash` after `.registerDelivery`, or
   `LXMessage.deliveryHash(identityHash: identity.hash)` at any time.
 - **Registration order.** `.setDisplayName` only changes state; `.registerDelivery` registers the
-  destination and announces it with the current name and stamp cost. To re-announce later, send
+  destination and announces it with the current name and stamp cost. The `stampCost` you pass
+  to `.setDisplayName` is stored only in 1...99 (reference LXMF 1.3.0 rejects 100 and above, because
+  RNS 1.6.0 caps stamp cost at 100 and its senders cannot stamp above that). A value below 1 clears
+  the cost; a value of 100 or more is ignored and the previous cost stays. To re-announce later, send
   `.announceDelivery` (every interface) or `.announceDeliveryOnInterface(_:)` (one). Do not bind
   a text field straight to an announce: nothing throttles locally originated announces.
 - **Sending.** `.send(destinationHash:title:content:method:)` builds, signs and sends a message.
