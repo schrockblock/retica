@@ -28,9 +28,17 @@ private final class Recorder: Sendable {
     }
 }
 
+/// A stamp search that never finds anything: it returns only when cancelled, so a test can hold a
+/// search open for as long as it likes, with no race against a real search.
+private let neverFinds = DestinationStampGenerator { _, _ in
+    try? await Task.sleep(for: .seconds(86_400))
+    return nil
+}
+
 @MainActor
 private func makeStore(_ initial: Transport.State = Transport.State(),
-                       recorder: Recorder = Recorder()) -> TestStore<Transport.State, Transport.Action> {
+                       recorder: Recorder = Recorder(),
+                       generator: DestinationStampGenerator? = nil) -> TestStore<Transport.State, Transport.Action> {
     let store = TestStore(initialState: initial) {
         CombineReducers {
             Reduce<Transport.State, Transport.Action> { _, action in
@@ -46,6 +54,7 @@ private func makeStore(_ initial: Transport.State = Transport.State(),
     } withDependencies: {
         $0.continuousClock = TestClock()
         $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+        if let generator { $0.destinationStampGenerator = generator }
     }
     store.exhaustivity = .off
     return store
@@ -228,13 +237,14 @@ private struct Fixtures: Decodable {
         }
     }
 
-    /// Value 16: about 65,000 rounds, long enough that the search is still running at the checks
-    /// straight after the announce.
+    /// The search is held open (`neverFinds`), so "a search started and nothing went out" is checked
+    /// with no race; its result is then delivered as the search's own report.
     @Test func aLoadedStampBelowTheValueIsMinedAgain() async throws {
         let dest = newDestination()
         let weak = weakStamp(dest, below: 16)
+        let mined = try await validStamp(dest, value: 16)
         let recorder = Recorder()
-        let store = makeStore(stamping(value: 16), recorder: recorder)
+        let store = makeStore(stamping(value: 16), recorder: recorder, generator: neverFinds)
         await store.send(.interfaceConnected(i0))
         await store.send(.registerLocalDestination(dest))
         // The wrong length is discarded at once.
@@ -245,13 +255,18 @@ private struct Fixtures: Decodable {
         await store.send(.rehydrateDestinationStamp(destinationHash: dest.hash, stamp: weak))
         await store.send(.announce(destinationHash: dest.hash, appData: nil))
         #expect(recorder.announces.isEmpty, "a stamp below the value is not used")
-        #expect(store.state.stampingDestinations == [dest.hash])
-        await nextAnnounce(store)
+        #expect(store.state.stampingDestinations == [dest.hash], "a new search replaces it")
+        await store.send(.destinationStampSearchEnded(destinationHash: dest.hash, stamp: mined,
+                                                      value: NetworkStamp.value(stamp: mined, material: material(dest))))
         let packet = try #require(recorder.announces.first?.1)
         let stamp = Data(packet.payload.suffix(18).dropFirst(2).prefix(14))
+        #expect(stamp == mined)
         #expect(stamp != weak)
-        #expect(NetworkStamp.isValid(stamp: stamp, cost: 16, material: material(dest)))
-        #expect(recorder.searchesEnded.value == 1)
+        #expect(store.state.destinationStamps[dest.hash] == mined)
+        #expect(store.state.stampingDestinations.isEmpty)
+        await store.skipReceivedActions(strict: false)
+        store.exhaustivity = .on
+        await store.finish()
     }
 
     @Test func theStampIsMinedOncePerDestination() async throws {
@@ -311,15 +326,14 @@ private struct Fixtures: Decodable {
     /// The host's database read can land after the first announce started a search. The stamp it
     /// brings ends that search and releases what waited for it.
     ///
-    /// Value 20: about a million rounds, so the store's own search is still running when the stamp
-    /// (mined beforehand, here) arrives a few sends later. It would have to finish within those
-    /// few sends, about one time in a thousand, to beat it.
+    /// The store's own search is held open (`neverFinds`), so it is certainly still running when the
+    /// stamp (mined beforehand, here) arrives.
     @Test func aStampRehydratedDuringTheSearchEndsIt() async throws {
         let dest = newDestination()
-        let stamp = try await validStamp(dest, value: 20)
-        let weak = weakStamp(dest, below: 20)
+        let stamp = try await validStamp(dest, value: 12)
+        let weak = weakStamp(dest, below: 12)
         let recorder = Recorder()
-        let store = makeStore(stamping(value: 20), recorder: recorder)
+        let store = makeStore(stamping(value: 12), recorder: recorder, generator: neverFinds)
         await store.send(.interfaceConnected(i0))
         await store.send(.registerLocalDestination(dest))
         await store.send(.announce(destinationHash: dest.hash, appData: nil))
@@ -348,25 +362,79 @@ private struct Fixtures: Decodable {
         await store.send(.interfaceConnected(i1))
         await store.send(.registerLocalDestination(dest))
         await store.send(.announce(destinationHash: dest.hash, appData: Data([0xA1])))
-        await store.send(.announce(destinationHash: dest.hash, appData: Data([0xA2])))
         await store.send(.announce(destinationHash: dest.hash, appData: nil, interface: i1))
         #expect(recorder.transmits.value.isEmpty, "nothing goes out without the stamp")
         #expect(store.state.stampingDestinations == [dest.hash])
-        #expect(store.state.pendingStampedAnnounces.count == 3)
+        #expect(store.state.pendingStampedAnnounces.count == 2)
 
         // The search's report, as its effect sends it (a value-100 stamp cannot be mined here).
         let stamp = Data(repeating: 7, count: 14)
         await store.send(.destinationStampSearchEnded(destinationHash: dest.hash, stamp: stamp, value: 100))
         let sent = recorder.announces
-        #expect(sent.count == 5, "two announces on both interfaces, one on i1")
+        #expect(sent.count == 3, "the broadcast on both interfaces, then the one on i1")
         #expect(sent.allSatisfy { Data($0.1.payload.suffix(18).dropFirst(2).prefix(14)) == stamp })
         let appData = sent.map { Data($0.1.payload.dropFirst(148).dropLast(18)) }
-        #expect(appData.filter { $0 == Data([0xA1]) }.count == 2)
-        #expect(appData.filter { $0 == Data([0xA2]) }.count == 3, "the third falls back to the sticky app data")
+        #expect(appData.allSatisfy { $0 == Data([0xA1]) }, "the second falls back to the sticky app data")
         #expect(sent.last?.0 == i1)
         #expect(store.state.pendingStampedAnnounces.isEmpty)
         #expect(store.state.stampingDestinations.isEmpty)
         #expect(store.state.destinationStamps[dest.hash] == stamp)
+        await store.skipReceivedActions(strict: false)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// A search takes minutes on a phone, and announces keep coming meanwhile (host calls, per-interface
+    /// re-announces). Reference keeps one queued announce per destination, the newest
+    /// (Transport.py:1456); here one per destination AND target, so a per-interface re-announce
+    /// (Contract 4) is not lost. The burst when the stamp lands is at most interfaces + 1 per destination.
+    @Test func repeatedAnnouncesDuringASearchCollapseToOnePerTarget() async throws {
+        let dest = newDestination()
+        let recorder = Recorder()
+        let store = makeStore(stamping(value: 100), recorder: recorder, generator: neverFinds)
+        await store.send(.interfaceConnected(i0))
+        await store.send(.interfaceConnected(i1))
+        await store.send(.registerLocalDestination(dest))
+        for n in 0..<10 { await store.send(.announce(destinationHash: dest.hash, appData: Data([0xA0 + UInt8(n)]))) }
+        for _ in 0..<10 { await store.send(.announce(destinationHash: dest.hash, appData: nil, interface: i1)) }
+        await store.send(.announce(destinationHash: dest.hash, appData: Data([0xB4]), interface: i1))
+        await store.send(.announce(destinationHash: dest.hash, appData: nil, interface: InterfaceID("gone")))
+        #expect(store.state.pendingStampedAnnounces.count == 2, "one for every interface, one for i1")
+
+        let stamp = Data(repeating: 7, count: 14)
+        await store.send(.destinationStampSearchEnded(destinationHash: dest.hash, stamp: stamp, value: 100))
+        let sent = recorder.announces
+        try #require(sent.count == 3)
+        let appData = sent.map { Data($0.1.payload.dropFirst(148).dropLast(18)) }
+        #expect(Set(sent.prefix(2).map(\.0)) == [i0, i1])
+        #expect(appData.prefix(2).allSatisfy { $0 == Data([0xA9]) }, "the newest app data is kept")
+        #expect(sent[2].0 == i1 && appData[2] == Data([0xB4]))
+        await store.skipReceivedActions(strict: false)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    @Test func oneDestinationsAnnouncesCannotCrowdOutAnothers() async throws {
+        let delivery = newDestination("delivery")
+        let propagation = newDestination("propagation")
+        let recorder = Recorder()
+        let store = makeStore(stamping(value: 100), recorder: recorder, generator: neverFinds)
+        await store.send(.interfaceConnected(i0))
+        await store.send(.registerLocalDestination(delivery))
+        await store.send(.registerLocalDestination(propagation))
+        for _ in 0..<40 {
+            await store.send(.announce(destinationHash: delivery.hash, appData: nil))
+            await store.send(.announce(destinationHash: delivery.hash, appData: nil, interface: i0))
+        }
+        await store.send(.announce(destinationHash: propagation.hash, appData: Data([0xC1, 0x0C])))
+        #expect(store.state.pendingStampedAnnounces.filter { $0.destinationHash == propagation.hash }.count == 1)
+
+        let stamp = Data(repeating: 7, count: 14)
+        await store.send(.destinationStampSearchEnded(destinationHash: propagation.hash, stamp: stamp, value: 100))
+        let sent = recorder.announces
+        #expect(sent.count == 1)
+        #expect(sent.first?.1.destinationHash == propagation.hash)
+        await store.send(.cancelDestinationStamps)
         await store.skipReceivedActions(strict: false)
         store.exhaustivity = .on
         await store.finish()
@@ -455,10 +523,15 @@ private struct Fixtures: Decodable {
 
     @Test func theWaitingQueuesAreBounded() async throws {
         let dest = newDestination()
-        let store = makeStore(stamping(value: 100))
+        let store = makeStore(stamping(value: 100), generator: neverFinds)
         await store.send(.interfaceConnected(i0))
         await store.send(.registerLocalDestination(dest))
-        for _ in 0..<40 { await store.send(.announce(destinationHash: dest.hash, appData: nil)) }
+        // Forty destinations, one announce each: forty distinct keys against a cap of 32.
+        for n in 0..<40 {
+            let other = newDestination("other\(n)")
+            await store.send(.registerLocalDestination(other))
+            await store.send(.announce(destinationHash: other.hash, appData: nil))
+        }
         for tag in 1...40 { await store.send(.received(i0, pathRequest(for: dest.hash, tag: UInt8(tag)))) }
         let pending = store.state.pendingStampedAnnounces
         #expect(pending.filter { !$0.isPathResponse }.count == Transport.stampedAnnounceQueueLimit)

@@ -144,7 +144,8 @@ public struct Transport {
         /// Local destinations whose stamp search is in flight. One search per destination.
         public var stampingDestinations: Set<Data> = []
         /// Announces and path responses waiting for their destination's stamp (reference
-        /// `stamp_queues`, Transport.py:1453-1463). Bounded by `Transport.stampedAnnounceQueueLimit` and
+        /// `stamp_queues`, Transport.py:1453-1463). At most one announce per destination and target
+        /// interface (the newest), and bounded overall by `Transport.stampedAnnounceQueueLimit` and
         /// `Transport.stampedPathResponseQueueLimit`; dropped if the search ends without a stamp.
         public var pendingStampedAnnounces: [PendingStampedAnnounce] = []
 
@@ -487,6 +488,7 @@ public struct Transport {
     @Dependency(\.transportDate) var date
     @Dependency(\.continuousClock) var clock
     @Dependency(\.randomBytes) var randomBytes
+    @Dependency(\.destinationStampGenerator) var destinationStampGenerator
 
     private enum CancelID: Hashable {
         case announceRetransmit(Data); case maintenance; case announceDrain(InterfaceID)
@@ -498,7 +500,7 @@ public struct Transport {
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { [clock, date, randomBytes] state, action in
+        Reduce { [clock, date, randomBytes, destinationStampGenerator] state, action in
             // Shared helper: rewrite a packet for forwarding toward its destination.
             // Final hop → HEADER_1 direct; onward → HEADER_2 to next hop. The final hop is the
             // destination itself OR a local client of the next hop (`LearnedDestination.relayNextHop`,
@@ -604,7 +606,7 @@ public struct Transport {
                 let material = dest.hash + identity.publicKey + dest.nameHash      // stamp_material()
                 let value = Transport.clampedDestinationValue(state.destinationValue)
                 return .run { send in
-                    let found = await NetworkStamp.generate(material: material, cost: value)
+                    let found = await destinationStampGenerator.generate(material, value)   // NetworkStamp.generate, live
                     // Cancelled from outside: nothing to report.
                     guard !Task.isCancelled else { return }
                     await send(.destinationStampSearchEnded(destinationHash: hash, stamp: found?.stamp,
@@ -615,8 +617,28 @@ public struct Transport {
 
             // Hold `item` until its destination's stamp exists, within the reference queue lengths;
             // past them the item is dropped, as reference drops it (Transport.py:1458-1461).
+            //
+            // Announces are KEYED by (destination, target interface): a newer one replaces the queued
+            // one in place, keeping the newest app data. Reference keys by destination alone
+            // (Transport.py:1456); the target is added so a per-interface re-announce (Contract 4) is
+            // not swallowed by a broadcast one. A search takes minutes on a phone, so without the key
+            // repeated announces of one destination filled every slot, crowding out other local
+            // destinations, and then burst onto the air together. A queued announce for an interface
+            // that is not connected would send nothing, so it is not queued. Path responses are not
+            // keyed, as in reference: each answers its own request.
             func waitForStamp(_ item: State.PendingStampedAnnounce, _ dest: Destination, _ identity: Identity,
                               _ state: inout State) -> Effect<Action> {
+                if case let .announce(_, interface) = item.kind {
+                    if let interface, state.interfaces[interface] == nil { return .none }
+                    if let queued = state.pendingStampedAnnounces.firstIndex(where: {
+                        guard $0.destinationHash == item.destinationHash,
+                              case let .announce(_, queuedInterface) = $0.kind else { return false }
+                        return queuedInterface == interface
+                    }) {
+                        state.pendingStampedAnnounces[queued] = item
+                        return startDestinationStampSearch(dest, identity, &state)
+                    }
+                }
                 let limit = item.isPathResponse ? Transport.stampedPathResponseQueueLimit
                                                 : Transport.stampedAnnounceQueueLimit
                 if state.pendingStampedAnnounces.filter({ $0.isPathResponse == item.isPathResponse }).count < limit {
