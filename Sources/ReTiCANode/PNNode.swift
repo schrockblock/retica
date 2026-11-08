@@ -63,6 +63,8 @@ public struct PNNode {
             /// carries no retry machinery (that lives in `LXMFRouter`) and has no production consumer
             /// today, so this exists to make the drop OBSERVABLE rather than abandoning the pending
             /// sync silently (handoff F3). The `LinkFailure` reason is surfaced, not discarded.
+            /// A node stop fails an in-progress sync with `.pathStale`: `LinkPlane` chose that over
+            /// `.stampFailure` on purpose (see its `failStampSearches`).
             case syncFailed(destinationHash: Data, reason: LinkFailure)
         }
     }

@@ -83,6 +83,21 @@ private func openedWithCost(_ store: TestStoreOf<TransportEndpoint>) async -> Do
     return cost.value
 }
 
+/// TransportEndpoint, counting the key searches that finish (each ends in `.stampedKeyFound`).
+private struct FoundKeyCountingEndpoint: Reducer {
+    typealias State = TransportEndpoint.State
+    typealias Action = TransportEndpoint.Action
+    let found: LockIsolated<Int>
+
+    var body: some ReducerOf<Self> {
+        Reduce { _, action in
+            if case .linkPlane(.stampedKeyFound) = action { found.withValue { $0 += 1 } }
+            return .none
+        }
+        TransportEndpoint()
+    }
+}
+
 @Suite @MainActor struct LinkPlaneStampedRequestTests {
     @Test func aLinkToADestinationWithACostUsesAKeyMeetingIt() async throws {
         let store = makePlane()
@@ -103,7 +118,7 @@ private func openedWithCost(_ store: TestStoreOf<TransportEndpoint>) async -> Do
     }
 
     @Test func noCostMeansAnOrdinaryKeyAndNoSearch() async {
-        for cost: Double? in [nil, 0] {
+        for cost: Double? in [nil, 0, -1, .nan] {
             let store = makePlane()
             await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash,
                                        interfaceID: iface, relayNextHop: nil, linkCost: cost))
@@ -184,7 +199,17 @@ private func openedWithCost(_ store: TestStoreOf<TransportEndpoint>) async -> Do
     /// Endpoint wiring: the cost an announce carried reaches the plane, and the request meets it.
     @Test func anAnnouncedLinkCostStampsTheEndpointsLinkRequest() async throws {
         let stamped = try fixture("stripped")
-        let store = makeEndpoint()
+        // Cost 3.25 is met by a random key about one time in ten, so `isValid` alone cannot show a
+        // search ran. A found key arrives as `.stampedKeyFound`, which only the search produces.
+        let found = LockIsolated(0)
+        let store = TestStore(initialState: TransportEndpoint.State()) {
+            FoundKeyCountingEndpoint(found: found)
+        } withDependencies: {
+            $0.uuid = .incrementing
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+        }
+        store.exhaustivity = .off
         await store.send(.transport(.interfaceConnected(iface, .tcp)))
         await store.send(.transport(.received(iface, stamped.raw(hops: 1))))
         await store.skipReceivedActions(strict: false)
@@ -202,6 +227,7 @@ private func openedWithCost(_ store: TestStoreOf<TransportEndpoint>) async -> Do
         let request = try #require(captured.value.flatMap { Packet(raw: $0) })
         #expect(NetworkStamp.isValid(stamp: Data(request.payload.prefix(32)), cost: 3.25,
                                      material: stamped.destinationHash + request.payload.dropFirst(32).prefix(32)))
+        #expect(found.value == 1, "the key must come from the search")
     }
 
     /// Reference records `lr_cost` on every valid announce (`Identity.remember`), not only on one that
@@ -284,11 +310,19 @@ private struct SearchCountingNode: Reducer {
     typealias State = LXMFNode.State
     typealias Action = LXMFNode.Action
     let searches: LockIsolated<Int>
+    /// Searches that reported back (found a key or timed out). A cancelled search reports nothing, so
+    /// one that is still running after its link failed shows up here when the clock runs it out.
+    let ended: LockIsolated<Int>
 
     var body: some ReducerOf<Self> {
         Reduce { _, action in
             if case let .endpoint(.linkPlane(.openLink(_, _, _, _, _, cost))) = action, let cost, cost > 0 {
                 searches.withValue { $0 += 1 }
+            }
+            switch action {
+            case .endpoint(.linkPlane(.stampedKeyFound)), .endpoint(.linkPlane(.stampSearchTimedOut)):
+                ended.withValue { $0 += 1 }
+            default: break
             }
             return .none
         }
@@ -301,7 +335,10 @@ private struct SearchCountingNode: Reducer {
 /// After the interface has gone, no search may be running and none may have started after the stop.
 @MainActor
 private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.Action>,
-                                    searches: LockIsolated<Int>, interfaceID: InterfaceID) async throws {
+                                    searches: LockIsolated<Int>, ended: LockIsolated<Int>,
+                                    interfaceID: InterfaceID,
+                                    interfaceGoesOffline: Bool = true,
+                                    clock: TestClock<Duration>, endDriverEvents: () -> Void) async throws {
     let peer = try fixture("lxmf_delivery_cost_20")
     await store.send(.endpoint(.transport(.received(interfaceID, peer.raw(hops: 1)))))
     await store.receive({ if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false },
@@ -316,24 +353,47 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
     #expect(searches.value == 1)
 
     await store.send(.endpoint(.stop))
-    await store.receive({ if case .endpoint(.transport(.interfaceDisconnected(interfaceID))) = $0 { return true }; return false },
-                        timeout: .seconds(5))
+    if interfaceGoesOffline {
+        await store.receive({ if case .endpoint(.transport(.interfaceDisconnected(interfaceID))) = $0 { return true }; return false },
+                            timeout: .seconds(5))
+    }
     await store.skipReceivedActions(strict: false)
     #expect(store.state.endpoint.linkPlane.stampingLinks.isEmpty, "no search may outlive the stop")
     #expect(searches.value == 1, "no search may start after the stop")
     #expect(store.state.endpoint.linkPlane.links.isEmpty, "no link may be opened after the stop")
+    // Two other effects outlive the stop and are not the search: the driver's event stream (the test
+    // owns it, so end it) and the router's timers on this TestClock (run them out). If running them
+    // out starts a search, that is a search the stop failed to prevent.
+    endDriverEvents()
+    if !interfaceGoesOffline {
+        // KNOWN GAP, not asserted as correct: a TCP-server stop never reports its accepted
+        // connections closed, so their interfaces stay in the router and the shared maintenance
+        // loop keeps sleeping on this clock. Close the connection by hand so `finish` can see the
+        // search is gone; without this line the loop is what `finish` times out on.
+        await store.send(.endpoint(.tcpServer(.interface(.delegate(.connectionClosed(TCPConnID(1)))))))
+    }
+    await clock.advance(by: .seconds(3600))
+    await store.skipReceivedActions(strict: false)
+    #expect(searches.value == 1, "no search may start once the timers have run")
+    #expect(store.state.endpoint.linkPlane.stampingLinks.isEmpty)
+    #expect(ended.value == 0, "the search was cancelled, not left to run out its timeout")
+    // A search still running (cost 20, over a minute) would keep its effect alive past `finish`.
+    store.exhaustivity = .on
+    await store.finish()
 }
 
 @Suite @MainActor struct StoppingAStampSearchTests {
     @Test func aTCPClientStopEndsTheSearchAndStartsNoOther() async throws {
         let searches = LockIsolated(0)
+        let ended = LockIsolated(0)
+        let clock = TestClock()
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: LXMFNode.State(
             identity: Identity(), endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))) {
-            SearchCountingNode(searches: searches)
+            SearchCountingNode(searches: searches, ended: ended)
         } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream }, send: { _ in }, close: { })
-            $0.continuousClock = TestClock()
+            $0.continuousClock = clock
             $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000.5))
             $0.uuid = .incrementing
         }
@@ -343,17 +403,19 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
         await store.receive({ if case .endpoint(.transport(.interfaceConnected)) = $0 { return true }; return false },
                             timeout: .seconds(5))
         let id = try #require(store.state.endpoint.transport.interfaces.keys.first)
-        try await stopWithASearchRunning(store, searches: searches, interfaceID: id)
+        try await stopWithASearchRunning(store, searches: searches, ended: ended, interfaceID: id, clock: clock) { events.continuation.finish() }
     }
 
     @Test func aBLEStopEndsTheSearchAndStartsNoOther() async throws {
         let searches = LockIsolated(0)
+        let ended = LockIsolated(0)
+        let clock = TestClock()
         let events = AsyncStream<BLEDriverEvent>.makeStream()
         let store = TestStore(initialState: LXMFNode.State(
             identity: Identity(), endpoint: BLEEndpoint.State(localIdentity: Data(repeating: 0x5A, count: 16)))) {
-            SearchCountingNode(searches: searches)
+            SearchCountingNode(searches: searches, ended: ended)
         } withDependencies: {
-            $0.continuousClock = TestClock()
+            $0.continuousClock = clock
             $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000.5))
             $0.uuid = .incrementing
             $0.bleDriver = BLEDriver(start: { _ in events.stream }, readIdentity: { _ in }, openChannel: { _ in },
@@ -369,21 +431,55 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
         await store.receive({ if case .endpoint(.transport(.interfaceConnected)) = $0 { return true }; return false },
                             timeout: .seconds(5))
         let id = try #require(store.state.endpoint.transport.interfaces.keys.first)
-        try await stopWithASearchRunning(store, searches: searches, interfaceID: id)
+        try await stopWithASearchRunning(store, searches: searches, ended: ended, interfaceID: id, clock: clock) { events.continuation.finish() }
     }
 
     /// The radio reports offline only after `driver.stop()` returns, so its interface outlives the
     /// endpoint's `.stop` by at least one effect hop.
+    @Test func aTCPServerStopEndsTheSearchAndStartsNoOther() async throws {
+        let searches = LockIsolated(0)
+        let ended = LockIsolated(0)
+        let clock = TestClock()
+        let events = AsyncStream<TCPListenerEvent>.makeStream()
+        let store = TestStore(initialState: LXMFNode.State(
+            identity: Identity(), endpoint: TransportEndpoint.State.tcpServer(TCPServerEndpoint.State(port: 4242, profile: .tcp)))) {
+            SearchCountingNode(searches: searches, ended: ended)
+        } withDependencies: {
+            $0.tcpListener = TCPListener(listen: { _ in events.stream }, send: { _, _ in }, close: { _ in }, stop: { })
+            $0.continuousClock = clock
+            $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000.5))
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+        await store.send(.endpoint(.start))
+        events.continuation.yield(.started)
+        events.continuation.yield(.accepted(TCPConnID(1)))
+        // Poll rather than `receive`: this store is non-exhaustive, so a `receive` predicate cannot
+        // see the actions an earlier `send` skipped, and it timed out here although the connection
+        // was accepted.
+        for _ in 0..<500 where store.state.endpoint.transport.interfaces.isEmpty {
+            await store.skipReceivedActions(strict: false)
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let id = try #require(store.state.endpoint.transport.interfaces.keys.first)
+        // Stopping the listener cancels its event effect, so no `.closed` reaches the reducer and the
+        // accepted connection's interface is not reported disconnected. Only the search is asserted.
+        try await stopWithASearchRunning(store, searches: searches, ended: ended, interfaceID: id,
+                                         interfaceGoesOffline: false, clock: clock) { events.continuation.finish() }
+    }
+
     @Test func aMeshtasticStopEndsTheSearchAndStartsNoOther() async throws {
         let searches = LockIsolated(0)
+        let ended = LockIsolated(0)
+        let clock = TestClock()
         let radio = AsyncStream<MeshtasticDriverEvent>.makeStream()
         let endpoint = TransportEndpoint.State.meshtastic(MeshtasticEndpoint.State(
             config: MeshtasticDriverConfig(radio: UUID(uuidString: "0000AAAA-0000-0000-0000-0000000000F3")!),
             profile: .meshtastic(modemPreset: nil)))
         let store = TestStore(initialState: LXMFNode.State(identity: Identity(), endpoint: endpoint)) {
-            SearchCountingNode(searches: searches)
+            SearchCountingNode(searches: searches, ended: ended)
         } withDependencies: {
-            $0.continuousClock = TestClock()
+            $0.continuousClock = clock
             $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000.5))
             $0.uuid = .incrementing
             $0.meshtasticClock = ImmediateClock()
@@ -395,7 +491,7 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
         await store.receive({ if case .endpoint(.transport(.interfaceConnected)) = $0 { return true }; return false },
                             timeout: .seconds(5))
         let id = try #require(store.state.endpoint.transport.interfaces.keys.first)
-        try await stopWithASearchRunning(store, searches: searches, interfaceID: id)
+        try await stopWithASearchRunning(store, searches: searches, ended: ended, interfaceID: id, clock: clock) { radio.continuation.finish() }
     }
 }
 

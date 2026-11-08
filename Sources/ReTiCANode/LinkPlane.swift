@@ -160,6 +160,9 @@ public struct LinkPlane {
         /// Create a responder link for an inbound LINKREQUEST and accept it. `arrivalBitrate` is
         /// the bitrate of the interface the request arrived on (`nil` = unknown → 15 s); it sets the
         /// establishment deadline via `LinkTiming.responderEstablishmentTimeout`.
+        ///
+        /// Stamp enforcement for inbound LINKREQUESTs happens in `Transport`, before it sends this
+        /// action. Sending the action directly accepts the request without checking any stamp.
         case acceptLinkRequest(owner: Identity, destinationHash: Data,
                                interfaceID: InterfaceID, data: Data, arrivalBitrate: Int? = nil)
         /// Route an inbound link-addressed packet to the link that owns it.
@@ -235,6 +238,21 @@ public struct LinkPlane {
         })
     }
 
+    /// The `.stampFailure` outcome for a link to `destinationHash`: nothing was sent.
+    private static func stampFailed(_ destinationHash: Data) -> Effect<Action> {
+        .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .stampFailure)))
+    }
+
+    /// An initiator link session. Without `ephemeral` it gets an ordinary random key.
+    private static func initiatorLink(id: UUID, to identity: Identity, destinationHash: Data,
+                                      interfaceID: InterfaceID, ephemeral: Identity = Identity(),
+                                      establishmentTimeout: TimeInterval,
+                                      relayNextHop: Data?) -> LinkSession.State {
+        LinkSession.State(id: id, initiatorTo: identity, destinationHash: destinationHash,
+                          interfaceID: interfaceID, ephemeral: ephemeral,
+                          establishmentTimeout: establishmentTimeout, relayNextHop: relayNextHop)
+    }
+
     public var body: some ReducerOf<Self> {
         // LATE ACTIONS FOR A REMOVED LINK are dropped quietly. A link element is removed on its
         // `.delegate(.closed)` / `.establishmentFailed`, and TCA drains effect actions
@@ -261,16 +279,14 @@ public struct LinkPlane {
                 // gets the same. STAMP_LRS is on by default in 1.6.0 and ALWAYS_STAMP_LRS off, so we
                 // never stamp a request to a destination that announced no cost.
                 guard let cost = linkCost, cost > 0 else {
-                    state.links.append(LinkSession.State(id: newID, initiatorTo: identity,
-                                                         destinationHash: destinationHash,
-                                                         interfaceID: interfaceID,
-                                                         establishmentTimeout: establishmentTimeout,
-                                                         relayNextHop: relayNextHop))
+                    state.links.append(Self.initiatorLink(id: newID, to: identity,
+                                                          destinationHash: destinationHash,
+                                                          interfaceID: interfaceID,
+                                                          establishmentTimeout: establishmentTimeout,
+                                                          relayNextHop: relayNextHop))
                     return .send(.link(.element(id: newID, action: .establish)))
                 }
-                guard cost <= Self.maxLinkStampCost else {
-                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .stampFailure)))
-                }
+                guard cost <= Self.maxLinkStampCost else { return Self.stampFailed(destinationHash) }
                 // Link.py:355-361: a fresh Ed25519 key first, because the stamp material is
                 // `destinationHash + ed25519Public`; then search X25519 keys against it.
                 let signing = Curve25519.Signing.PrivateKey()
@@ -319,22 +335,19 @@ public struct LinkPlane {
                 // `Identity`, so `LinkSession` sends its public half as the LINKREQUEST payload.
                 guard let ephemeral = Identity(privateKey: x25519PrivateKey + pending.ed25519PrivateKey),
                       ephemeral.publicKey == x25519PublicKey + pending.ed25519PublicKey
-                else {
-                    return .send(.delegate(.linkFailed(destinationHash: pending.destinationHash,
-                                                       reason: .stampFailure)))
-                }
-                state.links.append(LinkSession.State(id: id, initiatorTo: pending.destinationIdentity,
-                                                     destinationHash: pending.destinationHash,
-                                                     interfaceID: pending.interfaceID,
-                                                     ephemeral: ephemeral,
-                                                     establishmentTimeout: pending.establishmentTimeout,
-                                                     relayNextHop: pending.relayNextHop))
+                else { return Self.stampFailed(pending.destinationHash) }
+                state.links.append(Self.initiatorLink(id: id, to: pending.destinationIdentity,
+                                                      destinationHash: pending.destinationHash,
+                                                      interfaceID: pending.interfaceID,
+                                                      ephemeral: ephemeral,
+                                                      establishmentTimeout: pending.establishmentTimeout,
+                                                      relayNextHop: pending.relayNextHop))
                 // `.establish` arms the establishment timer, so it starts now, after the search.
                 return .send(.link(.element(id: id, action: .establish)))
 
             case let .stampSearchTimedOut(id):
                 guard let pending = state.stampingLinks.remove(id: id) else { return .none }
-                return .send(.delegate(.linkFailed(destinationHash: pending.destinationHash, reason: .stampFailure)))
+                return Self.stampFailed(pending.destinationHash)
 
             case .cancelStampSearches:
                 return failStampSearches(state.stampingLinks, from: &state)
