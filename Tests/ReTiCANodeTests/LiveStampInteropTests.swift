@@ -180,6 +180,40 @@ private final class LiveNode {
         #expect(log.contains("stamp_valid=True"))
     }
 
+    /// The peer's phone is off for longer than the 21 s first-send wait. The message goes to the router
+    /// unstamped, and the peer's announce, when it finally comes online, brings the cost. What goes out
+    /// then must be stamped. Before the fix the router's next retry sent the unstamped copy, the peer
+    /// proved it and dropped it, and we reported it delivered.
+    ///
+    /// A hub carries us until the peer joins it. The peer's identity is made here so its address is
+    /// known before it starts.
+    @Test func aFirstMessageToAPeerOfflineForLongerThanTheWaitSurvivesEnforcement() async throws {
+        let port = nextPort()
+        let hub = try Peer("offline-hub", ["--listen", "\(port)", "--cost", "0"])
+        defer { hub.stop() }
+        _ = try await hub.address()
+        let node = try await LiveNode(port: port)
+        defer { node.stop() }
+
+        let peerIdentity = Identity()
+        let identityFile = NSTemporaryDirectory() + "retica-stamp-identity-\(UUID().uuidString.prefix(8))"
+        try #require(peerIdentity.privateKey).write(to: URL(fileURLWithPath: identityFile))
+        defer { try? FileManager.default.removeItem(atPath: identityFile) }
+        let dest = LXMessage.deliveryHash(identityHash: peerIdentity.hash)
+
+        node.send("sent while the peer was offline", to: dest)
+        try await Task.sleep(for: .seconds(30))
+        #expect(node.store.state.node.waitingForPeerCost[dest] == nil, "the wait must have run out")
+        #expect(node.store.state.node.endpoint.learned[dest] == nil, "the peer must not have been heard yet")
+
+        let peer = try Peer("offline-peer", ["--connect", "\(port)", "--announce-every", "3",
+                                             "--identity", identityFile])
+        defer { peer.stop() }
+        #expect(try await peer.address() == dest)
+        let log = try #require(await peer.received(containing: "sent while the peer was offline", within: 60))
+        #expect(log.contains("stamp_valid=True"))
+    }
+
     /// Too big for one packet, so over a link to a destination with a link cost (3.25 in LXMF 1.3.0).
     @Test func aLargeMessageOverALinkSurvivesEnforcement() async throws {
         let port = nextPort()

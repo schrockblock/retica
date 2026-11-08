@@ -26,21 +26,54 @@ private struct PathRequestCountingNode: Reducer {
     typealias State = LXMFNode.State
     typealias Action = LXMFNode.Action
     let pathRequests: LockIsolated<Int>
+    let transmitted: Transmitted
 
     var body: some Reducer<State, Action> {
-        Reduce { _, action in
+        Reduce { state, action in
             if case .endpoint(.requestPath) = action { pathRequests.withValue { $0 += 1 } }
+            // Transport drops a send to a destination it has not learned (`sendFailed(.notLearned)`),
+            // so only one it has learned can reach the wire.
+            if case let .endpoint(.send(dest, plaintext, _)) = action, state.endpoint.learned[dest] != nil {
+                transmitted.opportunistic.withValue { $0.append(plaintext) }
+            }
+            if case let .router(.delegate(.sendDirect(_, data, _))) = action {
+                transmitted.overLink.withValue { $0.append(data) }
+            }
+            if case let .delegate(outcome) = action {
+                switch outcome {
+                case .deliveryFailed, .deliveryConfirmed, .propagationAccepted, .deliveryRejected, .deliveryCancelled:
+                    let described = String(describing: outcome)
+                    transmitted.terminals.withValue { $0.append(described) }
+                default: break
+                }
+            }
             return .none
         }
         LXMFNode()
     }
 }
 
+/// What could actually leave the node: opportunistic payloads sent to a learned destination, and
+/// packed messages sent over a link. Also every terminal outcome reported to the app.
+private struct Transmitted {
+    let opportunistic = LockIsolated<[Data]>([])
+    let overLink = LockIsolated<[Data]>([])
+    /// Described, because `LXMFNode.Action.Delegate` is not `Sendable`.
+    let terminals = LockIsolated<[String]>([])
+}
+
+private func described(_ outcome: LXMFNode.Action.Delegate) -> String { String(describing: outcome) }
+
+/// High enough that the search is still running when the test cancels it (about 8 minutes on a
+/// Mac, see `maxDeliveryStampCost`), and within the ceiling, so it does start.
+private let slowCost = LXMFNode.maxDeliveryStampCost
+
 @MainActor
 private func makeNode(_ identity: Identity, _ clock: TestClock<Duration>,
-                      countingPathRequestsIn pathRequests: LockIsolated<Int> = LockIsolated(0)) async -> TestStoreOf<LXMFNode> {
+                      countingPathRequestsIn pathRequests: LockIsolated<Int> = LockIsolated(0),
+                      recordingIn transmitted: Transmitted = Transmitted()) async -> TestStoreOf<LXMFNode> {
     let store = TestStore(initialState: LXMFNode.State(identity: identity, endpoint: TransportEndpoint.State())) {
-        PathRequestCountingNode(pathRequests: pathRequests)
+        PathRequestCountingNode(pathRequests: pathRequests, transmitted: transmitted)
     } withDependencies: {
         $0.continuousClock = clock
         $0.date = .constant(Date(timeIntervalSince1970: sentAt))
@@ -234,4 +267,143 @@ private func isHandedOver(_ store: TestStoreOf<LXMFNode>, _ m: LXMessage) async 
         let handed = try #require(await nextHandedToRouter(store))
         #expect(handed.validateStamp(targetCost: cheapCost))
     }
+
+    /// The peer's phone is off for longer than the wait. The router then holds the message unstamped,
+    /// and nothing has gone out: there was no path. The announce that finally brings the path brings
+    /// the cost, so what goes out must carry a stamp at that cost. Before the fix the router's next
+    /// retry sent the unstamped copy, and an enforcing peer proved it and dropped it.
+    @Test func aSendHandedOverAfterTheWaitIsStampedWhenTheCostArrivesLater() async throws {
+        let me = Identity(), peer = Identity(), clock = TestClock()
+        let transmitted = Transmitted()
+        let store = await makeNode(me, clock, recordingIn: transmitted)
+        let m = message(from: me, to: peer)
+
+        await store.send(.sendMessage(message: m, fallbackToPropagation: false))
+        await waitOutTheCostWait(store, clock)
+        #expect(await isHandedOver(store, m), "the wait ran out, so the router holds it")
+        #expect(transmitted.opportunistic.value.isEmpty, "no path yet, so nothing can have gone out")
+
+        await clock.advance(by: .seconds(9))     // 30 s in; the router's first retry is due at 31 s
+        await store.skipReceivedActions(strict: false)
+        await hearAnnounce(store, of: peer, stampCost: cheapCost)
+        await waitForStampedHandOver(store)
+        for _ in 0..<4 {
+            await clock.advance(by: .seconds(10))
+            await store.skipReceivedActions(strict: false)
+        }
+
+        #expect(!transmitted.opportunistic.value.isEmpty, "once the path is known the message must go out")
+        for payload in transmitted.opportunistic.value {
+            let copy = LXMessage.fromOpportunistic(destinationHash: m.destinationHash, payload: payload)
+            #expect(copy?.hash == m.hash)
+            #expect(copy?.validateStamp(targetCost: cheapCost) == true, "every copy on the wire must be stamped")
+        }
+    }
+
+    /// The same for a message too big for one packet: the router queues it behind a link it cannot
+    /// open without a path, and drains the queue when the link comes up.
+    @Test func aLinkSendHandedOverAfterTheWaitIsStampedWhenTheCostArrivesLater() async throws {
+        let me = Identity(), peer = Identity(), clock = TestClock()
+        let transmitted = Transmitted()
+        let store = await makeNode(me, clock, recordingIn: transmitted)
+        let m = message(from: me, to: peer, "large " + String(repeating: "x", count: 1000))
+        #expect(!m.opportunisticFits)
+
+        await store.send(.sendMessage(message: m, fallbackToPropagation: false))
+        await waitOutTheCostWait(store, clock)
+        #expect(await isHandedOver(store, m))
+
+        await clock.advance(by: .seconds(9))
+        await store.skipReceivedActions(strict: false)
+        await hearAnnounce(store, of: peer, stampCost: cheapCost)
+        await waitForStampedHandOver(store)
+        await store.skipReceivedActions(strict: false)
+        await store.send(.endpoint(.delegate(.linkEstablished(linkID: Data(repeating: 0x4C, count: 16),
+                                                               destinationHash: m.destinationHash))))
+        await store.skipReceivedActions(strict: false)
+
+        #expect(!transmitted.overLink.value.isEmpty, "the link drains the queue")
+        for data in transmitted.overLink.value {
+            let copy = LXMessage.unpack(data)
+            #expect(copy?.hash == m.hash)
+            #expect(copy?.validateStamp(targetCost: cheapCost) == true, "every copy on the wire must be stamped")
+        }
+    }
+
+    /// Cancelled while its copy is back in a stamp search: one `deliveryCancelled`, and nothing sent.
+    @Test func cancellingASendWhileItIsReStampedReportsCancelledOnceAndSendsNothing() async {
+        let me = Identity(), peer = Identity(), clock = TestClock()
+        let transmitted = Transmitted()
+        let store = await makeNode(me, clock, recordingIn: transmitted)
+        let m = message(from: me, to: peer)
+        await store.send(.sendMessage(message: m, fallbackToPropagation: false))
+        await waitOutTheCostWait(store, clock)
+        await hearAnnounce(store, of: peer, stampCost: slowCost)
+        #expect(store.state.inFlightDeliveryStamps == [m.hash], "the copy is back in a stamp search")
+
+        await store.send(.cancelOutbound(messageHash: m.hash))
+        for _ in 0..<(2 * LXMFDelivery.maxAttempts) {
+            await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+            await store.skipReceivedActions(strict: false)
+        }
+        #expect(transmitted.terminals.value == [described(.deliveryCancelled(messageHash: m.hash))])
+        #expect(transmitted.opportunistic.value.isEmpty)
+        #expect(!store.state.router.hasOutboundState(for: m.hash))
+    }
+
+    /// `.cancelDeliveryStamps` fails a send whose copy is back in a stamp search, once, and the router
+    /// stops counting the copy.
+    @Test func cancelDeliveryStampsFailsASendWhileItIsReStampedOnce() async {
+        let me = Identity(), peer = Identity(), clock = TestClock()
+        let transmitted = Transmitted()
+        let store = await makeNode(me, clock, recordingIn: transmitted)
+        let m = message(from: me, to: peer)
+        await store.send(.sendMessage(message: m, fallbackToPropagation: false))
+        await waitOutTheCostWait(store, clock)
+        await hearAnnounce(store, of: peer, stampCost: slowCost)
+        #expect(store.state.inFlightDeliveryStamps == [m.hash], "the copy is back in a stamp search")
+
+        await store.send(.cancelDeliveryStamps)
+        for _ in 0..<(2 * LXMFDelivery.maxAttempts) {
+            await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+            await store.skipReceivedActions(strict: false)
+        }
+        #expect(transmitted.terminals.value == [described(.deliveryFailed(messageHash: m.hash))])
+        #expect(transmitted.opportunistic.value.isEmpty)
+        #expect(!store.state.router.hasOutboundState(for: m.hash), "the router must stop counting the copy")
+    }
+}
+
+/// Run the first-send wait out: three path requests, seven seconds apart. Stepped, because each
+/// elapsed interval arms the next timer only once it has been received.
+@MainActor
+private func waitOutTheCostWait(_ store: TestStoreOf<LXMFNode>, _ clock: TestClock<Duration>) async {
+    for _ in 0..<LXMFNode.peerCostPathRequests {
+        await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
+        await store.skipReceivedActions(strict: false)
+    }
+    #expect(store.state.waitingForPeerCost.isEmpty, "the wait must have run out")
+    #expect(!store.state.unstampedHandOvers.isEmpty, "handed over unstamped, with the cost still unknown")
+}
+
+/// Deliver the peer's announce and wait until Transport has learned its path: the announce is
+/// checked in an effect, so the state does not show it when `send` returns.
+@MainActor
+private func hearAnnounce(_ store: TestStoreOf<LXMFNode>, of peer: Identity, stampCost: Int?) async {
+    await store.send(.endpoint(.transport(.received(iface, deliveryAnnounce(of: peer, stampCost: stampCost)))))
+    await store.receive({ action in
+        if case .endpoint(.delegate(.pathLearned)) = action { return true }
+        return false
+    }, timeout: .seconds(5))
+}
+
+/// A real search runs in real time, outside the test clock. Waits for its stamped hand-over, which
+/// fails the test if it never comes. (Polling `store.state` does not work: the TestStore delivers an
+/// effect's actions while it is awaited.)
+@MainActor
+private func waitForStampedHandOver(_ store: TestStoreOf<LXMFNode>) async {
+    await store.receive({ action in
+        if case let .router(.send(m, _)) = action, m.stamp != nil { return true }
+        return false
+    }, timeout: .seconds(10))
 }

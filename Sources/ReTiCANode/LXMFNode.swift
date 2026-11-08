@@ -181,6 +181,12 @@ public struct LXMFNode {
         /// going out unstamped. See `deliverySend`.
         public internal(set) var waitingForPeerCost: [Data: [WaitingSend]] = [:]
 
+        /// Sends whose wait ran out, handed to the router unstamped with their recipient's cost still
+        /// unknown, by destination. Nothing of them has gone out: there is no path. At the first
+        /// announce from that destination, if it brings a cost, each copy the router has not yet
+        /// sent is taken back and handed over again stamped. See `restampUnsentHandOvers`.
+        public internal(set) var unstampedHandOvers: [Data: [WaitingSend]] = [:]
+
         /// Messages sent with `fallbackToPropagation` whose propagated copy has not started: it is
         /// packed only when the router reports `propagationFallbackDue` (spec Amendment A2). Dropped
         /// at the hand-off and when the message ends any other way.
@@ -457,7 +463,8 @@ public struct LXMFNode {
     /// How many path requests a first send makes, `LXMFDelivery.pathRequestWaitSeconds` apart, before
     /// it is handed to the router unstamped: 21 s in all. A compromise. Waiting is what gets the
     /// stamp right, but the router only starts its own path budget and any propagation fallback once
-    /// it has the message, so a recipient that is really offline is delayed by this long.
+    /// it has the message, so a recipient that is really offline is delayed by this long. An announce
+    /// that comes after the hand-over still gets the message stamped: `restampUnsentHandOvers`.
     static let peerCostPathRequests = 3
 
     @Dependency(\.date) var date
@@ -753,6 +760,8 @@ public struct LXMFNode {
                 }
                 state.waitingForPeerCost = [:]
                 for hash in abandoned {
+                    // A copy taken back to be re-stamped ends here, so the router stops counting it.
+                    state.router.withdrawnDeliveryCopies.remove(hash)
                     if state.pendingFallbacks.removeValue(forKey: hash) != nil {
                         effects.append(.send(.router(.clearFallbackEligible(messageHash: hash))))
                     }
@@ -768,6 +777,7 @@ public struct LXMFNode {
                 let wasSearching = state.inFlightDeliveryStamps.contains(hash)
                 state.inFlightDeliveryStamps.removeAll { $0 == hash }
                 state.pendingFallbacks[hash] = nil      // the router drops its eligibility below
+                forgetUnstampedHandOver(&state, hash)
                 let routerReports = state.router.hasOutboundState(for: hash)
                 var effects: [Effect<Action>] = [
                     .cancel(id: CancelID.deliveryStampFor(hash)),
@@ -790,7 +800,9 @@ public struct LXMFNode {
                 guard state.waitingForPeerCost[dest] != nil else { return .none }
                 // Held, nothing can answer a request. As in the router, no attempt is counted.
                 if state.router.held { return peerCostWaitTimer(dest, requestsLeft: requestsLeft) }
-                guard requestsLeft > 0 else { return handOverWaitingSends(&state, destinationHash: dest) }
+                guard requestsLeft > 0 else {
+                    return handOverWaitingSends(&state, destinationHash: dest, costMayArriveLater: true)
+                }
                 return .merge(.send(.endpoint(.requestPath(destinationHash: dest))),
                               peerCostWaitTimer(dest, requestsLeft: requestsLeft - 1))
 
@@ -936,8 +948,13 @@ public struct LXMFNode {
                             learnedAt: date.now)
                     }
                 }
+                // Copies handed over unstamped are taken back, synchronously, before the router hears
+                // about the path. Once it has one, its next retry, or a link opened for its queue, would
+                // send them as they are.
+                let (withdraw, restamp) = restampUnsentHandOvers(&state, destinationHash: h)
                 // After the cost above is stored, and after the router has heard about the path.
-                return .concatenate(.merge(effects), handOverWaitingSends(&state, destinationHash: h))
+                return .concatenate(withdraw, .merge(effects), restamp,
+                                    handOverWaitingSends(&state, destinationHash: h))
 
             case let .router(.delegate(.messageDelivered(message, validated, method))):
                 // Ignore list, reference `LXMRouter.lxmf_delivery`'s `ignored_list` check: the
@@ -1022,22 +1039,26 @@ public struct LXMFNode {
             case let .router(.delegate(.deliveryFailed(hash))):
                 clearProgress(&state, hash)
                 state.pendingFallbacks[hash] = nil
+                forgetUnstampedHandOver(&state, hash)
                 return .send(.delegate(.deliveryFailed(messageHash: hash)))
 
             case let .router(.delegate(.deliveryRejected(hash))):
                 clearProgress(&state, hash)
                 state.pendingFallbacks[hash] = nil
+                forgetUnstampedHandOver(&state, hash)
                 return .send(.delegate(.deliveryRejected(messageHash: hash)))
 
             case let .router(.delegate(.deliveryCancelled(hash))):
                 clearProgress(&state, hash)
                 state.pendingFallbacks[hash] = nil
+                forgetUnstampedHandOver(&state, hash)
                 return .send(.delegate(.deliveryCancelled(messageHash: hash)))
 
             case let .router(.delegate(.deliveryConfirmed(hash))):
                 // The propagated copy is not needed: drop one not yet started, and stop one still in
                 // its stamp search (the router has already dropped its pending marker).
                 state.pendingFallbacks[hash] = nil
+                forgetUnstampedHandOver(&state, hash)
                 let done = finishProgress(&state, .delivery(hash))
                 return .merge(.cancel(id: CancelID.propagationStampFor(hash)), done,
                               .send(.delegate(.deliveryConfirmed(messageHash: hash))))
@@ -1444,13 +1465,58 @@ public struct LXMFNode {
     }
 
     /// Send everything waiting on `dest`, stamped if a cost is now known. It does not wait again.
-    private func handOverWaitingSends(_ state: inout State, destinationHash dest: Data) -> Effect<Action> {
+    ///
+    /// `costMayArriveLater`: the wait ran out with no announce, so a send that goes over unstamped
+    /// is remembered in `unstampedHandOvers`, to be re-stamped if the announce comes after all.
+    private func handOverWaitingSends(_ state: inout State, destinationHash dest: Data,
+                                      costMayArriveLater: Bool = false) -> Effect<Action> {
         guard let waiting = state.waitingForPeerCost.removeValue(forKey: dest) else { return .none }
         // `.cancel(id:)` cancels when constructed (86ee622); the guard above keeps this to a real hand-over.
         var effects: [Effect<Action>] = [.cancel(id: CancelID.peerCostWait(dest))]
         for send in waiting {
+            if costMayArriveLater, send.message.stamp == nil, state.learnedPeers[dest] == nil {
+                state.unstampedHandOvers[dest, default: []].append(send)
+            }
             effects.append(deliverySend(&state, message: send.message, method: send.method, waitForUnknownCost: false))
         }
         return .merge(effects)
+    }
+
+    /// At the first announce from `dest` since its sends were handed over unstamped
+    /// (`unstampedHandOvers`): if it brought a cost, take back each copy the router has not sent and
+    /// stamp it. Returns the take-backs, which must reach the router before it learns the path, and the
+    /// stamp searches, whose results reach it as ordinary `.router(.send)`s.
+    ///
+    /// Why taking back is safe:
+    ///  • Nothing has gone out. The sends were handed over while Transport had not learned `dest`,
+    ///    which drops every send to it, and this is the first announce since (the entry is removed
+    ///    here whatever the announce says). The router confirms each copy is still unsent
+    ///    (`holdsUnsentDeliveryCopy`) and gives it back silently.
+    ///  • One outcome. The copy is now a stamp search here, in `inFlightDeliveryStamps`, so
+    ///    `.cancelOutbound` and `.cancelDeliveryStamps` reach it as they reach any search, and the
+    ///    router counts it as outstanding (`withdrawnDeliveryCopies`) so a propagated copy failing
+    ///    meanwhile does not end the message. Its retry budget restarts when it comes back.
+    ///  • A fallback is untouched: the router keeps the message's eligibility, and `.router(.send)`
+    ///    swaps the stamped copy into `pendingFallbacks`.
+    private func restampUnsentHandOvers(_ state: inout State,
+                                        destinationHash dest: Data) -> (withdraw: Effect<Action>, restamp: Effect<Action>) {
+        guard let handed = state.unstampedHandOvers.removeValue(forKey: dest),
+              deliveryStampCost(state, destinationHash: dest) != nil
+        else { return (.none, .none) }
+        var withdraw: [Effect<Action>] = []
+        var restamp: [Effect<Action>] = []
+        for send in handed where state.router.holdsUnsentDeliveryCopy(send.message.hash) {
+            withdraw.append(.send(.router(.withdrawUnsentDeliveryCopy(messageHash: send.message.hash))))
+            restamp.append(deliverySend(&state, message: send.message, method: send.method, waitForUnknownCost: false))
+        }
+        return (.concatenate(withdraw), .merge(restamp))
+    }
+
+    /// The message has ended (or been cancelled): it will not need re-stamping.
+    private func forgetUnstampedHandOver(_ state: inout State, _ hash: Data) {
+        for (dest, sends) in state.unstampedHandOvers where sends.contains(where: { $0.message.hash == hash }) {
+            let rest = sends.filter { $0.message.hash != hash }
+            state.unstampedHandOvers[dest] = rest.isEmpty ? nil : rest
+        }
     }
 }

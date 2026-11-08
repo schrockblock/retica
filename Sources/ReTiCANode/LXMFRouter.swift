@@ -44,6 +44,11 @@ public struct LXMFRouter {
         public var knownPaths: Set<Data> = []
         /// destinationHash → messages queued until a direct link to it becomes active.
         var outboundQueue: [Data: [LXMessage]] = [:]
+        /// Message hashes whose delivery copy `LXMFNode` took back (`.withdrawUnsentDeliveryCopy`) to
+        /// stamp it, and has not handed over again yet. Counted as an outstanding delivery copy, so the
+        /// other copy failing meanwhile does not end the message. Cleared when the copy comes back
+        /// (`.send`), on `.cancelOutbound`, and by `LXMFNode` when it fails the copy itself.
+        var withdrawnDeliveryCopies: Set<Data> = []
         /// (message.hash, copy) → in-flight send awaiting a delivery outcome (with its resend info +
         /// attempts). Keyed per COPY because `LXMFNode.sendMessage(fallbackToPropagation:)` can arm a
         /// delivery copy and a propagated copy of one message; under one key the second overwrote
@@ -270,6 +275,11 @@ public struct LXMFRouter {
         /// via `establishAttempts == nil`, and it remains the mutation catcher for this action:
         /// drop the `knownPaths.remove` below and it fails.
         case pathLostAndClosed(destinationHash: Data)
+        /// Give the delivery copy of this message back, silently, if it has not gone out yet
+        /// (`State.holdsUnsentDeliveryCopy`): `LXMFNode` learned the recipient's stamp cost after
+        /// handing it over unstamped, and hands it over again stamped. Nothing is reported; the copy
+        /// stays outstanding (`withdrawnDeliveryCopies`) until it comes back.
+        case withdrawUnsentDeliveryCopy(messageHash: Data)
         /// A receipt for one copy of a message. The copy is named by the path that produced the
         /// receipt, never inferred from which copy was armed last.
         case delivered(messageHash: Data, leg: Leg)
@@ -500,7 +510,8 @@ public struct LXMFRouter {
                 if state.pendingDeliveries[DeliveryKey(messageHash: hash, leg: leg)] != nil { return true }
                 switch leg {
                 case .delivery:
-                    return state.outboundQueue.values.contains { $0.contains { $0.hash == hash } }
+                    return state.withdrawnDeliveryCopies.contains(hash)
+                        || state.outboundQueue.values.contains { $0.contains { $0.hash == hash } }
                 case .propagated:
                     return state.pendingPropagatedCopies.contains(hash)
                         || state.fallbackEligible.contains(hash)
@@ -761,6 +772,7 @@ public struct LXMFRouter {
                                                          method: method)))
 
             case let .send(message, desiredMethod):
+                state.withdrawnDeliveryCopies.remove(message.hash)
                 // A cancelled message is never armed again, whichever path hands it over late.
                 guard !state.cancelledMessages.contains(message.hash) else { return .none }
                 let effective: DeliveryMethod =
@@ -931,6 +943,22 @@ public struct LXMFRouter {
                 state.knownPaths.remove(dest)
                 return closed(&state, dest)
 
+            case let .withdrawUnsentDeliveryCopy(hash):
+                guard state.holdsUnsentDeliveryCopy(hash) else { return .none }
+                state.withdrawnDeliveryCopies.insert(hash)
+                var effects: [Effect<Action>] = []
+                let key = DeliveryKey.delivery(hash)
+                if state.pendingDeliveries.removeValue(forKey: key) != nil {
+                    effects.append(.cancel(id: CancelID.retry(key)))
+                }
+                // A park or establishment for this destination is left alone: the `learnedPath` that
+                // follows opens the link, and the stamped copy queues behind it when it comes back.
+                for (dest, messages) in state.outboundQueue where messages.contains(where: { $0.hash == hash }) {
+                    let rest = messages.filter { $0.hash != hash }
+                    state.outboundQueue[dest] = rest.isEmpty ? nil : rest
+                }
+                return .merge(effects)
+
             case let .learnedPath(dest):
                 // Deliberately does NOT reset the establishment budget.
                 //
@@ -1009,6 +1037,7 @@ public struct LXMFRouter {
             case let .cancelOutbound(hash):
                 let hadWork = state.hasOutboundState(for: hash)
                 state.cancelledMessages.insert(hash)
+                state.withdrawnDeliveryCopies.remove(hash)
                 state.pendingPropagatedCopies.remove(hash)
                 state.fallbackEligible.remove(hash)
                 guard hadWork else { return .none }
@@ -1185,6 +1214,23 @@ extension LXMFRouter.State {
             || outboundQueue.values.contains { $0.contains { $0.hash == messageHash } }
             || propagationQueue.values.contains { $0.contains { $0.messageHash == messageHash } }
             || pendingPropagatedCopies.contains(messageHash)
+            || withdrawnDeliveryCopies.contains(messageHash)
+    }
+
+    /// Whether this router holds the delivery copy of `messageHash` and can give it back: queued
+    /// behind a link that is not up (so not transmitted), or armed as an opportunistic copy.
+    ///
+    /// The opportunistic case relies on the caller. That copy went out at once when it was handed
+    /// over, and each retry sends it again once a path is known; Transport drops every such send to
+    /// a destination it has not learned. `LXMFNode` only asks for a copy it handed over while the
+    /// destination was unlearned, and only at the first announce since, so none of it left the node.
+    /// A link copy already armed (sent on an active link) or transferring is never given back.
+    func holdsUnsentDeliveryCopy(_ messageHash: Data) -> Bool {
+        if let pending = pendingDeliveries[.delivery(messageHash)] {
+            if case .opportunistic = pending.resend { return true }
+            return false
+        }
+        return outboundQueue.values.contains { $0.contains { $0.hash == messageHash } }
     }
 
     /// Whether `dest` has work that needs a link to it: a pending direct or propagated copy, a queued

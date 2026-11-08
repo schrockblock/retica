@@ -353,3 +353,64 @@ private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>
     }
     await store.receive(.delegate(.deliveryFailed(messageHash: h)))
 }
+
+// MARK: - A delivery copy taken back to be stamped
+
+private struct FailureCountingRouter: Reducer {
+    typealias State = LXMFRouter.State
+    typealias Action = LXMFRouter.Action
+    let failures: LockIsolated<Int>
+
+    var body: some Reducer<State, Action> {
+        Reduce { _, action in
+            if case .delegate(.deliveryFailed) = action { failures.withValue { $0 += 1 } }
+            return .none
+        }
+        LXMFRouter()
+    }
+}
+
+/// `LXMFNode` takes the unsent delivery copy back to stamp it while the propagated copy is out. That
+/// copy failing meanwhile must not end the message, and the stamped copy, once back, ends it once.
+/// Failures are counted in a reducer: a `receive` cannot count actions an earlier send skipped.
+@Test @MainActor func aWithdrawnDeliveryCopyKeepsTheMessageAliveUntilItComesBack() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let clock = TestClock()
+    let failures = LockIsolated(0)
+    let store = TestStore(initialState: LXMFRouter.State()) {
+        FailureCountingRouter(failures: failures)
+    } withDependencies: { $0.continuousClock = clock }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))   // no path: nothing reaches the wire
+    await store.send(.propagatedCopyPending(messageHash: h))
+    await store.send(.withdrawUnsentDeliveryCopy(messageHash: h))
+    #expect(store.state.pendingDeliveries[.delivery(h)] == nil, "the copy was given back")
+
+    await store.send(.propagatedCopyFailed(messageHash: h))
+    await store.skipReceivedActions(strict: false)
+    #expect(failures.value == 0, "the delivery copy is being stamped, so the message is not over")
+
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    for _ in 0..<(2 * LXMFDelivery.maxAttempts) {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+        await store.skipReceivedActions(strict: false)
+    }
+    #expect(failures.value == 1, "the stamped copy running out ends the message, once")
+    #expect(!store.state.hasOutboundState(for: h), "the copy came back, so the router holds nothing for it")
+}
+
+/// A link copy already sent on an active link has gone out: it is not given back.
+@Test @MainActor func aDeliveryCopyAlreadySentOnALinkIsNotWithdrawn() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let dest = msg.destinationHash
+    var state = LXMFRouter.State()
+    state.directLinks[dest] = .active(linkID: link)
+    let store = makeStore(state, clock: TestClock())
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    #expect(store.state.pendingDeliveries[.delivery(h)] != nil)
+    await store.send(.withdrawUnsentDeliveryCopy(messageHash: h))
+    #expect(store.state.pendingDeliveries[.delivery(h)] != nil)
+    #expect(!store.state.withdrawnDeliveryCopies.contains(h))
+}

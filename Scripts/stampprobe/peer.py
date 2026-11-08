@@ -35,6 +35,8 @@ ap.add_argument("--link-cost", type=float,
 ap.add_argument("--reply", action="store_true", help="message the first delivery destination heard")
 ap.add_argument("--propagation-node", action="store_true", help="also serve as a propagation node")
 ap.add_argument("--sync-from", help="file holding a propagation node's address, to sync from")
+ap.add_argument("--identity", help="load our identity from this private-key file (RNS.Identity.from_file), so a "
+                                   "test knows our address before we start")
 args = ap.parse_args()
 
 shutil.rmtree(args.dir, ignore_errors=True)
@@ -82,7 +84,8 @@ assert RNS.Transport.LR_STAMPS_ENFORCED == args.enforce_network
 assert RNS.Transport.STAMPS_ENFORCED == args.enforce_network
 if destination_cost is not None:
     assert RNS.Transport.DESTINATION_COST == destination_cost
-identity = RNS.Identity()
+identity = RNS.Identity.from_file(args.identity) if args.identity else RNS.Identity()
+assert identity is not None, "the identity file did not load"
 # The lowest cost LXMF accepts from a node, so a debug build's search stays short.
 router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(args.dir, "lxmf"), autopeer=False,
                         propagation_cost=LXMF.LXMRouter.PROPAGATION_COST_MIN, propagation_cost_flexibility=0)
