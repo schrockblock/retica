@@ -342,7 +342,8 @@ private final class LiveNode {
     }
 
     /// The control for the test above: the same enforcing peer never hears an unstamped announce, so
-    /// it never replies. Only the host's switch differs from the test above.
+    /// it never replies. The host's stamping switch differs from the test above; this one also sends
+    /// `.announceDelivery` itself and polls for 20 s where that one polls for 40 s.
     @Test func anUnstampedAnnounceIsIgnoredByAnEnforcingPeer() async throws {
         let port = nextPort()
         let peer = try Peer("enforce-announce-drop", ["--listen", "\(port)", "--enforce-network",

@@ -318,15 +318,36 @@ private func pathRequest(_ payload: Data) -> Data {
         let store = makeStore(enforce: true, recorder: recorder)
         await store.send(.registerLocalDestination(dest))
         await store.send(.received(InterfaceID("in"), f.unstampedRaw))
+        await store.skipReceivedActions(strict: false)
         #expect(recorder.linkRequests.value.isEmpty, "never handed to the link plane, so never answered")
         await store.send(.received(InterfaceID("in"), f.stampedRaw))
+        await store.skipReceivedActions(strict: false)
         #expect(recorder.linkRequests.value == [dest.hash], "the genuine stamped request is")
+
+        // The 64-byte form (keys only, no MTU signalling): the stamp material is the destination hash and
+        // bytes 32..<64 of the payload, so the first 64 bytes of the 67-byte fixture carry the same stamp.
+        func keysOnly(_ raw: Data) throws -> Data {
+            var packet = try #require(Packet(raw: raw))
+            try #require(packet.payload.count == 67)
+            packet.payload = Data(packet.payload.prefix(64))
+            return try packet.packed()
+        }
+        let keysRecorder = Recorder()
+        let keysStore = makeStore(enforce: true, recorder: keysRecorder)
+        await keysStore.send(.registerLocalDestination(dest))
+        await keysStore.send(.received(InterfaceID("in"), try keysOnly(f.unstampedRaw)))
+        await keysStore.skipReceivedActions(strict: false)
+        #expect(keysRecorder.linkRequests.value.isEmpty, "an unstamped 64-byte request is refused")
+        await keysStore.send(.received(InterfaceID("in"), try keysOnly(f.stampedRaw)))
+        await keysStore.skipReceivedActions(strict: false)
+        #expect(keysRecorder.linkRequests.value == [dest.hash], "a stamped 64-byte request is accepted")
 
         // The cost is the destination's own: above the stamp's value (13.375), it is refused too.
         let strict = Recorder()
         let strictStore = makeStore(enforce: true, recorder: strict)
         await strictStore.send(.registerLocalDestination(dest, linkCost: 14))
         await strictStore.send(.received(InterfaceID("in"), f.stampedRaw))
+        await strictStore.skipReceivedActions(strict: false)
         #expect(strict.linkRequests.value.isEmpty, "13.375 is below a link cost of 14")
 
         // A truncated request cannot carry a stamp, and must not trap.
@@ -335,6 +356,7 @@ private func pathRequest(_ payload: Data) -> Data {
                                destinationHash: dest.hash, transportId: nil,
                                payload: Data(repeating: 0, count: 40)).packed()
         await store.send(.received(InterfaceID("in"), short))
+        await store.skipReceivedActions(strict: false)
         #expect(recorder.linkRequests.value == [dest.hash])
     }
 
