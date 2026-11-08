@@ -372,6 +372,14 @@ costs those hashes and nothing more.
   `.cancelOutbound(messageHash:)` cancels one message wherever it is. Network stamp searches
   (destination, path-request and link-request stamps) are cancelled by `.endpoint(.stop)`; a link
   waiting for its key fails with `.pathStale`, and an announce waiting for its stamp is dropped.
+  While a send is prepared before the router has it, the node reports
+  `.delegate(.deliveryPreparing(messageHash:phase:))`: `.waitingForPeer` for a first send waiting
+  for the peer's announce (its stamp cost), `.stamping` while a stamp search runs (also for
+  `.sendViaPropagation`, and again for a copy taken back and re-stamped after a late announce), and
+  `.handedOver` when the message reaches the router. A send that goes straight to the router reports
+  nothing, and `.handedOver` is reported only for a message that reported an earlier phase. A
+  message that ends or is cancelled while preparing gets its terminal outcome and no `.handedOver`.
+  A host can show "Preparing…" between the first phase and `.handedOver`.
 - **Receiving while suspended.** A suspended app receives nothing. The options are a propagation
   node (sync when the app comes back with `.syncFromPropagationNode`) and push wake-ups (below).
 - **Main actor and dependencies.** Run the `Store` on the main actor, as TCA expects. Sockets,

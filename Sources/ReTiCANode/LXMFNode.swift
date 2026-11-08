@@ -176,6 +176,12 @@ public struct LXMFNode {
         /// so the same cancel and fallback handling applies to it.
         public internal(set) var inFlightDeliveryStamps: [Data] = []
 
+        /// The last `deliveryPreparing` phase reported per message that has not reached the router
+        /// (`.waitingForPeer` or `.stamping`; `.handedOver` is never stored). Lets each phase be
+        /// reported once, and `.handedOver` only for a message that reported an earlier phase.
+        /// Removed at hand-over and at every terminal outcome or cancel.
+        public internal(set) var preparingPhases: [Data: PreparingPhase] = [:]
+
         /// First sends to a peer we have no path to and no cost for, by destination, oldest first.
         /// The announce that brings the path also brings the cost, so they wait for it instead of
         /// going out unstamped. See `deliverySend`.
@@ -347,7 +353,24 @@ public struct LXMFNode {
             /// The propagated copy was not attempted — `.tooLargeForNode`: larger than the configured
             /// node's announced per-transfer limit. The delivery copy is unaffected.
             case propagationRefused(messageHash: Data, reason: LXMFRouter.RefusalReason)
+            /// A send is being prepared before the router has it, in the phase named. Reported once per
+            /// transition, and only for sends that need preparing: one that goes straight to the router
+            /// reports nothing. `.handedOver` follows a `.waitingForPeer` or `.stamping` report when the
+            /// message reaches the router. A re-stamp of a copy taken back after hand-over reports
+            /// `.stamping` again, then `.handedOver` again. A message that ends or is cancelled while
+            /// preparing reports its terminal outcome and no `.handedOver`.
+            case deliveryPreparing(messageHash: Data, phase: PreparingPhase)
         }
+    }
+
+    /// Where a send stands before the router has it. See `Action.Delegate.deliveryPreparing`.
+    public enum PreparingPhase: Equatable, Sendable {
+        /// A first send to a peer we have no path and no stamp cost for, waiting for its announce.
+        case waitingForPeer
+        /// A stamp search is running (the delivery stamp, or the work for an explicit propagated send).
+        case stamping
+        /// The message reached the router.
+        case handedOver
     }
 
     /// Per-transfer accept limit (KB) sent as the third element of the phase-2 /get payload. lxmd
@@ -659,6 +682,7 @@ public struct LXMFNode {
                 // having never reached the node (the photo of 2026-10-21). Every stamp in flight
                 // was sized to THIS node's cost, so there is nothing to stop or redo.
                 guard destinationHash != state.router.outboundPropagationNode else { return .none }
+                forgetPropagationStamping(&state)
                 // Every in-flight stamp was sized to the PREVIOUS node's advertised cost, and a stamp
                 // below a node's enforced minimum is dropped by its ingest — so finishing that search
                 // could only burn a core for a message the new node would reject. Constructed on this
@@ -681,7 +705,8 @@ public struct LXMFNode {
                 refreshOutboundPropagationNodeRetryWait(&state)
                 let ts = date.now.timeIntervalSince1970
                 let deliveryCost = deliveryStampCost(state, destinationHash: destinationHash)
-                return .run { send in
+                let preparing = reportPhase(&state, msg.hash, .stamping)
+                let work: Effect<Action> = .run { send in
                     guard let stamped = await LXMFNode.withDeliveryStamp(msg, cost: deliveryCost),
                           let (packed, _) = await LXMFPropagation.pack(
                               message: stamped, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
@@ -689,6 +714,7 @@ public struct LXMFNode {
                     await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
                 }
                 .cancellable(id: CancelID.propagationStamp)
+                return .merge(preparing, work)
 
             case let .sendMessage(message, fallbackToPropagation):
                 // The delivery copy is stamped on exactly the same terms as `.send` — this is the
@@ -737,6 +763,7 @@ public struct LXMFNode {
                 // merely discard its result. Reference exposes the same lever as
                 // `LXMRouter.cancel_outbound` → `LXStamper.cancel_work` (LXStamper.py:146-175).
                 // ...and the copies those searches were for have failed, through the router's `fail`.
+                forgetPropagationStamping(&state)
                 return .merge(.cancel(id: CancelID.propagationStamp), abandonPendingPropagatedCopies(state))
 
             case .cancelDeliveryStamps:
@@ -768,6 +795,7 @@ public struct LXMFNode {
                 // this cancel hands over late.
                 let abandoned = state.inFlightDeliveryStamps
                 state.inFlightDeliveryStamps = []
+                for hash in abandoned { state.preparingPhases[hash] = nil }
                 var effects: [Effect<Action>] = [.cancel(id: CancelID.deliveryStamp)]
                 for dest in state.waitingForPeerCost.keys {
                     effects.append(.cancel(id: CancelID.peerCostWait(dest)))
@@ -786,6 +814,7 @@ public struct LXMFNode {
                 // nothing else for the message the cancel is reported here — once either way.
                 let wasSearching = state.inFlightDeliveryStamps.contains(hash)
                 state.inFlightDeliveryStamps.removeAll { $0 == hash }
+                state.preparingPhases[hash] = nil
                 state.pendingFallbacks[hash] = nil      // the router drops its eligibility below
                 forgetUnstampedHandOver(&state, hash)
                 let routerReports = state.router.hasOutboundState(for: hash)
@@ -1044,25 +1073,33 @@ public struct LXMFNode {
                 if handedOn.stamp != nil, state.pendingFallbacks[handedOn.hash] != nil {
                     state.pendingFallbacks[handedOn.hash] = handedOn
                 }
-                return .none
+                return reportHandedOver(&state, handedOn.hash)
+
+            // The hand-over point of an explicit propagated send (`.sendViaPropagation`) and of a
+            // fallback copy. Only a message that reported a phase earlier reports `.handedOver`.
+            case let .router(.sendViaPropagation(handedOn, _)):
+                return reportHandedOver(&state, handedOn.hash)
 
             // The message is over, so a fallback it was waiting on is not needed (a rejected
             // delivery copy ends the message without a hand-off).
             case let .router(.delegate(.deliveryFailed(hash))):
                 clearProgress(&state, hash)
                 state.pendingFallbacks[hash] = nil
+                state.preparingPhases[hash] = nil
                 forgetUnstampedHandOver(&state, hash)
                 return .send(.delegate(.deliveryFailed(messageHash: hash)))
 
             case let .router(.delegate(.deliveryRejected(hash))):
                 clearProgress(&state, hash)
                 state.pendingFallbacks[hash] = nil
+                state.preparingPhases[hash] = nil
                 forgetUnstampedHandOver(&state, hash)
                 return .send(.delegate(.deliveryRejected(messageHash: hash)))
 
             case let .router(.delegate(.deliveryCancelled(hash))):
                 clearProgress(&state, hash)
                 state.pendingFallbacks[hash] = nil
+                state.preparingPhases[hash] = nil
                 forgetUnstampedHandOver(&state, hash)
                 return .send(.delegate(.deliveryCancelled(messageHash: hash)))
 
@@ -1070,6 +1107,7 @@ public struct LXMFNode {
                 // The propagated copy is not needed: drop one not yet started, and stop one still in
                 // its stamp search (the router has already dropped its pending marker).
                 state.pendingFallbacks[hash] = nil
+                state.preparingPhases[hash] = nil
                 forgetUnstampedHandOver(&state, hash)
                 let done = finishProgress(&state, .delivery(hash))
                 return .merge(.cancel(id: CancelID.propagationStampFor(hash)), done,
@@ -1450,7 +1488,8 @@ public struct LXMFNode {
         if !state.inFlightDeliveryStamps.contains(message.hash) {
             state.inFlightDeliveryStamps.append(message.hash)
         }
-        return .run { send in
+        let preparing = reportPhase(&state, message.hash, .stamping)
+        let search: Effect<Action> = .run { send in
             // nil ⟹ cancelled (the only way `search` returns nil). Nothing to send: see above.
             guard let stamp = await LXStamper.generateStamp(messageId: message.hash, targetCost: cost)
             else { return }
@@ -1458,6 +1497,28 @@ public struct LXMFNode {
         }
         .cancellable(id: CancelID.deliveryStampFor(message.hash))
         .cancellable(id: CancelID.deliveryStamp)
+        return .merge(preparing, search)
+    }
+
+    /// `deliveryPreparing` for `phase`, unless the message already reported it (once per transition).
+    private func reportPhase(_ state: inout State, _ hash: Data, _ phase: PreparingPhase) -> Effect<Action> {
+        guard state.preparingPhases[hash] != phase else { return .none }
+        state.preparingPhases[hash] = phase
+        return .send(.delegate(.deliveryPreparing(messageHash: hash, phase: phase)))
+    }
+
+    /// `.handedOver`, only for a message that reported `.waitingForPeer` or `.stamping`.
+    private func reportHandedOver(_ state: inout State, _ hash: Data) -> Effect<Action> {
+        guard state.preparingPhases.removeValue(forKey: hash) != nil else { return .none }
+        return .send(.delegate(.deliveryPreparing(messageHash: hash, phase: .handedOver)))
+    }
+
+    /// The propagation stamp work was cancelled or its node changed: a message that reported
+    /// `.stamping` for an explicit propagated send, and so is not in `inFlightDeliveryStamps`, will
+    /// not reach the router and reports nothing further, so its phase is forgotten.
+    private func forgetPropagationStamping(_ state: inout State) {
+        let searching = Set(state.inFlightDeliveryStamps)
+        state.preparingPhases = state.preparingPhases.filter { searching.contains($0.key) }
     }
 
     /// `message` stamped at `cost`, or unchanged when `cost` is nil. Nil only if the search was cancelled.
@@ -1477,8 +1538,9 @@ public struct LXMFNode {
         if !(state.waitingForPeerCost[dest]?.contains { $0.message.hash == message.hash } ?? false) {
             state.waitingForPeerCost[dest, default: []].append(WaitingSend(message: message, method: method))
         }
-        guard !alreadyAsking else { return .none }
-        return .merge(.send(.endpoint(.requestPath(destinationHash: dest))),
+        let preparing = reportPhase(&state, message.hash, .waitingForPeer)
+        guard !alreadyAsking else { return preparing }
+        return .merge(preparing, .send(.endpoint(.requestPath(destinationHash: dest))),
                       peerCostWaitTimer(dest, requestsLeft: LXMFNode.peerCostPathRequests - 1))
     }
 
