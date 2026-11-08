@@ -190,8 +190,14 @@ private func meshCoreSendReaches(_ rig: TwoRadioRig, _ data: Data) async -> Bool
     return returned && sent.value && rig.core.receivedFrames.filter { $0.first == 0x3E }.count == before + 1
 }
 
-private func meshtasticDrops(_ run: LiveDriverRun) -> Int { run.count { $0 == .disconnected(reason: nil) } }
-private func meshCoreDrops(_ run: LiveCoreDriverRun) -> Int { run.count { $0 == .disconnected(reason: nil) } }
+/// Any `.disconnected`, whatever its reason (neither driver has a `.reconnecting` event: the
+/// adapters map a reconnect to `.disconnected` too).
+private func meshtasticDrops(_ run: LiveDriverRun) -> Int {
+    run.count { if case .disconnected = $0 { return true }; return false }
+}
+private func meshCoreDrops(_ run: LiveCoreDriverRun) -> Int {
+    run.count { if case .disconnected = $0 { return true }; return false }
+}
 
 private let coexistFrame = Data([0x01, 0x00, 0x00, 0x00, 0x01, 0x42])
 private let meshtasticPayload = Data([0x00, 0xFF, 0x01])
@@ -255,8 +261,8 @@ extension FCBDriverAdapterCBMTests {
             guard let running = await startEverything(rig) else { return }
             #expect(await returns(within: 6) { await rig.mc.stop() }, "MeshCore stop did not return")
             running.core.cancel()
-            #expect(meshtasticDrops(running.mesh) == 0, "events: \(running.mesh.events.value)")
             #expect(await meshtasticSendReaches(rig, meshtasticPayload), "the Meshtastic send failed or did not return")
+            #expect(meshtasticDrops(running.mesh) == 0, "events: \(running.mesh.events.value)")
             #expect(!running.ble.events.value.contains(where: isBLEChannelClosed), "the BLE channel closed with the MeshCore stop")
             await tearDown(rig, ble: running.ble, mesh: running.mesh, core: nil)
         }
@@ -266,8 +272,8 @@ extension FCBDriverAdapterCBMTests {
             guard let running = await startEverything(rig) else { return }
             #expect(await returns(within: 6) { await rig.mesh.stop() }, "Meshtastic stop did not return")
             running.mesh.cancel()
-            #expect(meshCoreDrops(running.core) == 0, "events: \(running.core.events.value)")
             #expect(await meshCoreSendReaches(rig, meshCorePayload), "the MeshCore send failed or did not return")
+            #expect(meshCoreDrops(running.core) == 0, "events: \(running.core.events.value)")
             #expect(!running.ble.events.value.contains(where: isBLEChannelClosed), "the BLE channel closed with the Meshtastic stop")
             await tearDown(rig, ble: running.ble, mesh: nil, core: running.core)
         }
