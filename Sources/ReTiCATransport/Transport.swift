@@ -56,6 +56,9 @@ public struct Transport {
         /// (RNS Transport.py:1824 `not random_blob in random_blobs`). Bounded to
         /// `announceBlobRingSize` per destination (RNS MAX_RANDOM_BLOBS).
         public var announceBlobs: [Data: RingSet] = [:]
+        /// What recently heard announce bytes were judged to be (reference `announce_valid_cache` and
+        /// `announce_invalid_cache`), consulted in place of a parse. See `AnnounceVerdictCache`.
+        var announceVerdicts = AnnounceVerdictCache()
         /// A cached announce, kept whole so a relay can re-emit it verbatim.
         ///
         /// The context flag is stored ALONGSIDE the payload rather than re-derived when the
@@ -956,11 +959,13 @@ public struct Transport {
                     // remembered, not relayed, and not counted by ingress control below, as reference
                     // returns before `received_announce` (Transport.py:2046-2053). A C4-held announce
                     // replays through here and is checked again.
-                    guard let parsed = Announce.parse(payload: packet.payload,
-                                                      destinationHash: packet.destinationHash,
-                                                      contextFlagSet: packet.contextFlag,
-                                                      requiredStampValue: state.resolvedDestinationCost(on: interfaceID),
-                                                      enforceStamp: state.enforceStamps)
+                    //
+                    // The verdict cache answers for bytes judged before (reference consults its caches
+                    // first, Identity.py:750-791): a refused announce is dropped unparsed, and a valid one
+                    // skips the parse and signature but goes on through ingress control, the
+                    // known-destination refresh, the replay check and the path logic below as before.
+                    guard let parsed = state.announceVerdicts.resolve(
+                        packet, cost: state.resolvedDestinationCost(on: interfaceID), enforce: state.enforceStamps)
                     else { return .none }
                     // C4 ingress control (RNS Transport.py:1748-1766). Record the arrival first — the deque
                     // counts every signature-valid announce, including this one, before the decision.

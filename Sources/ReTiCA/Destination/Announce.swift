@@ -100,10 +100,33 @@ public struct Announce {
                              contextFlagSet: Bool,
                              requiredStampValue: Double = NetworkStamp.defaultDestinationCost,
                              enforceStamp: Bool = false) -> Parsed? {
+        try? validate(payload: rawPayload, destinationHash: destinationHash, contextFlagSet: contextFlagSet,
+                      requiredStampValue: requiredStampValue, enforceStamp: enforceStamp).get()
+    }
+
+    /// Why `validate` refused an announce, as reference's `validate_announce` tells its verdicts apart
+    /// when it caches them (Identity.py:885-889, 919, 932, 937).
+    public enum Rejection: Error, Equatable, Sendable {
+        /// Enforcing, and the app data carries no well-formed stamp extension (reference "no_stamp").
+        case noStamp
+        /// Enforcing, and the stamp's value falls short of the required value (reference
+        /// "invalid_stamp", cached with the stamp's value).
+        case lowStamp(value: Double)
+        /// Too short, an unusable key, a bad signature or a destination-hash mismatch. Each depends on
+        /// the announce's bytes alone.
+        case invalid
+    }
+
+    /// `parse`, saying why an announce was refused. Same checks in the same order.
+    public static func validate(payload rawPayload: Data, destinationHash: Data,
+                                contextFlagSet: Bool,
+                                requiredStampValue: Double = NetworkStamp.defaultDestinationCost,
+                                enforceStamp: Bool = false) -> Result<Parsed, Rejection> {
+        parseProbe?.withValue { $0 += 1 }
         let payload = Data(rawPayload)
         let ratchetLen = contextFlagSet ? ratchetSize : 0
         let minLen = keySize + nameHashLength + randomHashLength + ratchetLen + signatureLength
-        guard payload.count >= minLen else { return nil }
+        guard payload.count >= minLen else { return .failure(.invalid) }
 
         var idx = 0
         let publicKey = payload.subdata(in: idx..<idx + keySize); idx += keySize
@@ -126,7 +149,10 @@ public struct Announce {
         var early: StampExtension? = nil
         if enforceStamp {
             let ext = readStampExtension(appData: appData, material: material, requiredValue: requiredStampValue)
-            guard ext.linkCost != nil else { return nil }
+            guard ext.linkCost != nil else {
+                guard ext.stamp != nil, let value = ext.stampValue else { return .failure(.noStamp) }
+                return .failure(.lowStamp(value: value))
+            }
             early = ext
         }
 
@@ -147,22 +173,27 @@ public struct Announce {
             ratchet = wireRatchet
         }
 
-        guard let identity = Identity(publicKey: publicKey) else { return nil }
+        guard let identity = Identity(publicKey: publicKey) else { return .failure(.invalid) }
         var signedData = destinationHash + publicKey + nameHash + randomHash + wireRatchet
         if let appData { signedData += appData }
-        guard identity.validate(signature: signature, message: signedData) else { return nil }
+        guard identity.validate(signature: signature, message: signedData) else { return .failure(.invalid) }
 
         let expectedHash = Crypto.fullHash(nameHash + identity.hash).prefix(16)
-        guard destinationHash == Data(expectedHash) else { return nil }
+        guard destinationHash == Data(expectedHash) else { return .failure(.invalid) }
 
         // Only now, with the signature checked over the full wire app data, read and strip the
         // network-stamp extension. Relays forward the packet's own bytes, never these.
         let ext = early ?? readStampExtension(appData: appData, material: material,
                                               requiredValue: requiredStampValue)
-        return Parsed(identity: identity, publicKey: publicKey, nameHash: nameHash,
-                      randomHash: randomHash, ratchet: ratchet, signature: signature, appData: ext.appData,
-                      stamp: ext.stamp, stampValue: ext.stampValue, linkCost: ext.linkCost)
+        return .success(Parsed(identity: identity, publicKey: publicKey, nameHash: nameHash,
+                               randomHash: randomHash, ratchet: ratchet, signature: signature, appData: ext.appData,
+                               stamp: ext.stamp, stampValue: ext.stampValue, linkCost: ext.linkCost))
     }
+
+    /// Test seam: when a test binds a counter here, each `validate` (and so each `parse`) increments
+    /// it, so a test can show that a path does not parse again. Task-local, so parallel tests do not
+    /// mix counts; unbound (nil) in production, where it costs one task-local read.
+    @TaskLocal static var parseProbe: Identity.LockedCounter? = nil
 
     /// `randomPrefix[:5] ‖ now.bigEndian(5 bytes)` — matches RNS random_hash construction.
     public static func randomHash(now: UInt64, randomPrefix: Data) -> Data {
