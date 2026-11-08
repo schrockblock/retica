@@ -383,19 +383,12 @@ public struct TransportEndpoint {
             // listener's `stop()` cancels the sockets themselves. Forgetting them also makes a
             // `.closed` that races the stop a no-op (see the guard below).
             case .tcpServer(.interface(.stop)):
-                guard let conns = state.tcpServer?.connInterfaces, !conns.isEmpty else { return .none }
-                state.tcpServer?.connInterfaces = [:]
-                let departing = Set(conns.keys)
-                var effects: [Effect<Action>] = []
-                for id in departing.sorted(by: { $0.rawValue < $1.rawValue }) {
-                    effects.append(.send(.transport(.interfaceDisconnected(id))))
-                    effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
-                }
-                // The node's last interfaces iff nothing outside the departing set is registered.
-                if Set(state.transport.interfaces.keys).isSubset(of: departing) {
-                    effects.append(.send(.transport(.stopMaintenance)))
-                }
-                return .merge(effects)
+                return disconnectAllServerConnections(&state)
+
+            // A listener FAILURE finishes the event stream the same way, with the accepted sockets
+            // still open (the driver's `.failed` arm calls `tcpListener.stop()` to close them).
+            case .tcpServer(.interface(.listenerEvent(.failed))):
+                return disconnectAllServerConnections(&state)
 
             case let .tcpServer(.interface(.delegate(.connectionClosed(conn)))):
                 let id = tcpServerInterfaceID(conn)
@@ -677,9 +670,30 @@ public struct TransportEndpoint {
     /// drivers — i.e. the router's interface set is exactly {departing} at call time (the
     /// disconnect effect that removes it is still pending). Any other live interface keeps GC up.
     private func maintenanceStopEffect(_ state: State, departing: InterfaceID) -> [Effect<Action>] {
-        let live = state.transport.interfaces
-        let isLast = live[departing] != nil ? live.count <= 1 : live.isEmpty
-        return isLast ? [.send(.transport(.stopMaintenance))] : []
+        maintenanceStopEffect(state, departing: [departing])
+    }
+
+    /// The same rule for several interfaces leaving at once: stop iff nothing outside `departing`
+    /// is registered. THE one place that decides whether anything else is still live.
+    private func maintenanceStopEffect(_ state: State, departing: Set<InterfaceID>) -> [Effect<Action>] {
+        Set(state.transport.interfaces.keys).isSubset(of: departing)
+            ? [.send(.transport(.stopMaintenance))] : []
+    }
+
+    /// Report every accepted server connection disconnected, from the driver's own record of them
+    /// (callers run before the driver's reducer, so the map is still full), and forget them so a
+    /// `.closed` that arrives afterwards is a no-op. Stops the shared loop iff none else is live.
+    private func disconnectAllServerConnections(_ state: inout State) -> Effect<Action> {
+        guard let conns = state.tcpServer?.connInterfaces, !conns.isEmpty else { return .none }
+        state.tcpServer?.connInterfaces = [:]
+        let departing = Set(conns.keys)
+        var effects: [Effect<Action>] = []
+        for id in departing.sorted(by: { $0.rawValue < $1.rawValue }) {
+            effects.append(.send(.transport(.interfaceDisconnected(id))))
+            effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
+        }
+        effects.append(contentsOf: maintenanceStopEffect(state, departing: departing))
+        return .merge(effects)
     }
 
     /// Routes an outbound (already IFAC-masked) buffer to whichever driver owns `txID`. Each TCP

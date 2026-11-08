@@ -127,7 +127,9 @@ public struct TCPServerInterface {
             case .listenerEvent(.failed):
                 state.status = .stopped
                 state.deframers.removeAll()
-                return .none
+                // The listener finishes its stream on failure but leaves accepted sockets open,
+                // and their events are lost with the stream: close them.
+                return .run { _ in await tcpListener.stop() }
 
             case let .listenerEvent(.accepted(conn)):
                 // Fresh, per-connection deframer.
