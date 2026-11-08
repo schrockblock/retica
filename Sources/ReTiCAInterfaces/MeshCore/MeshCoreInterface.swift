@@ -358,9 +358,16 @@ public struct MeshCoreInterface {
                 return pump(&state)
 
             case .bindDelayElapsed:
-                // No `bindReplyPending` guard: `.disconnected` and `.stop` cancel this timer.
+                // `.disconnected` and `.stop` cancel this timer, but `.cancellable` registers its
+                // id only when the task starts, so a drop or stop in the request's burst misses
+                // it. The guard makes such an escaped timer harmless: if a fresh request re-armed
+                // `bindReplyPending`, the first timer to fire answers it and the other finds the
+                // flag clear. At most one `BIND` per pending reply.
+                guard state.bindReplyPending else { return .none }
                 state.bindReplyPending = false
-                guard case let .online(_, publicKey, _) = state.status,
+                // Rechecked here as well as at the request: the wall clock may have moved since.
+                guard !isInsideBindWindow(state),
+                      case let .online(_, publicKey, _) = state.status,
                       enqueue(&state, publicKey, type: .bind)
                 else { return .none }
                 state.lastBindSent = date()
@@ -419,10 +426,7 @@ public struct MeshCoreInterface {
     /// counted from the last enqueue. A request inside the 60 s schedules nothing at all. The
     /// request body isn't validated: the 60 s limit bounds the reply whatever it says.
     private func scheduleBind(_ state: inout State) -> Effect<Action> {
-        guard !state.bindReplyPending else { return .none }
-        if let last = state.lastBindSent, date().timeIntervalSince(last) < Self.bindInterval {
-            return .none
-        }
+        guard !state.bindReplyPending, !isInsideBindWindow(state) else { return .none }
         state.bindReplyPending = true
         let delay = random.bindDelay()
         return .run { [clock] send in
@@ -430,6 +434,15 @@ public struct MeshCoreInterface {
             await send(.bindDelayElapsed)
         }
         .cancellable(id: CancelID.bindReply)
+    }
+
+    /// Less than 60 s since the last `BIND` was enqueued. A negative elapsed time (the wall clock
+    /// moved back) counts as expired, or replies would stay silenced until the clock caught up
+    /// (Review Focus 1).
+    private func isInsideBindWindow(_ state: State) -> Bool {
+        guard let last = state.lastBindSent else { return false }
+        let elapsed = date().timeIntervalSince(last)
+        return elapsed >= 0 && elapsed < Self.bindInterval
     }
 
     /// Frames `body` from our prefix to broadcast with the next packet ID and the current
