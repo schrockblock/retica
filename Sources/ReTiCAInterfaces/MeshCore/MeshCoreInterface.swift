@@ -45,13 +45,15 @@ public struct MeshCoreCounters: Equatable, Sendable {
 }
 
 /// Reticulum over ONE MeshCore radio, in ScotMesh's Raw tunnel format (spec 2026-11-07 §5). Owns
-/// the driver lifecycle, the §5.2 receive rules, inbound reassembly keyed `(src, packetID)`, and
-/// slot removal. The limiter's state lives here but this reducer never touches it:
-/// `TransportEndpoint` runs it on unmasked packets.
+/// the driver lifecycle, the §5.2 receive rules, inbound reassembly keyed `(src, packetID)`, the
+/// §5.4 paced sender, §5.3 `BIND` replies, and slot removal. The limiter's state lives here but
+/// this reducer never touches it: `TransportEndpoint` runs it on unmasked packets.
 @Reducer
 public struct MeshCoreInterface {
     /// The sender's FIFO cap, in datagrams (spec §5.4).
     public static let queueCapacity = 64
+    /// At most one `BIND` per this many seconds, measured from enqueue (spec §5.3).
+    static let bindInterval: TimeInterval = 60
 
     struct Counters: Equatable, Sendable {
         /// Datagrams addressed to a prefix that is neither ours nor broadcast.
@@ -93,6 +95,18 @@ public struct MeshCoreInterface {
         /// A `.start` arrived after a held stop. It runs right after that stop, once the removal
         /// finishes, so it reaches the driver after the stop (Contract 3). A later `.stop` clears it.
         var startHeld = false
+        /// Framed datagrams waiting for the radio, oldest first. Excludes the one in flight.
+        var queue: [Data] = []
+        /// A datagram went out and its pacing delay has not yet elapsed.
+        var pacing = false
+        /// The next fragment/`BIND` packet ID. Drawn at the first `.connected`, then kept across
+        /// reconnects and stop/start so a key isn't reused inside a peer's 30 s dedupe.
+        var nextPacketID: UInt16?
+        /// A `BIND_REQ` scheduled a reply whose random delay has not elapsed yet.
+        var bindReplyPending = false
+        /// When the last `BIND` was enqueued. Survives a drop, so reconnecting can't reset the
+        /// 60 s limit.
+        var lastBindSent: Date?
 
         public init(config: MeshCoreDriverConfig, framing: MeshCoreFraming = .scotMeshRaw) {
             self.config = config
@@ -118,6 +132,9 @@ public struct MeshCoreInterface {
         /// way the next slot's start could race the old stop. A held stop leaves the status
         /// unchanged until the removal finishes, so it is not idle either.
         public var isIdle: Bool { status == .stopped && !stopping }
+
+        /// Datagrams waiting to be sent, not counting the one in flight.
+        public var queuedDatagramCount: Int { queue.count }
 
         /// Every counter in one public value (read by `MeshCoreEndpoint`).
         public var diagnostics: MeshCoreCounters {
@@ -147,6 +164,16 @@ public struct MeshCoreInterface {
         case restartDeferred
         /// `driver.removeChannel()` returned.
         case channelRemovalFinished(Bool)
+        /// An outbound Reticulum packet, already IFAC-masked. Dropped unless online.
+        case send(Data)
+        /// The app's Relay setting changed: the can-route bit of every packet framed from now on.
+        /// Queued datagrams keep the bit they were framed with; the driver is not restarted.
+        case setCanRoute(Bool)
+        /// `driver.send` returned.
+        case datagramSent(ok: Bool)
+        case pacingElapsed
+        /// A `BIND_REQ`'s random reply delay elapsed.
+        case bindDelayElapsed
         case delegate(Delegate)
 
         public enum Delegate: Equatable, Sendable {
@@ -169,8 +196,10 @@ public struct MeshCoreInterface {
 
     @Dependency(\.meshCoreDriver) var driver
     @Dependency(\.meshCoreDate) var date
+    @Dependency(\.meshCoreClock) var clock
+    @Dependency(\.meshCoreRandom) var random
 
-    private enum CancelID: Hashable { case driver }
+    private enum CancelID: Hashable { case driver, pacing, bindReply }
 
     public init() {}
 
@@ -224,6 +253,8 @@ public struct MeshCoreInterface {
                 state.epoch.invalidate()
                 clearTraffic(&state)
                 return .merge(.cancel(id: CancelID.driver),
+                              .cancel(id: CancelID.pacing),
+                              .cancel(id: CancelID.bindReply),
                               .run { [driver] send in
                                   await driver.stop()
                                   await send(.driverStopped)
@@ -278,6 +309,7 @@ public struct MeshCoreInterface {
 
             case let .driverEvent(.connected(selfPrefix, publicKey, params)):
                 guard state.status != .stopped else { return .none }
+                if state.nextPacketID == nil { state.nextPacketID = random.packetID() }
                 state.status = .online(selfPrefix: selfPrefix, publicKey: publicKey, params: params)
                 return .send(.delegate(.online(selfPrefix: selfPrefix, publicKey: publicKey, params: params)))
 
@@ -286,14 +318,16 @@ public struct MeshCoreInterface {
                 let wasOnline = state.isOnline
                 state.status = .connecting
                 clearTraffic(&state)
-                return wasOnline ? .send(.delegate(.offline(reason: reason))) : .none
+                var effects: [Effect<Action>] = [.cancel(id: CancelID.pacing), .cancel(id: CancelID.bindReply)]
+                if wasOnline { effects.append(.send(.delegate(.offline(reason: reason)))) }
+                return .merge(effects)
 
             case let .driverEvent(.unavailable(cause)):
                 guard state.status != .stopped else { return .none }
                 let wasOnline = state.isOnline
                 state.status = .unavailable(cause)
                 clearTraffic(&state)
-                var effects: [Effect<Action>] = []
+                var effects: [Effect<Action>] = [.cancel(id: CancelID.pacing), .cancel(id: CancelID.bindReply)]
                 if wasOnline { effects.append(.send(.delegate(.offline(reason: nil)))) }
                 effects.append(.send(.delegate(.adapterUnavailable(cause))))
                 return .merge(effects)
@@ -305,6 +339,32 @@ public struct MeshCoreInterface {
 
             case let .driverEvent(.datagram(bytes)):
                 return receive(&state, bytes)
+
+            case let .send(packet):
+                guard enqueue(&state, packet, type: .rnsFragment) else { return .none }
+                return pump(&state)
+
+            case let .setCanRoute(canRoute):
+                // Review Focus 4: only packets framed from now on change.
+                state.config.canRoute = canRoute
+                return .none
+
+            case let .datagramSent(ok):
+                if !ok { state.counters.sendFailed += 1 }
+                return .none
+
+            case .pacingElapsed:
+                state.pacing = false
+                return pump(&state)
+
+            case .bindDelayElapsed:
+                // No `bindReplyPending` guard: `.disconnected` and `.stop` cancel this timer.
+                state.bindReplyPending = false
+                guard case let .online(_, publicKey, _) = state.status,
+                      enqueue(&state, publicKey, type: .bind)
+                else { return .none }
+                state.lastBindSent = date()
+                return pump(&state)
 
             case .delegate:
                 return .none
@@ -347,16 +407,75 @@ public struct MeshCoreInterface {
                 total: datagram.fragmentTotal, body: datagram.body, now: date())
             else { return .none }
             return .send(.delegate(.packetReceived(packet)))
-        case .bindRequest, .bind, .other:
-            // We keep no peer table, so `BIND` is ignored; so are unknown types. Answering
-            // `BIND_REQ` arrives with the sender.
+        case .bindRequest:
+            return scheduleBind(&state)
+        case .bind, .other:
+            // We keep no peer table, so `BIND` is ignored; so are unknown types.
             return .none
         }
     }
 
-    /// A drop: forget partial packets. The limiter survives (see `State.limiter`), and so do the
-    /// reassembler's counters and dedupe keys.
+    /// §5.3: answer a `BIND_REQ` after a random delay, coalesced, at most one `BIND` per 60 s
+    /// counted from the last enqueue. A request inside the 60 s schedules nothing at all. The
+    /// request body isn't validated: the 60 s limit bounds the reply whatever it says.
+    private func scheduleBind(_ state: inout State) -> Effect<Action> {
+        guard !state.bindReplyPending else { return .none }
+        if let last = state.lastBindSent, date().timeIntervalSince(last) < Self.bindInterval {
+            return .none
+        }
+        state.bindReplyPending = true
+        let delay = random.bindDelay()
+        return .run { [clock] send in
+            try await clock.sleep(for: delay)
+            await send(.bindDelayElapsed)
+        }
+        .cancellable(id: CancelID.bindReply)
+    }
+
+    /// Frames `body` from our prefix to broadcast with the next packet ID and the current
+    /// can-route bit, and queues it whole. A packet that doesn't fit is dropped whole and counts
+    /// `queueFull`. The ID advances only when the packet is queued. True if queued.
+    private func enqueue(_ state: inout State, _ body: Data, type: MeshCoreFrameType) -> Bool {
+        guard case let .online(selfPrefix, _, _) = state.status, let packetID = state.nextPacketID
+        else { return false }
+        let datagrams = state.framing.codec.split(body, type: type, src: selfPrefix,
+                                                  dst: ScotMeshRawCodec.broadcast,
+                                                  packetID: packetID, canRoute: state.config.canRoute)
+        guard !datagrams.isEmpty else { return false }
+        guard state.queue.count + datagrams.count <= Self.queueCapacity else {
+            state.counters.queueFull += 1
+            return false
+        }
+        state.queue.append(contentsOf: datagrams)
+        state.nextPacketID = packetID &+ 1
+        return true
+    }
+
+    /// Stop-and-wait (§5.4): send the queue head now if online and no pacing window is open, wait
+    /// for the driver to return, then one fragment delay (two after a failure). The first datagram
+    /// never waits. A failed datagram is dropped, not retried.
+    private func pump(_ state: inout State) -> Effect<Action> {
+        guard state.isOnline, !state.pacing, !state.queue.isEmpty else { return .none }
+        let datagram = state.queue.removeFirst()
+        state.pacing = true
+        let delay = MeshCoreLinkPacing.fragmentDelay(state.params)
+        return .run { [driver, clock] send in
+            let ok = await driver.send(datagram)
+            await send(.datagramSent(ok: ok))
+            try await clock.sleep(for: ok ? delay : delay * 2)
+            await send(.pacingElapsed)
+        }
+        .cancellable(id: CancelID.pacing, cancelInFlight: true)
+    }
+
+    /// A drop or stop: forget queued datagrams, the pacing window, a pending `BIND` reply and
+    /// partial packets. The caller cancels the pacing and `BIND` timers. The limiter survives (see
+    /// `State.limiter`), and so do the packet ID, `lastBindSent`, and the reassembler's counters
+    /// and dedupe keys.
     private func clearTraffic(_ state: inout State) {
+        state.queue = []
+        state.pacing = false
+        state.bindReplyPending = false
         state.reassembler.reset()
     }
 }

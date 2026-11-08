@@ -83,13 +83,42 @@ struct MeshCoreInterfaceHarness {
     }
 }
 
+/// Holds every driver `send` until `open()`: the call is recorded at once, the return waits.
+final class MeshCoreSendGate: Sendable {
+    private let state = LockIsolated<(open: Bool, waiters: [CheckedContinuation<Void, Never>])>((false, []))
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let pass = state.withValue { gate -> Bool in
+                if gate.open { return true }
+                gate.waiters.append(continuation)
+                return false
+            }
+            if pass { continuation.resume() }
+        }
+    }
+
+    func open() {
+        let waiters = state.withValue { gate -> [CheckedContinuation<Void, Never>] in
+            gate.open = true
+            defer { gate.waiters = [] }
+            return gate.waiters
+        }
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
 /// A MeshCoreInterface over a mock radio. `sendResults` are returned by successive driver
-/// `send`s (then `true`); `removeChannel` returns `removeResult`. Every `receive` waits up to 5 s.
+/// `send`s (then `true`); `removeChannel` returns `removeResult`. `packetID` and `bindDelay` are
+/// the scripted `\.meshCoreRandom` values; `sendGate` holds driver sends. Every `receive` waits
+/// up to 5 s.
 @MainActor
 func makeMeshCoreInterface(initial: MeshCoreInterface.State = MeshCoreInterface.State(config: meshCoreTestConfig),
                            sendResults: [Bool] = [],
                            removeResult: Bool = true,
-                           bindDelay: Duration = .seconds(3)) -> MeshCoreInterfaceHarness {
+                           packetID: UInt16 = 0x1000,
+                           bindDelay: Duration = .seconds(3),
+                           sendGate: MeshCoreSendGate? = nil) -> MeshCoreInterfaceHarness {
     let radio = AsyncStream<MeshCoreDriverEvent>.makeStream()
     let calls = LockIsolated<[MeshCoreMockCall]>([])
     let results = LockIsolated(sendResults)
@@ -106,6 +135,7 @@ func makeMeshCoreInterface(initial: MeshCoreInterface.State = MeshCoreInterface.
             },
             send: { datagram in
                 calls.withValue { $0.append(.send(datagram)) }
+                if let sendGate { await sendGate.wait() }
                 return results.withValue { $0.isEmpty ? true : $0.removeFirst() }
             },
             removeChannel: {
@@ -116,7 +146,7 @@ func makeMeshCoreInterface(initial: MeshCoreInterface.State = MeshCoreInterface.
         )
         $0.meshCoreClock = clock
         $0.meshCoreDate = DateGenerator { now.value }
-        $0.meshCoreRandom = MeshCoreRandom(packetID: { 0x1000 }, bindDelay: { bindDelay })
+        $0.meshCoreRandom = MeshCoreRandom(packetID: { packetID }, bindDelay: { bindDelay })
     }
     store.exhaustivity = .off
     store.timeout = .seconds(5)
@@ -128,8 +158,12 @@ func makeMeshCoreInterface(initial: MeshCoreInterface.State = MeshCoreInterface.
 @MainActor
 func makeOnlineMeshCoreInterface(params: MeshCoreLinkParams? = meshCoreTestParams,
                                  initial: MeshCoreInterface.State = MeshCoreInterface.State(config: meshCoreTestConfig),
-                                 sendResults: [Bool] = []) async -> MeshCoreInterfaceHarness {
-    let h = makeMeshCoreInterface(initial: initial, sendResults: sendResults)
+                                 sendResults: [Bool] = [],
+                                 packetID: UInt16 = 0x1000,
+                                 bindDelay: Duration = .seconds(3),
+                                 sendGate: MeshCoreSendGate? = nil) async -> MeshCoreInterfaceHarness {
+    let h = makeMeshCoreInterface(initial: initial, sendResults: sendResults, packetID: packetID,
+                                  bindDelay: bindDelay, sendGate: sendGate)
     await h.store.send(.start)
     h.radio.yield(.connected(selfPrefix: meshCoreOwnPrefix, publicKey: meshCoreOwnKey, params: params))
     await h.store.receive { if case .delegate(.online) = $0 { return true }; return false }
