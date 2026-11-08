@@ -152,6 +152,19 @@ private func expectedTarget(hex: String, saturated isSaturated: Bool) -> Data {
 
 @Test func networkStampValidityMatchesReference() throws {
     let f = try Fixtures.load()
+    // The reference's own generated stamps at the default announce cost and value, 23.5 and 25.
+    for cost in [23.5, 25.0] {
+        let generated = f.generated_cases.filter { $0.cost == cost }
+        #expect(!generated.isEmpty, "no generated case at cost \(cost)")
+        for c in generated {
+            #expect(c.valid)
+            #expect(c.value >= cost - 1.0 / 256)
+            #expect(NetworkStamp.isValid(stamp: Data(hexString: c.stamp)!, cost: c.cost,
+                                         material: Data(hexString: c.material)!))
+            #expect(NetworkStamp.value(stamp: Data(hexString: c.stamp)!,
+                                       material: Data(hexString: c.material)!) == c.value)
+        }
+    }
     let cases = f.allStampCases
     #expect(cases.contains { $0.valid } && cases.contains { !$0.valid })
     for c in cases {
@@ -164,8 +177,10 @@ private func expectedTarget(hex: String, saturated isSaturated: Bool) -> Data {
 }
 
 @Test func networkStampValidityIsExactlyHashAtOrBelowTarget() throws {
-    // The reference compares with <=, so a hash equal to the target is valid. Check on both sides of
-    // the fixtures' own boundary stamps by recomputing from the hash, not from the cost path.
+    // Recomputes validity from the raw hash and the target (big-endian hash <= target) and compares it
+    // with isValid and with the reference's verdict, on stamps the reference found just under and just
+    // over the target. None of these hashes EQUALS the target, so this does not exercise the equality
+    // case; NetworkStampBoundaryTests pins that.
     for c in try Fixtures.load().edge_validity_cases {
         let material = Data(hexString: c.material)!
         let stamp = Data(hexString: c.stamp)!
@@ -187,7 +202,8 @@ func generatedStampIsValidAndCarriesItsValue() async throws {
         #expect(NetworkStamp.isValid(stamp: result.stamp, cost: cost, material: material))
         #expect(result.value == NetworkStamp.value(stamp: result.stamp, material: material))
         #expect(result.value >= cost - 1.0 / 256)
-        // The same stamp is far too weak for a much higher cost.
+        // The same stamp is far too weak for a much higher cost. Probabilistic: it fails if the random
+        // stamp happens to carry 16 more leading zero bits than asked, about 1 in 65,000 per cost.
         #expect(!NetworkStamp.isValid(stamp: result.stamp, cost: cost + 16, material: material))
     }
 }

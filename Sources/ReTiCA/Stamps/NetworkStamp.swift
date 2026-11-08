@@ -105,6 +105,7 @@ public enum NetworkStamp {
 
     /// Stamp value for `stamp` over `material` (RNS stamp_value; reference takes `(workblock, stamp)`).
     /// A real number: the leading-zero count of the hash plus a 1/256-step fraction from its mantissa.
+    /// Does not check the stamp's length; callers reject a stamp whose length is not `stampLength`.
     public static func value(stamp: Data, material: Data) -> Double {
         let hash = [UInt8](Crypto.fullHash(material + stamp))
         guard let firstNonZero = hash.firstIndex(where: { $0 != 0 }) else { return 256 }
@@ -117,20 +118,28 @@ public enum NetworkStamp {
             let bit: UInt64 = pos >= 0 ? UInt64(hash[31 - pos / 8] >> UInt8(pos % 8) & 1) : 0
             mantissa = mantissa << 1 | bit
         }
-        // bisect_right: the number of table entries at or below the mantissa.
-        let climb = tab.firstIndex(where: { $0 > mantissa }) ?? tab.count
+        let climb = tabClimb(mantissa: mantissa)
         let valueFP = ((leadingZeros + 1) << costFixedPointBits) - climb
         return Double(valueFP) / Double(costFixedPointScale)
     }
 
+    /// bisect_right over `tab`: the number of table entries at or below `mantissa`. A mantissa equal to an
+    /// entry counts that entry.
+    static func tabClimb(mantissa: UInt64) -> Int {
+        tab.firstIndex(where: { $0 > mantissa }) ?? tab.count
+    }
+
     /// True when `full_hash(material ‖ stamp)` is at or below the target for `cost` (RNS stamp_valid).
+    ///
+    /// Does not check the stamp's length: the reference does not either. Callers reject a stamp whose
+    /// length is not `stampLength` before asking.
     public static func isValid(stamp: Data, cost: Double, material: Data) -> Bool {
         let target = [UInt8](target(fixedPoint: fixedPoint(cost: cost)))
         return hashMeets(Crypto.fullHash(material + stamp), target: target)
     }
 
     /// Big-endian `hash <= target`, both 32 bytes.
-    private static func hashMeets(_ hash: Data, target: [UInt8]) -> Bool {
+    static func hashMeets(_ hash: Data, target: [UInt8]) -> Bool {
         var i = 0
         for byte in hash {
             if byte != target[i] { return byte < target[i] }
@@ -148,13 +157,21 @@ public enum NetworkStamp {
     /// Search random 14-byte stamps until one is valid for `cost` over `material`. Nil only if the
     /// enclosing `Task` was cancelled first. `cost` clamps like `fixedPoint(cost:)`.
     public static func generate(material: Data, cost: Double) async -> (stamp: Data, value: Double)? {
+        let found = await search(material: material, cost: cost) { (SecureRandom.bytes(stampLength), ()) }
+        return found.map { ($0.stamp, value(stamp: $0.stamp, material: material)) }
+    }
+
+    /// The loop `generate` and `generateKey` share: draw a candidate, hash `material ‖ stamp`, stop at the
+    /// first at or below the target for `cost`. Yields every `searchYieldInterval` rounds and returns nil
+    /// as soon as the enclosing `Task` is cancelled.
+    private static func search<Extra>(
+        material: Data, cost: Double, candidate: () -> (stamp: Data, extra: Extra)
+    ) async -> (stamp: Data, extra: Extra)? {
         let target = [UInt8](target(fixedPoint: fixedPoint(cost: cost)))
         var round = 0
         while !Task.isCancelled {
-            let stamp = SecureRandom.bytes(stampLength)
-            if hashMeets(Crypto.fullHash(material + stamp), target: target) {
-                return (stamp, value(stamp: stamp, material: material))
-            }
+            let next = candidate()
+            if hashMeets(Crypto.fullHash(material + next.stamp), target: target) { return next }
             round += 1
             if round % searchYieldInterval == 0 { await Task.yield() }
         }
@@ -165,18 +182,11 @@ public enum NetworkStamp {
     /// `material` (RNS generate_stamped_key). Nil only if the enclosing `Task` was cancelled first.
     public static func generateKey(material: Data, cost: Double)
         async -> (privateKey: Data, publicKey: Data, value: Double)? {
-        let target = [UInt8](target(fixedPoint: fixedPoint(cost: cost)))
-        var round = 0
-        while !Task.isCancelled {
+        let found = await search(material: material, cost: cost) {
             let key = Curve25519.KeyAgreement.PrivateKey()
-            let publicKey = key.publicKey.rawRepresentation
-            if hashMeets(Crypto.fullHash(material + publicKey), target: target) {
-                return (key.rawRepresentation, publicKey, value(stamp: publicKey, material: material))
-            }
-            round += 1
-            if round % searchYieldInterval == 0 { await Task.yield() }
+            return (key.publicKey.rawRepresentation, key.rawRepresentation)
         }
-        return nil
+        return found.map { ($0.extra, $0.stamp, value(stamp: $0.stamp, material: material)) }
     }
 
     // MARK: Table

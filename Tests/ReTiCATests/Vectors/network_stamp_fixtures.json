@@ -3146,283 +3146,297 @@
   },
   "value_cases": [
     {
-      "material": "9110e0036b2e5c00eb396aa5237568e5c6aa377e557a33026adf51085a1f0820",
-      "stamp": "29a9afc68203c737762c3bae833e",
+      "material": "da7de099efef8f0ef8801ac212d29117f005d876763e132b05166e7bea7ea0ef",
+      "stamp": "7a14b0b167bd2c7d35a3b3388212",
       "cost": 0,
-      "value": 1.12890625,
+      "value": 0.0625,
       "valid": true
     },
     {
-      "material": "bd3d43f7fdaa39d2ee018ae47764005dafa42b972cd604f806feeb9dd0a78550",
-      "stamp": "4c25e22defd77426c798966308bebff2e9cc493ff803db3b887243dcb5f106d9",
+      "material": "0ef7199cdd6fff35aba31da4d5b60ee69722e4d8eeb5f72125d1a9119cb2fcac",
+      "stamp": "38b3d53e18f9432c33f085de37181f4bf9062151b97dd79230f6ab44ecc54575",
       "cost": 0,
-      "value": 0.07421875,
+      "value": 0.4296875,
       "valid": true
     },
     {
-      "material": "a0d2b5313ab5b8f1e9b0216f27712b493b07b4354647940560765edc65743902",
-      "stamp": "d4014f1a9af5981427262a4a771d",
+      "material": "6385db330d73d3762cef0aff9551e62f616f6992e543aa7a62276d8220e74d9d",
+      "stamp": "718b3e773fe75130178e0d1b5d7f",
       "cost": 3.25,
-      "value": 0.76171875,
+      "value": 2.73828125,
       "valid": false
     },
     {
-      "material": "8ce45030a3d687abbd6c11a09b7c807cb01869e0821aa85dfb82d301f7e425b9",
-      "stamp": "78b766bb38d048d6bbfcb47cd6e46006cc55c1e70127dc93a06258ebd9c5592b",
+      "material": "3a0af521df55d89b24be2dd4f91ca56642aeadb321e4ad30e66c24bbd2538ce0",
+      "stamp": "2f37fe89452924fd3438f57967cdfcd70a4113a7a5598d56f7cf017736c0bf21",
       "cost": 3.25,
-      "value": 2.63671875,
+      "value": 1.82421875,
       "valid": false
     },
     {
-      "material": "c8c5cd6e7b6106d492b6c2252f29ce28c518d96421ae699611652cebe8752aa4",
-      "stamp": "cd3bc2b3b3ee66608945f68959e3",
+      "material": "d1c1333ca225ad9499871e9b537ac7f9155ddcede1fd20cce850ce4af7b6712e",
+      "stamp": "2544f661322d5d7d4bc3e1b710fd",
       "cost": 8,
-      "value": 0.515625,
+      "value": 3.8515625,
       "valid": false
     },
     {
-      "material": "f0b8e94c4a185fe2db019ef57d3b0ae396d7efe11c3fb73d42a00dfe36a0b743",
-      "stamp": "e8fc816119f20e1f39b8a088d7a08b04fccdb76ad5e49e77296ac30483851782",
+      "material": "b2305213c96322786f97f9b247445b06ad70b87477ff3a84c5beac467e5459a6",
+      "stamp": "069e8699281801fdd89230a07622e0cd5b4ad6b3e2549cff22a13d2614e99b0a",
       "cost": 8,
-      "value": 0.16796875,
+      "value": 2.59765625,
       "valid": false
     },
     {
-      "material": "c37c3dd1d8ade505947ebba992329c392beaa6c529a3eb6ca96eae493571afa1",
-      "stamp": "40cba3fa8f5a35bd262128bce2a1",
+      "material": "85489cf88d0f82963aee0421352d4356c278294b54ebe1e1685a3dc14464616e",
+      "stamp": "c076c62ac54a1466a333ec0f72d0",
       "cost": 8.5,
-      "value": 0.7421875,
+      "value": 1.640625,
       "valid": false
     },
     {
-      "material": "8ae4ac443a79612231eae4369670273125f167638aa569c6a79ccfd359a6e018",
-      "stamp": "5437b204ef65c2f9f1f6d5d5ffe8f4ce278561bdf4efc3490aa45dbe13681806",
+      "material": "528692174d215791ad5d9bd96ff77621c17cc5bcc7f946d0084997f95387176f",
+      "stamp": "83ea5e7695b9edd9954ad1149f3c16feb3d66cad7da3ceb212151c39c568e04b",
       "cost": 8.5,
-      "value": 0.171875,
+      "value": 0.4453125,
       "valid": false
     },
     {
-      "material": "394f53ef3215eccd017ff6d8ab40bfd5c51f3058c5c71a34f476e61c3b5c29fd",
-      "stamp": "62a16c8247d6a9e44872f13c2a6c",
+      "material": "20203b973a377b537a736d2a35175e6828cf1951175452627756997a1eed09c7",
+      "stamp": "c353a507932db7c0ff836da23d40",
       "cost": 12.5,
-      "value": 5.01953125,
+      "value": 2.58203125,
       "valid": false
     },
     {
-      "material": "e3095acd46480e6df9f154c5714e1a1c0229144e8fdb1fd8686c292e08c7c2b4",
-      "stamp": "936ed16d8e9003dc46327da16f29cd6c8e37dfa5b39f7db3ebb01c48fd285984",
+      "material": "caf61806d84fbf2d3b8dcfcd343e79b0a67be2f86f2862ea893a4d552656a4c4",
+      "stamp": "1b166ab0742b2b82d88e758d5400bce41051e22dc28d95f948efa027f4315753",
       "cost": 12.5,
-      "value": 0.2890625,
+      "value": 0.11328125,
       "valid": false
     },
     {
-      "material": "c92c7fe6454209e68e70d1349e8c028b729fe4c5a4f1908f74597d2d10e3aae8",
-      "stamp": "83c1b485d226714d75f888d5fbc5",
+      "material": "70840dd093426e92102545a74403c815bdade8a22d1438cfe91b89b589bd4f86",
+      "stamp": "73b21b56b2a0e7dc05a5fffcd45c",
       "cost": 15.8,
-      "value": 3.08984375,
+      "value": 0.34375,
       "valid": false
     },
     {
-      "material": "686fb9e7764ba73aec9e2d3bdba52389c402bc2439f643297aa5546deb39bd22",
-      "stamp": "23f963f463ab7550787678a51504f5eff52e56ee0c590d05ec21a303ae5496a0",
+      "material": "4b46f565b6aba8baf3f2fcb994367c1b22a2ac36e45408693c82788e22a00635",
+      "stamp": "9eaeac28c5c2857cde59df345efef9d5c7303eda5c8c727789eca0cd4be230fd",
       "cost": 15.8,
-      "value": 5.66796875,
+      "value": 2.88671875,
       "valid": false
     },
     {
-      "material": "41ba183ac0ef29ec57567fccf6a89935e2d8e8a25b50666eefaac818d1130830",
-      "stamp": "1917b95bc9348a996927d76e6cb2",
+      "material": "ee75b996bbaf4ea79f50c9054641701eb732830647a2c9e0077e650ea5423393",
+      "stamp": "ade70613cdcec60389ffdaab3d5a",
       "cost": 23.5,
-      "value": 4.42578125,
+      "value": 0.6875,
       "valid": false
     },
     {
-      "material": "41828b34a87d8597f3f7e400e5b06450730670353c66473f09f891349b2a61e4",
-      "stamp": "bcca1e38d116cd9a759259a7d7428b2ebe605e273786327267c88283bc276cb4",
+      "material": "e658fe5cba9fa81ca8bfd6d22999dd3d59bff549993a1ad7b3443e092a7ded4f",
+      "stamp": "87caef52bb3712df14aff2fe9e28bdaee22c7d00c58044d943940879c27bfe21",
       "cost": 23.5,
-      "value": 1.92578125,
+      "value": 0.44140625,
       "valid": false
     },
     {
-      "material": "06aa29c5698bddd0c48613cc08c424bb5325814c5727ffbe7d87176fff774d74",
-      "stamp": "cab62afd7e16cce4a13c12649f22",
+      "material": "94cae4947282106a58d0f162292b7494352ee89e4e6c0aa9854f19f6a50705a8",
+      "stamp": "fa622d44d7edddfddf0718a48228",
       "cost": 25,
-      "value": 0.06640625,
+      "value": 0.77734375,
       "valid": false
     },
     {
-      "material": "1b62649d92b01e6e621255bf30937bcfa9ec75f20904806c1b427c2cad7e1fd0",
-      "stamp": "65b9e2550cb9a10790a51c9f8194d7645ef74bc4898d03777ff4fd1be68c5fa9",
+      "material": "8cd51fabac3d4784ff44b3fd4c7d81c02a95f65ca3956615008b3983679dface",
+      "stamp": "ff1d0b971e78c968ef0c8cf8a109843a4f5c05766d0f3112109a0483f14f3530",
       "cost": 25,
-      "value": 0.0390625,
+      "value": 3.140625,
       "valid": false
     },
     {
-      "material": "d2a5dc1df3b4794a014792ad59392e6452e28f9f31c1712761476572beb1819c",
-      "stamp": "5a47b4871aadb56282621f4c48c0",
+      "material": "c65d0c9569e031e8aa697014f1892e1bf0e608b826aaf7b42861909ecdf54772",
+      "stamp": "2375d96ec7cd3c603a2fcb7f7f26",
       "cost": 100,
-      "value": 0.94140625,
+      "value": 2.58984375,
       "valid": false
     },
     {
-      "material": "6a7140eb7589562d262b968ecf0e8b9c47a02b9bd13c70085ad5f82f9315a4e7",
-      "stamp": "c202d4953dd60b20d53c7f5318f187e81ef82c4452ea354ad862c50c818199b9",
+      "material": "8853ee20363d4ac84fd39e5cc4fdef49e0559cf17a2b355111b4b952d16d59d9",
+      "stamp": "eeb6c8149d5d744910b0645e80cc1d01ff31fecf2076303e2304af4a38447650",
       "cost": 100,
-      "value": 4.7578125,
+      "value": 1.42578125,
       "valid": false
     },
     {
       "material": "",
-      "stamp": "367081baf34089ed859a23259fb5",
+      "stamp": "78b88afb9abb77747f744b0b2a86",
       "cost": 8,
-      "value": 0.1484375,
+      "value": 8.5234375,
+      "valid": true
+    },
+    {
+      "material": "ec3635f67c",
+      "stamp": "94e34feed2552dae3e73d01ac2c2",
+      "cost": 8,
+      "value": 2.20703125,
       "valid": false
     },
     {
-      "material": "74616eab09",
-      "stamp": "826304dd36f9f78dd7f848564aa0",
+      "material": "2563e687a2fa4033a2134c1ba65ea3c1a12842625da965b4da90abb2c28ca22daa8460829c64edcb6c68839ff7330e481f6edf438d058ec6ec2d0447414089a3d6ae36f5a016ee566843d7100dd4ac927b74fbae7d9a50dc521b17cdadd7ffe6ba5637fe81b761d8e559e89b5621136281689d99fa5756c8d54e0f7a28d59a7be333e6a195c3a30780026c8272d62bcd90946b1fc82e7e9dcfedb8e9fe015c47e2957d08bd90eea8f0e94bdd1f74da6e9677f7702d57916d2a1e99420a5f5099eb175b911a7a8999bd3f04616b7da049b276388e9d0cb903cb4e0c83c88cd18b48ada5790f31f4bed6f7fd6364353d65614be772653fe2e2c176d7b428c490560af3c10b47703e345049ac1736e570cc6a5ff384dc81a06fa001dfba9b611d75dcd5df02dda12551070a366a",
+      "stamp": "af03d5bebc02390c124a4100ecbf",
       "cost": 8,
-      "value": 3.1640625,
-      "valid": false
-    },
-    {
-      "material": "9e6a72cc2e26b8d2f7605b1068b2648a8efe27962f2f0037ce8e72b2e1ad3b9a81e34b14e098b55a4ed84d3adcb60519bead8ca4461f4bd698e9f71e0e12e44bdb3278fd8f75a9deecf4eaf65da112c91824eb1618426f2faa2a1bf360430259f5fbe7ef372e646a6ee6f8afc68445b8696218cdf4ebbcebced8e66629e7fcc30c01f3dab5c13576830a4158d9a4b85970f9f4d4ca381351f00bb6f66832fe5ff05664fe34515683ec1bf44cedee4052c43436c2cfcde9e3bf1d4a06484fd844155f9212727242e392435450fa6ae43486fe7e390be549f040fbd5e0d8c1e6a40131f3fc5f744aad354ec8541a964577e519a63bf2106ccc09ce8996bc92c76ab2280cb8d1fbd559df05dbbd848fed3c7ee81c4abce60de73bfd34d05ab4b363d209b47746b726b01cc0b948",
-      "stamp": "cc23ef836ffb079f1b9d389404d8",
-      "cost": 8,
-      "value": 0.13671875,
+      "value": 1.39453125,
       "valid": false
     }
   ],
   "generated_cases": [
     {
-      "material": "37e15b8ecf74336a7a7ace0c94e67b72b3bc7ec810d321bec364f7894e91d945",
-      "stamp": "037e974452cd9c05c3fd78f81b49",
+      "material": "cc7182f285fb0063c6c69f5ca1f187d3cca73c1121efbee4d92a4faea4a85e3e",
+      "stamp": "65fc0553ee7b3e7a598099b08f74",
       "cost": 0,
-      "value": 0.78125,
+      "value": 0.59375,
       "valid": true
     },
     {
-      "material": "937bfd73be6f81d9a5f80dcd9d3b9634c53e62d6b2c646819d258cf09bfbadb3",
-      "stamp": "b49679600514c021e94036cd128c",
+      "material": "f375e9a4e6dfadd4c8d3cfaeb5ce74aec04b75281bbbd899b97a4dd43ac3f249",
+      "stamp": "f122fceae678fc0da448c329b0b0",
       "cost": 3.25,
-      "value": 4.2578125,
+      "value": 4.1953125,
       "valid": true
     },
     {
-      "material": "f12775da6f1f04d4a1b4b49f0aaf3df69ad191620b8ebcd414b848df2647ac67",
-      "stamp": "9e39304d400cdf820a9fa0364fd5",
+      "material": "e295ac3f39513461985b88811a8235178afb090d2d8259667e6219ff39ff8f6e",
+      "stamp": "00956f517e27469bbf5895b207de",
       "cost": 8,
-      "value": 15.5546875,
+      "value": 11.1640625,
       "valid": true
     },
     {
-      "material": "0ecbb09a5d3dc40e1681973a14f658102a2e8499e2e0dab9a7ba65c010774ba1",
-      "stamp": "16a3ac9192ba1985eb42ba482f3b",
+      "material": "936ead91f009162f46e344074c6abe8f1b363e735dc3e6fdf22ba4f5e9001cd1",
+      "stamp": "9b89bc8cc42259e1641d18364b49",
       "cost": 8.5,
-      "value": 9.6640625,
+      "value": 9.08203125,
       "valid": true
     },
     {
-      "material": "211bf5114d78cd2f52fd63c5b70b09b6898f2ea450496036ff57dbea92fef257",
-      "stamp": "2d10fe61a4bbc5ba30e0318ab2de",
+      "material": "748cd006d32ed07677f948c43961dd7bacde1a0dd0a90c425e02d1778a38334b",
+      "stamp": "4d1d82468f927a7c3305da27e279",
       "cost": 12.5,
-      "value": 12.68359375,
+      "value": 17.51171875,
       "valid": true
     },
     {
-      "material": "ac22bf795fb85aa488f2d89b707417b07e1f9e278f3b29134caf99fd72d36858",
-      "stamp": "2c88510604847826c28c4745287a",
+      "material": "6a6250b49dc176d78668c7b3eb22963d6288256a3c649d2d73d8e97fa9d1b37b",
+      "stamp": "082b2c69fd288563079fd493ea33",
       "cost": 15.8,
-      "value": 17.3984375,
+      "value": 16.9609375,
+      "valid": true
+    },
+    {
+      "material": "4d1e3b46a7bdea2cd24c8da5933cc4956f1a5d20b13af70fa2289086f1085371",
+      "stamp": "ba432b878007d31dcc02d5a03dfc",
+      "cost": 23.5,
+      "value": 25.16015625,
+      "valid": true
+    },
+    {
+      "material": "5f7bc33a13f97efe43ece9b973c97e20ae0e544be1105d1726b6dc0dea4e4a9f",
+      "stamp": "79ccd79e43974908b354e121b801",
+      "cost": 25,
+      "value": 25.015625,
       "valid": true
     }
   ],
   "low_value_cases": [
     {
-      "material": "3aa9b0a172c27e09225ba60478c41dafb23fa3c89158af5e9152b3c4025238e1",
-      "stamp": "500dce499ddee05b54a50e23be12",
+      "material": "b1bdfc512d4ba95770b337f32231e87897c187726e6d93a52e0ded0a87603f21",
+      "stamp": "0aa6d0f49e3a95b8ddd069901180",
       "cost": 8,
-      "value": 0.12109375,
+      "value": 0.140625,
       "valid": false
     },
     {
-      "material": "2481b3fd20cda5d5a5ecf0a7c70c7b2b9fe78faff0e30d88507aab40d02091e7",
-      "stamp": "75757c329bb838938c1f4865357c",
+      "material": "a39baf868414378e966808b99536f50d17eb078572094d0396cb9079f3ecdcc5",
+      "stamp": "4618745b23a0aec5f1e58bd84bfa",
       "cost": 12.5,
-      "value": 4.45703125,
+      "value": 0.05078125,
       "valid": false
     },
     {
-      "material": "297f9fa66ca606d4949a76a5b3f008864c829db1414952ae73d4b82cb66dee11",
-      "stamp": "e68476b873bd72253490203d7c34",
+      "material": "8c02eda4f3b50abc2b5b10b19382d932f4d5aa95563a31682c2606e5ca712896",
+      "stamp": "7e558a99a6abcf03a91967763717",
       "cost": 15.8,
-      "value": 0.03125,
+      "value": 4.90625,
       "valid": false
     }
   ],
   "boundary_cases": [
     {
-      "material": "492e8099e90b5bd51dff9754db0ea30f70178dd98ce4548cba774b299c91bcac",
-      "stamp": "c3dc2ab47de881b00da3d73a9e5c",
+      "material": "dbe67b4941fe621662f94132c2d6e41014f3ce6036408b30e6e5b184bed16d4d",
+      "stamp": "fd94a3ae2b25ecd41a8c8cb12e26",
       "cost": 8,
-      "value": 0.33984375,
+      "value": 0.72265625,
       "valid": false,
       "kind": "at_or_above_entry",
-      "mantissa_distance": 11
+      "mantissa_distance": 77
     },
     {
-      "material": "492e8099e90b5bd51dff9754db0ea30f70178dd98ce4548cba774b299c91bcac",
-      "stamp": "1f5e0a6d8eac007f385adb1314be",
+      "material": "dbe67b4941fe621662f94132c2d6e41014f3ce6036408b30e6e5b184bed16d4d",
+      "stamp": "db642ecc1ad6ae98714497d991f0",
       "cost": 8,
-      "value": 0.234375,
+      "value": 3.6640625,
       "valid": false,
       "kind": "at_or_above_entry",
-      "mantissa_distance": 94
+      "mantissa_distance": 99
     },
     {
-      "material": "492e8099e90b5bd51dff9754db0ea30f70178dd98ce4548cba774b299c91bcac",
-      "stamp": "d2047937e9456f6e9250ebda11cb",
+      "material": "dbe67b4941fe621662f94132c2d6e41014f3ce6036408b30e6e5b184bed16d4d",
+      "stamp": "12ae4d83f7926d08e4bf2493698d",
       "cost": 8,
-      "value": 3.94921875,
+      "value": 0.94140625,
       "valid": false,
       "kind": "just_below_entry",
-      "mantissa_distance": 64
+      "mantissa_distance": 14
     },
     {
-      "material": "492e8099e90b5bd51dff9754db0ea30f70178dd98ce4548cba774b299c91bcac",
-      "stamp": "b66317ff26c5816dffb6c17d8db8",
+      "material": "dbe67b4941fe621662f94132c2d6e41014f3ce6036408b30e6e5b184bed16d4d",
+      "stamp": "97f5ab00f86cdcd1482ac6c82d16",
       "cost": 8,
-      "value": 1.46875,
+      "value": 0.19921875,
       "valid": false,
       "kind": "just_below_entry",
-      "mantissa_distance": 75
+      "mantissa_distance": 24
     }
   ],
   "edge_validity_cases": [
     {
-      "material": "512216d44c9705aa78b5d24122d628c9322efa932f7c3c94a89e48297bdde0c8",
-      "stamp": "7bb188dd3c8cc248dd6152b0e586",
+      "material": "a37d6eec527404b212f24c1978cd7f42b18c99ad49653ad957bd7bc7db39c927",
+      "stamp": "9621065fd6d5d84763b871bffaf3",
       "cost": 3.25,
       "value": 3.25,
       "valid": true
     },
     {
-      "material": "512216d44c9705aa78b5d24122d628c9322efa932f7c3c94a89e48297bdde0c8",
-      "stamp": "298db2a2093f1950d0929f4f77e9",
+      "material": "a37d6eec527404b212f24c1978cd7f42b18c99ad49653ad957bd7bc7db39c927",
+      "stamp": "958337565c76c3ec7e79ff54d04a",
       "cost": 3.25,
       "value": 3.24609375,
       "valid": false
     },
     {
-      "material": "b824d0bda5ef958078cd5e306015400061cda63bad6bae033f411a0ad7a5c87f",
-      "stamp": "51b4c127a13128728800c68efdb7",
+      "material": "6b59147c11b61046c551139965043093d4f0aeb9e007dcee1351e01da5c5aa97",
+      "stamp": "0f6b91cf4c9ec4030a55a50fab2a",
       "cost": 8,
-      "value": 8.0,
+      "value": 8.00390625,
       "valid": true
     },
     {
-      "material": "b824d0bda5ef958078cd5e306015400061cda63bad6bae033f411a0ad7a5c87f",
-      "stamp": "30a10d349a4677711908b0dca453",
+      "material": "6b59147c11b61046c551139965043093d4f0aeb9e007dcee1351e01da5c5aa97",
+      "stamp": "8984c69aa16b9297d174c7be16f7",
       "cost": 8,
       "value": 7.99609375,
       "valid": false
@@ -3430,27 +3444,27 @@
   ],
   "key_cases": [
     {
-      "material": "bef81285510ba1befe2c3ff9f985ef410fbf10e7ab1cb126f14eb364c9691a30",
-      "private": "48a751a9fbad8989796e83123590973e798e76ba63043345caa0050e114e1756",
-      "public": "08a865da4d5112218d05fb5488399aab7795efe99e5f1d8b1d342d6668c97c30",
+      "material": "36f892850c89426070bf87178286536916abcc233b819335d6100fb0e4bc9ab0",
+      "private": "08b737af981fc3777cfb55820f16b089a827dc0a7718d411b3e53f90ef87bb76",
+      "public": "6e30bf8c4f1f2aa2c51ac8b274dd9881ed95f4d42a60296681e8ca8b995cc92d",
       "cost": 3.25,
-      "value": 3.7265625,
+      "value": 3.2578125,
       "valid": true
     },
     {
       "material": "",
-      "private": "68ba11027da268d0e352cc195f3808eb47542579057fa013656cfc9efb189442",
-      "public": "d63d5b1830d8ea5a1c55ae7cdb66e83ca68a3ab9863d907ccba2c25c2acfa24e",
+      "private": "68b86fa30248a19c90f0bcd7c98f1272d3fbe45b4a870de20df8325eadc9c378",
+      "public": "115cd1098cc0f07b6f0de575507e80ab3bcc4329eb31020093378f715b640b60",
       "cost": 3.25,
-      "value": 6.52734375,
+      "value": 3.41796875,
       "valid": true
     },
     {
-      "material": "9e5f3a2fb10be3729b388fb378c964f8",
-      "private": "48950b61b0cfeda10dd2e2fa44269409bcb5fdc5ae909322559b7fc1a01e7a62",
-      "public": "676bdc5f67ab952d4c12167dc227339f583e6fa2964a48d9fc6b026d9923e737",
+      "material": "1a4e419614e37a57447dae65870969a4",
+      "private": "b83eadd8fd455f5ef11dcc390a35cb9867e0fe4eb9b825e4a59b852b4e680175",
+      "public": "bd71d4b087dcb90831f4e0b5418afad1feea75b228632c39ca8d408727444739",
       "cost": 8,
-      "value": 8.265625,
+      "value": 8.625,
       "valid": true
     }
   ],

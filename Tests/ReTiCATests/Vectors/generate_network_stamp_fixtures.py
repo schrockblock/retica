@@ -23,7 +23,7 @@ COSTS = [0, 3.25, 8, 8.5, 12.5, 15.8, 23.5, 25, 100]
 # Swift tests cover them by hand against cost_to_fp's documented clamp (max(0, min(v, cap))).
 EDGE_COSTS = [-1, -1e30, 0.001953125, 0.0019531249, 0.001953126, 3.255859375, 99.998046875, 100.5, 1e30]
 # Costs we can afford to search for in Python on one core.
-GENERATED_COSTS = [0, 3.25, 8, 8.5, 12.5, 15.8]
+GENERATED_COSTS = [0, 3.25, 8, 8.5, 12.5, 15.8, 23.5, 25]
 
 
 def target_hex(fp):
@@ -88,8 +88,10 @@ for cost in (8, 12.5, 15.8):
     assert case["valid"] is False
     low_value_cases.append(case)
 
-# Stamps whose hash lands as close as we can find to a TAB boundary, on each side of it. A mantissa
-# one step either side of a TAB entry is where bisect_right and a naive floor disagree.
+# Stamps whose hash lands as close as we can find to a TAB boundary, on each side of it. With 600000
+# random tries the closest mantissa is still tens of units from a TAB entry, not one step, so these
+# are near-boundary samples. The exact-boundary behaviour (mantissa equal to an entry, and one less)
+# is pinned by NetworkStampBoundaryTests, which needs no fixture.
 material = os.urandom(32)
 closest = {"at_or_above_entry": (1 << 64, None), "just_below_entry": (1 << 64, None)}
 closest_extra = {"at_or_above_entry": (1 << 64, None), "just_below_entry": (1 << 64, None)}
