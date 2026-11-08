@@ -53,7 +53,8 @@ private let radio = UUID(uuidString: "0000AAAA-0000-0000-0000-00000000BEEF")!
     }
 
     /// Every host-settable field survives except the radio-derived name, bitrate and hardware MTU,
-    /// so a field added to `InterfaceProfile` later and forgotten by the driver fails this.
+    /// so a driver that drops a current field fails this. (A field added later passes until the
+    /// host profile here sets it to a non-default value.)
     @Test func registeredProfileKeepsEveryHostFieldExceptTheRadioDerivedOnes() {
         let profile = InterfaceProfile(name: "host", bitrate: 999, mode: .roaming, hwMTU: 1,
                                        announceCap: 0.5, ifac: MeshtasticEndpoint.ifac(networkName: "mesh", passphrase: "pw"),

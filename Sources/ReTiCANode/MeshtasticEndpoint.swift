@@ -40,8 +40,8 @@ public struct MeshtasticEndpoint {
     @ObservableState
     public struct State: Equatable {
         public var interface: MeshtasticInterface.State
-        /// Supplies ONLY the IFAC, the mode and the per-interface stamp costs. The bitrate is the
-        /// radio's, known at `.connected`.
+        /// Supplies every field of the registered profile except the name, bitrate and hardware MTU,
+        /// which are the radio's (the bitrate is known at `.connected`).
         public let profile: InterfaceProfile
 
         public var interfaceID: InterfaceID { meshtasticInterfaceID(radio: interface.config.radio) }

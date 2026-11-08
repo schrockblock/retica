@@ -43,7 +43,8 @@ public struct RNodeEndpoint {
     @ObservableState
     public struct State: Equatable {
         public var interface: RNodeInterface.State
-        /// Supplies ONLY the IFAC and the mode. The bitrate is the radio's, known when it reports.
+        /// Supplies every field of the registered profile except the name, bitrate and hardware MTU,
+        /// which are the radio's (the bitrate is known when it reports).
         public let profile: InterfaceProfile
 
         public var interfaceID: InterfaceID { rnodeInterfaceID(radio: interface.config.radio) }

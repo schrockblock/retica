@@ -41,7 +41,8 @@ public struct MeshCoreEndpoint {
     @ObservableState
     public struct State: Equatable {
         public var interface: MeshCoreInterface.State
-        /// Supplies ONLY the IFAC and the mode. The bitrate is the radio's, known at `.online`.
+        /// Supplies every field of the registered profile except the name, bitrate and hardware MTU,
+        /// which are the radio's (the bitrate is known at `.online`).
         public let profile: InterfaceProfile
 
         public var interfaceID: InterfaceID { meshCoreInterfaceID(radio: interface.config.radio) }
