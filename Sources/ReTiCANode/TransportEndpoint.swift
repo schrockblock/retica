@@ -41,6 +41,11 @@ public struct TransportEndpoint {
         /// (`meshtastic:<UUID>`) and the TCP-client lifecycle — registered when the radio comes
         /// online, deregistered when it drops. A broadcast medium has no per-peer interfaces.
         public var meshtastic: MeshtasticEndpoint.State?
+        /// The MeshCore radio slot: at most one radio, with ONE `InterfaceID` (`meshcore:<UUID>`)
+        /// and the same TCP-client lifecycle as the Meshtastic slot. Its interface state also
+        /// holds the §5.5 limiter, which only this reducer mutates (in `transmit` and on inbound
+        /// packets); it survives drops and stop/start and dies with the slot.
+        public var meshCore: MeshCoreEndpoint.State?
 
         /// Learned-destination table of the shared router (identity / appData / path).
         public var learned: [Data: LearnedDestination] { transport.learned }
@@ -79,13 +84,15 @@ public struct TransportEndpoint {
                     tcpClients: IdentifiedArrayOf<TCPEndpoint.State> = [],
                     tcpServer: TCPServerEndpoint.State? = nil,
                     ble: BLEEndpoint.State? = nil,
-                    meshtastic: MeshtasticEndpoint.State? = nil) {
+                    meshtastic: MeshtasticEndpoint.State? = nil,
+                    meshCore: MeshCoreEndpoint.State? = nil) {
             self.transport = transport
             self.linkPlane = linkPlane
             self.tcpClients = tcpClients
             self.tcpServer = tcpServer
             self.ble = ble
             self.meshtastic = meshtastic
+            self.meshCore = meshCore
         }
 
         /// Convenience factory: an endpoint running over a single TCP-client driver.
@@ -107,6 +114,11 @@ public struct TransportEndpoint {
         public static func meshtastic(_ driver: MeshtasticEndpoint.State) -> State {
             State(meshtastic: driver)
         }
+
+        /// Convenience factory: an endpoint running over one MeshCore radio.
+        public static func meshCore(_ driver: MeshCoreEndpoint.State) -> State {
+            State(meshCore: driver)
+        }
     }
 
     public enum Action: Equatable {
@@ -119,6 +131,7 @@ public struct TransportEndpoint {
         case tcpServer(TCPServerEndpoint.Action)
         case ble(BLEEndpoint.Action)
         case meshtastic(MeshtasticEndpoint.Action)
+        case meshCore(MeshCoreEndpoint.Action)
         case transport(Transport.Action)
         case linkPlane(LinkPlane.Action)
         case link(IdentifiedActionOf<LinkSession>)
@@ -195,6 +208,8 @@ public struct TransportEndpoint {
     }
 
     @Dependency(\.tcpConnectionPool) var connectionPool
+    /// "Now" for the MeshCore limiter, read once per packet.
+    @Dependency(\.meshCoreDate) var meshCoreDate
 
     public init() {}
 
@@ -208,7 +223,8 @@ public struct TransportEndpoint {
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .connect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.start)) : .none,
                                  state.ble != nil ? .send(.ble(.start)) : .none,
-                                 state.meshtastic != nil ? .send(.meshtastic(.start)) : .none])
+                                 state.meshtastic != nil ? .send(.meshtastic(.start)) : .none,
+                                 state.meshCore != nil ? .send(.meshCore(.start)) : .none])
             case .stop:
                 // Link-request key searches are CPU work, not I/O, so no driver stopping ends them:
                 // cancel them here, not when each interface reports its disconnect, because a
@@ -221,6 +237,7 @@ public struct TransportEndpoint {
                               + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
                                  state.ble != nil ? .send(.ble(.stop)) : .none,
                                  state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none,
+                                 state.meshCore != nil ? .send(.meshCore(.stop)) : .none,
                                  state.linkPlane.stampingLinks.isEmpty ? .none : .send(.linkPlane(.cancelStampSearches)),
                                  state.transport.stampingPathRequests.isEmpty ? .none
                                      : .send(.transport(.cancelPathRequestStamps)),
@@ -416,6 +433,55 @@ public struct TransportEndpoint {
             case let .meshtastic(.interface(.delegate(.adapterUnavailable(cause)))):
                 return .send(.meshtastic(.delegate(.adapterUnavailable(cause))))
 
+            // --- MeshCore radio lifecycle → shared router interface set (+ maintenance) ---
+            // The Meshtastic shape: ONE InterfaceID per radio, registered at `.online` with the
+            // profile the radio's LoRa params give, deregistered at `.offline`. A repeated
+            // `.online` re-registers with the new params; maintenance is not re-armed.
+            case let .meshCore(.interface(.delegate(.online(_, publicKey, params)))):
+                guard let core = state.meshCore else { return .none }
+                let id = core.interfaceID
+                let startEffects = maintenanceStartEffect(state)
+                return .merge([.send(.transport(.interfaceConnected(id, core.registeredProfile(params: params))))]
+                              + startEffects
+                              + [.send(.meshCore(.delegate(.radioOnline(publicKey: publicKey, params: params))))])
+
+            case let .meshCore(.interface(.delegate(.offline(reason)))):
+                guard let core = state.meshCore else { return .none }
+                let id = core.interfaceID
+                var effects: [Effect<Action>] = []
+                if state.transport.interfaces[id] != nil {
+                    effects.append(.send(.transport(.interfaceDisconnected(id))))
+                    effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
+                    effects.append(contentsOf: maintenanceStopEffect(state, departing: id))
+                }
+                effects.append(.send(.meshCore(.delegate(.radioOffline(reason: reason)))))
+                return .merge(effects)
+
+            case let .meshCore(.interface(.delegate(.packetReceived(packet)))):
+                guard let core = state.meshCore else { return .none }
+                let id = core.interfaceID
+                // The limiter's inbound half (Review Focus 3): note a heard path request only once
+                // it passes the IFAC gate, or a stranger without the key could open the 15 s
+                // bypass. Transport's own gate runs later, so this duplicates it. KEEP IN STEP
+                // WITH `Transport.swift:558-565` (the `.received` arm): an IFAC interface must
+                // unprotect; a plain one rejects bit 7 of byte 0.
+                let plain: Data?
+                if let ifac = state.transport.interfaces[id]?.ifac {
+                    plain = ifac.unprotect(packet)
+                } else {
+                    plain = (packet.first.map { $0 & 0x80 == 0 } ?? false) ? packet : nil
+                }
+                // Synchronously, so the note precedes any path response Transport sends back.
+                if let plain {
+                    state.meshCore?.interface.limiter.noteHeard(unmasked: plain, now: meshCoreDate())
+                }
+                // The ORIGINAL bytes: Transport applies its own IFAC gate (and C4 replays them).
+                return .send(.transport(.received(id, packet)))
+
+            // Like Meshtastic's, adapter unavailability is MeshCore-hatch-only.
+            case let .meshCore(.interface(.delegate(.adapterUnavailable(cause)))):
+                return .send(.meshCore(.delegate(.adapterUnavailable(cause))))
+
             // --- shared router delegates → interface / unified delegate ---
             case let .transport(.delegate(.transmit(txID, raw))):
                 // C5 IFAC outbound masking, on the interface's OWN profile. `transport.interfaces`
@@ -424,7 +490,7 @@ public struct TransportEndpoint {
                 // Masking centrally (not in Transport) keeps it off every emission point and off
                 // the inbound C4 replay path.
                 let masked = state.transport.interfaces[txID]?.ifac?.protect(raw) ?? raw
-                return transmit(state, to: txID, masked: masked, unmasked: raw)
+                return transmit(&state, to: txID, masked: masked, unmasked: raw)
             case let .transport(.delegate(.received(h, p, packetHash, interfaceID))):
                 return .send(.delegate(.messageReceived(destinationHash: h, plaintext: p,
                                                         packetHash: packetHash, interfaceID: interfaceID)))
@@ -455,7 +521,7 @@ public struct TransportEndpoint {
             case let .linkPlane(.delegate(.transmit(txID, raw))):
                 // C5 IFAC outbound masking (same rationale as transport transmit above).
                 let masked = state.transport.interfaces[txID]?.ifac?.protect(raw) ?? raw
-                return transmit(state, to: txID, masked: masked, unmasked: raw)
+                return transmit(&state, to: txID, masked: masked, unmasked: raw)
 
             case let .linkPlane(.delegate(.linkEstablished(linkID, destHash))):
                 // An inbound link exists only to serve a registered local destination. One that
@@ -501,7 +567,7 @@ public struct TransportEndpoint {
 
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).
-            case .tcpClients, .tcpServer, .ble, .meshtastic, .transport, .linkPlane, .link, .delegate,
+            case .tcpClients, .tcpServer, .ble, .meshtastic, .meshCore, .transport, .linkPlane, .link, .delegate,
                  .sendOverLink, .sendResourceOverLink, .cancelResource, .identifyOverLink, .sendRequestOverLink,
                  .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
                  .closeLink, .registerRequestHandler, .deregisterRequestHandler:
@@ -512,6 +578,7 @@ public struct TransportEndpoint {
         .ifLet(\.tcpServer, action: \.tcpServer) { TCPServerEndpoint() }
         .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
         .ifLet(\.meshtastic, action: \.meshtastic) { MeshtasticEndpoint() }
+        .ifLet(\.meshCore, action: \.meshCore) { MeshCoreEndpoint() }
     }
 
     /// The ONE maintenance loop (path-expiry / link-table / discovery-request GC) is shared by the
@@ -549,7 +616,10 @@ public struct TransportEndpoint {
     /// `peerInterfaces` map. If the id maps to no live driver interface, the send is not
     /// deliverable: for BLE, surface `.sendFailed` (a stale binding otherwise dies silently on the
     /// ~60s inactivity watchdog); for TCP the id mismatch cannot occur for a live socket, so drop.
-    private func transmit(_ state: State, to txID: InterfaceID,
+    ///
+    /// `inout` for the MeshCore radio: its §5.5 limiter state lives in the slot and must keep
+    /// what `admit` records.
+    private func transmit(_ state: inout State, to txID: InterfaceID,
                           masked: Data, unmasked: Data) -> Effect<Action> {
         if state.tcpClients[id: txID] != nil {
             return .send(.tcpClients(.element(id: txID, action: .interface(.send(masked)))))
@@ -566,10 +636,20 @@ public struct TransportEndpoint {
         if meshOwnsID, state.meshtastic?.interface.isOnline == true {
             return .send(.meshtastic(.interface(.send(masked))))
         }
+        // The MeshCore radio's ONE id, while online. The limiter runs only here, for a packet that
+        // would really go out, and classifies the UNMASKED bytes: IFAC masking scrambles the
+        // header (the ScotMesh bug the spec warns about). A limited packet drops silently; it is
+        // policy, not a delivery failure.
+        let coreOwnsID = state.meshCore?.interfaceID == txID
+        if coreOwnsID, state.meshCore?.interface.isOnline == true {
+            guard state.meshCore?.interface.limiter.admit(unmasked: unmasked, now: meshCoreDate()) == true
+            else { return .none }
+            return .send(.meshCore(.interface(.send(masked))))
+        }
         // Not deliverable. `Packet(raw:)` recovers the destination hash; for established link
         // traffic that value IS the link ID, so the failure correlates. An unparseable packet
         // drops silently (no destination to report).
-        guard state.ble != nil || meshOwnsID, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
+        guard state.ble != nil || meshOwnsID || coreOwnsID, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
         return .send(.delegate(.sendFailed(destinationHash: destHash, reason: .interfaceUnavailable)))
     }
 }
