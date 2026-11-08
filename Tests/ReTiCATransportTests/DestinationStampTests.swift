@@ -440,6 +440,72 @@ private struct Fixtures: Decodable {
         await store.finish()
     }
 
+    /// Past eight a destination's announces are dropped, newest first, as the full queue drops
+    /// (reference WorkerQueues.put raises Full). Without the quota 40 interfaces would fill all 32 slots.
+    @Test func oneDestinationOnManyInterfacesHoldsAtMostEightSlots() async throws {
+        let busy = newDestination("busy")
+        let quiet = newDestination("quiet")
+        let store = makeStore(stamping(value: 100), generator: neverFinds)
+        let ids = (0..<40).map { InterfaceID("many\($0)") }
+        for id in ids { await store.send(.interfaceConnected(id)) }
+        await store.send(.registerLocalDestination(busy))
+        await store.send(.registerLocalDestination(quiet))
+        for id in ids { await store.send(.announce(destinationHash: busy.hash, appData: nil, interface: id)) }
+        let queued = store.state.pendingStampedAnnounces.filter { $0.destinationHash == busy.hash }
+        #expect(queued.count == Transport.stampedQueuePerDestinationLimit)
+        #expect(Transport.stampedQueuePerDestinationLimit == 8)
+        let kept = queued.compactMap { item -> InterfaceID? in
+            if case let .announce(_, interface) = item.kind { return interface }
+            return nil
+        }
+        #expect(kept == Array(ids.prefix(8)), "the oldest eight stay, the newer ones are dropped")
+
+        await store.send(.announce(destinationHash: quiet.hash, appData: nil))
+        #expect(store.state.pendingStampedAnnounces.filter { $0.destinationHash == quiet.hash }.count == 1)
+
+        // A replacement of a queued announce needs no new slot, so it still lands at the quota.
+        await store.send(.announce(destinationHash: busy.hash, appData: Data([0xEE]), interface: ids[0]))
+        let replaced = store.state.pendingStampedAnnounces.first {
+            if case let .announce(_, interface) = $0.kind { return $0.destinationHash == busy.hash && interface == ids[0] }
+            return false
+        }
+        #expect(replaced?.kind == .announce(appData: Data([0xEE]), interface: ids[0]))
+
+        // Path responses are held to the same quota, apart from the announces.
+        for tag in 1...12 { await store.send(.received(ids[0], pathRequest(for: busy.hash, tag: UInt8(tag)))) }
+        #expect(store.state.pendingStampedAnnounces.filter { $0.destinationHash == busy.hash && $0.isPathResponse }.count
+                == Transport.stampedQueuePerDestinationLimit)
+        await store.send(.cancelDestinationStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// Re-registering a destination (new app data, new composition) drops what waited for its stamp
+    /// under the old registration, as deregistering does; only what follows is ever announced.
+    @Test func reRegisteringDuringASearchDropsTheOldQueuedAnnounces() async throws {
+        let dest = newDestination()
+        let recorder = Recorder()
+        let store = makeStore(stamping(value: 100), recorder: recorder, generator: neverFinds)
+        await store.send(.interfaceConnected(i0))
+        await store.send(.registerLocalDestination(dest))
+        await store.send(.announce(destinationHash: dest.hash, appData: Data([0x01])))
+        await store.send(.received(i0, pathRequest(for: dest.hash, tag: 1)))
+        #expect(store.state.pendingStampedAnnounces.count == 2)
+
+        await store.send(.registerLocalDestination(dest))
+        #expect(store.state.pendingStampedAnnounces.isEmpty)
+        await store.send(.announce(destinationHash: dest.hash, appData: Data([0x02])))
+
+        let stamp = Data(repeating: 7, count: 14)
+        await store.send(.destinationStampSearchEnded(destinationHash: dest.hash, stamp: stamp, value: 100))
+        let sent = recorder.announces
+        #expect(sent.count == 1)
+        #expect(sent.map { Data($0.1.payload.dropFirst(148).dropLast(18)) } == [Data([0x02])])
+        await store.skipReceivedActions(strict: false)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
     @Test func aPathRequestDuringTheSearchIsAnsweredWhenTheStampIsReady() async throws {
         let dest = newDestination()
         let recorder = Recorder()
@@ -526,13 +592,14 @@ private struct Fixtures: Decodable {
         let store = makeStore(stamping(value: 100), generator: neverFinds)
         await store.send(.interfaceConnected(i0))
         await store.send(.registerLocalDestination(dest))
-        // Forty destinations, one announce each: forty distinct keys against a cap of 32.
+        // Forty destinations, one announce and one path request each: forty distinct keys against a
+        // cap of 32 (a single destination is held to its own quota, see the next test).
         for n in 0..<40 {
             let other = newDestination("other\(n)")
             await store.send(.registerLocalDestination(other))
             await store.send(.announce(destinationHash: other.hash, appData: nil))
+            await store.send(.received(i0, pathRequest(for: other.hash, tag: UInt8(n + 1))))
         }
-        for tag in 1...40 { await store.send(.received(i0, pathRequest(for: dest.hash, tag: UInt8(tag)))) }
         let pending = store.state.pendingStampedAnnounces
         #expect(pending.filter { !$0.isPathResponse }.count == Transport.stampedAnnounceQueueLimit)
         #expect(pending.filter { $0.isPathResponse }.count == Transport.stampedPathResponseQueueLimit)

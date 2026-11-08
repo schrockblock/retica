@@ -131,7 +131,7 @@ public struct Transport {
         /// phone) and reported with
         /// `.delegate(.destinationStampGenerated)` so the host can persist it and hand it back with
         /// `.rehydrateDestinationStamp` (reference persists it, Stamps.py:888-930). A host sets this at
-        /// construction, on `TransportEndpoint.State.transport`.
+        /// construction, on `TransportEndpoint.State.transport`; there is no action to change it.
         public var stampDestinations = false
         /// The value our announce stamps are mined to (RNS `Transport.DESTINATION_VALUE`). Read through
         /// `Transport.clampedDestinationValue`, which clamps it to 0...`NetworkStamp.stampCostCap` as
@@ -690,7 +690,15 @@ public struct Transport {
                 }
                 let limit = item.isPathResponse ? Transport.stampedPathResponseQueueLimit
                                                 : Transport.stampedAnnounceQueueLimit
-                if state.pendingStampedAnnounces.filter({ $0.isPathResponse == item.isPathResponse }).count < limit {
+                // A destination may hold at most `stampedQueuePerDestinationLimit` of a class's slots
+                // (reference has no such quota), so one destination announcing on many interfaces cannot
+                // fill the queue. Past it the NEWEST is dropped, as reference drops the newest when the
+                // queue is full (WorkerQueues.put raises Full, Transport.py:117); a replacement above
+                // does not grow the queue and so never reaches this.
+                let sameClass = state.pendingStampedAnnounces.filter { $0.isPathResponse == item.isPathResponse }
+                if sameClass.count < limit,
+                   sameClass.filter({ $0.destinationHash == item.destinationHash }).count
+                       < Transport.stampedQueuePerDestinationLimit {
                     state.pendingStampedAnnounces.append(item)
                 }
                 return startDestinationStampSearch(dest, identity, &state)
@@ -769,6 +777,11 @@ public struct Transport {
                 // than by line: the previous revision's `LXMFNode.swift:91` had already rotted to
                 // :201 within one slice.)
                 state.localAppData[destination.hash] = nil
+                // Announces and path responses still waiting for this destination's stamp were queued
+                // for the previous registration (its app data, its interfaces); drop them as
+                // deregistration does, so only what is announced after this registration goes out.
+                // The search itself keeps running: its stamp is the destination's, not the app data's.
+                state.pendingStampedAnnounces.removeAll { $0.destinationHash == destination.hash }
                 state.localDestinations[destination.hash] = destination
                 return .none
 
@@ -1966,6 +1979,9 @@ public struct Transport {
     public static let stampedAnnounceQueueLimit = 32
     /// RNS STAMPER_PR_QUEUE_LENGTH (Transport.py:209): path responses that may wait for a stamp.
     public static let stampedPathResponseQueueLimit = 32
+    /// Most announces (and, separately, path responses) one destination may have queued for its stamp.
+    /// ReTiCA's own bound inside the two limits above.
+    public static let stampedQueuePerDestinationLimit = 8
 
     /// `destinationValue` as reference's config parser clamps `destination_value`
     /// (Reticulum.py:529-531): 0...`NetworkStamp.stampCostCap`. NaN reads as 0, as Python's
