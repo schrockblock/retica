@@ -1,5 +1,10 @@
 # Deferred follow-ups from the network-stamps work (2026-11-07)
 
+**Status 2026-11-09:** worked by `docs/superpowers/plans/2026-11-08-stamp-followups.md` (commits
+9dcdbd5..09a224b on main). #7 was already fixed, #22 is not a defect, #23 needs no change, and the link-key
+search concurrency cap from #13 moved to the stamp-priority work. The rest are done, plus a cost cap of 100
+and a TCP-server stop fix found on the way. Minors the task reviews deferred are listed at the end.
+
 Recorded by the task and final reviews of `docs/superpowers/plans/2026-11-07-network-stamps.md`
 (commits ef77762..46ef2ff) and deferred as minor. The ledger that held them was scratch and is gone;
 this is the surviving copy. Each still needs checking against current code before it is worked.
@@ -48,3 +53,28 @@ this is the surviving copy. Each still needs checking against current code befor
 27. The link-request enforcement test reads its recorder without `skipReceivedActions`.
 28. `LinkPlane.acceptLinkRequest`'s doc should say it is not enforced when called directly.
 29. No invalid-announce verdict cache: identical replays cost more than in reference.
+
+## Deferred by the 2026-11-08 plan's reviews (all minor)
+
+- NetworkStamp: the bisect_right test pins `tabClimb`, not `value` end to end; a comment says "default
+  announce cost" for the destination cost; "none of these hashes EQUALS the target" is unasserted.
+- Per-interface costs: propagation is tested for the radio drivers; TCP client, TCP server and BLE only by
+  reading. A path-request gate comment in Transport.swift is one overlong line.
+- LinkPlane driver stop tests: after the 3600 s clock advance, `links.isEmpty` is not rechecked and no
+  assertion that nothing was transmitted; the wiring test could assert the found key is the transmitted key.
+  `hasLinkWork`'s doc is one overlong line. `abandonStampSearches` relies on LXMFNode being the only link
+  opener (true today, unenforced).
+- Path requests: a request made with no interface connected is dropped, not started when one connects
+  (reference queues it; the router re-requests anyway) — say so in a comment. The race test injects the old
+  search end by hand, so the `Task.isCancelled` guard is untested. TransportTests.swift ~:2662's sender-ID
+  check is vacuous (its stub returns the same bytes for every draw). The `megaYield` timing fixes are a
+  heuristic.
+- `pnCopyAbandonWhileTheDeliveryStampIsSearchedDoesNotFailTheMessage` assumes a cost-20 search never
+  finishes during the test; it occasionally does, and the test flakes.
+- Destination-stamp queue: a newest-dropped item still starts a stamp search; the path-response quota test
+  uses one interface; an in-place replacement keeps its queue position (reference moves it to the back).
+- Verdict cache: the enforcement guard on the valid-hit path is untested (matters only if `enforceStamps`
+  changes at runtime); `announceVerdicts` is in State equality, so exhaustive tests that send announces must
+  account for it.
+- TCP server: no test of a stop racing a connection mid-accept. Host-set `name` and `hwMTU` are ignored by
+  the radio drivers (by design today).
