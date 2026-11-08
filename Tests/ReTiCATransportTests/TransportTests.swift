@@ -2634,7 +2634,8 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     return try! packet.packed()
 }
 
-/// requestPath broadcasts a DATA PATH_REQUEST to the control dest with destHash ‖ tag payload.
+/// requestPath broadcasts a DATA PATH_REQUEST to the control dest with a 48-byte
+/// destHash ‖ senderID ‖ tag payload (RNS 1.6.0).
 @Test @MainActor func requestPathBuildsBroadcastPathRequest() async {
     let destHash = Data(repeating: 0x22, count: 16)
     let tag = Data(repeating: 0xAB, count: 16)

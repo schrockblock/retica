@@ -276,7 +276,7 @@ stamps. Save these and replay them at launch:
 | Transient ids downloaded from a propagation node | `.router(.messagesDownloaded(transientIds:))` actions, or `state.router.downloadedTransientIds` | the same action |
 | Peers' display names and stamp costs | `state.learnedPeers` | `.rehydrateLearnedPeers(_:)` |
 | Blocked senders | `state.ignoredDestinations` | `.rehydrateIgnoredDestinations(_:)` |
-| Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))` |
+| Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))`; in an `LXMFServiceNode` host (ReTiCaMsgr), `.node(.client(.endpoint(.delegate(.destinationStampGenerated(...)))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.rehydrateDestinationStamp(...))))` |
 | A propagation node's stored messages (only if you run one) | the stored entries | `.pn(.ingestContainer(LXMFPropagation.container(timestamp:entries:)))` on `LXMFServiceNode` |
 
 Ordering matters for `seenHashes`: it is a ring of 10,000, so supplying newest-first keeps the
@@ -513,7 +513,15 @@ These are choices, explained at the relevant place in the source:
   announce asked it to.
 - **A first message to a peer with no known path waits for its announce**, up to 21 seconds, so
   it can carry the stamp that peer requires. Reference reads the cost once at send time, so its
-  first message goes out unstamped.
+  first message goes out unstamped. If the announce comes later than that, the message has been
+  handed on unstamped but has not gone out (there was no path), so ReTiCA takes it back, stamps it
+  and sends it then.
+
+  **What still loses a message:** one already transmitted before the cost was known. An
+  enforcing peer proves it and drops it, and ReTiCA reports it delivered. That happens when we
+  hold a path to the peer but no cost for it (a path table restored without its `learnedPeers`
+  row), when the peer raised its cost after we sent, and for a propagated copy packed before the
+  cost was known. Nothing on the wire can be recalled.
 - **One Resource per link**, the rest queued.
 - **An oversized propagated copy is refused up front** instead of being sent and rejected by the node.
 - **Outbound retries can be held** while the app is suspended (no reference equivalent).
@@ -619,7 +627,8 @@ Both are skipped unless an environment variable is set.
 - **Messages surviving a peer that enforces stamps**
   (`Tests/ReTiCANodeTests/LiveStampInteropTests.swift`, peer `Scripts/stampprobe/peer.py`, RNS 1.6.0
   and LXMF 1.3.0, peer configured as MeshChatX configures its router). Covers stamped announces, a
-  first message before any announce, a large message over a link, a message from the peer, and a
+  first message before any announce, a first message to a peer that comes online 30 s later (after
+  the wait), a large message over a link, a message from the peer, and a
   propagated message through a real node to a recipient that syncs. For RNS network stamps, peers
   that enforce them (`--enforce-network`) accept ReTiCA's stamped link requests, path requests and
   announces and drop its unstamped ones, and a ReTiCA node with `enforceStamps` on learns a

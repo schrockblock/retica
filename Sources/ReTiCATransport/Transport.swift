@@ -125,7 +125,8 @@ public struct Transport {
         /// Off by default, as in 1.6.0, and then announce bytes are exactly as before. When on, every
         /// announce and local path response carries the 18-byte extension (`Transport.destinationStampExtension`)
         /// with a stamp of `destinationValue` over `destinationHash + publicKey + nameHash`. The stamp is
-        /// mined once per destination (minutes on a phone at the default value) and reported with
+        /// mined once per destination (about 45 s at the default value on a Mac; unmeasured on a
+        /// phone) and reported with
         /// `.delegate(.destinationStampGenerated)` so the host can persist it and hand it back with
         /// `.rehydrateDestinationStamp` (reference persists it, Stamps.py:888-930). A host sets this at
         /// construction, on `TransportEndpoint.State.transport`.
@@ -503,8 +504,9 @@ public struct Transport {
             /// A valid proof arrived for a packet sent with `receiptToken`; the receipt is gone.
             case singlePacketDelivered(token: Data)
             /// A stamp was mined for a local destination. Persist it and hand it back with
-            /// `.rehydrateDestinationStamp` after a relaunch: at the default value it takes minutes on
-            /// a phone (reference `store_destination_stamp`, Stamps.py:888-905).
+            /// `.rehydrateDestinationStamp` after a relaunch: at the default value it takes about 45 s on
+            /// a Mac, and has not been measured on a phone (reference `store_destination_stamp`,
+            /// Stamps.py:888-905).
             case destinationStampGenerated(destinationHash: Data, stamp: Data, value: Double)
         }
     }
@@ -621,7 +623,8 @@ public struct Transport {
             }
 
             // One search per destination, no timeout (reference sets none for destination stamps; at
-            // the default value it takes minutes on a phone). Bounded by cancellation: the endpoint's
+            // the default value it takes about 45 s on a Mac, unmeasured on a phone). Bounded by
+            // cancellation: the endpoint's
             // stop, `.cancelDestinationStamps`, deregistration, or a rehydrated stamp.
             func startDestinationStampSearch(_ dest: Destination, _ identity: Identity,
                                              _ state: inout State) -> Effect<Action> {
@@ -645,7 +648,8 @@ public struct Transport {
             // Announces are KEYED by (destination, target interface): a newer one replaces the queued
             // one in place, keeping the newest app data. Reference keys by destination alone
             // (Transport.py:1456); the target is added so a per-interface re-announce (Contract 4) is
-            // not swallowed by a broadcast one. A search takes minutes on a phone, so without the key
+            // not swallowed by a broadcast one. A search takes about 45 s on a Mac at the default value
+            // (unmeasured on a phone), so without the key
             // repeated announces of one destination filled every slot, crowding out other local
             // destinations, and then burst onto the air together. A queued announce for an interface
             // that is not connected would send nothing, so it is not queued. Path responses are not
