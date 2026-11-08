@@ -226,6 +226,93 @@ where Wrapped.State == TransportEndpoint.State, Wrapped.Action == TransportEndpo
         -> Effect<TransportEndpoint.Action> {
         if case .transport(.startMaintenance) = action { log.withValue { $0.append("start") } }
         if case .transport(.stopMaintenance) = action { log.withValue { $0.append("stop") } }
+        if case let .transport(.interfaceDisconnected(id)) = action { log.withValue { $0.append("disc:" + id.rawValue) } }
         return wrapped.reduce(into: &state, action: action)
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (d) Stopping a TCP-server endpoint closes its accepted connections: stopping the listener cancels
+// its event effect, so no `.closed` reaches the reducer, and the endpoint must report each accepted
+// connection disconnected itself — else the interfaces stay registered and the shared loop never stops.
+// ═════════════════════════════════════════════════════════════════════════════
+
+@MainActor
+private func makeServerOnly(log: LockIsolated<[String]>)
+    -> (TestStore<TransportEndpoint.State, TransportEndpoint.Action>,
+        AsyncStream<TCPListenerEvent>.Continuation, LockIsolated<Date>, TestClock<Duration>) {
+    let serverEvents = AsyncStream<TCPListenerEvent>.makeStream()
+    let now = LockIsolated(Date(timeIntervalSince1970: 0))
+    let clock = TestClock<Duration>()
+    let store = TestStore(initialState: TransportEndpoint.State.tcpServer(
+        TCPServerEndpoint.State(port: 5252, profile: .tcp))) {
+        MaintenanceRecorder(log: log) { TransportEndpoint() }
+    } withDependencies: {
+        $0.tcpListener = TCPListener(listen: { _ in serverEvents.stream },
+                                     send: { _, _ in }, close: { _ in }, stop: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+        $0.transportDate = DateGenerator { now.value }
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    return (store, serverEvents.continuation, now, clock)
+}
+
+@Test @MainActor func stoppingAServerDisconnectsEveryAcceptedConnectionAndStopsMaintenance() async throws {
+    let log = LockIsolated<[String]>([])
+    let (store, serverEvents, now, clock) = makeServerOnly(log: log)
+    let (a, b) = (TCPConnID(1), TCPConnID(2))
+
+    await store.send(.start)
+    serverEvents.yield(.started)
+    serverEvents.yield(.accepted(a))
+    serverEvents.yield(.accepted(b))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.interfaces.count == 2)
+
+    let remote = Identity()
+    let (announceRaw, destHash) = makeAnnouncePacket(identity: remote, appName: "app",
+                                                     aspects: ["svc"], hops: 3, emitted: 1000)
+    serverEvents.yield(.data(a, HDLC.frame(announceRaw)))
+    await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+
+    await store.send(.stop)
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.interfaces.isEmpty, "both accepted connections must leave the router")
+    #expect(store.state.tcpServer?.connInterfaces.isEmpty == true)
+    let disconnected = log.value.filter { $0.hasPrefix("disc:") }
+    #expect(Set(disconnected) == ["disc:\(tcpServerInterfaceID(a).rawValue)", "disc:\(tcpServerInterfaceID(b).rawValue)"])
+    #expect(disconnected.count == 2, "each connection is reported exactly once")
+    #expect(log.value.filter { $0 == "stop" }.count == 1, "the shared loop stops once, at the last interface")
+
+    // The loop is really gone: aging past expiry and ticking sweeps nothing.
+    now.setValue(Date(timeIntervalSince1970: Transport.pathExpiry + 1))
+    await clock.advance(by: .seconds(Transport.maintenanceTickInterval))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.learned[destHash] != nil, "with the loop stopped no tick sweeps the path")
+}
+
+@Test @MainActor func aLateCloseAfterTheStopIsNotReportedASecondTime() async throws {
+    let log = LockIsolated<[String]>([])
+    let (store, serverEvents, _, _) = makeServerOnly(log: log)
+    let conn = TCPConnID(1)
+
+    await store.send(.start)
+    serverEvents.yield(.started)
+    serverEvents.yield(.accepted(conn))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.interfaces.count == 1)
+
+    await store.send(.stop)
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.interfaces.isEmpty)
+    #expect(log.value.filter { $0.hasPrefix("disc:") }.count == 1)
+
+    // A `.closed` that was already in flight when the stop landed.
+    await store.send(.tcpServer(.interface(.listenerEvent(.closed(conn, reason: nil)))))
+    await store.skipReceivedActions(strict: false)
+    #expect(log.value.filter { $0.hasPrefix("disc:") }.count == 1,
+            "a connection already reported disconnected must not be reported again")
+    #expect(log.value.filter { $0 == "stop" }.count == 1)
 }

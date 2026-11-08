@@ -377,8 +377,31 @@ public struct TransportEndpoint {
             case let .tcpServer(.interface(.delegate(.packetReceived(conn, data)))):
                 return .send(.transport(.received(tcpServerInterfaceID(conn), data)))
 
+            // A stop cancels the listener's event effect, so no `.closed` follows for the accepted
+            // connections: report each of them disconnected here, from the driver's own record of
+            // them (this arm runs before the driver's, so the map is still full). The live
+            // listener's `stop()` cancels the sockets themselves. Forgetting them also makes a
+            // `.closed` that races the stop a no-op (see the guard below).
+            case .tcpServer(.interface(.stop)):
+                guard let conns = state.tcpServer?.connInterfaces, !conns.isEmpty else { return .none }
+                state.tcpServer?.connInterfaces = [:]
+                let departing = Set(conns.keys)
+                var effects: [Effect<Action>] = []
+                for id in departing.sorted(by: { $0.rawValue < $1.rawValue }) {
+                    effects.append(.send(.transport(.interfaceDisconnected(id))))
+                    effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
+                }
+                // The node's last interfaces iff nothing outside the departing set is registered.
+                if Set(state.transport.interfaces.keys).isSubset(of: departing) {
+                    effects.append(.send(.transport(.stopMaintenance)))
+                }
+                return .merge(effects)
+
             case let .tcpServer(.interface(.delegate(.connectionClosed(conn)))):
                 let id = tcpServerInterfaceID(conn)
+                // Already reported (a stop got there first): a second disconnect would be a
+                // duplicate, and could stop the shared loop for interfaces that are still live.
+                guard state.tcpServer?.connInterfaces[id] != nil else { return .none }
                 state.tcpServer?.connInterfaces[id] = nil
                 return .merge([.send(.transport(.interfaceDisconnected(id))),
                                .send(.linkPlane(.interfaceDisconnected(id)))]

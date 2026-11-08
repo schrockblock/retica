@@ -341,7 +341,6 @@ private struct SearchCountingNode: Reducer {
 private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.Action>,
                                     searches: LockIsolated<Int>, ended: LockIsolated<Int>,
                                     interfaceID: InterfaceID,
-                                    interfaceGoesOffline: Bool = true,
                                     clock: TestClock<Duration>, endDriverEvents: () -> Void) async throws {
     let peer = try fixture("lxmf_delivery_cost_20")
     await store.send(.endpoint(.transport(.received(interfaceID, peer.raw(hops: 1)))))
@@ -357,10 +356,8 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
     #expect(searches.value == 1)
 
     await store.send(.endpoint(.stop))
-    if interfaceGoesOffline {
-        await store.receive({ if case .endpoint(.transport(.interfaceDisconnected(interfaceID))) = $0 { return true }; return false },
-                            timeout: .seconds(5))
-    }
+    await store.receive({ if case .endpoint(.transport(.interfaceDisconnected(interfaceID))) = $0 { return true }; return false },
+                        timeout: .seconds(5))
     await store.skipReceivedActions(strict: false)
     #expect(store.state.endpoint.linkPlane.stampingLinks.isEmpty, "no search may outlive the stop")
     #expect(searches.value == 1, "no search may start after the stop")
@@ -369,13 +366,6 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
     // owns it, so end it) and the router's timers on this TestClock (run them out). If running them
     // out starts a search, that is a search the stop failed to prevent.
     endDriverEvents()
-    if !interfaceGoesOffline {
-        // KNOWN GAP, not asserted as correct: a TCP-server stop never reports its accepted
-        // connections closed, so their interfaces stay in the router and the shared maintenance
-        // loop keeps sleeping on this clock. Close the connection by hand so `finish` can see the
-        // search is gone; without this line the loop is what `finish` times out on.
-        await store.send(.endpoint(.tcpServer(.interface(.delegate(.connectionClosed(TCPConnID(1)))))))
-    }
     await clock.advance(by: .seconds(3600))
     await store.skipReceivedActions(strict: false)
     #expect(searches.value == 1, "no search may start once the timers have run")
@@ -464,10 +454,8 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
             try await Task.sleep(for: .milliseconds(10))
         }
         let id = try #require(store.state.endpoint.transport.interfaces.keys.first)
-        // Stopping the listener cancels its event effect, so no `.closed` reaches the reducer and the
-        // accepted connection's interface is not reported disconnected. Only the search is asserted.
         try await stopWithASearchRunning(store, searches: searches, ended: ended, interfaceID: id,
-                                         interfaceGoesOffline: false, clock: clock) { events.continuation.finish() }
+                                         clock: clock) { events.continuation.finish() }
     }
 
     /// The radio reports offline only after `driver.stop()` returns, so its interface outlives the
