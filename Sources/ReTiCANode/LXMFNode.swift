@@ -1181,9 +1181,11 @@ public struct LXMFNode {
                     // No LINKREQUEST left this node: the destination announced a link cost we could
                     // not meet (above `LinkPlane.maxLinkStampCost`, or the search timed out). The path
                     // is not in question, so do not request one. Retry the link like `.handshakeRejected`:
-                    // a fresh search at a lower cost may still succeed, and `establishAttempts` bounds the
-                    // retries. A retry at the same cost or higher within `LinkPlane.linkStampFailureBackoff`
-                    // fails at once without searching, so the retries cost one search, not one each.
+                    // each search is an independent random trial, so a fresh one may succeed where the
+                    // last timed out, and `establishAttempts` bounds the retries, each costing at most
+                    // `NetworkStamp.linkStampTimeout` of search. Reference also searches afresh: LXMF 1.3.0
+                    // opens a new link per delivery attempt (LXMRouter.py:3190-3225), though it waits
+                    // `DELIVERY_RETRY_WAIT` between attempts where this retries at once.
                     return .send(.router(.linkClosed(destinationHash: dest)))
                 }
 

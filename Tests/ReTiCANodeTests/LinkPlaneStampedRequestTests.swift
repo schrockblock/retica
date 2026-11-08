@@ -495,20 +495,9 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
     }
 }
 
-// MARK: - Abandoning a search, and backing off after a failed one
+// MARK: - Abandoning a search the router no longer needs
 
 private let otherDest = Data(repeating: 0x6B, count: 16)
-
-@MainActor
-private func makePlane(clock: TestClock<Duration>, now: LockIsolated<Date>) -> TestStoreOf<LinkPlane> {
-    let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
-        $0.uuid = .incrementing
-        $0.continuousClock = clock
-        $0.date = DateGenerator { now.value }
-    }
-    store.exhaustivity = .off
-    return store
-}
 
 /// Advance `clock` by the key-search timeout until `searching()` is false. One advance is not
 /// enough under load: it wakes only sleeps already registered, and the search's timeout sleep may
@@ -521,31 +510,32 @@ private func runSearchOut(_ clock: TestClock<Duration>, while searching: () -> B
     }
 }
 
-/// Run a search for `destHash` at `cost` out to its timeout (it cannot finish: callers pass 19 or
-/// more) and receive its `.stampFailure`.
+/// A router whose link to `destHash` is establishing, with `queued` queued behind it.
 @MainActor
-private func failASearch(_ store: TestStoreOf<LinkPlane>, clock: TestClock<Duration>, cost: Double) async throws {
-    await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash,
-                               interfaceID: iface, relayNextHop: nil, linkCost: cost))
-    #expect(store.state.stampingLinks.count == 1)
-    try await runSearchOut(clock) { !store.state.stampingLinks.isEmpty }
-    await store.receive(.delegate(.linkFailed(destinationHash: destHash, reason: .stampFailure)), timeout: .seconds(5))
-    #expect(store.state.stampingLinks.isEmpty)
+private func establishingRouter(_ queued: [LXMessage]) async -> (TestStore<LXMFRouter.State, LXMFRouter.Action>,
+                                                                  LockIsolated<Int>) {
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(destHash)
+    let abandons = LockIsolated(0)
+    let store = TestStore(initialState: initial) {
+        CombineReducers {
+            Reduce<LXMFRouter.State, LXMFRouter.Action> { _, action in
+                if case .delegate(.abandonLink(destHash)) = action { abandons.withValue { $0 += 1 } }
+                return .none
+            }
+            LXMFRouter()
+        }
+    } withDependencies: { $0.continuousClock = TestClock() }
+    store.exhaustivity = .off
+    for message in queued { await store.send(.send(message: message, desiredMethod: .direct)) }
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.directLinks[destHash] == .establishing)
+    return (store, abandons)
 }
 
-/// `openLink` to `destHash` at `cost`, then whether it started a search. One that did is cancelled
-/// again, so the store holds no search afterwards.
-@MainActor
-private func searches(_ store: TestStoreOf<LinkPlane>, cost: Double) async -> Bool {
-    await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash,
-                               interfaceID: iface, relayNextHop: nil, linkCost: cost))
-    let searched = !store.state.stampingLinks.isEmpty
-    if searched {
-        await store.send(.abandonStampSearches(destinationHash: destHash))
-    } else {
-        await store.receive(.delegate(.linkFailed(destinationHash: destHash, reason: .stampFailure)))
-    }
-    return searched
+private func directNote(_ text: String) -> LXMessage {
+    LXMessage.create(source: Identity(), destinationHash: destHash, timestamp: 1700000000.5,
+                     title: Data("t".utf8), content: Data(text.utf8))
 }
 
 @Suite @MainActor struct LinkStampSearchBoundsTests {
@@ -568,48 +558,26 @@ private func searches(_ store: TestStoreOf<LinkPlane>, cost: Double) async -> Bo
         try await runSearchOut(clock) { store.state.stampingLinks[id: UUID(1)] != nil }
         await store.receive(.stampSearchTimedOut(id: UUID(1)), timeout: .seconds(5)) {
             $0.stampingLinks.remove(id: UUID(1))
-            $0.linkStampFailures[otherDest] = LinkPlane.LinkStampFailure(
-                cost: LinkPlane.maxLinkStampCost, failedAt: Date(timeIntervalSince1970: 0))
         }
         await store.receive(.delegate(.linkFailed(destinationHash: otherDest, reason: .stampFailure)))
-        #expect(store.state.linkStampFailures[destHash] == nil, "an abandoned search did not fail: no backoff")
         // A search still running (cost 20, over a minute) would keep its effect alive past `finish`.
         await store.finish()
     }
 
-    /// Within the backoff a repeat at the same cost or higher fails at once and searches nothing; a
-    /// lower cost searches. Repeats do not restart the backoff.
-    @Test func aRepeatWithinTheBackoffFailsAtOnceUnlessCheaper() async throws {
+    /// Searches are independent random trials, so a failed one says nothing about the next: a second
+    /// `openLink` at the same cost right after a `.stampFailure` searches again, as reference does.
+    @Test func aSearchAfterAFailedOneAtTheSameCostSearchesAgain() async throws {
         let clock = TestClock()
-        let now = LockIsolated(Date(timeIntervalSince1970: 1_000))
-        let store = makePlane(clock: clock, now: now)
-        try await failASearch(store, clock: clock, cost: 19)
-        #expect(store.state.linkStampFailures[destHash]
-                == LinkPlane.LinkStampFailure(cost: 19, failedAt: Date(timeIntervalSince1970: 1_000)))
+        let store = makePlane(clock: clock)
+        await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash, interfaceID: iface,
+                                   relayNextHop: nil, linkCost: LinkPlane.maxLinkStampCost))
+        try await runSearchOut(clock) { !store.state.stampingLinks.isEmpty }
+        await store.receive(.delegate(.linkFailed(destinationHash: destHash, reason: .stampFailure)), timeout: .seconds(5))
 
-        #expect(await searches(store, cost: 19) == false, "the same cost must not search again")
-        #expect(await searches(store, cost: 20) == false, "a higher cost must not search either")
-        now.setValue(Date(timeIntervalSince1970: 1_000 + LinkPlane.linkStampFailureBackoff - 0.1))
-        #expect(await searches(store, cost: 19) == false, "still within the backoff")
-        #expect(store.state.linkStampFailures[destHash]?.failedAt == Date(timeIntervalSince1970: 1_000),
-                "a repeat must not restart the backoff")
-        #expect(await searches(store, cost: 18.5) == true, "a cheaper re-announce searches")
-        store.exhaustivity = .on
-        await store.finish()
-    }
-
-    /// The backoff ends `linkStampFailureBackoff` seconds after the failure. A failure dated in the
-    /// future (the wall clock was set back) holds nothing back.
-    @Test func theBackoffEndsAfterItsPeriodAndIgnoresAClockSetBack() async throws {
-        let clock = TestClock()
-        let now = LockIsolated(Date(timeIntervalSince1970: 1_000))
-        let store = makePlane(clock: clock, now: now)
-        try await failASearch(store, clock: clock, cost: 20)
-
-        now.setValue(Date(timeIntervalSince1970: 1_000 + LinkPlane.linkStampFailureBackoff))
-        #expect(await searches(store, cost: 20) == true, "the backoff is over")
-        now.setValue(Date(timeIntervalSince1970: 990))
-        #expect(await searches(store, cost: 20) == true, "a clock set back must not extend the backoff")
+        await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash, interfaceID: iface,
+                                   relayNextHop: nil, linkCost: LinkPlane.maxLinkStampCost))
+        #expect(store.state.stampingLinks.count == 1, "the retry must search")
+        await store.send(.abandonStampSearches(destinationHash: destHash))
         store.exhaustivity = .on
         await store.finish()
     }
@@ -617,29 +585,8 @@ private func searches(_ store: TestStoreOf<LinkPlane>, cost: Double) async -> Bo
     /// The router abandons an establishing link when its last queued message is cancelled, not before,
     /// and stays `.establishing` (the link's outcome may still come).
     @Test func routerAbandonsAnEstablishingLinkWhenItsLastMessageIsCancelled() async {
-        let me = Identity()
-        let first = LXMessage.create(source: me, destinationHash: destHash, timestamp: 1700000000.5,
-                                     title: Data("t".utf8), content: Data("one".utf8))
-        let second = LXMessage.create(source: me, destinationHash: destHash, timestamp: 1700000000.5,
-                                      title: Data("t".utf8), content: Data("two".utf8))
-        var initial = LXMFRouter.State()
-        initial.knownPaths.insert(destHash)
-        let abandons = LockIsolated(0)
-        let store = TestStore(initialState: initial) {
-            CombineReducers {
-                Reduce<LXMFRouter.State, LXMFRouter.Action> { _, action in
-                    if case .delegate(.abandonLink(destHash)) = action { abandons.withValue { $0 += 1 } }
-                    return .none
-                }
-                LXMFRouter()
-            }
-        } withDependencies: { $0.continuousClock = TestClock() }
-        store.exhaustivity = .off
-        await store.send(.send(message: first, desiredMethod: .direct))
-        await store.send(.send(message: second, desiredMethod: .direct))
-        await store.skipReceivedActions(strict: false)
-        #expect(store.state.directLinks[destHash] == .establishing)
-
+        let first = directNote("one"), second = directNote("two")
+        let (store, abandons) = await establishingRouter([first, second])
         await store.send(.cancelOutbound(messageHash: first.hash))
         await store.skipReceivedActions(strict: false)
         #expect(abandons.value == 0, "a message still needs the link")
@@ -647,6 +594,33 @@ private func searches(_ store: TestStoreOf<LinkPlane>, cost: Double) async -> Bo
         await store.skipReceivedActions(strict: false)
         #expect(abandons.value == 1)
         #expect(store.state.directLinks[destHash] == .establishing)
+    }
+
+    /// A copy withdrawn to be re-stamped still needs the link: cancelling another message does not
+    /// abandon it. Cancelling the withdrawn copy, its last work, does.
+    @Test func routerAbandonsAnEstablishingLinkWhenAWithdrawnCopyIsCancelled() async {
+        let withdrawn = directNote("re-stamped"), other = directNote("other")
+        let (store, abandons) = await establishingRouter([withdrawn, other])
+        await store.send(.withdrawUnsentDeliveryCopy(messageHash: withdrawn.hash))
+        await store.send(.cancelOutbound(messageHash: other.hash))
+        await store.skipReceivedActions(strict: false)
+        #expect(abandons.value == 0, "the withdrawn copy comes back for this link")
+        await store.send(.cancelOutbound(messageHash: withdrawn.hash))
+        await store.skipReceivedActions(strict: false)
+        #expect(abandons.value == 1)
+    }
+
+    /// `.cancelDeliveryStamps` reclaiming a withdrawn copy (`.deliveryCopyAbandoned`) that was the
+    /// link's last work abandons the link.
+    @Test func routerAbandonsAnEstablishingLinkWhenAWithdrawnCopyIsReclaimed() async {
+        let withdrawn = directNote("re-stamped")
+        let (store, abandons) = await establishingRouter([withdrawn])
+        await store.send(.withdrawUnsentDeliveryCopy(messageHash: withdrawn.hash))
+        await store.skipReceivedActions(strict: false)
+        #expect(abandons.value == 0)
+        await store.send(.deliveryCopyAbandoned(messageHash: withdrawn.hash))
+        await store.skipReceivedActions(strict: false)
+        #expect(abandons.value == 1)
     }
 
     /// The router abandons an establishing link when the last copy waiting for it fails.
@@ -681,16 +655,48 @@ private func searches(_ store: TestStoreOf<LinkPlane>, cost: Double) async -> Bo
         await store.receive(.delegate(.abandonLink(destinationHash: otherDest)))
         #expect(store.state.propagationQueue[otherDest] == nil)
     }
+
+    /// A late proof for a direct copy still retrying while its link re-establishes settles the last
+    /// work for that link: it is abandoned.
+    @Test func routerAbandonsAnEstablishingLinkWhenItsLastCopySucceeds() async {
+        let hash = Data(repeating: 0x33, count: 32)
+        var initial = LXMFRouter.State()
+        initial.knownPaths.insert(destHash)
+        initial.directLinks[destHash] = .establishing
+        initial.pendingDeliveries[.delivery(hash)] = LXMFRouter.PendingDelivery(
+            resend: .direct(destinationHash: destHash, data: Data("m".utf8), asResource: false), attempts: 2)
+        let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: { $0.continuousClock = TestClock() }
+        store.exhaustivity = .off
+        await store.send(.delivered(messageHash: hash, leg: .delivery))
+        await store.receive(.delegate(.abandonLink(destinationHash: destHash)))
+    }
+
+    /// After an abandon the router is still `.establishing`, so a new message queues. When the host
+    /// then reports the link closed (as `LXMFNode` does after cancelling the search), the router
+    /// re-establishes for it.
+    @Test func routerReestablishesWhenWorkArrivesBetweenAbandonAndClose() async {
+        let first = directNote("one"), later = directNote("later")
+        let (store, abandons) = await establishingRouter([first])
+        await store.send(.cancelOutbound(messageHash: first.hash))
+        await store.skipReceivedActions(strict: false)
+        #expect(abandons.value == 1)
+        await store.send(.send(message: later, desiredMethod: .direct))
+        #expect(store.state.outboundQueue[destHash]?.map(\.hash) == [later.hash])
+        await store.send(.linkClosed(destinationHash: destHash))
+        await store.receive(.delegate(.requestLink(destinationHash: destHash)))
+        #expect(store.state.directLinks[destHash] == .establishing)
+    }
 }
 
 /// LXMFNode, counting key searches started (distinct searching links seen), searches that reported
-/// back, and every link failure the endpoint reported.
+/// back, every link failure the endpoint reported, and every message reported failed.
 private struct SearchLifecycleNode: Reducer {
     typealias State = LXMFNode.State
     typealias Action = LXMFNode.Action
     let seen = LockIsolated<Set<UUID>>([])
     let ended = LockIsolated(0)
     let failures = LockIsolated<[LinkFailure]>([])
+    let failedMessages = LockIsolated<[Data]>([])
     var started: Int { seen.value.count }
 
     var body: some ReducerOf<Self> {
@@ -703,6 +709,8 @@ private struct SearchLifecycleNode: Reducer {
                 ended.withValue { $0 += 1 }
             case let .endpoint(.delegate(.linkFailed(_, reason))):
                 failures.withValue { $0.append(reason) }
+            case let .delegate(.deliveryFailed(hash)):
+                failedMessages.withValue { $0.append(hash) }
             default: break
             }
             return .none
@@ -770,27 +778,32 @@ private func nodeSearchingForAKey(_ counter: SearchLifecycleNode, clock: TestClo
         await store.finish()
     }
 
-    /// After a search times out, the router retries the link at once (up to `maxAttempts`). Within the
-    /// backoff each retry fails at once without searching, so one delivery costs one search, not five.
-    @Test func aRouterRetryWithinTheBackoffStartsNoSecondSearch() async throws {
+    /// After a search times out the router retries the link at once, and each retry searches afresh
+    /// (searches are independent random trials; reference searches again per attempt too). A full
+    /// saga is `maxAttempts` searches, each run out to its timeout, then the message fails.
+    @Test func aRouterRetryAfterAStampFailureStartsAFreshSearch() async throws {
         let counter = SearchLifecycleNode()
         let clock = TestClock()
         let events = AsyncStream<TCPEvent>.makeStream()
         let (store, dest, message) = try await nodeSearchingForAKey(counter, clock: clock, events: events)
 
-        try await runSearchOut(clock) { counter.ended.value == 0 }
-        await store.receive(.delegate(.deliveryFailed(messageHash: message)), timeout: .seconds(5))
-        #expect(counter.started == 1, "the router's retries must not search again")
-        #expect(counter.ended.value == 1)
-        #expect(counter.failures.value == Array(repeating: .stampFailure, count: LXMFDelivery.maxAttempts),
-                "every attempt the router made failed as a stamp failure")
+        for attempt in 1...LXMFDelivery.maxAttempts {
+            #expect(counter.started == attempt, "attempt \(attempt) must run its own search")
+            try await runSearchOut(clock) { counter.ended.value < attempt }
+            await store.skipReceivedActions(strict: false)
+        }
+        // Counted, not `receive`d: the last skip above has already consumed it.
+        #expect(counter.failedMessages.value == [message])
+        #expect(counter.started == LXMFDelivery.maxAttempts)
+        #expect(counter.ended.value == LXMFDelivery.maxAttempts)
+        #expect(counter.failures.value == Array(repeating: .stampFailure, count: LXMFDelivery.maxAttempts))
         #expect(store.state.endpoint.linkPlane.stampingLinks.isEmpty)
         #expect(store.state.router.directLinks[dest] == nil)
 
         events.continuation.finish()
         await clock.advance(by: .seconds(3600))
         await store.skipReceivedActions(strict: false)
-        #expect(counter.started == 1)
+        #expect(counter.started == LXMFDelivery.maxAttempts, "nothing searches after the router gives up")
         store.exhaustivity = .on
         await store.finish()
     }
