@@ -24,7 +24,9 @@ private final class Recorder: Sendable {
 
 @MainActor
 private func makeStore(_ initial: Transport.State = Transport.State(), clock: TestClock<Duration> = TestClock(),
-                       recorder: Recorder = Recorder()) -> TestStore<Transport.State, Transport.Action> {
+                       recorder: Recorder = Recorder(),
+                       randomBytes: RandomBytesGenerator = RandomBytesGenerator { _ in tag })
+    -> TestStore<Transport.State, Transport.Action> {
     let store = TestStore(initialState: initial) {
         CombineReducers {
             Reduce<Transport.State, Transport.Action> { _, action in
@@ -35,7 +37,7 @@ private func makeStore(_ initial: Transport.State = Transport.State(), clock: Te
             Transport()
         }
     } withDependencies: {
-        $0.randomBytes = RandomBytesGenerator { _ in tag }
+        $0.randomBytes = randomBytes
         $0.continuousClock = clock
         $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
     }
@@ -52,7 +54,7 @@ private func nextPathRequest(_ store: TestStore<Transport.State, Transport.Actio
               Packet(raw: raw)?.destinationHash == Transport.pathRequestDestinationHash else { return false }
         captured.setValue(raw)
         return true
-    }, timeout: .seconds(10))
+    }, timeout: .seconds(30))
     return captured.value.flatMap { Packet(raw: $0) }
 }
 
@@ -110,18 +112,87 @@ private func isPathResponse(_ raw: Data, for dest: Data) -> Bool {
 @Suite @MainActor struct PathRequestStampTests {
     @Test func aPathRequestAlwaysCarriesASenderID() async throws {
         #expect(Transport.State().stampPathRequests == false, "1.6.0 does not stamp by default")
-        #expect(Transport.State().pathRequestSenderID.count == 16)
-        #expect(Transport.State().pathRequestSenderID != Transport.State().pathRequestSenderID,
-                "random per instance")
-        let store = makeStore()
+        #expect(Transport.State().pathRequestSenderID == nil, "drawn at the first request, not at construction")
+        // The tag is the first draw and the sender ID the second: told apart by their bytes.
+        let senderID = Data(repeating: 0x5E, count: 16)
+        let draws = LockIsolated(0)
+        let store = makeStore(randomBytes: RandomBytesGenerator { _ in
+            draws.withValue { $0 += 1; return $0 == 2 ? senderID : tag }
+        })
         await store.send(.interfaceConnected(InterfaceID("i0")))
         await store.send(.requestPath(destinationHash: destHash))
         let request = try #require(await nextPathRequest(store))
         #expect(request.payload.count == 48)
         #expect(Data(request.payload.prefix(16)) == destHash)
-        #expect(Data(request.payload.dropFirst(16).prefix(16)) == store.state.pathRequestSenderID,
-                "a leaf has no transport identity, so it sends its per-instance sender ID")
+        #expect(Data(request.payload.dropFirst(16).prefix(16)) == senderID,
+                "a leaf has no transport identity, so it sends a sender ID from the randomBytes dependency")
         #expect(Data(request.payload.dropFirst(32)) == tag)
+        #expect(store.state.pathRequestSenderID == senderID)
+        // Kept: a second request reuses it (draws only the tag).
+        await store.send(.requestPath(destinationHash: Data(repeating: 0x23, count: 16)))
+        let second = try #require(await nextPathRequest(store))
+        #expect(Data(second.payload.dropFirst(16).prefix(16)) == senderID)
+        #expect(draws.value == 3)
+    }
+
+    @Test func aTransportIdentityIsTheSenderIDAndNothingIsDrawnForIt() async throws {
+        let relay = Identity()
+        let draws = LockIsolated(0)
+        let store = makeStore(randomBytes: RandomBytesGenerator { _ in draws.withValue { $0 += 1 }; return tag })
+        await store.send(.interfaceConnected(InterfaceID("i0")))
+        await store.send(.setTransportIdentity(relay))
+        await store.send(.requestPath(destinationHash: destHash))
+        let request = try #require(await nextPathRequest(store))
+        #expect(Data(request.payload.dropFirst(16).prefix(16)) == relay.hash)
+        #expect(draws.value == 1, "only the tag")
+        #expect(store.state.pathRequestSenderID == nil)
+    }
+
+    @Test func withNoInterfaceThereIsNoStampSearchButThePendingEntryIsWritten() async {
+        var initial = Transport.State()
+        initial.stampPathRequests = true
+        initial.pathRequestValue = 100        // a search that started would still be running at `finish`
+        let store = makeStore(initial)
+        await store.send(.requestPath(destinationHash: destHash))
+        #expect(store.state.pathRequests[destHash] != nil)
+        #expect(store.state.stampingPathRequests.isEmpty, "no interface to send on, so nothing to search for")
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    @Test func aCancelledSearchesLateEndDoesNotDisturbTheNewSearchForTheSameDestination() async throws {
+        let clock = TestClock()
+        let recorder = Recorder()
+        var initial = Transport.State()
+        initial.stampPathRequests = true
+        initial.pathRequestValue = 100
+        let draws = LockIsolated(0)
+        let store = makeStore(initial, clock: clock, recorder: recorder, randomBytes: RandomBytesGenerator { n in
+            Data(repeating: UInt8(draws.withValue { $0 += 1; return $0 }), count: n)
+        })
+        await store.send(.interfaceConnected(InterfaceID("i0")))
+        await store.send(.requestPath(destinationHash: destHash))
+        let oldTag = try #require(store.state.stampingPathRequests[destHash])
+        await store.send(.cancelPathRequestStamps)
+        await store.send(.requestPath(destinationHash: destHash))
+        let newTag = try #require(store.state.stampingPathRequests[destHash])
+        #expect(newTag != oldTag)
+        // The old search had already queued its end when it was cancelled.
+        let oldRequest = destHash + Data(repeating: 1, count: 16) + oldTag
+        await store.send(.pathRequestStampSearchEnded(destinationHash: destHash, tag: oldTag, request: oldRequest))
+        #expect(store.state.stampingPathRequests[destHash] == newTag, "the new search is still the one recorded")
+        #expect(recorder.payloads.isEmpty, "the old search's request is not transmitted")
+        let newRequest = destHash + Data(repeating: 1, count: 16) + newTag
+        await store.send(.pathRequestStampSearchEnded(destinationHash: destHash, tag: newTag, request: newRequest))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.stampingPathRequests.isEmpty)
+        #expect(recorder.payloads == [newRequest], "the new search transmits its own request, once")
+        // Let the still-running (cost 100) search time out.
+        await Task.megaYield()
+        await clock.advance(by: .seconds(15))
+        store.exhaustivity = .off
+        await store.finish()
+        #expect(recorder.payloads == [newRequest])
     }
 
     @Test func aStampedPathRequestIs64BytesAndValidates() async throws {
@@ -136,6 +207,7 @@ private func isPathResponse(_ raw: Data, for dest: Data) -> Bool {
         try #require(payload.count == 64)
         #expect(Data(payload.prefix(16)) == destHash)
         #expect(Data(payload.dropFirst(16).prefix(16)) == store.state.pathRequestSenderID)
+        #expect(store.state.pathRequestSenderID?.count == 16)
         #expect(Data(payload.dropFirst(32).prefix(16)) == tag)
         #expect(payload[payload.startIndex + 48] == 0xC1)
         #expect(payload[payload.startIndex + 49] == 0x00, "flags 0x00 mark a real stamp")
@@ -157,9 +229,11 @@ private func isPathResponse(_ raw: Data, for dest: Data) -> Bool {
         await store.send(.requestPath(destinationHash: destHash))
         #expect(store.state.pathRequests[destHash] != nil,
                 "set before the search, so the answering announce is exempt from ingress holding")
-        #expect(store.state.stampingPathRequests == [destHash])
+        #expect(Set(store.state.stampingPathRequests.keys) == [destHash])
+        // `advance` wakes only sleeps already registered: let the search's timeout sleep register.
+        await Task.megaYield()
         await clock.advance(by: .seconds(14.9))
-        #expect(store.state.stampingPathRequests == [destHash], "still searching before the timeout")
+        #expect(Set(store.state.stampingPathRequests.keys) == [destHash], "still searching before the timeout")
         await clock.advance(by: .seconds(0.1))
         await store.receive({ if case .pathRequestStampSearchEnded = $0 { return true }; return false },
                             timeout: .seconds(5))
@@ -196,7 +270,7 @@ private func isPathResponse(_ raw: Data, for dest: Data) -> Bool {
         let store = makeStore(initial, recorder: recorder)
         await store.send(.interfaceConnected(InterfaceID("i0")))
         await store.send(.requestPath(destinationHash: destHash))
-        #expect(store.state.stampingPathRequests == [destHash])
+        #expect(Set(store.state.stampingPathRequests.keys) == [destHash])
         await store.send(.cancelPathRequestStamps)
         #expect(store.state.stampingPathRequests.isEmpty)
         // A search still running (cost 100) would keep its effect alive past `finish`.

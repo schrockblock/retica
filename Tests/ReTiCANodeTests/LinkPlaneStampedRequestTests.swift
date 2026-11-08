@@ -134,6 +134,8 @@ private struct FoundKeyCountingEndpoint: Reducer {
         await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash,
                                    interfaceID: iface, relayNextHop: nil, linkCost: LinkPlane.maxLinkStampCost))
         #expect(store.state.stampingLinks.count == 1, "the ceiling itself is searched")
+        // `advance` wakes only sleeps already registered: let the search's timeout sleep register.
+        await Task.megaYield()
         await clock.advance(by: .seconds(14.9))
         #expect(store.state.stampingLinks.count == 1, "still searching before the timeout")
         #expect(store.state.links.isEmpty)
@@ -185,9 +187,11 @@ private struct FoundKeyCountingEndpoint: Reducer {
             $0.date = .constant(Date(timeIntervalSince1970: 0))
         }
         stopping.exhaustivity = .off
+        // A search needs an interface to send on.
+        await stopping.send(.transport(.interfaceConnected(InterfaceID("i0"), .default)))
         await stopping.send(.requestPath(destinationHash: destHash))
         await stopping.receive(.transport(.requestPath(destinationHash: destHash)))
-        #expect(stopping.state.transport.stampingPathRequests == [destHash])
+        #expect(Set(stopping.state.transport.stampingPathRequests.keys) == [destHash])
         await stopping.send(.stop)
         await stopping.skipReceivedActions(strict: false)
         #expect(stopping.state.transport.stampingPathRequests.isEmpty)

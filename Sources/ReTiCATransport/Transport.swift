@@ -114,12 +114,14 @@ public struct Transport {
         /// The sender ID a path request carries when this node has no `transportIdentity`. RNS 1.6.0
         /// always sends `destination + transport ID + tag` (Transport.py:3699) and every reference
         /// instance has a transport identity; a leaf here has none, so it sends 16 random bytes,
-        /// fixed per instance. A relay compares this field with its next hop (the loop guard), and a
+        /// drawn from the `randomBytes` dependency at its first path request and kept after that.
+        /// A relay compares this field with its next hop (the loop guard), and a
         /// random value matches no real next hop.
-        public var pathRequestSenderID: Data = SecureRandom.bytes(16)
-        /// Destinations whose path-request stamp search is in flight. A further `.requestPath` for one
-        /// of them is coalesced into it. Cleared when the search ends or `.cancelPathRequestStamps`.
-        public var stampingPathRequests: Set<Data> = []
+        public var pathRequestSenderID: Data?
+        /// Destinations whose path-request stamp search is in flight, each with the tag of the request
+        /// that search is for. A further `.requestPath` for one of them is coalesced into it. Cleared
+        /// when the search ends or `.cancelPathRequestStamps`.
+        public var stampingPathRequests: [Data: Data] = [:]
 
         /// Stamp our own announces (RNS `Transport.STAMP_DESTINATIONS`, `[stamps] stamp_destinations`).
         /// Off by default, as in 1.6.0, and then announce bytes are exactly as before. When on, every
@@ -443,7 +445,7 @@ public struct Transport {
         case requestPath(destinationHash: Data)
         /// A path-request stamp search for `destinationHash` ended: `request` is the stamped 64-byte
         /// payload to send, or nil when the search ran out `NetworkStamp.pathStampTimeout`.
-        case pathRequestStampSearchEnded(destinationHash: Data, request: Data?)
+        case pathRequestStampSearchEnded(destinationHash: Data, tag: Data, request: Data?)
         /// Cancel every path-request stamp search; none of them sends. The host sends this when it stops.
         case cancelPathRequestStamps
         /// Hand back a destination stamp the host persisted from `.delegate(.destinationStampGenerated)`.
@@ -1587,7 +1589,15 @@ public struct Transport {
                 // sets it before enqueueing one (Transport.py:3714).
                 state.pathRequests[destinationHash] = date.now
                 let tag = randomBytes(16)                              // request tag (RNS get_random_hash)
-                let senderID = state.transportIdentity?.hash ?? state.pathRequestSenderID
+                let senderID: Data
+                if let identityHash = state.transportIdentity?.hash {
+                    senderID = identityHash
+                } else if let held = state.pathRequestSenderID {
+                    senderID = held
+                } else {
+                    senderID = randomBytes(16)
+                    state.pathRequestSenderID = senderID
+                }
                 let request = destinationHash + senderID + tag
                 // Stamping off (the default): sent at once, exactly as before.
                 guard state.stampPathRequests else {
@@ -1596,7 +1606,10 @@ public struct Transport {
                 // Reference queues one stamp job per destination (enqueue_stamped_pr keys its queue
                 // by destination, Transport.py:1466-1468): a search already running for it answers
                 // this request too.
-                guard state.stampingPathRequests.insert(destinationHash).inserted else { return .none }
+                guard state.stampingPathRequests[destinationHash] == nil else { return .none }
+                // Nothing to send on: no search either (the pending entry above stays).
+                guard !state.interfaces.isEmpty else { return .none }
+                state.stampingPathRequests[destinationHash] = tag
                 let material = destinationHash + tag                    // pr_stamp_material
                 let cost = state.pathRequestValue
                 return .run { send in
@@ -1620,20 +1633,23 @@ public struct Transport {
                             ? request + Data([NetworkStamp.extensionMarker, Transport.pathRequestStampFlags]) + stamp
                             : nil
                     }
-                    await send(.pathRequestStampSearchEnded(destinationHash: destinationHash, request: stamped))
+                    await send(.pathRequestStampSearchEnded(destinationHash: destinationHash, tag: tag, request: stamped))
                 }
                 .cancellable(id: CancelID.pathRequestStamp(destinationHash))
 
-            case let .pathRequestStampSearchEnded(destinationHash, request):
-                // Cancelled meanwhile (`.cancelPathRequestStamps`): the search no longer counts.
-                guard state.stampingPathRequests.remove(destinationHash) != nil else { return .none }
+            case let .pathRequestStampSearchEnded(destinationHash, tag, request):
+                // Cancelled meanwhile (`.cancelPathRequestStamps`): the search no longer counts. A
+                // cancelled search's end can already be queued when a re-request starts a new search
+                // for the same destination; only the end carrying the recorded search's tag counts.
+                guard state.stampingPathRequests[destinationHash] == tag else { return .none }
+                state.stampingPathRequests[destinationHash] = nil
                 // Ran out `pathStampTimeout`: reference logs and sends nothing (Transport.py:4038-4041).
                 guard let request else { return .none }
                 return transmitPathRequest(request, on: Array(state.interfaces.keys))
 
             case .cancelPathRequestStamps:
-                let cancelled = state.stampingPathRequests
-                state.stampingPathRequests = []
+                let cancelled = state.stampingPathRequests.keys
+                state.stampingPathRequests = [:]
                 return .merge(cancelled.map { .cancel(id: CancelID.pathRequestStamp($0)) })
 
             case let .rehydrateDestinationStamp(destinationHash, stamp):
