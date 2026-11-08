@@ -71,24 +71,46 @@ final class RNodeSendGate: Sendable {
 @MainActor
 struct RNodeInterfaceHarness {
     let store: TestStore<RNodeInterface.State, RNodeInterface.Action>
-    let radio: AsyncStream<RNodeDriverEvent>.Continuation
+    /// One continuation per driver session: the first is made up front (so events yielded before
+    /// `.start` reach the first session), every later `driver.start` appends a fresh one.
+    let radios: LockIsolated<[AsyncStream<RNodeDriverEvent>.Continuation]>
     let calls: LockIsolated<[RNodeMockCall]>
     /// Every driver `send` waits on it. Open unless `holdSends`.
     let gate: RNodeSendGate
     /// Every delegate the interface emitted, in reduce order.
     let delegates: LockIsolated<[RNodeInterface.Action.Delegate]>
 
+    /// The latest session's event stream. A `.stop` cancels the session's `for await`, which ends
+    /// its stream for good, so a restarted interface needs a fresh one, as a live driver gives.
+    var radio: AsyncStream<RNodeDriverEvent>.Continuation { radios.value[radios.value.count - 1] }
+
     var packets: [Data] {
         delegates.value.compactMap { if case let .packetReceived(packet) = $0 { return packet }; return nil }
     }
+
+    var sent: [Data] { calls.value.rnodeSentPackets }
+
+    /// Polls until at least `count` driver sends happened, without failing: the caller's
+    /// `#expect` judges.
+    func waitForSends(_ count: Int) async {
+        for _ in 0..<400 where sent.count < count { await Task.megaYield() }
+    }
+
+    /// Polls until at least `count` driver starts happened, without failing.
+    func waitForStarts(_ count: Int) async {
+        for _ in 0..<400 where calls.value.rnodeStartCount < count { await Task.megaYield() }
+    }
 }
 
-/// An RNodeInterface over a mock radio. `sendResults` are returned by successive driver `send`s
-/// (then `true`). With `holdSends`, every driver `send` is recorded at once and returns only after
-/// `gate.open()`. Every `receive` waits up to 5 s.
+/// An RNodeInterface over a mock radio. Every `driver.start` gets its own session stream (see
+/// `radios`). `sendResults` are returned by successive driver `send`s (then `true`). With
+/// `holdSends`, every driver `send` is recorded at once and returns only after `gate.open()`.
+/// Every `receive` waits up to 5 s.
 @MainActor
 func makeRNodeInterface(sendResults: [Bool] = [], holdSends: Bool = false) -> RNodeInterfaceHarness {
-    let radio = AsyncStream<RNodeDriverEvent>.makeStream()
+    let first = AsyncStream<RNodeDriverEvent>.makeStream()
+    let radios = LockIsolated([first.continuation])
+    let sessions = LockIsolated(0)
     let calls = LockIsolated<[RNodeMockCall]>([])
     let results = LockIsolated(sendResults)
     let gate = RNodeSendGate()
@@ -100,7 +122,11 @@ func makeRNodeInterface(sendResults: [Bool] = [], holdSends: Bool = false) -> RN
         $0.rnodeDriver = RNodeDriver(
             start: { config in
                 calls.withValue { $0.append(.start(config)) }
-                return radio.stream
+                let index = sessions.withValue { n in defer { n += 1 }; return n }
+                if index == 0 { return first.stream }
+                let session = AsyncStream<RNodeDriverEvent>.makeStream()
+                radios.withValue { $0.append(session.continuation) }
+                return session.stream
             },
             send: { packet in
                 calls.withValue { $0.append(.send(packet)) }
@@ -112,15 +138,15 @@ func makeRNodeInterface(sendResults: [Bool] = [], holdSends: Bool = false) -> RN
     }
     store.exhaustivity = .off
     store.timeout = .seconds(5)
-    return RNodeInterfaceHarness(store: store, radio: radio.continuation, calls: calls, gate: gate,
+    return RNodeInterfaceHarness(store: store, radios: radios, calls: calls, gate: gate,
                                  delegates: delegates)
 }
 
 /// Started and online with `report`.
 @MainActor
 func makeOnlineRNodeInterface(report: RNodeRadioReport = rnodeTestReport,
-                              sendResults: [Bool] = []) async -> RNodeInterfaceHarness {
-    let h = makeRNodeInterface(sendResults: sendResults)
+                              sendResults: [Bool] = [], holdSends: Bool = false) async -> RNodeInterfaceHarness {
+    let h = makeRNodeInterface(sendResults: sendResults, holdSends: holdSends)
     await h.store.send(.start)
     h.radio.yield(.connected(report))
     await h.store.receive { if case .delegate(.online) = $0 { return true }; return false }

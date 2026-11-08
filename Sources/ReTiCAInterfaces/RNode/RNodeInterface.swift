@@ -94,12 +94,16 @@ public struct RNodeInterface {
         var epoch = DriverEpoch()
         /// Whole packets waiting for the radio, oldest first. Excludes the one in flight.
         var queue: [Data] = []
+        /// A driver `send` is out and its current-generation `.packetSent` hasn't arrived yet
+        /// (stop-and-wait, §5.6). Cleared by `clearTraffic`.
+        var sendInFlight = false
         /// The traffic generation a send result must match: the `epoch` value of
         /// `.packetSent(ok:epoch:)`. Bumped at reduce time by every `.stop` that reaches the
         /// driver, every `.driverEvent(.disconnected)` and every `.driverEvent(.unavailable)`
         /// (`clearTraffic`).
         ///
-        /// Why not `epoch`: the sender's effect is cancelled by a drop or stop, but `.cancellable`
+        /// Why not `epoch`: the sender's effect is cancelled by a drop or stop (the
+        /// `.cancel(id: .sending)` inside each of those arms' `return`), but `.cancellable`
         /// registers its id only when the task starts (see `DriverEpoch`), so a send launched in
         /// the same burst escapes. After a stop, the send effect's own `DriverEpoch` check (taken
         /// before `driver.send`) ends it before it reaches the driver. A drop doesn't bump the
@@ -111,7 +115,7 @@ public struct RNodeInterface {
         /// `.packetSent` is ignored unless its value equals it. (MeshCore's `TrafficToken` also
         /// carries the slot's identity; a replaced RNode slot is nil'd only once `isIdle`, after
         /// the stop cancelled its sender and bumped its epoch, so no result of the old slot can
-        /// reach the new one.) The send-side guard and the `.packetSent` filter are Task 3's.
+        /// reach the new one.)
         var trafficGeneration = 0
 
         public init(config: RNodeDriverConfig) {
@@ -148,7 +152,8 @@ public struct RNodeInterface {
     public enum Action: Equatable {
         case start
         case stop
-        /// An outbound Reticulum packet, already IFAC-masked. Dropped unless online.
+        /// An outbound Reticulum packet, already IFAC-masked. Dropped unless online (uncounted),
+        /// over `maxPacketSize` (`oversize`) or with the FIFO full (`queueFull`).
         case send(Data)
         case driverEvent(RNodeDriverEvent)
         /// `driver.send` returned. `epoch` is the `State.trafficGeneration` the send was launched
@@ -180,7 +185,7 @@ public struct RNodeInterface {
 
     @Dependency(\.rnodeDriver) var driver
 
-    private enum CancelID: Hashable { case driver }
+    private enum CancelID: Hashable { case driver, sending }
 
     public init() {}
 
@@ -220,6 +225,7 @@ public struct RNodeInterface {
                 state.epoch.invalidate()
                 clearTraffic(&state)
                 return .merge(.cancel(id: CancelID.driver),
+                              .cancel(id: CancelID.sending),
                               .run { [driver] send in
                                   await driver.stop()
                                   await send(.driverStopped)
@@ -261,35 +267,74 @@ public struct RNodeInterface {
                 let wasOnline = state.isOnline
                 state.status = .connecting
                 clearTraffic(&state)
-                return wasOnline ? .send(.delegate(.offline(reason: reason))) : .none
+                var effects: [Effect<Action>] = [.cancel(id: CancelID.sending)]
+                if wasOnline { effects.append(.send(.delegate(.offline(reason: reason)))) }
+                return .merge(effects)
 
             case let .driverEvent(.unavailable(cause)):
                 guard state.status != .stopped else { return .none }
                 let wasOnline = state.isOnline
                 state.status = .unavailable(cause)
+                // A drop like `.disconnected`: a restarted session must not send this one's queue,
+                // nor wait behind its in-flight flag.
                 clearTraffic(&state)
-                var effects: [Effect<Action>] = []
+                var effects: [Effect<Action>] = [.cancel(id: CancelID.sending)]
                 if wasOnline { effects.append(.send(.delegate(.offline(reason: nil)))) }
                 effects.append(.send(.delegate(.adapterUnavailable(cause))))
                 return .merge(effects)
 
-            case let .driverEvent(.packet(packet, _, _)):
-                // §5.6: only an online radio delivers. Task 3 records the packet's RSSI/SNR here.
+            case let .driverEvent(.packet(packet, rssi, snr)):
+                // §5.6: only an online radio delivers, and only a delivered packet's signal is
+                // recorded. A packet without signal keeps the last values.
                 guard state.isOnline else { return .none }
                 state.counters.received += 1
+                if let rssi { state.telemetry.lastRSSI = rssi }
+                if let snr { state.telemetry.lastSNR = snr }
                 return .send(.delegate(.packetReceived(packet)))
 
-            case .driverEvent(.channelLoad), .driverEvent(.hardwareError):
-                // Task 3: telemetry and the hardware-error counter.
+            case let .driverEvent(.channelLoad(load)):
+                // Any status but `.stopped`: stats arrive mid-handshake too, and are real data.
+                guard state.status != .stopped else { return .none }
+                state.telemetry.channelLoad = load
                 return .none
 
-            case .send:
-                // Task 3: the FIFO and stop-and-wait sender.
+            case let .driverEvent(.hardwareError(code)):
+                // Counted only. The status follows the driver's `.disconnected`, not the error
+                // (Review Focus 4).
+                guard state.status != .stopped else { return .none }
+                state.counters.hardwareErrors += 1
+                state.telemetry.lastHardwareError = code
                 return .none
 
-            case .packetSent:
-                // Task 3: ignored unless `epoch == state.trafficGeneration`.
-                return .none
+            case let .send(packet):
+                guard state.isOnline else { return .none }
+                guard packet.count <= Self.maxPacketSize else {
+                    state.counters.oversize += 1
+                    return .none
+                }
+                guard !state.sendInFlight else {
+                    guard state.queue.count < Self.queueCapacity else {
+                        state.counters.queueFull += 1
+                        return .none
+                    }
+                    state.queue.append(packet)
+                    return .none
+                }
+                return transmit(&state, packet)
+
+            case let .packetSent(ok, epoch):
+                // A result from before a drop or stop: its packet was already forgotten, and
+                // another may be in flight now (see `State.trafficGeneration`).
+                guard epoch == state.trafficGeneration else { return .none }
+                state.sendInFlight = false
+                if ok {
+                    state.counters.sent += 1
+                } else {
+                    // Dropped, not retried.
+                    state.counters.sendFailed += 1
+                }
+                guard state.isOnline, !state.queue.isEmpty else { return .none }
+                return transmit(&state, state.queue.removeFirst())
 
             case .delegate:
                 return .none
@@ -312,10 +357,33 @@ public struct RNodeInterface {
         .cancellable(id: CancelID.driver, cancelInFlight: true)
     }
 
-    /// A drop or stop: forget queued packets and move the traffic generation, so a send result
-    /// from before it is ignored (see `State.trafficGeneration`). Telemetry and counters survive.
+    /// Stop-and-wait (§5.6): hand `packet` to the driver now and mark it in flight. The next
+    /// packet goes out when this one's `.packetSent` arrives. No pacing: the radio's own airtime
+    /// and the driver's return are the only wait.
+    private func transmit(_ state: inout State, _ packet: Data) -> Effect<Action> {
+        state.sendInFlight = true
+        let traffic = state.trafficGeneration
+        let epoch = state.epoch
+        let generation = epoch.current
+        return .run { [driver] send in
+            // As in `startDriver`: a `.stop` reduced since this effect was built (in the same
+            // burst, before this task registered its cancel id) wins. The send never reaches the
+            // driver after it and reports nothing, so it can't outlive `isIdle`.
+            guard epoch.current == generation else { return }
+            let ok = await driver.send(packet)
+            await send(.packetSent(ok: ok, epoch: traffic))
+        }
+        // No `cancelInFlight`: stop-and-wait launches one current send at a time, and a send that
+        // escaped a drop is neutralised by the traffic generation, not by being cancelled here.
+        .cancellable(id: CancelID.sending)
+    }
+
+    /// A drop or stop: forget queued packets and the in-flight send, and move the traffic
+    /// generation, so a send result from before it is ignored (see `State.trafficGeneration`).
+    /// The caller cancels the sender inside its `return`. Telemetry and counters survive.
     private func clearTraffic(_ state: inout State) {
         state.queue = []
+        state.sendInFlight = false
         state.trafficGeneration += 1
     }
 }
