@@ -398,3 +398,17 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
         try await stopWithASearchRunning(store, searches: searches, interfaceID: id)
     }
 }
+
+/// This target's copy of the stamped-announce fixtures must be byte-identical to the ReTiCATests copy,
+/// which the one generator writes. A regeneration that misses a copy fails here.
+@Test func theStampedAnnounceFixtureMatchesTheReTiCATestsCopy() throws {
+    let here = try #require(Bundle.module.url(forResource: "stamped_announce_packet_fixtures", withExtension: "json"))
+    let reference = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()   // Tests/ReTiCANodeTests
+        .deletingLastPathComponent()   // Tests
+        .appendingPathComponent("ReTiCATests/Vectors/stamped_announce_packet_fixtures.json")
+    let ours = try Data(contentsOf: here)
+    let theirs = try Data(contentsOf: reference)
+    #expect(!theirs.isEmpty)
+    #expect(ours == theirs)
+}

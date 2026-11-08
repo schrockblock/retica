@@ -54,9 +54,9 @@ public struct Announce {
         let anchor = ext[length - 1]                         // integer part, reserved flag in the MSB
         let fraction = ext[length - 2]
         let extended = anchor & 0x80 != 0
-        guard let cost = NetworkStamp.cost(fromBytes: Data([anchor & 0x7F, fraction])) else {
-            return StampExtension(appData: appData)
-        }
+        // The link cost is the two bytes as big-endian fixed point, integer part first, over 256 (RNS
+        // cost_from_bytes). Both bytes are always in hand here, so there is no unreadable case.
+        let cost = Double((Int(anchor & 0x7F) << 8) | Int(fraction)) / 256
         let knownFormat = !extended && cost <= Double(NetworkStamp.stampCostCap)
         guard marker == NetworkStamp.extensionMarker, knownFormat else {
             return StampExtension(appData: appData)

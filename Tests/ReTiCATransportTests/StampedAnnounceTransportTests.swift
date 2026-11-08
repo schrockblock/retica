@@ -109,3 +109,17 @@ private struct StampedFixtures: Decodable {
                            contextFlagSet: false)?.linkCost == 3.25)
     await store.skipReceivedActions()
 }
+
+/// This target's copy of the stamped-announce fixtures must be byte-identical to the ReTiCATests copy,
+/// which the one generator writes. A regeneration that misses a copy fails here.
+@Test func theStampedAnnounceFixtureMatchesTheReTiCATestsCopy() throws {
+    let here = try #require(Bundle.module.url(forResource: "stamped_announce_packet_fixtures", withExtension: "json"))
+    let reference = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()   // Tests/ReTiCATransportTests
+        .deletingLastPathComponent()   // Tests
+        .appendingPathComponent("ReTiCATests/Vectors/stamped_announce_packet_fixtures.json")
+    let ours = try Data(contentsOf: here)
+    let theirs = try Data(contentsOf: reference)
+    #expect(!theirs.isEmpty)
+    #expect(ours == theirs)
+}
