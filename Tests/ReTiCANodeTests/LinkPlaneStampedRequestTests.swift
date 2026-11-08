@@ -495,6 +495,307 @@ private func stopWithASearchRunning(_ store: TestStore<LXMFNode.State, LXMFNode.
     }
 }
 
+// MARK: - Abandoning a search, and backing off after a failed one
+
+private let otherDest = Data(repeating: 0x6B, count: 16)
+
+@MainActor
+private func makePlane(clock: TestClock<Duration>, now: LockIsolated<Date>) -> TestStoreOf<LinkPlane> {
+    let store = TestStore(initialState: LinkPlane.State()) { LinkPlane() } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = clock
+        $0.date = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off
+    return store
+}
+
+/// Advance `clock` by the key-search timeout until `searching()` is false. One advance is not
+/// enough under load: it wakes only sleeps already registered, and the search's timeout sleep may
+/// not be yet (seen once in the full parallel suite).
+@MainActor
+private func runSearchOut(_ clock: TestClock<Duration>, while searching: () -> Bool) async throws {
+    for _ in 0..<200 where searching() {
+        await clock.advance(by: .seconds(NetworkStamp.linkStampTimeout))
+        try await Task.sleep(for: .milliseconds(10))
+    }
+}
+
+/// Run a search for `destHash` at `cost` out to its timeout (it cannot finish: callers pass 19 or
+/// more) and receive its `.stampFailure`.
+@MainActor
+private func failASearch(_ store: TestStoreOf<LinkPlane>, clock: TestClock<Duration>, cost: Double) async throws {
+    await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash,
+                               interfaceID: iface, relayNextHop: nil, linkCost: cost))
+    #expect(store.state.stampingLinks.count == 1)
+    try await runSearchOut(clock) { !store.state.stampingLinks.isEmpty }
+    await store.receive(.delegate(.linkFailed(destinationHash: destHash, reason: .stampFailure)), timeout: .seconds(5))
+    #expect(store.state.stampingLinks.isEmpty)
+}
+
+/// `openLink` to `destHash` at `cost`, then whether it started a search. One that did is cancelled
+/// again, so the store holds no search afterwards.
+@MainActor
+private func searches(_ store: TestStoreOf<LinkPlane>, cost: Double) async -> Bool {
+    await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash,
+                               interfaceID: iface, relayNextHop: nil, linkCost: cost))
+    let searched = !store.state.stampingLinks.isEmpty
+    if searched {
+        await store.send(.abandonStampSearches(destinationHash: destHash))
+    } else {
+        await store.receive(.delegate(.linkFailed(destinationHash: destHash, reason: .stampFailure)))
+    }
+    return searched
+}
+
+@Suite @MainActor struct LinkStampSearchBoundsTests {
+    /// Abandoned: the search is dropped and its effect cancelled, and nothing at all is reported, not
+    /// even when its timeout would have fired. Another destination's search runs on.
+    @Test func anAbandonedSearchReportsNothingAndStops() async throws {
+        let clock = TestClock()
+        let store = makePlane(clock: clock)
+        await store.send(.openLink(initiatorTo: Identity(), destinationHash: destHash, interfaceID: iface,
+                                   relayNextHop: nil, linkCost: LinkPlane.maxLinkStampCost))
+        await store.send(.openLink(initiatorTo: Identity(), destinationHash: otherDest, interfaceID: iface,
+                                   relayNextHop: nil, linkCost: LinkPlane.maxLinkStampCost))
+        #expect(store.state.stampingLinks.ids == [UUID(0), UUID(1)])
+
+        // Exhaustive from here: any action the abandoned search sent would fail the test.
+        store.exhaustivity = .on
+        await store.send(.abandonStampSearches(destinationHash: destHash)) {
+            $0.stampingLinks.remove(id: UUID(0))
+        }
+        try await runSearchOut(clock) { store.state.stampingLinks[id: UUID(1)] != nil }
+        await store.receive(.stampSearchTimedOut(id: UUID(1)), timeout: .seconds(5)) {
+            $0.stampingLinks.remove(id: UUID(1))
+            $0.linkStampFailures[otherDest] = LinkPlane.LinkStampFailure(
+                cost: LinkPlane.maxLinkStampCost, failedAt: Date(timeIntervalSince1970: 0))
+        }
+        await store.receive(.delegate(.linkFailed(destinationHash: otherDest, reason: .stampFailure)))
+        #expect(store.state.linkStampFailures[destHash] == nil, "an abandoned search did not fail: no backoff")
+        // A search still running (cost 20, over a minute) would keep its effect alive past `finish`.
+        await store.finish()
+    }
+
+    /// Within the backoff a repeat at the same cost or higher fails at once and searches nothing; a
+    /// lower cost searches. Repeats do not restart the backoff.
+    @Test func aRepeatWithinTheBackoffFailsAtOnceUnlessCheaper() async throws {
+        let clock = TestClock()
+        let now = LockIsolated(Date(timeIntervalSince1970: 1_000))
+        let store = makePlane(clock: clock, now: now)
+        try await failASearch(store, clock: clock, cost: 19)
+        #expect(store.state.linkStampFailures[destHash]
+                == LinkPlane.LinkStampFailure(cost: 19, failedAt: Date(timeIntervalSince1970: 1_000)))
+
+        #expect(await searches(store, cost: 19) == false, "the same cost must not search again")
+        #expect(await searches(store, cost: 20) == false, "a higher cost must not search either")
+        now.setValue(Date(timeIntervalSince1970: 1_000 + LinkPlane.linkStampFailureBackoff - 0.1))
+        #expect(await searches(store, cost: 19) == false, "still within the backoff")
+        #expect(store.state.linkStampFailures[destHash]?.failedAt == Date(timeIntervalSince1970: 1_000),
+                "a repeat must not restart the backoff")
+        #expect(await searches(store, cost: 18.5) == true, "a cheaper re-announce searches")
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// The backoff ends `linkStampFailureBackoff` seconds after the failure. A failure dated in the
+    /// future (the wall clock was set back) holds nothing back.
+    @Test func theBackoffEndsAfterItsPeriodAndIgnoresAClockSetBack() async throws {
+        let clock = TestClock()
+        let now = LockIsolated(Date(timeIntervalSince1970: 1_000))
+        let store = makePlane(clock: clock, now: now)
+        try await failASearch(store, clock: clock, cost: 20)
+
+        now.setValue(Date(timeIntervalSince1970: 1_000 + LinkPlane.linkStampFailureBackoff))
+        #expect(await searches(store, cost: 20) == true, "the backoff is over")
+        now.setValue(Date(timeIntervalSince1970: 990))
+        #expect(await searches(store, cost: 20) == true, "a clock set back must not extend the backoff")
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// The router abandons an establishing link when its last queued message is cancelled, not before,
+    /// and stays `.establishing` (the link's outcome may still come).
+    @Test func routerAbandonsAnEstablishingLinkWhenItsLastMessageIsCancelled() async {
+        let me = Identity()
+        let first = LXMessage.create(source: me, destinationHash: destHash, timestamp: 1700000000.5,
+                                     title: Data("t".utf8), content: Data("one".utf8))
+        let second = LXMessage.create(source: me, destinationHash: destHash, timestamp: 1700000000.5,
+                                      title: Data("t".utf8), content: Data("two".utf8))
+        var initial = LXMFRouter.State()
+        initial.knownPaths.insert(destHash)
+        let abandons = LockIsolated(0)
+        let store = TestStore(initialState: initial) {
+            CombineReducers {
+                Reduce<LXMFRouter.State, LXMFRouter.Action> { _, action in
+                    if case .delegate(.abandonLink(destHash)) = action { abandons.withValue { $0 += 1 } }
+                    return .none
+                }
+                LXMFRouter()
+            }
+        } withDependencies: { $0.continuousClock = TestClock() }
+        store.exhaustivity = .off
+        await store.send(.send(message: first, desiredMethod: .direct))
+        await store.send(.send(message: second, desiredMethod: .direct))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.directLinks[destHash] == .establishing)
+
+        await store.send(.cancelOutbound(messageHash: first.hash))
+        await store.skipReceivedActions(strict: false)
+        #expect(abandons.value == 0, "a message still needs the link")
+        await store.send(.cancelOutbound(messageHash: second.hash))
+        await store.skipReceivedActions(strict: false)
+        #expect(abandons.value == 1)
+        #expect(store.state.directLinks[destHash] == .establishing)
+    }
+
+    /// The router abandons an establishing link when the last copy waiting for it fails.
+    @Test func routerAbandonsAnEstablishingLinkWhenItsLastCopyFails() async {
+        let hash = Data(repeating: 0x11, count: 32)
+        var initial = LXMFRouter.State()
+        initial.knownPaths.insert(destHash)
+        initial.directLinks[destHash] = .establishing
+        initial.pendingDeliveries[.delivery(hash)] = LXMFRouter.PendingDelivery(
+            resend: .direct(destinationHash: destHash, data: Data("m".utf8), asResource: false),
+            attempts: LXMFDelivery.maxAttempts)
+        let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: { $0.continuousClock = TestClock() }
+        store.exhaustivity = .off
+        await store.send(.retryDue(messageHash: hash, leg: .delivery))
+        await store.receive(.delegate(.abandonLink(destinationHash: destHash)))
+        #expect(store.state.pendingDeliveries.isEmpty)
+    }
+
+    /// A confirmed delivery copy drops its unsent propagated copy; if that was all the propagation
+    /// node's establishing link was for, the link is abandoned.
+    @Test func routerAbandonsAnEstablishingLinkADeliverySuccessMadeUnnecessary() async {
+        let hash = Data(repeating: 0x22, count: 32)
+        var initial = LXMFRouter.State()
+        initial.outboundPropagationNode = otherDest
+        initial.directLinks[otherDest] = .establishing
+        initial.propagationQueue[otherDest] = [LXMFRouter.PropagationItem(messageHash: hash, propagationPacked: Data("p".utf8))]
+        initial.pendingDeliveries[.delivery(hash)] = LXMFRouter.PendingDelivery(
+            resend: .opportunistic(destinationHash: destHash, payload: Data("m".utf8)), attempts: 1)
+        let store = TestStore(initialState: initial) { LXMFRouter() } withDependencies: { $0.continuousClock = TestClock() }
+        store.exhaustivity = .off
+        await store.send(.opportunisticDelivered(messageHash: hash))
+        await store.receive(.delegate(.abandonLink(destinationHash: otherDest)))
+        #expect(store.state.propagationQueue[otherDest] == nil)
+    }
+}
+
+/// LXMFNode, counting key searches started (distinct searching links seen), searches that reported
+/// back, and every link failure the endpoint reported.
+private struct SearchLifecycleNode: Reducer {
+    typealias State = LXMFNode.State
+    typealias Action = LXMFNode.Action
+    let seen = LockIsolated<Set<UUID>>([])
+    let ended = LockIsolated(0)
+    let failures = LockIsolated<[LinkFailure]>([])
+    var started: Int { seen.value.count }
+
+    var body: some ReducerOf<Self> {
+        LXMFNode()
+        Reduce { state, action in
+            let ids = state.endpoint.linkPlane.stampingLinks.ids
+            seen.withValue { $0.formUnion(ids) }
+            switch action {
+            case .endpoint(.linkPlane(.stampedKeyFound)), .endpoint(.linkPlane(.stampSearchTimedOut)):
+                ended.withValue { $0 += 1 }
+            case let .endpoint(.delegate(.linkFailed(_, reason))):
+                failures.withValue { $0.append(reason) }
+            default: break
+            }
+            return .none
+        }
+    }
+}
+
+/// A connected TCP-client LXMFNode that has heard an lxmf.delivery destination announcing link cost
+/// 20 (a search that cannot finish here) and queued one direct message to it, whose key search is
+/// running. Returns the destination and the message hash.
+@MainActor
+private func nodeSearchingForAKey(_ counter: SearchLifecycleNode, clock: TestClock<Duration>,
+                                  events: (stream: AsyncStream<TCPEvent>, continuation: AsyncStream<TCPEvent>.Continuation))
+    async throws -> (TestStore<LXMFNode.State, LXMFNode.Action>, dest: Data, message: Data) {
+    let store = TestStore(initialState: LXMFNode.State(
+        identity: Identity(), endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))) {
+        counter
+    } withDependencies: {
+        $0.tcpConnection = TCPConnection(open: { _, _ in events.stream }, send: { _ in }, close: { })
+        $0.continuousClock = clock
+        $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000.5))
+        $0.uuid = .incrementing
+    }
+    store.exhaustivity = .off
+    await store.send(.endpoint(.start))
+    events.continuation.yield(.connected)
+    await store.receive({ if case .endpoint(.transport(.interfaceConnected)) = $0 { return true }; return false },
+                        timeout: .seconds(5))
+    let id = try #require(store.state.endpoint.transport.interfaces.keys.first)
+    let peer = try fixture("lxmf_delivery_cost_20")
+    await store.send(.endpoint(.transport(.received(id, peer.raw(hops: 1)))))
+    await store.receive({ if case .endpoint(.delegate(.pathLearned)) = $0 { return true }; return false },
+                        timeout: .seconds(5))
+    await store.send(.send(destinationHash: peer.destinationHash, title: Data("t".utf8),
+                           content: Data("behind a search".utf8), method: .direct))
+    await store.receive({ if case .endpoint(.linkPlane(.openLink)) = $0 { return true }; return false },
+                        timeout: .seconds(5))
+    #expect(store.state.endpoint.linkPlane.stampingLinks.count == 1, "the search must be running")
+    let message = try #require(store.state.router.outboundQueue[peer.destinationHash]?.first?.hash)
+    return (store, peer.destinationHash, message)
+}
+
+@Suite @MainActor struct LXMFNodeLinkStampSearchBoundsTests {
+    /// Cancelling the only message that needed the link stops its key search, silently: no link
+    /// failure is reported, the search never reports back, and no other search starts.
+    @Test func cancellingTheOnlyMessageStopsItsLinksSearchSilently() async throws {
+        let counter = SearchLifecycleNode()
+        let clock = TestClock()
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let (store, dest, message) = try await nodeSearchingForAKey(counter, clock: clock, events: events)
+
+        await store.send(.cancelOutbound(messageHash: message))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.endpoint.linkPlane.stampingLinks.isEmpty, "the search must be cancelled")
+        #expect(store.state.router.directLinks[dest] == nil, "the router must no longer wait for the link")
+        #expect(counter.failures.value.isEmpty, "an abandoned search reports no link failure")
+
+        events.continuation.finish()
+        await clock.advance(by: .seconds(3600))
+        await store.skipReceivedActions(strict: false)
+        #expect(counter.ended.value == 0, "the search was cancelled, not left to run out its timeout")
+        #expect(counter.started == 1, "no search may start after the cancel")
+        #expect(counter.failures.value.isEmpty)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// After a search times out, the router retries the link at once (up to `maxAttempts`). Within the
+    /// backoff each retry fails at once without searching, so one delivery costs one search, not five.
+    @Test func aRouterRetryWithinTheBackoffStartsNoSecondSearch() async throws {
+        let counter = SearchLifecycleNode()
+        let clock = TestClock()
+        let events = AsyncStream<TCPEvent>.makeStream()
+        let (store, dest, message) = try await nodeSearchingForAKey(counter, clock: clock, events: events)
+
+        try await runSearchOut(clock) { counter.ended.value == 0 }
+        await store.receive(.delegate(.deliveryFailed(messageHash: message)), timeout: .seconds(5))
+        #expect(counter.started == 1, "the router's retries must not search again")
+        #expect(counter.ended.value == 1)
+        #expect(counter.failures.value == Array(repeating: .stampFailure, count: LXMFDelivery.maxAttempts),
+                "every attempt the router made failed as a stamp failure")
+        #expect(store.state.endpoint.linkPlane.stampingLinks.isEmpty)
+        #expect(store.state.router.directLinks[dest] == nil)
+
+        events.continuation.finish()
+        await clock.advance(by: .seconds(3600))
+        await store.skipReceivedActions(strict: false)
+        #expect(counter.started == 1)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+}
+
 /// This target's copy of the stamped-announce fixtures must be byte-identical to the ReTiCATests copy,
 /// which the one generator writes. A regeneration that misses a copy fails here.
 @Test func theStampedAnnounceFixtureMatchesTheReTiCATestsCopy() throws {

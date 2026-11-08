@@ -613,7 +613,7 @@ extension TransportEndpoint.Action.AllCasePaths {
                 case let .deregisterRequestHandler(path):
                     return .deregisterRequestHandler(path: path)
                 case .openLink, .acceptLinkRequest, .routeLinkPacket, .interfaceDisconnected, .delegate,
-                     .stampedKeyFound, .stampSearchTimedOut, .cancelStampSearches:
+                     .stampedKeyFound, .stampSearchTimedOut, .cancelStampSearches, .abandonStampSearches:
                     return .linkPlane(plane)
                 }
             },

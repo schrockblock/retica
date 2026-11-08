@@ -26,8 +26,9 @@ public enum LinkFailure: Equatable, Sendable {
     /// not help, because the path demonstrably works.
     case handshakeRejected
     /// The destination announced a link cost and we could not produce a LINKREQUEST key meeting it:
-    /// the cost is above `LinkPlane.maxLinkStampCost`, or the search ran out its
-    /// `NetworkStamp.linkStampTimeout`. Reference `Link.STAMP_FAILURE` (Link.py:337-342). No packet
+    /// the cost is above `LinkPlane.maxLinkStampCost`, the search ran out its
+    /// `NetworkStamp.linkStampTimeout`, or a search at that cost or higher already did within
+    /// `LinkPlane.linkStampFailureBackoff` (then none ran). Reference `Link.STAMP_FAILURE` (Link.py:337-342). No packet
     /// left this node, so it says nothing about the path or the peer. A search ended because its
     /// interface went away, or the endpoint stopped, reports `.pathStale` instead.
     case stampFailure
@@ -96,6 +97,11 @@ public struct LinkPlane {
         /// timeout starts after the search, as reference's does (`Link.__initiate` sends the request,
         /// and starts the watchdog, only once the key exists).
         public var stampingLinks: IdentifiedArrayOf<StampingLink> = []
+        /// The last key search that failed for each destination: its cost and when it failed. An
+        /// `openLink` to that destination at the same cost or higher within `linkStampFailureBackoff`
+        /// fails at once instead of searching. Entries older than the backoff are dropped when a new
+        /// one is recorded.
+        public var linkStampFailures: [Data: LinkStampFailure] = [:]
         public init(links: IdentifiedArrayOf<LinkSession.State> = [],
                     registrations: [Data: RequestRegistration] = [:],
                     maxResponderLinks: Int? = 256,
@@ -134,6 +140,22 @@ public struct LinkPlane {
     /// ceiling we search and let the timeout decide, as reference does.
     public static let maxLinkStampCost: Double = 20
 
+    /// A key search that failed (ran out `NetworkStamp.linkStampTimeout`) for a destination at cost c.
+    public struct LinkStampFailure: Equatable, Sendable {
+        public let cost: Double
+        public let failedAt: Date
+    }
+
+    /// How long, in seconds, a failed key search for a destination at cost c makes every `openLink`
+    /// to it at cost c or higher fail at once with `.stampFailure`, without searching. A lower cost
+    /// (the destination re-announced cheaper) searches.
+    ///
+    /// Reference has no such backoff: LXMF retries the link and RNS searches again each time. Here
+    /// `LXMFRouter` retries a stamp failure at once, up to `LXMFDelivery.maxAttempts` times, so a
+    /// destination whose cost this device cannot meet in 15 s would cost five 15 s searches per
+    /// delivery. A search at the same cost would fail the same way, so with the backoff it costs one.
+    public static let linkStampFailureBackoff: TimeInterval = 300
+
     public enum Action: Equatable {
         case link(IdentifiedActionOf<LinkSession>)
 
@@ -157,6 +179,10 @@ public struct LinkPlane {
         /// when it stops, so no search outlives the endpoint. (`.interfaceDisconnected` does the same
         /// for the searches bound to that one interface.)
         case cancelStampSearches
+        /// Cancel the key searches for links to `destinationHash` and drop them, reporting nothing.
+        /// The host sends this when it has given up on that destination's link, so nobody is waiting
+        /// for the outcome. A link already minted (its search done, or none needed) is not touched.
+        case abandonStampSearches(destinationHash: Data)
         /// Create a responder link for an inbound LINKREQUEST and accept it. `arrivalBitrate` is
         /// the bitrate of the interface the request arrived on (`nil` = unknown → 15 s); it sets the
         /// establishment deadline via `LinkTiming.responderEstablishmentTimeout`.
@@ -218,6 +244,9 @@ public struct LinkPlane {
     @Dependency(\.uuid) var uuid
     @Dependency(\.requestResponder) var requestResponder
     @Dependency(\.continuousClock) var clock
+    /// Read only for `linkStampFailures`, which must store a timestamp. `LinkSession` stamps its link
+    /// timing (`lastData`, `activatedAt`) from the same dependency.
+    @Dependency(\.date) var date
 
     private enum CancelID: Hashable { case stampSearch(UUID) }
 
@@ -241,6 +270,21 @@ public struct LinkPlane {
     /// The `.stampFailure` outcome for a link to `destinationHash`: nothing was sent.
     private static func stampFailed(_ destinationHash: Data) -> Effect<Action> {
         .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .stampFailure)))
+    }
+
+    /// The `.stampFailure` outcome for a search that ran and failed: also starts the backoff for
+    /// `pending`'s destination at its cost (`linkStampFailureBackoff`).
+    private func searchFailed(_ pending: StampingLink, in state: inout State) -> Effect<Action> {
+        let now = date.now
+        state.linkStampFailures = state.linkStampFailures.filter { !Self.backingOff($0.value, now: now) }
+        state.linkStampFailures[pending.destinationHash] = LinkStampFailure(cost: pending.linkCost, failedAt: now)
+        return Self.stampFailed(pending.destinationHash)
+    }
+
+    /// Whether `failure` still holds back a search at `now`. A failure dated after `now` (the wall
+    /// clock was set back) holds nothing back, so a clock change cannot extend the backoff.
+    private static func backingOff(_ failure: LinkStampFailure, now: Date) -> Bool {
+        (0..<linkStampFailureBackoff).contains(now.timeIntervalSince(failure.failedAt))
     }
 
     /// An initiator link session. Without `ephemeral` it gets an ordinary random key.
@@ -287,6 +331,13 @@ public struct LinkPlane {
                     return .send(.link(.element(id: newID, action: .establish)))
                 }
                 guard cost <= Self.maxLinkStampCost else { return Self.stampFailed(destinationHash) }
+                // A search at this cost or higher failed for this destination within the backoff: it
+                // would fail again. Fail at once, and do not restart the backoff, so retries cannot
+                // stretch it.
+                if let failure = state.linkStampFailures[destinationHash], cost >= failure.cost,
+                   Self.backingOff(failure, now: date.now) {
+                    return Self.stampFailed(destinationHash)
+                }
                 // Link.py:355-361: a fresh Ed25519 key first, because the stamp material is
                 // `destinationHash + ed25519Public`; then search X25519 keys against it.
                 let signing = Curve25519.Signing.PrivateKey()
@@ -317,7 +368,8 @@ public struct LinkPlane {
                         group.cancelAll()
                         return first
                     }
-                    // Cancelled from outside (`cancelStampSearches`): that handler reports the failure.
+                    // Cancelled from outside: `cancelStampSearches` / `interfaceDisconnected` report the
+                    // failure, and `abandonStampSearches` reports nothing.
                     guard !Task.isCancelled else { return }
                     if let found {
                         await send(.stampedKeyFound(id: newID, x25519PrivateKey: found.privateKey,
@@ -335,7 +387,7 @@ public struct LinkPlane {
                 // `Identity`, so `LinkSession` sends its public half as the LINKREQUEST payload.
                 guard let ephemeral = Identity(privateKey: x25519PrivateKey + pending.ed25519PrivateKey),
                       ephemeral.publicKey == x25519PublicKey + pending.ed25519PublicKey
-                else { return Self.stampFailed(pending.destinationHash) }
+                else { return searchFailed(pending, in: &state) }
                 state.links.append(Self.initiatorLink(id: id, to: pending.destinationIdentity,
                                                       destinationHash: pending.destinationHash,
                                                       interfaceID: pending.interfaceID,
@@ -347,10 +399,16 @@ public struct LinkPlane {
 
             case let .stampSearchTimedOut(id):
                 guard let pending = state.stampingLinks.remove(id: id) else { return .none }
-                return Self.stampFailed(pending.destinationHash)
+                return searchFailed(pending, in: &state)
 
             case .cancelStampSearches:
                 return failStampSearches(state.stampingLinks, from: &state)
+
+            case let .abandonStampSearches(destinationHash):
+                // Silent: no `linkFailed`, and no backoff, because the search did not fail.
+                let abandoned = state.stampingLinks.filter { $0.destinationHash == destinationHash }
+                for pending in abandoned { state.stampingLinks.remove(id: pending.id) }
+                return .merge(abandoned.map { .cancel(id: CancelID.stampSearch($0.id)) })
 
             case let .acceptLinkRequest(owner, destinationHash, interfaceID, data, arrivalBitrate):
                 // A responder cannot sign the LRPROOF without a private key: `Link.buildProof` →

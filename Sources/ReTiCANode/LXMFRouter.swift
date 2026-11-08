@@ -347,6 +347,12 @@ public struct LXMFRouter {
             case requestMessageList(linkID: Data)
             case requestMessages(linkID: Data, wants: [Data], haves: [Data])
             case closeLink(destinationHash: Data)
+            /// The link to `destinationHash` is still `.establishing` and the last work that needed it
+            /// has gone (cancelled, failed, or made unnecessary by a success). The router stays
+            /// `.establishing`: the host may stop that work and report `.linkClosed`, or let the
+            /// establishment finish and report its outcome as usual. `LXMFNode` stops a link-request
+            /// key search this way.
+            case abandonLink(destinationHash: Data)
             case deliveryConfirmed(messageHash: Data)
             case propagationAccepted(messageHash: Data)
             case deliveryFailed(messageHash: Data)
@@ -384,6 +390,12 @@ public struct LXMFRouter {
                 let wait = state.pendingDeliveries[key].flatMap { state.nextHopRetryWaits[$0.resend.destinationHash] }
                     ?? LXMFDelivery.retryWaitSeconds
                 return retryTimer(key, wait)
+            }
+            /// `.abandonLink` for `dest`, if its link is still being established and no work for it is
+            /// left. Call after removing work for `dest`.
+            func abandonIfIdle(_ state: State, _ dest: Data) -> Effect<Action> {
+                guard state.directLinks[dest] == .establishing, !state.hasLinkWork(for: dest) else { return .none }
+                return .send(.delegate(.abandonLink(destinationHash: dest)))
             }
             func idleTimer(_ dest: Data, _ linkID: Data) -> Effect<Action> {
                 .run { send in
@@ -499,14 +511,19 @@ public struct LXMFRouter {
             /// contradiction.
             func dropUnsentPropagatedCopy(_ state: inout State, _ hash: Data) -> Effect<Action> {
                 state.pendingPropagatedCopies.remove(hash)
+                var emptied: [Data] = []
                 for (dest, items) in state.propagationQueue where items.contains(where: { $0.messageHash == hash }) {
                     let rest = items.filter { $0.messageHash != hash }
                     state.propagationQueue[dest] = rest.isEmpty ? nil : rest
+                    emptied.append(dest)
                 }
                 let key = DeliveryKey.propagated(hash)
-                guard state.pendingDeliveries[key]?.attempts == 0 else { return .none }
-                state.pendingDeliveries[key] = nil
-                return .cancel(id: CancelID.retry(key))
+                var cancelRetry: Effect<Action> = .none
+                if state.pendingDeliveries[key]?.attempts == 0 {
+                    state.pendingDeliveries[key] = nil
+                    cancelRetry = .cancel(id: CancelID.retry(key))
+                }
+                return .merge([cancelRetry] + emptied.map { abandonIfIdle(state, $0) })
             }
             /// Whether the `leg` copy of `hash` can still succeed: armed with a retry timer, or queued
             /// behind its link (not yet armed, but it will be when the link comes up).
@@ -529,8 +546,9 @@ public struct LXMFRouter {
             /// other copy can still succeed and none already did (spec §3). Every router failure path
             /// goes through here, `LXMFNode`'s `.cancelDeliveryStamps` included (`.deliveryCopyAbandoned`).
             func fail(_ state: inout State, _ key: DeliveryKey, reason: FailureReason = .exhausted) -> Effect<Action> {
-                state.pendingDeliveries[key] = nil
+                let dest = state.pendingDeliveries.removeValue(forKey: key)?.resend.destinationHash
                 if key.leg == .propagated { state.pendingPropagatedCopies.remove(key.messageHash) }
+                let abandoned = dest.map { abandonIfIdle(state, $0) } ?? .none
                 // A delivery copy that ran out before its hand-off hands off now, and the propagated
                 // copy it starts keeps the message alive below. A REJECTED one was answered, not
                 // stalled: it ends the message as it always did.
@@ -545,12 +563,12 @@ public struct LXMFRouter {
                 let other: Leg = key.leg == .delivery ? .propagated : .delivery
                 guard !isOutstanding(state, key.messageHash, other),
                       !state.succeededMessages.contains(key.messageHash)
-                else { return handOff }
+                else { return .merge(abandoned, handOff) }
                 // The terminal outcome carries the reason of the copy that ended the message.
                 let outcome: Action.Delegate = reason == .rejected
                     ? .deliveryRejected(messageHash: key.messageHash)
                     : .deliveryFailed(messageHash: key.messageHash)
-                return .merge(handOff, .send(.delegate(outcome)))
+                return .merge(abandoned, handOff, .send(.delegate(outcome)))
             }
             /// A fallback-eligible message's delivery copy has stalled: its propagated copy is now
             /// pending, and `LXMFNode` is asked for it. The ONE place the hand-off happens; it fires
@@ -1052,9 +1070,13 @@ public struct LXMFRouter {
                 guard hadWork else { return .none }
                 var effects: [Effect<Action>] = []
                 var freed: [Data] = []
+                // Every destination this message's work named: one now without work, whose link is
+                // still being established, is abandoned (below).
+                var touched: [Data] = []
                 for leg in [Leg.delivery, .propagated] {
                     let key = DeliveryKey(messageHash: hash, leg: leg)
                     guard let pending = state.pendingDeliveries.removeValue(forKey: key) else { continue }
+                    touched.append(pending.resend.destinationHash)
                     effects.append(.cancel(id: CancelID.retry(key)))
                     switch pending.phase {
                     case .retrying:
@@ -1075,10 +1097,15 @@ public struct LXMFRouter {
                 for (dest, messages) in state.outboundQueue where messages.contains(where: { $0.hash == hash }) {
                     let rest = messages.filter { $0.hash != hash }
                     state.outboundQueue[dest] = rest.isEmpty ? nil : rest
+                    touched.append(dest)
                 }
                 for (dest, items) in state.propagationQueue where items.contains(where: { $0.messageHash == hash }) {
                     let rest = items.filter { $0.messageHash != hash }
                     state.propagationQueue[dest] = rest.isEmpty ? nil : rest
+                    touched.append(dest)
+                }
+                for dest in Set(touched).sorted(by: { $0.lexicographicallyPrecedes($1) }) {
+                    effects.append(abandonIfIdle(state, dest))
                 }
                 // A message one of whose copies already succeeded has had its terminal outcome
                 // (`deliveryConfirmed` / `propagationAccepted`): the remaining copy is torn down

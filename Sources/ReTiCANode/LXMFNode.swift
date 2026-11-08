@@ -1126,6 +1126,16 @@ public struct LXMFNode {
                 guard let linkID = state.directLinks[dest] else { return .none }
                 return .send(.endpoint(.closeLink(linkID: linkID)))
 
+            case let .router(.delegate(.abandonLink(dest))):
+                // Only a link still waiting for its link-request key is stopped: nothing has left this
+                // node for it, so dropping it is silent. Its search is cancelled and the router told the
+                // link is gone (it re-establishes if work arrived meanwhile). A link already minted is
+                // left to finish; the router, still `.establishing`, takes its outcome as usual.
+                guard state.endpoint.linkPlane.stampingLinks.contains(where: { $0.destinationHash == dest })
+                else { return .none }
+                return .concatenate(.send(.endpoint(.linkPlane(.abandonStampSearches(destinationHash: dest)))),
+                                    .send(.router(.linkClosed(destinationHash: dest))))
+
             // --- Direct-over-link: endpoint delegates → router actions ---
             case let .endpoint(.delegate(.linkEstablished(linkID, dest))):
                 state.directLinks[dest] = linkID
@@ -1171,8 +1181,9 @@ public struct LXMFNode {
                     // No LINKREQUEST left this node: the destination announced a link cost we could
                     // not meet (above `LinkPlane.maxLinkStampCost`, or the search timed out). The path
                     // is not in question, so do not request one. Retry the link like `.handshakeRejected`:
-                    // a fresh search may still succeed in time, and `establishAttempts` bounds the
-                    // retries, each costing at most `NetworkStamp.linkStampTimeout` of search.
+                    // a fresh search at a lower cost may still succeed, and `establishAttempts` bounds the
+                    // retries. A retry at the same cost or higher within `LinkPlane.linkStampFailureBackoff`
+                    // fails at once without searching, so the retries cost one search, not one each.
                     return .send(.router(.linkClosed(destinationHash: dest)))
                 }
 

@@ -239,6 +239,7 @@ private func handedOff(_ msg: LXMessage, _ state: LXMFRouter.State,
 /// The confirmation, exhaustively: one `deliveryConfirmed`, and the delivery copy's retries stop.
 @MainActor
 private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>, _ h: Data,
+                         abandoning abandoned: Data? = nil,
                          _ update: @escaping (inout LXMFRouter.State) -> Void) async {
     store.exhaustivity = .on
     await store.send(.opportunisticDelivered(messageHash: h)) {
@@ -246,6 +247,7 @@ private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>
         $0.succeededMessages.insert(h)
         update(&$0)
     }
+    if let abandoned { await store.receive(.delegate(.abandonLink(destinationHash: abandoned))) }
     await store.receive(.delegate(.deliveryConfirmed(messageHash: h)))
 }
 
@@ -274,7 +276,8 @@ private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>
     await store.send(.sendViaPropagation(message: msg, propagationPacked: container))
     await store.skipReceivedActions(strict: false)
     #expect(store.state.propagationQueue[pn]?.count == 1)
-    await confirmOnce(store, h) { $0.propagationQueue[pn] = nil }
+    // The queued copy was all the node's establishing link was for: it is abandoned.
+    await confirmOnce(store, h, abandoning: pn) { $0.propagationQueue[pn] = nil }
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
     // The link comes up with nothing to send: no sendPropagatedPacket, so no propagationAccepted.
     await store.send(.linkEstablished(destinationHash: pn, linkID: pnLink)) {
