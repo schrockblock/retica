@@ -663,7 +663,9 @@ public struct LXMFNode {
                               .send(.router(.setOutboundPropagationNode(destinationHash))))
 
             case let .sendViaPropagation(destinationHash, title, content):
-                guard let recipient = state.endpoint.learned[destinationHash]?.identity,
+                // `recall`, not the path table: a propagated copy needs only the recipient's key,
+                // which a host may know without a path (an lxma:// contact, a persisted announce).
+                guard let recipient = state.endpoint.recall(destinationHash: destinationHash),
                       let cost = propagationStampCost(state)
                 else { return .none }
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
@@ -702,7 +704,7 @@ public struct LXMFNode {
                 // the two effects are concatenated, not merged.
                 var fallback: Effect<Action> = .none
                 if fallbackToPropagation,
-                   state.endpoint.learned[message.destinationHash]?.identity != nil,
+                   state.endpoint.recall(destinationHash: message.destinationHash) != nil,
                    propagationStampCost(state) != nil {
                     if let limit = propagationTransferLimitBytes(state), message.packed.count > limit {
                         // Spec §6: the node would refuse it, so the copy is not attempted at all.
@@ -1316,7 +1318,7 @@ public struct LXMFNode {
 
     /// Start the propagated copy the router handed off with `propagationFallbackDue`: search its
     /// propagation stamp, pack it, and give it to the router. The router already counts it as
-    /// pending, so a copy that can no longer be packed (the recipient's identity is gone, or the node
+    /// pending, so a copy that can no longer be packed (the recipient's identity is unknown, or the node
     /// now advertises a cost we refuse) is failed through the router's `fail` — the message still
     /// gets its terminal outcome.
     ///
@@ -1327,7 +1329,7 @@ public struct LXMFNode {
     /// is for a cost learned since then. Retries stay stable because `ResendInfo.propagated` re-sends
     /// the packed bytes and never packs again.
     private func startPropagatedCopy(_ state: inout State, message: LXMessage) -> Effect<Action> {
-        guard let recipient = state.endpoint.learned[message.destinationHash]?.identity,
+        guard let recipient = state.endpoint.recall(destinationHash: message.destinationHash),
               let cost = propagationStampCost(state)
         else { return .send(.router(.propagatedCopyFailed(messageHash: message.hash))) }
         refreshOutboundPropagationNodeRetryWait(&state)
