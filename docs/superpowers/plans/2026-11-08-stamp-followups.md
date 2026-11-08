@@ -188,3 +188,19 @@ and what reference does with an out-of-range configured cost, and match it.
   PEER's advertised cost matches reference too (outbound searches are already capped by
   `maxDeliveryStampCost`).
 - [ ] Tests at the boundary (100 accepted, 101 handled as reference handles it). Commit.
+
+### Task 11: Stopping a TCP-server endpoint closes its accepted connections (found during Task 4)
+
+**Files:** the TCP-server driver (`Sources/ReTiCANode/TransportEndpoint.swift` server slot and whatever
+`TCPServerEndpoint`-like reducer it composes); its tests.
+
+Stopping the listener cancels its event effect, so no `.closed` for an accepted connection reaches the reducer:
+those interfaces stay in `Transport.State.interfaces`, and the shared maintenance loop (driven off the shared
+interface count) keeps running after the stop. Expected: a stop disconnects every accepted connection
+(`interfaceDisconnected` for each), as TCP-client and BLE stops do, so the shared loop stops when no interface
+is left.
+
+- [ ] Test: start a server, accept two connections, stop; both interfaces leave `transport.interfaces`, and the
+  maintenance loop stops (the endpoint test that pins the shared loop shows how to observe it).
+- [ ] Remove the KNOWN GAP workaround from Task 4's TCP-server stop test (`LinkPlaneStampedRequestTests.swift`).
+- [ ] Commit.
