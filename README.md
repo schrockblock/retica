@@ -50,7 +50,7 @@ local path dependencies:
 
 Neither of those has a public remote. To build ReTiCA you need checkouts of `FCB` and
 `MeshtasticKit` next to the ReTiCA directory, and your app depends on ReTiCA by path as well.
-This is how the one known consumer (the ReTiCaMsgr app) does it:
+This is how the one known consumer (the ReTiCAMsgr app) does it:
 
 ```swift
 // In your app's Package.swift, with ReTiCA, FCB and MeshtasticKit checked out side by side:
@@ -205,7 +205,7 @@ What the example relies on:
   when it does not. If no path is known, the router requests one. To know the message hash
   before sending, or to add `fields`, build the message with
   `LXMessage.create(source:destinationHash:timestamp:title:content:fields:)` and send
-  `.sendMessage(message:fallbackToPropagation:)`, which is what ReTiCaMsgr does.
+  `.sendMessage(message:fallbackToPropagation:)`, which is what ReTiCAMsgr does.
 - **Outcomes.** Every outbound message ends with at least one of `deliveryConfirmed`,
   `propagationAccepted`, `deliveryFailed`, `deliveryRejected`, `deliveryCancelled`. It can get
   two successes (a direct and a propagated copy both landing), so handle them idempotently.
@@ -230,7 +230,7 @@ a packet can arrive on one and leave on another:
 
 | Slot | State | Notes |
 |---|---|---|
-| TCP client | `tcpClients: IdentifiedArrayOf<TCPEndpoint.State>` | One socket per node dialled. Give each a distinct `interfaceID` (ReTiCaMsgr uses `"tcp:<host>:<port>"`). Reconnects on drop by default. Remove one with `.removeTCPClient(_:)`. |
+| TCP client | `tcpClients: IdentifiedArrayOf<TCPEndpoint.State>` | One socket per node dialled. Give each a distinct `interfaceID` (ReTiCAMsgr uses `"tcp:<host>:<port>"`). Reconnects on drop by default. Remove one with `.removeTCPClient(_:)`. |
 | TCP server | `tcpServer: TCPServerEndpoint.State?` | Listens on a port so peers can dial you. No connection cap. Not discoverable: peers must be told your address and port. |
 | BLE | `ble: BLEEndpoint.State?` | ble-reticulum protocol v2.2 over GATT, with an L2CAP path (v3) when the peer publishes a PSM. `BLEEndpoint.State(localIdentity: identity.hash)`. |
 | Meshtastic | `meshtastic: MeshtasticEndpoint.State?` | Reticulum over a Meshtastic radio, compatible with landandair's RNS_Over_Meshtastic interface. Needs `ReTiCAMeshtasticLive` and `$0.meshtasticDriver = .live(session:)`; without it the slot reports the adapter as unavailable. |
@@ -271,18 +271,18 @@ stamps. Save these and replay them at launch:
 |---|---|---|
 | Your identity's private key | `identity.privateKey` | `Identity(privateKey:)` |
 | Path table | `state.endpoint.learned` (`[Data: LearnedDestination]`) | `.endpoint(.transport(.rehydrateLearnedDestinations(_:)))` |
-| Known identities (recall) | `state.endpoint.knownDestinations` | `.endpoint(.transport(.rehydrateKnownDestinations(_:)))` |
+| Known identities (recall) and the link costs they announced | `state.endpoint.knownDestinations` | `.endpoint(.transport(.rehydrateKnownDestinations(_:)))`. Without it the first link to a peer enforcing link-request stamps fails until it announces again. |
 | Hashes of messages already received | `message.hash` from each `.delegate(.messageReceived)` | `.router(.rehydrateDedup(seenHashes:downloadedTransientIds:))`, **oldest first** |
 | Transient ids downloaded from a propagation node | `.router(.messagesDownloaded(transientIds:))` actions, or `state.router.downloadedTransientIds` | the same action |
 | Peers' display names and stamp costs | `state.learnedPeers` | `.rehydrateLearnedPeers(_:)` |
 | Blocked senders | `state.ignoredDestinations` | `.rehydrateIgnoredDestinations(_:)` |
-| Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))`; in an `LXMFServiceNode` host (ReTiCaMsgr), `.node(.client(.endpoint(.delegate(.destinationStampGenerated(...)))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.rehydrateDestinationStamp(...))))` |
+| Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))`; in an `LXMFServiceNode` host (ReTiCAMsgr), `.node(.client(.endpoint(.delegate(.destinationStampGenerated(...)))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.rehydrateDestinationStamp(...))))` |
 | A propagation node's stored messages (only if you run one) | the stored entries | `.pn(.ingestContainer(LXMFPropagation.container(timestamp:entries:)))` on `LXMFServiceNode` |
 
 Ordering matters for `seenHashes`: it is a ring of 10,000, so supplying newest-first keeps the
 wrong half. The rehydrate actions drop expired, malformed or future-dated rows and never
 overwrite an entry the network has already refreshed, so they are safe to send after
-`.endpoint(.start)` (ReTiCaMsgr runs its database reads alongside starting the interfaces). They
+`.endpoint(.start)` (ReTiCAMsgr runs its database reads alongside starting the interfaces). They
 cannot tell you to delete expired rows from disk; prune those yourself with
 `Transport.pathExpiry` (7 days), `Transport.knownDestinationExpiry` (8.75 days) and
 `LXMFNode.stampCostExpiry` (45 days). `LearnedDestination` and `KnownDestination` are not
@@ -329,7 +329,7 @@ costs those hashes and nothing more.
 ## iOS lifecycle
 
 - **Background.** When iOS suspends the app its sockets go quiet, but the other end may keep
-  writing into them. ReTiCaMsgr closes its sockets when it goes to the background (after
+  writing into them. ReTiCAMsgr closes its sockets when it goes to the background (after
   finishing in-flight sends inside a background task) and redials on foreground. Before closing,
   send `.holdOutbound(true)`: held messages keep their retry state instead of failing, or falling
   back to a propagation node, while the app is suspended. Send `.holdOutbound(false)` on
@@ -394,7 +394,7 @@ The library declares nothing itself. The host app needs:
 | `ReTiCAKeychain` | `keychain-access-groups` containing the group you pass to `IdentityKeychain.Location`. |
 | Push wake-ups (ReTiCAPush) | `aps-environment`, the `remote-notification` background mode, and an App Group shared with the Notification Service Extension. |
 
-These are the keys ReTiCaMsgr uses, except `NSLocalNetworkUsageDescription`, which it does not
+These are the keys ReTiCAMsgr uses, except `NSLocalNetworkUsageDescription`, which it does not
 set; that row comes from how iOS behaves, not from this codebase.
 
 ## Propagation nodes
