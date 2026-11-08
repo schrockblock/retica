@@ -276,6 +276,7 @@ stamps. Save these and replay them at launch:
 | Transient ids downloaded from a propagation node | `.router(.messagesDownloaded(transientIds:))` actions, or `state.router.downloadedTransientIds` | the same action |
 | Peers' display names and stamp costs | `state.learnedPeers` | `.rehydrateLearnedPeers(_:)` |
 | Blocked senders | `state.ignoredDestinations` | `.rehydrateIgnoredDestinations(_:)` |
+| Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))` |
 | A propagation node's stored messages (only if you run one) | the stored entries | `.pn(.ingestContainer(LXMFPropagation.container(timestamp:entries:)))` on `LXMFServiceNode` |
 
 Ordering matters for `seenHashes`: it is a ring of 10,000, so supplying newest-first keeps the
@@ -286,7 +287,41 @@ cannot tell you to delete expired rows from disk; prune those yourself with
 `Transport.pathExpiry` (7 days), `Transport.knownDestinationExpiry` (8.75 days) and
 `LXMFNode.stampCostExpiry` (45 days). `LearnedDestination` and `KnownDestination` are not
 `Codable`; store their public fields (the identity as `identity.publicKey`) and rebuild them with
-their public initialisers.
+their public initialisers. A destination stamp is mined once per destination and takes minutes at
+the default value, so without it every cold start mines again before the first announce goes out.
+A rehydrated stamp is checked against `destinationValue` and mined again if it falls short.
+
+## Network stamps (RNS 1.6)
+
+RNS 1.6.0 adds proof of work to announces, path requests and link requests. ReTiCA has the same
+three switches as reference's `[stamps]` section, all off by default, as in 1.6.0. They live on
+`Transport.State`; a host sets them before starting, through `TransportEndpoint.State.transport`:
+
+```swift
+var node = LXMFNode.State(identity: identity, endpoint: TCPEndpoint.State(host: host, port: port))
+node.endpoint.transport.stampDestinations = true   // stamp our announces
+node.endpoint.transport.stampPathRequests = true   // stamp our path requests
+node.endpoint.transport.enforceStamps = true       // refuse unstamped traffic we receive
+```
+
+| Setting | Default | Reference | What it does |
+|---|---|---|---|
+| `stampDestinations` | off | `stamp_destinations` | Every announce and path response carries a stamp of `destinationValue` (default 25) and the destination's link cost. Mined once per destination; persist it (above). |
+| `stampPathRequests` | off | `stamp_path_requests` | Each path request is sent only after a stamp of `pathRequestValue` (default 15.8) is found, up to 15 s. A relay marks unstamped requests it forwards. |
+| `enforceStamps` | off | `enforce_stamps` | Announces below `destinationCost` (default 23.5) are not learned or relayed; path requests below `pathRequestCost` (default 15.8) are not answered or forwarded; link requests to our destinations below their link cost (LXMF 3.25, otherwise 12.5) are not answered. Our own outbound traffic is unaffected. |
+
+Link requests are stamped whatever these say, as in 1.6.0: when a destination announced a link
+cost, the link waits for a key meeting it (up to 15 s, cost 20 at most). With `enforceStamps` on
+and `stampDestinations` off, peers never learn our link cost, so a 1.6.0 peer opens its links to us
+unstamped and every one is refused; reference behaves the same way. Reference sets its costs per
+interface; ReTiCA has one value for all of them.
+
+What it costs. Hash rates measured on a Mac (release build, about +/-15%) are in
+`NetworkStamp.swift`: about 790,000 stamp rounds a second and 14,000 link keys a second. From
+those, a path-request stamp (15.8) takes well under a second, a destination stamp at 23.5 about
+15 s and at the default 25 roughly three times that, and a link key at 12.5 about 0.4 s.
+**Rates on a phone have not been measured.** Checking a stamp is one SHA-256, and with
+`enforceStamps` on an announce's stamp is checked before its signature, so junk costs one hash.
 
 ## iOS lifecycle
 
@@ -310,7 +345,9 @@ their public initialisers.
 - **Stamp work.** Delivery and propagation stamps are proof-of-work searches that can take
   minutes. `.cancelDeliveryStamps` and `.cancelPropagationStamps` stop them; a message whose
   search is cancelled is reported `deliveryFailed`, not sent unstamped.
-  `.cancelOutbound(messageHash:)` cancels one message wherever it is.
+  `.cancelOutbound(messageHash:)` cancels one message wherever it is. Network stamp searches
+  (destination, path-request and link-request stamps) are cancelled by `.endpoint(.stop)`; a link
+  waiting for its key fails with `.pathStale`, and an announce waiting for its stamp is dropped.
 - **Receiving while suspended.** A suspended app receives nothing. The options are a propagation
   node (sync when the app comes back with `.syncFromPropagationNode`) and push wake-ups (below).
 - **Main actor and dependencies.** Run the `Store` on the main actor, as TCA expects. Sockets,
@@ -397,7 +434,7 @@ content. See that package's README and its `docs/server-contract.md`.
 | RNS (Python) | **1.4.2** | Current fixtures and source comments (IFAC, proofs, transport, the link probe harness). |
 | RNS (Python) | 1.3.8 | The first fixtures (crypto, packets, links, resources); some source comments still cite it. |
 | LXMF (Python) | **1.1.0** | Almost all LXMF fixtures and source comments. One comment cites 1.1.1 (the ignore list). |
-| RNS 1.6.0 with LXMF 1.3.0 | The latest, partly covered | Stamped announce fixtures and the live stamp tests only, in the conda env `rns-latest`. |
+| RNS 1.6.0 with LXMF 1.3.0 | The latest, partly covered | Network stamp fixtures (stamp arithmetic, stamped announces, destination stamps, path requests, link requests) and the live stamp tests only, in the conda env `rns-latest`. |
 | ble-reticulum | a local checkout of torlando-tech/ble-reticulum, plus `ble_support.py` from a Reticulum fork | BLE fragmentation and greylist fixtures. The script calls the checkout pinned but does not record which commit. |
 | RNS_Over_Meshtastic | landandair, commit `e5eb5d23a619958ae0556c88fcbc4bf1d867ab0a` | Meshtastic fragment fixtures (an unmodified copy of the reference file is in the repo). |
 
@@ -417,6 +454,11 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Packet framing (HEADER_1/HEADER_2, flags, contexts), packet hash | Implemented, cross-validated | |
 | Destinations: SINGLE, GROUP, PLAIN; name hashing | Implemented, cross-validated | Link destinations via `LinkSession`. |
 | Announces: build, validate, app data | Implemented, cross-validated | |
+| Network stamps (RNS 1.6): arithmetic, validation | Implemented, cross-validated against RNS 1.6.0 | Fixed-point costs, targets, values and stamped keys. |
+| Network stamps on our announces (`stampDestinations`) | Implemented, cross-validated, tested live against RNS 1.6.0. **Off by default** | The extension layout is compared with reference announces; an enforcing reference peer accepts a stamped ReTiCA announce and drops an unstamped one. The stamp is persisted by the host. |
+| Network stamps on our path requests (`stampPathRequests`) | Implemented, tested live against RNS 1.6.0. **Off by default** | Inbound parsing is checked against reference requests. An enforcing reference peer answers a stamped ReTiCA request and drops an unstamped one. |
+| Network stamps on our link requests | Implemented, tested live against RNS 1.6.0. **On, as in 1.6.0** | Only to a destination that announced a link cost, and only up to cost 20 (reference has no ceiling). An enforcing reference peer accepts the stamped request and ignores an unstamped one. |
+| Enforcing network stamps (`enforceStamps`) | Implemented, tested against reference fixtures; announces also tested live against RNS 1.6.0. **Off by default**, as in 1.6.0 | Refuses announces, path requests and link requests whose stamp falls short (see Part 1). One cost for all interfaces, where reference has one per interface. Inbound path- and link-request enforcement is tested only with fixtures, not against a live reference peer. |
 | Announce propagation as a transport node | Implemented | Relay mode (`.enableRelay`), HEADER_2 rewrite; rebroadcast and retry constants cross-validated; per-interface announce bandwidth cap. |
 | Ratchets | **Partial** | ReTiCA encrypts to a peer's announced ratchet but never generates, rotates, persists or announces its own. So there is no forward secrecy for traffic *to* a ReTiCA destination, and a peer that calls `enforce_ratchets()` drops everything ReTiCA sends it. |
 | Path table, path requests and responses | Implemented, cross-validated (request and response layout) | Path expiry by interface mode. Persisted by the host. No rate limiting of inbound path requests. |
@@ -493,6 +535,9 @@ byte-for-byte reproduces what the reference produced. Running the tests does not
 | MsgPack types the reference emits, in signed payloads | `generate_msgpack_signed_fixtures.py` | `msgpack_signed_fixtures.json` | `MsgPackSignedCrossValidationTests.swift` |
 | LXMF message format | `generate_lxmf_fixtures.py`, `generate_lxmf_rich_fixtures.py`, `generate_lxmf_signed_fixtures.py` | `lxmf_fixtures.json`, `lxmf_rich_fixtures.json`, `lxmf_signed_fixtures.json` | `LXMessageCrossValidationTests.swift`, `LXMFRichCrossValidationTests.swift`, `MsgPackSignedCrossValidationTests.swift` |
 | Announce app data as RNS 1.6.0 / LXMF 1.3.0 send it, with network stamps | `generate_lxmf_stamped_announce_fixtures.py` | `lxmf_stamped_announce_fixtures.json` | `LXMFStampedAnnounceCrossValidationTests.swift` |
+| RNS 1.6.0 network stamp arithmetic and stamped keys | `generate_network_stamp_fixtures.py` | `network_stamp_fixtures.json` | `NetworkStampCrossValidationTests.swift` |
+| RNS 1.6.0 stamped announce packets | `generate_stamped_announce_packet_fixtures.py` | `stamped_announce_packet_fixtures.json` (copied to the transport and node tests) | `Tests/ReTiCATests/Destination/StampedAnnounceTests.swift`, `StampedAnnounceTransportTests.swift`, `StampEnforcementTests.swift` |
+| RNS 1.6.0 destination stamps, path requests, link requests | `Tests/ReTiCATransportTests/Vectors/generate_destination_stamp_fixtures.py`, `generate_path_request_fixtures.py`, `generate_link_request_stamp_fixtures.py` | `destination_stamp_fixtures.json`, `path_request_fixtures.json`, `link_request_stamp_fixtures.json` | `DestinationStampTests.swift`, `PathRequestStampTests.swift`, `StampEnforcementTests.swift` |
 | LXMF stamps and peering keys | `generate_lxmf_stamp_fixtures.py`, `generate_lxmf_peering_fixtures.py` | `lxmf_stamp_fixtures.json`, `lxmf_peering_fixtures.json` | `LXStamperCrossValidationTests.swift`, `LXStamperPeeringCrossValidationTests.swift`, `LXMFStampMessageCrossValidationTests.swift` |
 | Propagation container | `generate_lxmf_propagation_fixtures.py` | `lxmf_propagation_fixtures.json` | `LXMFPropagationCrossValidationTests.swift` |
 | Delivery announce app data, propagation node announces | `generate_lxmf_announce_fixtures.py`, `generate_lxmf_pn_announce_fixtures.py` | `lxmf_announce_fixtures.json`, `lxmf_pn_announce_fixtures.json` | `Tests/ReTiCATests/LXMFAnnounceDataCrossValidationTests.swift`, `PNAnnounceCrossValidationTests.swift` |
@@ -572,7 +617,10 @@ Both are skipped unless an environment variable is set.
   (`Tests/ReTiCANodeTests/LiveStampInteropTests.swift`, peer `Scripts/stampprobe/peer.py`, RNS 1.6.0
   and LXMF 1.3.0, peer configured as MeshChatX configures its router). Covers stamped announces, a
   first message before any announce, a large message over a link, a message from the peer, and a
-  propagated message through a real node to a recipient that syncs. The tests start the peers
+  propagated message through a real node to a recipient that syncs. For RNS network stamps, peers
+  that enforce them (`--enforce-network`) accept ReTiCA's stamped link requests, path requests and
+  announces and drop its unstamped ones, and a ReTiCA node with `enforceStamps` on learns a
+  stamped reference announce and drops an unstamped one. The tests start the peers
   themselves and assert on what the peer logged, because an enforcing peer proves a packet before
   it drops it, so `deliveryConfirmed` does not show receipt.
 
@@ -629,10 +677,16 @@ So that nobody reads more into the tables than is there:
   `docs/superpowers/plans/2026-10-16-meshtastic-hardware-checklist.md`) have no recorded results.
   BLE compatibility is cross-validated only at the fragmentation level.
 - Propagation node peering has not been tested against a reference `lxmd`.
-- Against RNS 1.6.0 and LXMF 1.3.0, only announce parsing and the live stamp tests have been
-  checked. RNS network stamps are not implemented, so a network enforcing them will drop ReTiCA's
-  announces and path requests, and ignore its link requests to destinations with a link cost.
-  The real MeshChatX application has not been run against ReTiCA, only a router configured from
+- Against RNS 1.6.0 and LXMF 1.3.0, only the network stamp fixtures and the live stamp tests have
+  been checked. RNS 1.6's other changes (table culling, SQLite storage) are not implemented.
+- Network stamps are off by default. A network enforcing them drops ReTiCA's announces and path
+  requests unless the host turns on `stampDestinations` and `stampPathRequests`. Link requests
+  are stamped regardless.
+- ReTiCA's own enforcement (`enforceStamps`) has been run live only for announces. Refusing
+  inbound path requests and link requests is tested only with reference fixtures.
+- **Hash rates on a phone have not been measured.** The figures in Part 1 are from a Mac. Nothing
+  about network stamps has been tried on a phone.
+- The real MeshChatX application has not been run against ReTiCA, only a router configured from
   its source.
 
 ---

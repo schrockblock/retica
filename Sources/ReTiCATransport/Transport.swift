@@ -143,6 +143,29 @@ public struct Transport {
         public var localLinkCosts: [Data: Double] = [:]
         /// Local destinations whose stamp search is in flight. One search per destination.
         public var stampingDestinations: Set<Data> = []
+        /// Enforce network stamps on what we receive (RNS `[stamps] enforce_stamps`, which sets both
+        /// `STAMPS_ENFORCED` and `LR_STAMPS_ENFORCED`, Reticulum.py:507-511). Off by default, as in
+        /// 1.6.0. When on:
+        ///   * an announce whose stamp does not meet `destinationCost` is neither learned, remembered
+        ///     nor relayed (Identity.py:883-889, Transport.py:2046-2049). The stamp, one SHA-256, is
+        ///     checked before the Ed25519 signature, so a junk announce costs one hash;
+        ///   * a path request without a stamp meeting `pathRequestCost` over `destination + tag` is
+        ///     neither answered nor forwarded (Transport.py:2099-2129);
+        ///   * a link request to a local destination whose X25519 key, the stamp, does not meet that
+        ///     destination's link cost over `destinationHash + Ed25519 key` is never handed to the link
+        ///     plane, so it is not answered and costs no DH (Link.py:192-195).
+        /// Peers learn our link cost only from stamped announces, so enforcing link requests without
+        /// `stampDestinations` refuses every link a 1.6.0 peer opens to us, as reference does. Our own
+        /// outbound traffic is unaffected. A host sets this at construction, on
+        /// `TransportEndpoint.State.transport`.
+        public var enforceStamps = false
+        /// The stamp value an announce must carry (RNS `Transport.DESTINATION_COST`; reference reads it
+        /// per receiving interface, `destination_cost`, which defaults to this). Also the value below
+        /// which a stamp is left in the app data and its link cost ignored, enforced or not.
+        public var destinationCost: Double = NetworkStamp.defaultDestinationCost
+        /// The stamp value a path request must carry when `enforceStamps` is on (RNS
+        /// `Transport.PR_COST`; reference reads it per receiving interface, `pr_cost`).
+        public var pathRequestCost: Double = NetworkStamp.defaultPathRequestCost
         /// Announces and path responses waiting for their destination's stamp (reference
         /// `stamp_queues`, Transport.py:1453-1463). At most one announce per destination and target
         /// interface (the newest), and bounded overall by `Transport.stampedAnnounceQueueLimit` and
@@ -863,6 +886,14 @@ public struct Transport {
                     return .send(.delegate(.linkPacket(linkID: packet.destinationHash, arrivalInterface: interfaceID, data: plain)))
                 }
                 if packet.packetType == .linkRequest, state.localDestinations[packet.destinationHash] != nil {
+                    // Enforcing, a request whose key falls short of the destination's link cost is
+                    // dropped before the link plane sees it, so it costs one hash and no DH.
+                    if state.enforceStamps {
+                        let cost = state.localLinkCosts[packet.destinationHash] ?? NetworkStamp.defaultLinkRequestCost
+                        guard Transport.linkRequestStampMeets(cost: cost, destinationHash: packet.destinationHash,
+                                                              payload: packet.payload)
+                        else { return .none }
+                    }
                     return .send(.delegate(.linkRequest(destinationHash: packet.destinationHash,
                                                         arrivalInterface: interfaceID, data: plain)))
                 }
@@ -881,9 +912,15 @@ public struct Transport {
                 case .announce:
                     // Don't learn a path to one of our own destinations.
                     guard state.localDestinations[packet.destinationHash] == nil else { return .none }
+                    // Enforcing, an announce below `destinationCost` stops here: not learned, not
+                    // remembered, not relayed, and not counted by ingress control below, as reference
+                    // returns before `received_announce` (Transport.py:2046-2053). A C4-held announce
+                    // replays through here and is checked again.
                     guard let parsed = Announce.parse(payload: packet.payload,
                                                       destinationHash: packet.destinationHash,
-                                                      contextFlagSet: packet.contextFlag)
+                                                      contextFlagSet: packet.contextFlag,
+                                                      requiredStampValue: state.destinationCost,
+                                                      enforceStamp: state.enforceStamps)
                     else { return .none }
                     // C4 ingress control (RNS Transport.py:1748-1766). Record the arrival first — the deque
                     // counts every signature-valid announce, including this one, before the decision.
@@ -1072,11 +1109,19 @@ public struct Transport {
                         let requestorTransportId: Data? = payload.count >= Transport.pathRequestLength
                             ? Data(payload.dropFirst(16).prefix(16)) : nil
                         // Carried through unchanged by a relay, whatever it holds (Transport.py:3940).
-                        // Not validated: 1.6.0 does not enforce path-request stamps by default.
+                        // Validated only when enforcing: 1.6.0 does not enforce by default.
                         let extensionPayload: Data? = payload.count == Transport.pathRequestStampedLength
                             ? Data(payload.dropFirst(Transport.pathRequestLength)) : nil
                         // Entry gate: ignore duplicate (destHash ‖ tag) requests.
                         guard state.discoveryPrTags.insert(requested + tag) else { return .none }
+                        // Enforcing, a request without a stamp meeting `pathRequestCost` is neither
+                        // answered nor forwarded. After the tag gate, as in reference (Transport.py:2088-2129),
+                        // so a refused request still uses up its tag.
+                        if state.enforceStamps {
+                            guard Transport.pathRequestStampMeets(cost: state.pathRequestCost, destinationHash: requested,
+                                                                  tag: tag, extensionPayload: extensionPayload)
+                            else { return .none }
+                        }
                         // (1) We OWN the requested destination → answer with a fresh path-response.
                         if let dest = state.localDestinations[requested],
                            let identity = dest.identity, identity.privateKey != nil {
@@ -1849,6 +1894,29 @@ public struct Transport {
     /// tell it came from a stamp-aware node: marker, flags `0xFF`, 14 zero bytes (Transport.py:3935-3936).
     static let lenientPathRequestExtension =
         Data([NetworkStamp.extensionMarker, 0xFF]) + Data(repeating: 0, count: NetworkStamp.stampLength)
+
+    /// True when a path request's 16-byte extension holds a stamp meeting `cost` over
+    /// `destinationHash + tag` (Transport.py:2099-2105, `validate_pr_stamp` 4012-4016). No extension, a
+    /// wrong marker or a short stamp is false; the lenient mark's 14 zero bytes are judged like any
+    /// stamp. One SHA-256.
+    static func pathRequestStampMeets(cost: Double, destinationHash: Data, tag: Data, extensionPayload: Data?) -> Bool {
+        guard let ext = extensionPayload, ext.count == 2 + NetworkStamp.stampLength,
+              ext.first == NetworkStamp.extensionMarker else { return false }
+        return NetworkStamp.isValid(stamp: Data(ext.dropFirst(2)), cost: cost, material: destinationHash + tag)
+    }
+
+    /// LINKREQUEST payload sizes reference reads, keys alone or with MTU signalling (Link.py:188).
+    static let linkRequestPayloadLengths: Set<Int> = [64, 67]
+
+    /// True when a LINKREQUEST's X25519 key, the stamp, meets `cost` over `destinationHash` plus the
+    /// request's Ed25519 key (Link.py:190-195). Any other payload size is false. One SHA-256.
+    static func linkRequestStampMeets(cost: Double, destinationHash: Data, payload: Data) -> Bool {
+        guard linkRequestPayloadLengths.contains(payload.count) else { return false }
+        let bytes = Data(payload)                       // zero-based, whatever slice it came from
+        let x25519 = Data(bytes.prefix(32))
+        let ed25519 = Data(bytes.dropFirst(32).prefix(32))
+        return NetworkStamp.isValid(stamp: x25519, cost: cost, material: destinationHash + ed25519)
+    }
 
     /// Extension flags on our announce stamps (reference `get_ext_flags`, Destination.py:384-385).
     static let destinationStampFlags: UInt8 = 0x00

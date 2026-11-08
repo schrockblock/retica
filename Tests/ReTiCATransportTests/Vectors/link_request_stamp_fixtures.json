@@ -1,0 +1,16 @@
+{
+  "identity_private_key": "002bea8f5b02dc89b78054722e0abeeb03448ba573375ff08d93a5cb00b868661be08be558d9a24316c9e2363d0c8433a3f64bf816754f0bf2a9ecb40fc10103",
+  "app_name": "retica",
+  "aspects": [
+    "lrtest"
+  ],
+  "destination_hash": "e8f8cd0d03f84eccd83953f1cc086bf8",
+  "lr_cost": 12.5,
+  "stamped_raw": "0200e8f8cd0d03f84eccd83953f1cc086bf800095dc315f825addf627c68904a7552f955a9bae4c383d62406e7b27dfe58fa6b4b67fd8ae2b3912f8ed40467b6c6ead3902c6f075945101c6dbf15af2617eede2001f4",
+  "stamped_value": 13.375,
+  "unstamped_raw": "0200e8f8cd0d03f84eccd83953f1cc086bf80035871c6f8d7f57949c2145cc70810fdf67f73d0c1212933654558b016ebab46c427ea0eb697076e0a6fad1b699e3104449879c159794e65887b7040a20ba46e12001f4",
+  "unstamped_value": 2.35546875,
+  "versions": {
+    "rns": "1.6.0"
+  }
+}

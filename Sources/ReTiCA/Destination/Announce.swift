@@ -89,11 +89,17 @@ public struct Announce {
     ///
     /// A trailing RNS 1.6.0 network-stamp extension is read as reference `validate_announce` reads it
     /// (Identity.py:840-873): a stamp meeting `requiredStampValue` is stripped from `appData` and its link
-    /// cost reported; any other stamp is left in `appData`. Nothing is rejected for its stamp: reference
-    /// enforcement is off by default.
+    /// cost reported; any other stamp is left in `appData`.
+    ///
+    /// With `enforceStamp` false (the default, as reference enforcement is off by default) nothing is
+    /// rejected for its stamp. With it true, an announce without a stamp meeting `requiredStampValue`
+    /// returns nil, and that is decided BEFORE the signature is verified, as reference does
+    /// (Identity.py:883-889 precede the validate at 900): a junk announce costs one SHA-256, not an
+    /// Ed25519 verification. The stamp material is wire bytes only, so nothing is trusted early.
     public static func parse(payload rawPayload: Data, destinationHash: Data,
                              contextFlagSet: Bool,
-                             requiredStampValue: Double = NetworkStamp.defaultDestinationCost) -> Parsed? {
+                             requiredStampValue: Double = NetworkStamp.defaultDestinationCost,
+                             enforceStamp: Bool = false) -> Parsed? {
         let payload = Data(rawPayload)
         let ratchetLen = contextFlagSet ? ratchetSize : 0
         let minLen = keySize + nameHashLength + randomHashLength + ratchetLen + signatureLength
@@ -124,6 +130,17 @@ public struct Announce {
         let signature = payload.subdata(in: idx..<idx + signatureLength); idx += signatureLength
         let appData: Data? = idx < payload.count ? payload.subdata(in: idx..<payload.count) : nil
 
+        let material = destinationHash + publicKey + nameHash
+        // Enforcing: an announce whose stamp is missing or short is refused here, before the signature.
+        // A met stamp always reports its link cost, so a nil cost is exactly reference's
+        // `not dst_stamped or not stamp_validated`.
+        var early: StampExtension? = nil
+        if enforceStamp {
+            let ext = readStampExtension(appData: appData, material: material, requiredValue: requiredStampValue)
+            guard ext.linkCost != nil else { return nil }
+            early = ext
+        }
+
         guard let identity = Identity(publicKey: publicKey) else { return nil }
         var signedData = destinationHash + publicKey + nameHash + randomHash + wireRatchet
         if let appData { signedData += appData }
@@ -134,8 +151,8 @@ public struct Announce {
 
         // Only now, with the signature checked over the full wire app data, read and strip the
         // network-stamp extension. Relays forward the packet's own bytes, never these.
-        let ext = readStampExtension(appData: appData, material: destinationHash + publicKey + nameHash,
-                                     requiredValue: requiredStampValue)
+        let ext = early ?? readStampExtension(appData: appData, material: material,
+                                              requiredValue: requiredStampValue)
         return Parsed(identity: identity, publicKey: publicKey, nameHash: nameHash,
                       randomHash: randomHash, ratchet: ratchet, signature: signature, appData: ext.appData,
                       stamp: ext.stamp, stampValue: ext.stampValue, linkCost: ext.linkCost)

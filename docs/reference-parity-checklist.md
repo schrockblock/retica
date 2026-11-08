@@ -459,6 +459,34 @@ exactly the class Tier 1 just closed.*
       breaks exactly the test it should. 952 tests, 121 reviewed conversions, zero known-open.
 - [ ] **LXMF tickets — entirely absent.** Zero `ticket` hits in `Sources/`. No stamp-cost exemption
       in either direction; an inbound `FIELD_TICKET` survives round-trip but is never acted on.
+- [x] **RNS 1.6.0 network stamps (announces, path requests, link requests).** Added 2026-11-07
+      against RNS 1.6.0 (conda env `rns-latest`). Every switch defaults to reference 1.6.0's:
+      `stampDestinations` off, `stampPathRequests` off, `enforceStamps` off, and link requests to a
+      destination that announced a cost stamped (STAMP_LRS on). Costs verbatim: `DESTINATION_COST`
+      23.5, `PR_COST` 15.8, `LR_COST` 12.5, `DESTINATION_VALUE` 25, `PR_VALUE` 15.8.
+      Commits: `62fe2f2` (stamp arithmetic, `NetworkStamp`), `86df1ae` (reading stamps and link costs
+      from announces, Identity.py:840-873), `4f67070` + `7d2bea1` (stamped link requests,
+      Link.py:344-382), `88ae4f0` (48/64-byte path requests, Transport.py:3685-3722), `894fd83` +
+      `2cd6f23` (stamping our announces, Destination.py:307-379), and the enforcement commit
+      `feat(transport): enforce network stamps when enabled` (Identity.py:883-889,
+      Transport.py:2046-2049 and 2099-2129, Link.py:192-195).
+      **What was tested:** fixtures from genuine RNS 1.6.0 for the arithmetic, stamped announces,
+      destination stamps, path requests and link requests; live runs against reference 1.6.0 peers
+      (`LiveStampInteropTests`) for our stamped announces, path requests and link requests reaching
+      an enforcing peer and their unstamped controls being dropped, and for our own enforcement of
+      announces. **Not tested:** our enforcement of inbound path and link requests against a live
+      peer (fixtures only); anything on a phone, including hash rates (the rates in
+      `NetworkStamp.swift` are Mac figures); the real MeshChatX app.
+      **Known differences:** reference holds `destination_cost` and `pr_cost` per interface; ReTiCA
+      has one `destinationCost` and one `pathRequestCost` on `Transport.State`. Link-request keys are
+      searched only up to cost 20 (`LinkPlane.maxLinkStampCost`); reference searches any cost up to
+      40 and lets the 15 s timeout end it. Reference caches announce validations by packet hash
+      (Identity.py:745-791); ReTiCA keeps no such cache and re-checks each copy, which under
+      enforcement gives the same answer. Enforcing link requests while not stamping our announces
+      refuses every link a 1.6.0 peer opens to us, as in reference.
+      **Still open in this area:** exact fractional LXMF stamps (searched at the ceiling), tickets
+      (above), ratchets on our own destinations, RNS 1.6's table culling and SQLite storage, and
+      app-side settings in ReTiCaMsgr for these switches.
 
 ## Tier 4 — durability
 

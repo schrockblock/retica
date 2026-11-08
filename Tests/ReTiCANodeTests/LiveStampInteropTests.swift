@@ -109,14 +109,18 @@ private final class LiveNode {
 
     /// `stampPathRequests` and `stampDestinations` are the host's switches for RNS 1.6 path-request and
     /// announce stamps, set at construction; `destinationValue` is the value our announce stamp is mined to.
+    /// `enforceStamps` and `destinationCost` are the switches for enforcing what we receive.
     init(port: Int, stampPathRequests: Bool = false, stampDestinations: Bool = false,
-         destinationValue: Double = NetworkStamp.defaultDestinationValue) async throws {
+         destinationValue: Double = NetworkStamp.defaultDestinationValue,
+         enforceStamps: Bool = false, destinationCost: Double = NetworkStamp.defaultDestinationCost) async throws {
         let (inbound, accepted, linkFailures) = (self.inbound, self.accepted, self.linkFailures)
         var initial = Harness.State(node: LXMFNode.State(
             identity: identity, endpoint: TCPEndpoint.State(host: "127.0.0.1", port: UInt16(port), reconnectOnDrop: true)))
         initial.node.endpoint.transport.stampPathRequests = stampPathRequests
         initial.node.endpoint.transport.stampDestinations = stampDestinations
         initial.node.endpoint.transport.destinationValue = destinationValue
+        initial.node.endpoint.transport.enforceStamps = enforceStamps
+        initial.node.endpoint.transport.destinationCost = destinationCost
         store = Store(initialState: initial) {
             Harness(inbound: inbound, accepted: accepted, linkFailures: linkFailures)
         } withDependencies: { $0.context = .live }
@@ -316,6 +320,33 @@ private final class LiveNode {
         node.store.send(.node(.announceDelivery))
         let heard = await poll(seconds: 20) { node.inbound.value.contains("hello from the reference peer") ? true : nil }
         #expect(heard == nil, "an enforcing peer must drop an unstamped announce")
+    }
+
+    /// Our own enforcement against genuine announces: a stamped one (value 12) from the listening peer,
+    /// and an unstamped one from a second peer that the listener relays. Two of our nodes hear both:
+    /// the one not enforcing learns the unstamped peer, so its announce was on the wire, and the one
+    /// enforcing a destination cost of 10 learns only the stamped peer.
+    @Test func anEnforcingReTiCALearnsOnlyTheStampedPeer() async throws {
+        let port = nextPort()
+        let stamped = try Peer("enforced-in-stamped", ["--listen", "\(port)", "--announce-every", "3",
+                                                       "--network-stamps"])
+        defer { stamped.stop() }
+        let stampedDest = try await stamped.address()
+        let unstamped = try Peer("enforced-in-plain", ["--connect", "\(port)", "--announce-every", "3"])
+        defer { unstamped.stop() }
+        let unstampedDest = try await unstamped.address()
+
+        let enforcing = try await LiveNode(port: port, enforceStamps: true, destinationCost: 10)
+        defer { enforcing.stop() }
+        let lenient = try await LiveNode(port: port)
+        defer { lenient.stop() }
+
+        #expect(await lenient.hears(unstampedDest), "the unstamped peer's announce must reach us")
+        #expect(await enforcing.hears(stampedDest), "a stamp of value 12 meets a cost of 10")
+        #expect(enforcing.store.state.node.endpoint.knownDestinations[stampedDest]?.linkCost == 3.25)
+        // Both peers announce every 3 s, so by now the enforcing node has heard several unstamped ones.
+        #expect(await enforcing.hears(unstampedDest, within: 10) == false, "an unstamped announce is dropped")
+        #expect(enforcing.store.state.node.endpoint.knownDestinations[unstampedDest] == nil)
     }
 
     @Test func aMessageFromAReferencePeerArrives() async throws {
