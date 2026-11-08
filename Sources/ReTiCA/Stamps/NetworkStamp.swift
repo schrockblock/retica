@@ -74,9 +74,12 @@ public enum NetworkStamp {
     /// cost_from_bytes). Nil unless exactly two bytes. Not clamped: up to 255.996, as the reference reads.
     public static func cost(fromBytes bytes: Data) -> Double? {
         guard bytes.count == 2 else { return nil }
-        let high = Int(bytes[bytes.startIndex])
-        let low = Int(bytes[bytes.startIndex + 1])
-        return Double(high << costFixedPointBits | low) / Double(costFixedPointScale)
+        return cost(high: bytes[bytes.startIndex], low: bytes[bytes.startIndex + 1])
+    }
+
+    /// `cost(fromBytes:)` for two bytes already in hand: integer part first.
+    public static func cost(high: UInt8, low: UInt8) -> Double {
+        Double(Int(high) << costFixedPointBits | Int(low)) / Double(costFixedPointScale)
     }
 
     /// The 32-byte big-endian hash threshold for a fixed-point cost (RNS target_from_fp). Out-of-range
