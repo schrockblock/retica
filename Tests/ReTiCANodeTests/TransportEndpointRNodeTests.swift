@@ -333,6 +333,8 @@ private func ifacProfile() -> InterfaceProfile {
         await transmit(h, raw)
         _ = await rnodeEndpointWaitUntil { !h.onAir.value.isEmpty }
         #expect(h.onAir.value.map(\.count) == [508])
+        await Task.megaYield()
+        await h.store.skipReceivedActions(strict: false)
         #expect(h.store.state.rnode?.counters.oversize == 0)
         await stopEndpoint(h)
     }

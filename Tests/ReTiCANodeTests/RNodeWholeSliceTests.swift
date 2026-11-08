@@ -137,16 +137,8 @@ private func rnodeIsAnnounce(_ action: LXMFNode.Action, of destination: Data, ma
     return packet.packetType == .announce && packet.destinationHash == destination
 }
 
-/// Sizes (and the packet type, decoded with `ifac` when given) of what A put on the air, for the
-/// test log: the `maxPacketSize` mutation at verification step (b) is set from these.
-private func rnodeLogOnAir(_ label: String, _ onAir: [Data], ifac: IFAC?) {
-    let described = onAir.map { wire -> String in
-        let raw = ifac.map { $0.unprotect(wire) } ?? wire
-        let type = raw.flatMap { Packet(raw: $0) }.map { "\($0.packetType)" } ?? "?"
-        return "\(wire.count)B:\(type)"
-    }
-    print("RNODE-ON-AIR \(label): \(described.joined(separator: " "))")
-}
+// What A puts on the air: an open link carries a 172 B announce and a 227 B data packet; an IFAC
+// link (8-byte access code) 180 B and 235 B. A `maxPacketSize` mutation is set from these.
 
 private func rnodeProbeIFAC(passphrase: String = "secret") -> IFAC? {
     RNodeEndpoint.ifac(networkName: "testnet", passphrase: passphrase)
@@ -155,14 +147,12 @@ private func rnodeProbeIFAC(passphrase: String = "secret") -> IFAC? {
 @MainActor @Suite struct RNodeWholeSliceTests {
     @Test func opportunisticMessageCrossesAnOpenRNodeLink() async {
         let result = await runRNodeProbe(aIFAC: nil, bIFAC: nil)
-        rnodeLogOnAir("open", result.aOnAir, ifac: nil)
         #expect(result.content == Data("hello over rnode".utf8))
     }
 
     @Test func opportunisticMessageCrossesAnIFACProtectedRNodeLink() async {
         let ifac = rnodeProbeIFAC()
         let result = await runRNodeProbe(aIFAC: ifac, bIFAC: ifac)
-        rnodeLogOnAir("ifac", result.aOnAir, ifac: ifac)
         #expect(result.content == Data("hello over rnode".utf8))
     }
 
