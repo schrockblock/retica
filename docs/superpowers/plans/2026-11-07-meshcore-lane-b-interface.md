@@ -839,7 +839,7 @@ Run: `grep -rln "import MeshCoreKit" WT/Sources WT/Tests`. Expected: no output.
 | Kind | Name | Lane D's use |
 |---|---|---|
 | State | `TransportEndpoint.State.meshCore`, `MeshCoreEndpoint.State(config:profile:)` | Install the slot. Profile: `.meshCore(params: nil)` plus `MeshCoreEndpoint.ifac(...)`, `mode` as wanted. `config` holds `Data()` for `channelSecret` and carries `canRoute`; lane D's driver wrapper fills the secret and `retiredChannelSecrets` at `driver.start`. |
-| Action | `.meshCore(.start)`, `.meshCore(.stop)` | Normal lifecycle. To drop a slot: `.stop`, wait for `.radioOffline`, check `interface.isIdle` (not idle means a deferred restart follows: send `.stop` again), then nil it. |
+| Action | `.meshCore(.start)`, `.meshCore(.stop)` | Normal lifecycle. To drop a slot: `.stop`, wait for `.radioOffline`, check `interface.isIdle` (not idle: send `.stop` again and wait for the next `.radioOffline`), then nil it. |
 | Action | `.meshCore(.removeChannel)` | Feature off while connected: send it, wait for `.channelRemoved`, then `.stop`. A `.stop` sent early is held, so the order is safe either way. |
 | Action | `.meshCore(.setCanRoute(Bool))` | Mirror the Relay setting at runtime. |
 | Delegate | `.radioOnline(publicKey:params:)` | Online state, params. |
@@ -849,11 +849,18 @@ Run: `grep -rln "import MeshCoreKit" WT/Sources WT/Tests`. Expected: no output.
 | Delegate | `.channelRemoved(Bool)` | false means the slot stayed; tell the user. |
 | Read | `state.meshCore?.counters`, `.interface.status`, `.interface.params` | `MeshCoreStatus`. Radio name, firmware code and channel slot aren't here: they reach the app through the `details` sink on `.live(session:details:)` (spec Contract 3). |
 
+**Replacing the slot resets what must survive reconnects.** A new `TransportEndpoint.State.meshCore` starts with fresh limiter budgets and 600 s stamps, a new `nextPacketID`, an empty reassembler dedupe list and no `lastBindSent`. All of these survive drops and stop/start only. The Meshtastic wiring swaps its slot whenever `current.interface.config != wanted` (`ReTiCAMsgrCore/AppFeature+MeshtasticRadio.swift:45-84`). Copied as-is, every Connect or settings change would reset the airtime caps, which §5.5 forbids. So:
+- Replace the slot only for a different radio, or for an IFAC change (`profile` is a `let`).
+- Apply a key change by `.stop`, waiting for `.radioOffline` (and `isIdle`), then `.start` on the same slot. The driver wrapper fills the secret at `driver.start`.
+- Apply Relay with `.setCanRoute`, never by restarting or replacing.
+- Keep `channelSecret: Data()` and `retiredChannelSecrets: []` in the state's `config`, so comparing configs stays stable whatever the key store holds.
+
 **The live driver must:**
 - Run the slot policy after `.configured` and before `.connected`, and emit `.retiredChannelsCleared` before `.connected`.
 - Filter `.datagram` to our slot and `dataType` for `0x1B`, and pass `0x84` pushes through unfiltered (§5.2 expects unrelated raw frames at the parser).
 - Give a 4-byte `selfPrefix` from a correct `SELF_INFO`.
 - Always return from `send`, `removeChannel` and `stop`. A `removeChannel` that hangs also holds any `.stop` behind it.
+- Tolerate a `send` called while an earlier one is still waiting on the radio. A drop cancels the pacing effect but not a `driver.send` already in flight, so after a reconnect the next pump can call `send` while the old call is still running. Return false for that leftover call.
 - Make a `stop()` called after `start()` win over whatever `start` spawned (`DriverEpoch.swift:16-19`).
 - Ignore `config.canRoute`: the header is built in `MeshCoreInterface`.
 

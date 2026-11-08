@@ -55,7 +55,7 @@ App work only sees **merged** ReTiCA code, because `ReTiCAMsgrCore/Package.swift
 - A session always gets the real `ContinuousClock`: its 30 s handshake timeout sleeps on it.
 - `scanRadios` finishes on `.unauthorized` or `.unsupported` (`MeshtasticLive.swift:24-41`).
 - One app-owned session, a lazy static, never dropped; no CoreBluetooth until a slot starts (`MeshtasticLiveWiring.swift:11`).
-- Removal is `.stop`, wait for `.radioOffline`, then replace. A slot not idle at offline has a restart queued, so stop again (`AppFeature+MeshtasticRadio.swift:60-75`).
+- Removal is `.stop`, wait for `.radioOffline`, then replace. A slot not idle at offline has a restart queued, so stop again (`AppFeature+MeshtasticRadio.swift:60-75`). Unlike Meshtastic, which replaces on any `config` change, replace a MeshCore slot only for a different radio (or an IFAC change, since `profile` is a `let`): a new slot resets the §5.5 limiter budgets and 600 s stamps, `nextPacketID`, the reassembler's dedupe keys and `lastBindSent`. A key change is `.stop`, `.radioOffline`, then `.start` on the same slot. Relay is `.setCanRoute`. The state's `config` keeps `channelSecret: Data()` and `retiredChannelSecrets: []` (lane B hand-off).
 - Read `@Shared` into locals before mutating `state.node…`. After a swap with nothing connected, show `.connecting`, not after a Disconnect. Retired counters carry across swaps. `redialDownNodes` never restarts a slot being replaced. Connect is dropped under a picker; radios aren't deferred behind it, since sessions never scan.
 - TCA: `\.date` has no usable `testValue`, use `.constant`; `Transport` reads `\.transportDate`. A test that seeds state proves nothing about reachability, so drive real actions. To assert nothing happened, inspect the harness log. No `store.finish()` under a presented picker.
 
@@ -70,7 +70,7 @@ App work only sees **merged** ReTiCA code, because `ReTiCAMsgrCore/Package.swift
 ## Decisions recorded
 
 - **Key path.** Keychain → `MeshCoreKeyStore.secrets()` → `MeshCoreDriver.resolvingSecrets` closure at `driver.start` → a local config copy → `MeshCoreLiveAdapter`. State holds `MeshCoreDriverConfig(radio:, channelSecret: Data(), canRoute:)`.
-- **Slot identity.** `MeshCoreSlotIdentity { radio, keyGeneration }` decides whether a slot must be replaced, not `config ==`: the reducer never sees the key, and `retiredChannelSecrets` change without needing a restart.
+- **Slot identity.** `MeshCoreSlotIdentity { radio, keyGeneration }` decides whether a slot must be restarted, not `config ==`: the reducer never sees the key, and `retiredChannelSecrets` change without needing a restart. Only a different `radio` replaces the slot. A new `keyGeneration` on the same radio stops and restarts the existing slot, because replacing it would reset the airtime caps (lane B hand-off, §5.5).
 - **Relay while connected.** Checked: `.setRelayMode` applies to Transport at once (`AppFeature.swift:2430-2450`), not at next Connect. So the bit follows at once too, through lane B's `.setCanRoute`, with no restart. A slot being swapped reads `relayEnabled` at install.
 - **Turn-off acts at once.** Other radio settings wait for Connect (`SettingsView.swift:329`), but if turn-off waited too, then toggle-off → Disconnect → Connect would never have the radio connected at sync, and the slot would stay. `.binding(\.meshCoreEnabled)` going false runs `syncMeshCoreSlot`. Turning on, and radio or key changes, wait for Connect, with one exception: turning back on while a swap is in flight also syncs, because that swap is already replacing the slot and would otherwise end with `next` nil and the feature on.
 - **A turn-off that can't reach the radio tells the user.** With an idle slot (after a Disconnect), `channelLeftOnRadio` is set. With no slot this session we can't know, so nothing is claimed, and lane C's `meshCoreTurnOffNoticeVisible` shows `turnOffNotice`, which says "may".
@@ -541,16 +541,16 @@ Below, `.meshCore(x)` means `.node(.client(.endpoint(.meshCore(x))))`.
 **`syncMeshCoreSlot`,** first match wins. First set `state.meshCoreKeyPresence = keyStore.presence()` through `@Dependency(\.meshCoreKeyStore)`, so a foreground recovers an `.unreadable`. Compute `wanted` from `meshCoreWillDial`.
 1. Swap in flight → retarget its `next`, `startNext = true`, leave `removingChannel`; `.none`.
 2. `meshCoreSlotIdentity == wanted` → `.none`.
-3. No slot, or slot `isIdle` → if `wanted == nil` and a slot exists, set `channelLeftOnRadio = true`, since an idle slot can't reach the radio; then `installMeshCoreSlot(&state, wanted, start: true)`.
+3. No slot, or slot `isIdle` → if `wanted == nil` and a slot exists, set `channelLeftOnRadio = true`, since an idle slot can't reach the radio; then, if `wanted?.radio == meshCoreSlotIdentity?.radio` (an idle slot whose key changed), set `meshCoreSlotIdentity = wanted` and send `.meshCore(.start)` to the slot as it is; otherwise `installMeshCoreSlot(&state, wanted, start: true)`.
 4. `wanted == nil`, slot online → swap with `removingChannel: true`, send `.meshCore(.removeChannel)`.
 5. `wanted == nil`, slot not online → `channelLeftOnRadio = true`, swap, send `.meshCore(.stop)`.
 6. Otherwise → swap, send `.meshCore(.stop)`.
 
 **`.meshCore(.delegate(.channelRemoved(ok)))`:** `channelLeftOnRadio = !ok`, `channelRemoved = ok`; if `meshCoreSwap?.removingChannel == true`, clear the flag and send `.meshCore(.stop)`. Lane B's interface holds any `.stop` until a removal finishes, so a Disconnect meanwhile is safe.
 
-**`finishMeshCoreSwap`** at `.radioOffline`: mirror `finishMeshtasticSwap`: not idle → `.stop` again; else install, and `.connecting` if nothing's connected and `startNext && next != nil`.
+**`finishMeshCoreSwap`** at `.radioOffline`: mirror `finishMeshtasticSwap`: not idle → `.stop` again and wait for the next `.radioOffline`. Idle and `next?.radio == meshCoreSlotIdentity?.radio` (a key change, or turned back on during a removal) → keep the slot: set `meshCoreSlotIdentity = next`, clear the swap, and send `.meshCore(.start)` if `startNext`. The wrapper reads the new key at `driver.start`, and the limiter, packet ID, dedupe keys and `BIND` stamp carry over. Otherwise install. Either way, show `.connecting` if nothing's connected and `startNext && next != nil`.
 
-**`installMeshCoreSlot`:** carry counters into `meshCoreRetiredCounters`; `endpoint.meshCore = identity.map { MeshCoreEndpoint.State(config: MeshCoreDriverConfig(radio: $0.radio, channelSecret: Data(), canRoute: relayEnabled), profile: .meshCore(params: nil)) }`, reading `relayEnabled` into a local first; set `meshCoreSlotIdentity`; reset `meshCoreStatus`, keeping counters, and keeping `channelLeftOnRadio` and `channelRemoved` unless the identity is non-nil; `.start` if wanted.
+**`installMeshCoreSlot`** (no slot, a different radio, or `nil`): carry counters into `meshCoreRetiredCounters`; `endpoint.meshCore = identity.map { MeshCoreEndpoint.State(config: MeshCoreDriverConfig(radio: $0.radio, channelSecret: Data(), canRoute: relayEnabled), profile: .meshCore(params: nil)) }`, reading `relayEnabled` into a local first; set `meshCoreSlotIdentity`; reset `meshCoreStatus`, keeping counters, and keeping `channelLeftOnRadio` and `channelRemoved` unless the identity is non-nil; `.start` if wanted.
 
 **`MeshCoreRadioReducer`:** `.binding(\.meshCoreEnabled)` going false, or going true while `meshCoreSwap != nil` → `syncMeshCoreSlot`, whose rule 1 retargets the swap. If that going-true sync runs after a Disconnect (`connection == .disconnected`), it then sets `meshCoreSwap?.startNext = false`, so turning on still doesn't start a radio without a Connect. `.radioOffline` → `finishMeshCoreSwap`. Other delegates in Task 9. **`.setRelayMode`** also sends `.meshCore(.setCanRoute(enabled))` when `endpoint.meshCore != nil`.
 
@@ -583,6 +583,8 @@ mcSlotChangingTheRadioWhileConnectingWaitsForItsStop
 mcSlotAnIdleOldSlotIsReplacedAtOnce
 mcSlotAKeyChangeRestartsAtTheNextConnect    // no stop until Connect; then start, stop, start
 mcSlotAKeyChangeDoesNotRemoveTheChannel
+mcSlotAKeyChangeKeepsTheSlotState           // limiter stamp + nextPacketID set before; after stop/start they're unchanged
+mcSlotAKeyChangeOnAnIdleSlotKeepsItsState   // Disconnect, key change, Connect: same limiter state, calls end [.stop, .start(A)]
 mcSlotRetiredKeysAloneDoNotRestart          // forgetRetired while online; Connect: calls unchanged
 mcSlotRelayOnSetsCanRoute                   // .start(A, canRoute: true, …)
 mcSlotRelayChangeUpdatesTheRunningSlot      // .setRelayMode(true): config.canRoute true
@@ -631,6 +633,7 @@ Batch 2 (restore first), hidden by J1, J5 and J7:
 | J24 | rule 3 doesn't set `channelLeftOnRadio` | `mcSlotTurningOffAfterDisconnectIsRecorded` |
 | J25 | `.channelRemoved` doesn't set `channelRemoved` | `mcSlotARemovedChannelIsRecorded` |
 | J26 | the binding arm syncs on every change | `mcSlotTurningOnWithNoSwapWaitsForConnect` |
+| J29 | `finishMeshCoreSwap` and rule 3 drop the same-radio check and always install | `mcSlotAKeyChangeKeepsTheSlotState`, `mcSlotAKeyChangeOnAnIdleSlotKeepsItsState` |
 
 Batch 3 (restore first), hidden by J23 and J25:
 
