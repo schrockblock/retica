@@ -114,6 +114,10 @@ public struct Announce {
         case lowStamp(value: Double)
         /// Too short, an unusable key, a bad signature or a destination-hash mismatch. Each depends on
         /// the announce's bytes alone.
+        ///
+        /// Transport caches this verdict by packet hash and drops every later copy unparsed
+        /// (`AnnounceVerdictCache`). A check whose outcome depends on state (a setting, a cost, a list)
+        /// must never return `.invalid`, or a later valid announce would be dropped: give it its own case.
         case invalid
     }
 
