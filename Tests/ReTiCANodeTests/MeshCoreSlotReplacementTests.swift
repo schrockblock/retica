@@ -16,7 +16,7 @@ private func meshCoreSlotConfig(_ radio: UUID) -> MeshCoreDriverConfig {
     MeshCoreDriverConfig(radio: radio, channelSecret: Data(repeating: 0x22, count: 16))
 }
 
-/// Contract 3's slot-removal protocol exactly as lane E's app runs it: `.replaceRadio` sends
+/// Contract 3's slot-removal protocol exactly as lane D's app runs it: `.replaceRadio` sends
 /// `.meshCore(.stop)`, and the slot is replaced (nil'd, then a new one started) only at
 /// `.radioOffline`.
 @Reducer

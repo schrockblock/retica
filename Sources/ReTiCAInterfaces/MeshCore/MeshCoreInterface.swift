@@ -107,6 +107,9 @@ public struct MeshCoreInterface {
         /// When the last `BIND` was enqueued. Survives a drop, so reconnecting can't reset the
         /// 60 s limit.
         var lastBindSent: Date?
+        /// Bumped by every drop and stop (`clearTraffic`), at reduce time. A pump captures it with
+        /// `epoch`'s identity in its `TrafficToken`; see `TrafficToken` for why.
+        var trafficGeneration = 0
 
         public init(config: MeshCoreDriverConfig, framing: MeshCoreFraming = .scotMeshRaw) {
             self.config = config
@@ -169,9 +172,10 @@ public struct MeshCoreInterface {
         /// The app's Relay setting changed: the can-route bit of every packet framed from now on.
         /// Queued datagrams keep the bit they were framed with; the driver is not restarted.
         case setCanRoute(Bool)
-        /// `driver.send` returned.
-        case datagramSent(ok: Bool)
-        case pacingElapsed
+        /// `driver.send` returned. Ignored unless `token` is current.
+        case datagramSent(ok: Bool, token: TrafficToken)
+        /// The pacing delay after a send elapsed. Ignored unless `token` is current.
+        case pacingElapsed(TrafficToken)
         /// A `BIND_REQ`'s random reply delay elapsed.
         case bindDelayElapsed
         case delegate(Delegate)
@@ -349,11 +353,15 @@ public struct MeshCoreInterface {
                 state.config.canRoute = canRoute
                 return .none
 
-            case let .datagramSent(ok):
+            case let .datagramSent(ok, token):
+                // A send from before a drop or stop: its datagram was already forgotten.
+                guard token.isCurrent(in: state) else { return .none }
                 if !ok { state.counters.sendFailed += 1 }
                 return .none
 
-            case .pacingElapsed:
+            case let .pacingElapsed(token):
+                // An escaped pump's delay must not close the pacing window of a later send.
+                guard token.isCurrent(in: state) else { return .none }
                 state.pacing = false
                 return pump(&state)
 
@@ -472,11 +480,18 @@ public struct MeshCoreInterface {
         let datagram = state.queue.removeFirst()
         state.pacing = true
         let delay = MeshCoreLinkPacing.fragmentDelay(state.params)
+        let token = TrafficToken(state)
+        let epoch = state.epoch
+        let generation = epoch.current
         return .run { [driver, clock] send in
+            // As in `startDriver`: a `.stop` reduced since this effect was built (in the same
+            // burst, before this task registered its cancel id) wins. The pump never reaches the
+            // driver after it and sends nothing, so it can't outlive `isIdle`.
+            guard epoch.current == generation else { return }
             let ok = await driver.send(datagram)
-            await send(.datagramSent(ok: ok))
+            await send(.datagramSent(ok: ok, token: token))
             try await clock.sleep(for: ok ? delay : delay * 2)
-            await send(.pacingElapsed)
+            await send(.pacingElapsed(token))
         }
         .cancellable(id: CancelID.pacing, cancelInFlight: true)
     }
@@ -490,5 +505,32 @@ public struct MeshCoreInterface {
         state.pacing = false
         state.bindReplyPending = false
         state.reassembler.reset()
+        state.trafficGeneration += 1
+    }
+}
+
+/// Which slot and which connection a pump's `.datagramSent` and `.pacingElapsed` belong to.
+///
+/// `.disconnected` and `.stop` cancel the pacing effect, but `.cancellable` registers its id only
+/// when the task starts (see `DriverEpoch`), so a pump launched in the same burst escapes. After a
+/// stop the pump's own `DriverEpoch` check ends it before it reaches the driver. A drop doesn't
+/// bump the epoch, so a pump escaping one still sends, and its actions arrive after the reconnect:
+/// a failure would count `sendFailed` for a datagram the drop already discarded. (The next pump's
+/// `cancelInFlight` cancels an escaped one, so its `.pacingElapsed` can't close a later send's
+/// window, but nothing here relies on that.) The pump captures this token when it is built and the
+/// reducer compares it when the action arrives: `trafficGeneration` moves on every drop and stop,
+/// and the slot's `DriverEpoch` identity tells a replacement slot (whose generation restarts at 0)
+/// from this one.
+public struct TrafficToken: Equatable, Sendable {
+    let slot: DriverEpoch
+    let generation: Int
+
+    init(_ state: MeshCoreInterface.State) {
+        slot = state.epoch
+        generation = state.trafficGeneration
+    }
+
+    func isCurrent(in state: MeshCoreInterface.State) -> Bool {
+        slot == state.epoch && generation == state.trafficGeneration
     }
 }

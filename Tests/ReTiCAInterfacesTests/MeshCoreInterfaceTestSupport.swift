@@ -49,9 +49,12 @@ struct MeshCoreDelegateRecorder: Reducer {
     typealias State = MeshCoreInterface.State
     typealias Action = MeshCoreInterface.Action
     let delegates: LockIsolated<[MeshCoreInterface.Action.Delegate]>
+    /// How many `.pacingElapsed` actions reached the reducer, current or stale.
+    var pacingElapsedCount = LockIsolated(0)
 
     func reduce(into state: inout State, action: Action) -> Effect<Action> {
         if case let .delegate(delegate) = action { delegates.withValue { $0.append(delegate) } }
+        if case .pacingElapsed = action { pacingElapsedCount.withValue { $0 += 1 } }
         return MeshCoreInterface().reduce(into: &state, action: action)
     }
 }
@@ -68,6 +71,8 @@ struct MeshCoreInterfaceHarness {
     let now: LockIsolated<Date>
     /// Every delegate the interface emitted, in reduce order.
     let delegates: LockIsolated<[MeshCoreInterface.Action.Delegate]>
+    /// Every `.pacingElapsed` the interface reduced, stale ones included.
+    let pacingElapsedCount: LockIsolated<Int>
 
     var packets: [Data] {
         delegates.value.compactMap { if case let .packetReceived(packet) = $0 { return packet }; return nil }
@@ -125,8 +130,9 @@ func makeMeshCoreInterface(initial: MeshCoreInterface.State = MeshCoreInterface.
     let clock = TestClock<Duration>()
     let now = LockIsolated(Date(timeIntervalSince1970: 1_000))
     let delegates = LockIsolated<[MeshCoreInterface.Action.Delegate]>([])
+    let pacingElapsedCount = LockIsolated(0)
     let store = TestStore(initialState: initial) {
-        MeshCoreDelegateRecorder(delegates: delegates)
+        MeshCoreDelegateRecorder(delegates: delegates, pacingElapsedCount: pacingElapsedCount)
     } withDependencies: {
         $0.meshCoreDriver = MeshCoreDriver(
             start: { config in
@@ -151,7 +157,7 @@ func makeMeshCoreInterface(initial: MeshCoreInterface.State = MeshCoreInterface.
     store.exhaustivity = .off
     store.timeout = .seconds(5)
     return MeshCoreInterfaceHarness(store: store, radio: radio.continuation, calls: calls, clock: clock,
-                                    now: now, delegates: delegates)
+                                    now: now, delegates: delegates, pacingElapsedCount: pacingElapsedCount)
 }
 
 /// Started and online as `meshCoreOwnKey` with `params`.

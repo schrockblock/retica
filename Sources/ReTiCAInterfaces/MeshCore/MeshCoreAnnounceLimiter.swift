@@ -112,16 +112,12 @@ public struct MeshCoreAnnounceLimiter: Equatable, Sendable {
 
     private mutating func admitPathRequest(key: Data, now: Date) -> Bool {
         prune(now: now)
-        var burst = pathRequests[key]
-        if let entry = burst {
-            if Self.isWithin(since: entry.first, now: now, limit: Self.pathRequestBurst) {
-                // Inside the burst window: keep `first`, update `last` on allow.
-            } else if pathRequestIsHeld(entry.last, now: now) {
-                return dropPathRequest()
-            } else {
-                // 1800 s past `last`: a new burst. `prune` normally removed the entry already.
-                burst = nil
-            }
+        // `prune` keeps only entries still held, so an entry here is inside its burst window
+        // (keep `first`, update `last` on allow) or held. One 1800 s past `last` is already gone:
+        // a new burst.
+        let burst = pathRequests[key]
+        if let entry = burst, !Self.isWithin(since: entry.first, now: now, limit: Self.pathRequestBurst) {
+            return dropPathRequest()
         }
         guard pathRequestTimes.count < Self.maxPathRequestsPerWindow else {
             return dropPathRequest()
