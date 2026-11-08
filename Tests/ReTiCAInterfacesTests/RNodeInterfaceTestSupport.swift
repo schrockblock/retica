@@ -121,11 +121,16 @@ func makeRNodeInterface(sendResults: [Bool] = [], holdSends: Bool = false) -> RN
     } withDependencies: {
         $0.rnodeDriver = RNodeDriver(
             start: { config in
-                calls.withValue { $0.append(.start(config)) }
+                // The new session's continuation goes into `radios` BEFORE `.start` is recorded, so
+                // a test that returns from `waitForStarts(n)` always finds `h.radio` on stream n.
                 let index = sessions.withValue { n in defer { n += 1 }; return n }
-                if index == 0 { return first.stream }
+                if index == 0 {
+                    calls.withValue { $0.append(.start(config)) }
+                    return first.stream
+                }
                 let session = AsyncStream<RNodeDriverEvent>.makeStream()
                 radios.withValue { $0.append(session.continuation) }
+                calls.withValue { $0.append(.start(config)) }
                 return session.stream
             },
             send: { packet in
