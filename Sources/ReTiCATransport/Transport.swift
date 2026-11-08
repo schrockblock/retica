@@ -147,11 +147,13 @@ public struct Transport {
         /// Enforce network stamps on what we receive (RNS `[stamps] enforce_stamps`, which sets both
         /// `STAMPS_ENFORCED` and `LR_STAMPS_ENFORCED`, Reticulum.py:507-511). Off by default, as in
         /// 1.6.0. When on:
-        ///   * an announce whose stamp does not meet `destinationCost` is neither learned, remembered
+        ///   * an announce whose stamp does not meet the receiving interface's destination cost
+        ///     (`resolvedDestinationCost(on:)`) is neither learned, remembered
         ///     nor relayed (Identity.py:883-889, Transport.py:2046-2049). The stamp is checked
         ///     before any public-key work (the Ed25519 signature, and the ratchet's trial X25519
         ///     agreement), so a junk announce costs at most two SHA-256;
-        ///   * a path request without a stamp meeting `pathRequestCost` over `destination + tag` is
+        ///   * a path request without a stamp meeting the receiving interface's path-request cost
+        ///     (`resolvedPathRequestCost(on:)`) over `destination + tag` is
         ///     neither answered nor forwarded (Transport.py:2099-2129);
         ///   * a link request to a local destination whose X25519 key, the stamp, does not meet that
         ///     destination's link cost over `destinationHash + Ed25519 key` is never handed to the link
@@ -161,12 +163,14 @@ public struct Transport {
         /// outbound traffic is unaffected. A host sets this at construction, on
         /// `TransportEndpoint.State.transport`.
         public var enforceStamps = false
-        /// The stamp value an announce must carry (RNS `Transport.DESTINATION_COST`; reference reads it
-        /// per receiving interface, `destination_cost`, which defaults to this). Also the value below
-        /// which a stamp is left in the app data and its link cost ignored, enforced or not.
+        /// The stamp value an announce must carry (RNS `Transport.DESTINATION_COST`). Also the value
+        /// below which a stamp is left in the app data and its link cost ignored, enforced or not.
+        /// An interface whose `InterfaceProfile.destinationCost` is set uses that instead (reference
+        /// `destination_cost`, Interface.py:350-353); see `resolvedDestinationCost(on:)`.
         public var destinationCost: Double = NetworkStamp.defaultDestinationCost
         /// The stamp value a path request must carry when `enforceStamps` is on (RNS
-        /// `Transport.PR_COST`; reference reads it per receiving interface, `pr_cost`).
+        /// `Transport.PR_COST`). An interface whose `InterfaceProfile.pathRequestCost` is set uses
+        /// that instead (reference `pr_cost`, Interface.py:355-358); see `resolvedPathRequestCost(on:)`.
         public var pathRequestCost: Double = NetworkStamp.defaultPathRequestCost
         /// Announces and path responses waiting for their destination's stamp (reference
         /// `stamp_queues`, Transport.py:1453-1463). At most one announce per destination and target
@@ -275,6 +279,21 @@ public struct Transport {
         public var pendingReceipts: [Data: PendingReceipt] = [:]
 
         public init() {}
+
+        /// The stamp value an announce received on `interfaceID` is checked against: that interface's
+        /// `InterfaceProfile.destinationCost` when set, else `destinationCost` (reference
+        /// `packet.receiving_interface.destination_cost`, Identity.py:794-795). An interface with no
+        /// registered profile uses `destinationCost`, as reference does with no receiving interface.
+        func resolvedDestinationCost(on interfaceID: InterfaceID) -> Double {
+            interfaces[interfaceID]?.destinationCost ?? destinationCost
+        }
+
+        /// The stamp value a path request received on `interfaceID` must carry when enforcing: that
+        /// interface's `InterfaceProfile.pathRequestCost` when set, else `pathRequestCost` (reference
+        /// `packet.receiving_interface.pr_cost`, Transport.py:2103).
+        func resolvedPathRequestCost(on interfaceID: InterfaceID) -> Double {
+            interfaces[interfaceID]?.pathRequestCost ?? pathRequestCost
+        }
 
         /// The public identity behind `destinationHash`, or nil if this node has never heard it —
         /// reference `Identity.recall(destination_hash)` (RNS/Identity.py:116-160). Looks in the
@@ -917,14 +936,15 @@ public struct Transport {
                 case .announce:
                     // Don't learn a path to one of our own destinations.
                     guard state.localDestinations[packet.destinationHash] == nil else { return .none }
-                    // Enforcing, an announce below `destinationCost` stops here: not learned, not
+                    // Enforcing, an announce below the receiving interface's destination cost
+                    // (`resolvedDestinationCost(on:)`) stops here: not learned, not
                     // remembered, not relayed, and not counted by ingress control below, as reference
                     // returns before `received_announce` (Transport.py:2046-2053). A C4-held announce
                     // replays through here and is checked again.
                     guard let parsed = Announce.parse(payload: packet.payload,
                                                       destinationHash: packet.destinationHash,
                                                       contextFlagSet: packet.contextFlag,
-                                                      requiredStampValue: state.destinationCost,
+                                                      requiredStampValue: state.resolvedDestinationCost(on: interfaceID),
                                                       enforceStamp: state.enforceStamps)
                     else { return .none }
                     // C4 ingress control (RNS Transport.py:1748-1766). Record the arrival first — the deque
@@ -1119,11 +1139,12 @@ public struct Transport {
                             ? Data(payload.dropFirst(Transport.pathRequestLength)) : nil
                         // Entry gate: ignore duplicate (destHash ‖ tag) requests.
                         guard state.discoveryPrTags.insert(requested + tag) else { return .none }
-                        // Enforcing, a request without a stamp meeting `pathRequestCost` is neither
-                        // answered nor forwarded. After the tag gate, as in reference (Transport.py:2088-2129),
+                        // Enforcing, a request without a stamp meeting the receiving interface's
+                        // path-request cost (`resolvedPathRequestCost(on:)`) is neither answered nor forwarded. After the tag gate, as in reference (Transport.py:2088-2129),
                         // so a refused request still uses up its tag.
                         if state.enforceStamps {
-                            guard Transport.pathRequestStampMeets(cost: state.pathRequestCost, destinationHash: requested,
+                            guard Transport.pathRequestStampMeets(cost: state.resolvedPathRequestCost(on: interfaceID),
+                                                                  destinationHash: requested,
                                                                   tag: tag, extensionPayload: extensionPayload)
                             else { return .none }
                         }

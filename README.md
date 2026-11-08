@@ -314,8 +314,24 @@ node.endpoint.transport.enforceStamps = true       // refuse unstamped traffic w
 Link requests are stamped whatever these say, as in 1.6.0: when a destination announced a link
 cost, the link waits for a key meeting it (up to 15 s, cost 20 at most). With `enforceStamps` on
 and `stampDestinations` off, peers never learn our link cost, so a 1.6.0 peer opens its links to us
-unstamped and every one is refused; reference behaves the same way. Reference sets its costs per
-interface; ReTiCA has one value for all of them.
+unstamped and every one is refused; reference behaves the same way.
+
+The two receive costs can be set per interface, as reference's per-interface `destination_cost` and
+`pr_cost` options can. Set them on the `InterfaceProfile` a driver registers; `nil` (the default)
+uses the Transport-wide `destinationCost` or `pathRequestCost`. An announce or path request is
+checked against the cost of the interface it arrived on. Values are clamped to 0...100 as
+reference's config parser clamps them. A cost of 0 accepts any stamp, but with `enforceStamps` on
+an announce or path request carrying no stamp is still refused, as in reference.
+
+```swift
+var profile = InterfaceProfile.tcp
+profile.destinationCost = 8         // announces arriving on this interface need a stamp of 8
+profile.pathRequestCost = nil       // path requests use transport.pathRequestCost
+let client = TCPEndpoint.State(host: host, port: port, profile: profile)
+```
+
+A TCP server's accepted connections and a BLE driver's peers all take the driver's profile, and a
+Meshtastic radio keeps the costs of the profile it was given.
 
 What it costs. Hash rates measured on a Mac (release build, about +/-15%) are in
 `NetworkStamp.swift`: about 790,000 stamp rounds a second and 14,000 link keys a second. From
@@ -462,7 +478,7 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Network stamps on our announces (`stampDestinations`) | Implemented, cross-validated, tested live against RNS 1.6.0. **Off by default** | The extension layout is compared with reference announces; an enforcing reference peer accepts a stamped ReTiCA announce and drops an unstamped one. The stamp is persisted by the host. |
 | Network stamps on our path requests (`stampPathRequests`) | Implemented, tested live against RNS 1.6.0. **Off by default** | Inbound parsing is checked against reference requests. An enforcing reference peer answers a stamped ReTiCA request and drops an unstamped one. |
 | Network stamps on our link requests | Implemented, tested live against RNS 1.6.0. **On, as in 1.6.0** | Only to a destination that announced a link cost, and only up to cost 20 (reference has no ceiling). An enforcing reference peer accepts the stamped request and ignores an unstamped one. |
-| Enforcing network stamps (`enforceStamps`) | Implemented, tested against reference fixtures; announces also tested live against RNS 1.6.0. **Off by default**, as in 1.6.0 | Refuses announces, path requests and link requests whose stamp falls short (see Part 1). One cost for all interfaces, where reference has one per interface. Inbound path- and link-request enforcement is tested only with fixtures, not against a live reference peer. |
+| Enforcing network stamps (`enforceStamps`) | Implemented, tested against reference fixtures; announces also tested live against RNS 1.6.0. **Off by default**, as in 1.6.0 | Refuses announces, path requests and link requests whose stamp falls short (see Part 1). Announce and path-request costs can be set per interface, as in reference. Inbound path- and link-request enforcement is tested only with fixtures, not against a live reference peer. |
 | Announce propagation as a transport node | Implemented | Relay mode (`.enableRelay`), HEADER_2 rewrite; rebroadcast and retry constants cross-validated; per-interface announce bandwidth cap. |
 | Ratchets | **Partial** | ReTiCA encrypts to a peer's announced ratchet but never generates, rotates, persists or announces its own. So there is no forward secrecy for traffic *to* a ReTiCA destination, and a peer that calls `enforce_ratchets()` drops everything ReTiCA sends it. |
 | Path table, path requests and responses | Implemented, cross-validated (request and response layout) | Path expiry by interface mode. Persisted by the host. No rate limiting of inbound path requests. |

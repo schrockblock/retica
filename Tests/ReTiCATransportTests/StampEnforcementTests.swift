@@ -338,6 +338,106 @@ private func pathRequest(_ payload: Data) -> Data {
         #expect(recorder.linkRequests.value == [dest.hash])
     }
 
+    // MARK: Per-interface costs (reference Interface.py:350-358, Identity.py:794, Transport.py:2103)
+
+    /// An announce is checked against the cost of the interface it ARRIVED on: an override there wins
+    /// over `destinationCost`, in both directions, and an interface without one uses `destinationCost`.
+    @Test func anAnnounceIsCheckedAgainstTheReceivingInterfacesDestinationCost() async throws {
+        let low = try StampedAnnounce.load("below_cost")          // value 9.09
+        let high = try StampedAnnounce.load("stripped")           // value 26.31
+        func learned(_ announce: StampedAnnounce, on id: String, cost: Double?) async -> Bool {
+            let store = makeStore(enforce: true, recorder: Recorder())   // destinationCost 23.5
+            await store.send(.interfaceConnected(InterfaceID("lo"),
+                                                 InterfaceProfile(name: "lo", bitrate: 62_500, destinationCost: cost)))
+            await store.send(.interfaceConnected(InterfaceID("plain")))
+            await store.send(.received(InterfaceID(id), announce.raw()))
+            await store.skipReceivedActions(strict: false)
+            return store.state.learned[announce.destinationHash] != nil
+        }
+        #expect(await learned(low, on: "lo", cost: 9), "9.09 meets the interface's 9")
+        #expect(!(await learned(low, on: "plain", cost: 9)), "but not the 23.5 of an interface without one")
+        #expect(!(await learned(high, on: "lo", cost: 27)), "26.31 is below the interface's 27")
+        #expect(await learned(high, on: "plain", cost: 27), "and meets 23.5 elsewhere")
+        #expect(await learned(high, on: "lo", cost: nil), "nil is the Transport-wide cost")
+        #expect(!(await learned(low, on: "lo", cost: nil)))
+    }
+
+    /// Unenforced, the receiving interface's cost still decides whether a stamp's link cost is believed.
+    @Test func unenforcedTheReceivingInterfacesCostDecidesTheLinkCost() async throws {
+        let low = try StampedAnnounce.load("below_cost")          // value 9.09
+        let store = makeStore(enforce: false, recorder: Recorder())
+        await store.send(.interfaceConnected(InterfaceID("lo"),
+                                             InterfaceProfile(name: "lo", bitrate: 62_500, destinationCost: 9)))
+        await store.send(.received(InterfaceID("lo"), low.raw()))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.knownDestinations[low.destinationHash]?.linkCost != nil)
+    }
+
+    /// A per-interface cost of 0 accepts any stamp, but, enforcing, an announce with NO stamp is still
+    /// refused: reference returns "no_stamp" before looking at the cost (Identity.py:883-886).
+    @Test func aZeroInterfaceCostAcceptsAnyStampButNotNone() async throws {
+        let unstamped = try UnstampedAnnounce.load()
+        let low = try StampedAnnounce.load("below_cost")
+        let store = makeStore(enforce: true, configure: { $0.destinationCost = 50 }, recorder: Recorder())
+        await store.send(.interfaceConnected(InterfaceID("free"),
+                                             InterfaceProfile(name: "free", bitrate: 62_500, destinationCost: 0)))
+        await store.send(.received(InterfaceID("free"), low.raw()))
+        await store.send(.received(InterfaceID("free"), unstamped.raw))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.learned[low.destinationHash] != nil, "9.09 meets 0, where the global 50 would refuse it")
+        #expect(store.state.learned[unstamped.destinationHash] == nil, "no stamp is refused at any cost")
+    }
+
+    /// A path request is checked against the cost of the interface it arrived on.
+    @Test func aPathRequestIsCheckedAgainstTheReceivingInterfacesCost() async throws {
+        let f = try PathRequestFixture.load()
+        let dest = try f.destination()
+        func answered(on id: String, cost: Double?) async -> Bool {
+            let recorder = Recorder()
+            let store = makeStore(enforce: true, configure: { $0.pathRequestCost = 100 }, recorder: recorder)
+            await store.send(.interfaceConnected(InterfaceID("cheap"),
+                                                 InterfaceProfile(name: "cheap", bitrate: 62_500, pathRequestCost: cost)))
+            await store.send(.interfaceConnected(InterfaceID("plain")))
+            await store.send(.registerLocalDestination(dest))
+            await store.send(.received(InterfaceID(id), f.stampedRaw))
+            await store.skipReceivedActions(strict: false)
+            return !recorder.pathResponses(for: dest.hash).isEmpty
+        }
+        #expect(await answered(on: "cheap", cost: NetworkStamp.defaultPathRequestCost),
+                "the genuine stamp meets the interface's 15.8")
+        #expect(!(await answered(on: "plain", cost: NetworkStamp.defaultPathRequestCost)),
+                "but not the global 100 on an interface without one")
+        #expect(!(await answered(on: "cheap", cost: nil)), "nil is the Transport-wide cost")
+
+        // Enforcing, an unstamped request is refused even at an interface cost of 0, as reference
+        // finds no stamp to validate (Transport.py:2099-2105).
+        let recorder = Recorder()
+        let store = makeStore(enforce: true, recorder: recorder)
+        await store.send(.interfaceConnected(InterfaceID("free"),
+                                             InterfaceProfile(name: "free", bitrate: 62_500, pathRequestCost: 0)))
+        await store.send(.registerLocalDestination(dest))
+        await store.send(.received(InterfaceID("free"), f.unstampedRaw))
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.pathResponses(for: dest.hash).isEmpty)
+    }
+
+    /// Clamped to 0...STAMP_COST_CAP as reference's config parser does (Reticulum.py:963-971), at
+    /// construction and when set.
+    @Test func interfaceCostsAreClampedLikeReferenceConfig() {
+        var profile = InterfaceProfile(name: "x", bitrate: 62_500, destinationCost: 1000, pathRequestCost: -3)
+        #expect(profile.destinationCost == 100)
+        #expect(profile.pathRequestCost == 0)
+        profile.destinationCost = .nan
+        profile.pathRequestCost = 250
+        #expect(profile.destinationCost == 0)
+        #expect(profile.pathRequestCost == 100)
+        profile.destinationCost = 23.5
+        profile.pathRequestCost = nil
+        #expect(profile.destinationCost == 23.5)
+        #expect(profile.pathRequestCost == nil)
+        #expect(InterfaceProfile.tcp.destinationCost == nil && InterfaceProfile.tcp.pathRequestCost == nil)
+    }
+
     @Test func withoutEnforcementAllOfThoseStillWork() async throws {
         let unstamped = try UnstampedAnnounce.load()
         let low = try StampedAnnounce.load("below_cost")

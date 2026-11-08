@@ -43,6 +43,15 @@ private let radio = UUID(uuidString: "0000AAAA-0000-0000-0000-00000000BEEF")!
         #expect(state.registeredProfile(modemPreset: 8).mode == .roaming)
     }
 
+    @Test func registeredProfileTakesStampCostsFromTheEndpointProfile() {
+        var profile = InterfaceProfile.meshtastic(modemPreset: nil)
+        profile.destinationCost = 9
+        profile.pathRequestCost = 12
+        let state = MeshtasticEndpoint.State(config: MeshtasticDriverConfig(radio: radio), profile: profile)
+        #expect(state.registeredProfile(modemPreset: 8).destinationCost == 9)
+        #expect(state.registeredProfile(modemPreset: 8).pathRequestCost == 12)
+    }
+
     /// The endpoint's own profile bitrate is ignored: the radio's preset decides it at `.connected`.
     @Test func registeredProfileTakesBitrateFromThePreset() {
         let profile = InterfaceProfile(name: "meshtastic", bitrate: 999, hwMTU: 500)
