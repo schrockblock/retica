@@ -9,11 +9,17 @@ import ComposableArchitecture
 private let pnHash = Data(repeating: 0xC0, count: 16)
 
 @MainActor
-private func makeNode(identity: Identity, seedLearned: Identity?, dest: Data, pn: Data?,
+private func makeNode(identity: Identity, seedLearned: Identity?, seedKnownOnly: Identity? = nil,
+                      dest: Data, pn: Data?,
                       pnStampCost: Int = 4, limitKB: Int = 0, deliveryStampCost: Int? = nil,
                       _ configure: (inout LXMFNode.State) -> Void = { _ in })
     -> TestStore<LXMFNode.State, LXMFNode.Action> {
     var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    // A key known without a path: what a scanned lxma:// contact leaves behind (no announce heard).
+    if let r = seedKnownOnly {
+        ep.transport.knownDestinations[dest] = KnownDestination(
+            identity: r, appData: nil, lastHeard: Date(timeIntervalSince1970: 1700000000))
+    }
     if let r = seedLearned {
         ep.transport.learned[dest] = LearnedDestination(
             identity: r, appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),
@@ -104,11 +110,47 @@ private func makeNode(identity: Identity, seedLearned: Identity?, dest: Data, pn
     let msg = LXMessage.create(source: me, destinationHash: dest, timestamp: 1700000000,
                                title: Data(), content: Data("x".utf8))
     await store.send(.sendMessage(message: msg, fallbackToPropagation: true))
-    await store.receive { if case let .router(.send(m, method)) = $0 { return m == msg && method == .opportunistic }; return false }
     await store.skipReceivedActions(strict: false)
+    // With no path it waits for the peer's cost, and that decision has already been made by then.
+    #expect(store.state.waitingForPeerCost[dest]?.map(\.message) == [msg])
     #expect(store.state.pendingFallbacks.isEmpty)
     #expect(store.state.router.fallbackEligible.isEmpty)
     #expect(store.state.router.propagationQueue.isEmpty)
+}
+
+/// A recipient whose key is known but who has no path (scanned from an lxma:// QR, never announced)
+/// can still be reached through the propagation node: the copy is marked eligible at send time.
+@MainActor @Test func sendMessageFallbackEligibleWithKnownOnlyRecipient() async {
+    let me = Identity(); let recipient = Identity()
+    let dest = Data(repeating: 0xB1, count: 16)
+    let store = makeNode(identity: me, seedLearned: nil, seedKnownOnly: recipient, dest: dest, pn: pnHash)
+    let msg = LXMessage.create(source: me, destinationHash: dest, timestamp: 1700000000,
+                               title: Data(), content: Data("x".utf8))
+    await store.send(.sendMessage(message: msg, fallbackToPropagation: true))
+    #expect(store.state.pendingFallbacks[msg.hash] == msg)
+    await store.receive(.router(.markFallbackEligible(messageHash: msg.hash)))
+}
+
+@MainActor @Test func sendMessageFallbackPacksForKnownOnlyRecipient() async {
+    let me = Identity(); let recipient = Identity()
+    let dest = Data(repeating: 0xB2, count: 16)
+    let store = makeNode(identity: me, seedLearned: nil, seedKnownOnly: recipient, dest: dest, pn: pnHash)
+    let msg = LXMessage.create(source: me, destinationHash: dest, timestamp: 1700000000,
+                               title: Data(), content: Data("x".utf8))
+    await store.send(.sendMessage(message: msg, fallbackToPropagation: true))
+    await store.skipReceivedActions(strict: false)
+    await store.send(.router(.delegate(.propagationFallbackDue(messageHash: msg.hash))))
+    await store.receive { if case let .router(.sendViaPropagation(m, _)) = $0 { return m == msg }; return false }
+    #expect(store.state.router.propagationQueue[pnHash]?.count == 1)
+}
+
+@MainActor @Test func sendViaPropagationWithKnownOnlyRecipient() async {
+    let me = Identity(); let recipient = Identity()
+    let dest = Data(repeating: 0xB3, count: 16)
+    let store = makeNode(identity: me, seedLearned: nil, seedKnownOnly: recipient, dest: dest, pn: pnHash)
+    await store.send(.sendViaPropagation(destinationHash: dest, title: Data(), content: Data("x".utf8)))
+    await store.receive { if case .router(.sendViaPropagation) = $0 { return true }; return false }
+    #expect(store.state.router.propagationQueue[pnHash]?.count == 1)
 }
 
 /// Spec §6: a copy the node would refuse is refused at send time, and never becomes a fallback.

@@ -17,11 +17,15 @@ let package = Package(
         // The live Meshtastic driver (spec 2026-10-16 Contract 2). The ONLY ReTiCA code that
         // imports MeshtasticKit.
         .library(name: "ReTiCAMeshtasticLive", targets: ["ReTiCAMeshtasticLive"]),
+        // The live MeshCore driver (spec 2026-11-07 Contract 2). The ONLY ReTiCA code that
+        // imports MeshCoreKit.
+        .library(name: "ReTiCAMeshCoreLive", targets: ["ReTiCAMeshCoreLive"]),
     ],
     dependencies: [
         .package(url: "https://github.com/pointfreeco/swift-composable-architecture", from: "1.15.0"),
         .package(path: "../FCB"),
         .package(path: "../MeshtasticKit"),
+        .package(path: "../MeshCoreKit"),
         .package(url: "https://github.com/NordicSemiconductor/IOS-CoreBluetooth-Mock.git", from: "1.0.0"),
         .package(url: "https://github.com/leif-ibsen/SwiftEdDSA", exact: "4.1.0"),
     ],
@@ -45,10 +49,19 @@ let package = Package(
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
             ]
         ),
+        .target(
+            name: "ReTiCAMeshCoreLive",
+            dependencies: [
+                "ReTiCAInterfaces",
+                .product(name: "MeshCoreKit", package: "MeshCoreKit"),
+                .product(name: "FCBComposable", package: "FCB"),
+                .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
+            ]
+        ),
         .testTarget(
             name: "ReTiCATests",
             dependencies: ["ReTiCA"],
-            resources: [.process("Vectors/fixtures.json"), .process("Vectors/lxmf_fixtures.json"), .process("Vectors/lxmf_propagation_fixtures.json"), .process("Vectors/lxmf_rich_fixtures.json"), .process("Vectors/lxmf_stamp_fixtures.json"), .process("Vectors/lxmf_peering_fixtures.json"), .process("Vectors/lxmf_pn_announce_fixtures.json"), .process("Vectors/msgpack_signed_fixtures.json"), .process("Vectors/lxmf_signed_fixtures.json"), .process("Vectors/lxmf_announce_fixtures.json")]
+            resources: [.process("Vectors/fixtures.json"), .process("Vectors/lxmf_fixtures.json"), .process("Vectors/lxmf_propagation_fixtures.json"), .process("Vectors/lxmf_rich_fixtures.json"), .process("Vectors/lxmf_stamp_fixtures.json"), .process("Vectors/lxmf_peering_fixtures.json"), .process("Vectors/lxmf_pn_announce_fixtures.json"), .process("Vectors/msgpack_signed_fixtures.json"), .process("Vectors/lxmf_signed_fixtures.json"), .process("Vectors/lxmf_announce_fixtures.json"), .process("Vectors/lxmf_stamped_announce_fixtures.json"), .process("Vectors/network_stamp_fixtures.json"), .process("Vectors/stamped_announce_packet_fixtures.json")]
         ),
         .testTarget(
             name: "ReTiCAInterfacesTests",
@@ -58,6 +71,9 @@ let package = Package(
                 // live in THIS target, nested in the serialized `FCBDriverAdapterCBMTests`, so they
                 // never overlap the BLE adapter's CBM tests.
                 "ReTiCAMeshtasticLive",
+                "ReTiCAMeshCoreLive",
+                .product(name: "MeshCoreKit", package: "MeshCoreKit"),
+                .product(name: "MeshCoreMock", package: "MeshCoreKit"),
                 .product(name: "MeshtasticKit", package: "MeshtasticKit"),
                 .product(name: "MeshtasticMock", package: "MeshtasticKit"),
                 .product(name: "MeshProto", package: "MeshtasticKit"),
@@ -82,7 +98,9 @@ let package = Package(
                 "ReTiCATransport",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
             ],
-            resources: [.process("Vectors/transport_fixtures.json"), .process("Vectors/proof_fixtures.json")]
+            resources: [.process("Vectors/transport_fixtures.json"), .process("Vectors/proof_fixtures.json"), .process("Vectors/stamped_announce_packet_fixtures.json"),
+                        .process("Vectors/path_request_fixtures.json"), .process("Vectors/destination_stamp_fixtures.json"),
+                        .process("Vectors/link_request_stamp_fixtures.json")]
         ),
         .target(
             name: "ReTiCANode",
@@ -97,7 +115,8 @@ let package = Package(
             dependencies: [
                 "ReTiCANode",
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
-            ]
+            ],
+            resources: [.process("Vectors/stamped_announce_packet_fixtures.json")]
         ),
         // Shared per-device identity storage (Keychain access group). Depends only on the
         // dependency-free core so any app can adopt it without pulling in TCA or transports.

@@ -21,10 +21,21 @@ public struct KnownDestination: Equatable, Sendable {
     public var appData: Data?
     /// When the most recent valid announce for this destination was heard (reference entry[0]).
     public var lastHeard: Date
+    /// The link-request stamp cost the most recent announce carried, or nil (reference entry[7],
+    /// `lr_cost`, read by `Identity.recall_link_cost`). Set only when that announce's network stamp met
+    /// the value we demand (`Announce.Parsed.linkCost`). Overwritten by EVERY valid announce, including
+    /// one that does not win the path, so a destination that changes its cost is believed at once.
+    public var linkCost: Double?
+    /// The value of the most recent announce's network stamp, valid or not, or nil when it carried none
+    /// (reference entry[6], `Identity.recall_stamp_value`).
+    public var stampValue: Double?
 
-    public init(identity: Identity, appData: Data?, lastHeard: Date) {
+    public init(identity: Identity, appData: Data?, lastHeard: Date,
+                linkCost: Double? = nil, stampValue: Double? = nil) {
         self.identity = identity
         self.appData = appData
         self.lastHeard = lastHeard
+        self.linkCost = linkCost
+        self.stampValue = stampValue
     }
 }

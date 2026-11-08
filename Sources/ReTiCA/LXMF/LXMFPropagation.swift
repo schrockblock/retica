@@ -8,6 +8,10 @@ import Foundation
 /// lives at the Transport/Endpoint boundary (as with opportunistic delivery); this namespace treats
 /// the encrypted tail as opaque bytes. Mirrors lxmf 1.1.0 LXMessage.pack() PROPAGATED (LXMessage.py:429-436).
 public enum LXMFPropagation {
+    /// Link-request stamp cost the propagation destination announces (LXMF 1.3.0
+    /// `LXMRouter.PROPAGATION_LINK_COST`, set at LXMRouter.py:634).
+    public static let propagationLinkCost = 3.25
+
     /// Propagation identity / dedup key: SHA-256 of a full lxmf_data entry.
     public static func transientId(lxmfData: Data) -> Data {
         Crypto.fullHash(lxmfData)

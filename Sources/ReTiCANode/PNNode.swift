@@ -63,6 +63,9 @@ public struct PNNode {
             /// carries no retry machinery (that lives in `LXMFRouter`) and has no production consumer
             /// today, so this exists to make the drop OBSERVABLE rather than abandoning the pending
             /// sync silently (handoff F3). The `LinkFailure` reason is surfaced, not discarded.
+            /// A node stop fails a sync still waiting for its link (one whose link-request key was being
+            /// searched) with `.pathStale`: `LinkPlane` chose that over
+            /// `.stampFailure` on purpose (see its `failStampSearches`).
             case syncFailed(destinationHash: Data, reason: LinkFailure)
         }
     }
@@ -110,7 +113,8 @@ public struct PNNode {
                                          perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
                                          targetStampCost: state.node.store.minStampCost,
                                          stampCostFlexibility: 0, peeringCost: state.peeringCost).packed
-                return .merge(.send(.endpoint(.registerLocalDestination(d))),
+                // LXMF 1.3.0's propagation link cost (LXMRouter.py:634), on the wire when stamping.
+                return .merge(.send(.endpoint(.registerLocalDestination(d, linkCost: LXMFPropagation.propagationLinkCost))),
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
 
             case let .syncToPeer(destinationHash, peeringCost):

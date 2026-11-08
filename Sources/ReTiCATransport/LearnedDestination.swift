@@ -8,9 +8,15 @@ public struct LearnedDestination: Equatable, Sendable {
     public var ratchet: Data?         // received 32-byte ratchet public key, or nil
     public var interfaceID: InterfaceID
     public var hops: UInt8
-    public var nextHop: Data?         // transport_id, or nil if directly heard
+    /// The announce's transport_id, or the destination's own hash when heard directly: Transport
+    /// always sets `packet.transportId ?? packet.destinationHash`. Nil only in a value built
+    /// elsewhere (a test, or a host's rehydrated entry); `relayNextHop` treats nil as direct.
+    public var nextHop: Data?
     public var announceEmitted: UInt64
     public var learnedAt: Date
+    // No link cost or stamp value here: a path is replaced only by a better announce, so a cost kept
+    // on it would go stale when the destination changed it in an announce that lost the path. They
+    // live on `KnownDestination`, which every valid announce refreshes, as reference keeps them.
 
     public init(identity: Identity, appData: Data?, ratchet: Data?, interfaceID: InterfaceID,
                 hops: UInt8, nextHop: Data?, announceEmitted: UInt64,

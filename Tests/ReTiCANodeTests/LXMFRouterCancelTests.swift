@@ -203,6 +203,8 @@ private func cancelStore(_ state: LXMFRouter.State, _ clock: TestClock<Duration>
         $0.outboundQueue[recipient] = nil
     }
     #expect(store.state.cancelledMessages.contains(big.hash))
+    // Nothing else needed the establishing link: the host may stop it (a key search, in LXMFNode).
+    await store.receive(.delegate(.abandonLink(destinationHash: recipient)))
     await store.receive(.delegate(.deliveryCancelled(messageHash: big.hash)))
     await store.send(.linkEstablished(destinationHash: recipient, linkID: recipientLink)) {
         $0.directLinks[recipient] = .active(linkID: recipientLink)

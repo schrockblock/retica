@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import ComposableArchitecture
 import ReTiCA
 import ReTiCATransport
@@ -7,9 +8,9 @@ import ReTiCATransport
 /// (recoverable by requesting a fresh one) from "the PEER did not complete" (recoverable only
 /// by retrying the link). `LXMFNode` routes on this — see its `linkFailed` handler.
 ///
-/// Three of the four are PATH-shaped: `.noPath`, `.pathStale` and `.establishmentTimedOut` all
-/// describe a route we cannot reach the peer over. Only `.handshakeRejected` is PEER-shaped —
-/// it is the one case where the peer demonstrably received our packets.
+/// Three are PATH-shaped: `.noPath`, `.pathStale` and `.establishmentTimedOut` all describe a route
+/// we cannot reach the peer over. `.handshakeRejected` is PEER-shaped — the one case where the peer
+/// demonstrably received our packets. `.stampFailure` is neither: nothing was sent.
 public enum LinkFailure: Equatable, Sendable {
     /// No learned path at all for the destination.
     case noPath
@@ -24,6 +25,12 @@ public enum LinkFailure: Equatable, Sendable {
     /// The peer answered and the handshake failed to validate. PEER-shaped — a path request would
     /// not help, because the path demonstrably works.
     case handshakeRejected
+    /// The destination announced a link cost and we could not produce a LINKREQUEST key meeting it:
+    /// the cost is above `LinkPlane.maxLinkStampCost`, or the search ran out its
+    /// `NetworkStamp.linkStampTimeout`. Reference `Link.STAMP_FAILURE` (Link.py:337-342). No packet
+    /// left this node, so it says nothing about the path or the peer. A search ended because its
+    /// interface went away, or the endpoint stopped, reports `.pathStale` instead.
+    case stampFailure
 }
 
 /// The interface-agnostic link/resource/request plane: owns the live `LinkSession`s and the
@@ -84,6 +91,11 @@ public struct LinkPlane {
         /// or refused by this bound. Only INCOMPLETE links count: a slot frees when its link
         /// reaches `.active` or leaves on its establishment deadline.
         public static let maxStretchedIncompleteResponderLinksPerInterface = 8
+        /// Initiator links waiting for a stamped LINKREQUEST key, one per in-flight search. Each
+        /// becomes a `LinkSession` in `links` only when its search finds a key, so its establishment
+        /// timeout starts after the search, as reference's does (`Link.__initiate` sends the request,
+        /// and starts the watchdog, only once the key exists).
+        public var stampingLinks: IdentifiedArrayOf<StampingLink> = []
         public init(links: IdentifiedArrayOf<LinkSession.State> = [],
                     registrations: [Data: RequestRegistration] = [:],
                     maxResponderLinks: Int? = 256,
@@ -95,18 +107,70 @@ public struct LinkPlane {
         }
     }
 
+    /// An initiator link whose LINKREQUEST key is still being searched for. Everything `openLink` was
+    /// given, plus the Ed25519 half of the ephemeral key, which is fixed before the search because it
+    /// is part of the stamp material (Link.py:355-358).
+    public struct StampingLink: Equatable, Identifiable, Sendable {
+        public let id: UUID
+        public let destinationIdentity: Identity
+        public let destinationHash: Data
+        public let interfaceID: InterfaceID
+        public let relayNextHop: Data?
+        public let establishmentTimeout: TimeInterval
+        public let linkCost: Double
+        let ed25519PrivateKey: Data
+        public let ed25519PublicKey: Data
+    }
+
+    /// The highest announced link cost we will search for. Above it, `openLink` fails the link at once
+    /// with `LinkFailure.stampFailure`.
+    ///
+    /// Reference has no such ceiling below `LINK_COST_CAP` (40): it searches any announced cost and
+    /// lets `LINK_STAMP_TIMEOUT` (15 s) end the attempt. A key search costs one X25519 key per round,
+    /// about 14,000 rounds/s on a Mac and fewer on a phone (`NetworkStamp`), so 15 s covers a cost of
+    /// about 17 on a Mac. Cost 20 needs about 2^20 rounds, over a minute, and every point above
+    /// doubles it, so a search above 20 would only burn 15 s of CPU (and battery) and then fail. LXMF
+    /// 1.3.0 announces 3.25 and RNS's own default `LR_COST` is 12.5, both far below. At or below the
+    /// ceiling we search and let the timeout decide, as reference does.
+    public static let maxLinkStampCost: Double = 20
+
     public enum Action: Equatable {
         case link(IdentifiedActionOf<LinkSession>)
 
         /// Create an initiator link and start establishment. `establishmentTimeout` is computed by
         /// the host, which can see Transport (`LinkTiming.initiatorEstablishmentTimeout`); this
         /// plane never reads Transport state.
+        ///
+        /// `linkCost` is the link-request stamp cost the destination announced (reference
+        /// `Identity.recall_link_cost`), or nil. With a positive cost the plane first searches for an
+        /// ephemeral X25519 key meeting it (Link.py:344-382) and opens the link only once it has one;
+        /// see `maxLinkStampCost` and `NetworkStamp.linkStampTimeout`.
         case openLink(initiatorTo: Identity, destinationHash: Data,
                       interfaceID: InterfaceID, relayNextHop: Data?,
-                      establishmentTimeout: TimeInterval = LinkTiming.defaultEstablishmentTimeout)
+                      establishmentTimeout: TimeInterval = LinkTiming.defaultEstablishmentTimeout,
+                      linkCost: Double? = nil)
+        /// A search for `stampingLinks[id]` found an X25519 key meeting the cost.
+        case stampedKeyFound(id: UUID, x25519PrivateKey: Data, x25519PublicKey: Data)
+        /// A search for `stampingLinks[id]` ran out `NetworkStamp.linkStampTimeout`.
+        case stampSearchTimedOut(id: UUID)
+        /// Cancel every in-flight key search and fail its link with `.pathStale`. The host sends this
+        /// when it stops, so no search outlives the endpoint. (`.interfaceDisconnected` does the same
+        /// for the searches bound to that one interface.)
+        case cancelStampSearches
+        /// Cancel the key searches for links to `destinationHash` and drop them, reporting nothing.
+        /// The host sends this when it has given up on that destination's link, so nobody is waiting
+        /// for the outcome. A link already minted (its search done, or none needed) is not touched.
+        ///
+        /// It drops EVERY search to the destination, whoever opened it: one a host opened for some
+        /// other purpose would end without a `linkFailed` too. `LXMFNode`, the only sender, opens links
+        /// only for its router.
+        case abandonStampSearches(destinationHash: Data)
         /// Create a responder link for an inbound LINKREQUEST and accept it. `arrivalBitrate` is
         /// the bitrate of the interface the request arrived on (`nil` = unknown → 15 s); it sets the
         /// establishment deadline via `LinkTiming.responderEstablishmentTimeout`.
+        ///
+        /// Stamp enforcement for inbound LINKREQUESTs happens in `Transport`, before it sends this
+        /// action. Sending the action directly accepts the request without checking any stamp.
         case acceptLinkRequest(owner: Identity, destinationHash: Data,
                                interfaceID: InterfaceID, data: Data, arrivalBitrate: Int? = nil)
         /// Route an inbound link-addressed packet to the link that owns it.
@@ -161,6 +225,41 @@ public struct LinkPlane {
 
     @Dependency(\.uuid) var uuid
     @Dependency(\.requestResponder) var requestResponder
+    @Dependency(\.continuousClock) var clock
+
+    private enum CancelID: Hashable { case stampSearch(UUID) }
+
+    /// Cancel these key searches, drop them, and fail each link with `.pathStale`: the interface the
+    /// link would ride is gone or going (it disconnected, or the endpoint is stopping).
+    ///
+    /// Deliberately not `.stampFailure`. LXMFNode retries a stamp failure at once (`requestLink`),
+    /// and on a stopping endpoint whose interface outlives `.stop` (a Meshtastic radio reports
+    /// offline only after `driver.stop()` returns) that retry started a NEW 15 s search. A
+    /// path-shaped failure parks the destination for a fresh path instead, which is also the right
+    /// recovery when the interface really went away.
+    private func failStampSearches(_ searches: IdentifiedArrayOf<StampingLink>,
+                                   from state: inout State) -> Effect<Action> {
+        for pending in searches { state.stampingLinks.remove(id: pending.id) }
+        return .merge(searches.map { pending in
+            .merge(.cancel(id: CancelID.stampSearch(pending.id)),
+                   .send(.delegate(.linkFailed(destinationHash: pending.destinationHash, reason: .pathStale))))
+        })
+    }
+
+    /// The `.stampFailure` outcome for a link to `destinationHash`: nothing was sent.
+    private static func stampFailed(_ destinationHash: Data) -> Effect<Action> {
+        .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .stampFailure)))
+    }
+
+    /// An initiator link session. Without `ephemeral` it gets an ordinary random key.
+    private static func initiatorLink(id: UUID, to identity: Identity, destinationHash: Data,
+                                      interfaceID: InterfaceID, ephemeral: Identity = Identity(),
+                                      establishmentTimeout: TimeInterval,
+                                      relayNextHop: Data?) -> LinkSession.State {
+        LinkSession.State(id: id, initiatorTo: identity, destinationHash: destinationHash,
+                          interfaceID: interfaceID, ephemeral: ephemeral,
+                          establishmentTimeout: establishmentTimeout, relayNextHop: relayNextHop)
+    }
 
     public var body: some ReducerOf<Self> {
         // LATE ACTIONS FOR A REMOVED LINK are dropped quietly. A link element is removed on its
@@ -181,14 +280,92 @@ public struct LinkPlane {
     private var core: some ReducerOf<Self> {
         Reduce { state, action in
             switch action {
-            case let .openLink(identity, destinationHash, interfaceID, relayNextHop, establishmentTimeout):
+            case let .openLink(identity, destinationHash, interfaceID, relayNextHop, establishmentTimeout, linkCost):
                 let newID = uuid()
-                state.links.append(LinkSession.State(id: newID, initiatorTo: identity,
-                                                     destinationHash: destinationHash,
-                                                     interfaceID: interfaceID,
-                                                     establishmentTimeout: establishmentTimeout,
-                                                     relayNextHop: relayNextHop))
-                return .send(.link(.element(id: newID, action: .establish)))
+                // Reference stamps when `stamp_cost` is truthy (Link.py:313): no cost, or zero, means an
+                // ordinary random key and no search. A negative or NaN cost is met by any key, so it
+                // gets the same. STAMP_LRS is on by default in 1.6.0 and ALWAYS_STAMP_LRS off, so we
+                // never stamp a request to a destination that announced no cost.
+                guard let cost = linkCost, cost > 0 else {
+                    state.links.append(Self.initiatorLink(id: newID, to: identity,
+                                                          destinationHash: destinationHash,
+                                                          interfaceID: interfaceID,
+                                                          establishmentTimeout: establishmentTimeout,
+                                                          relayNextHop: relayNextHop))
+                    return .send(.link(.element(id: newID, action: .establish)))
+                }
+                guard cost <= Self.maxLinkStampCost else { return Self.stampFailed(destinationHash) }
+                // Link.py:355-361: a fresh Ed25519 key first, because the stamp material is
+                // `destinationHash + ed25519Public`; then search X25519 keys against it.
+                let signing = Curve25519.Signing.PrivateKey()
+                let pending = StampingLink(id: newID, destinationIdentity: identity,
+                                           destinationHash: destinationHash, interfaceID: interfaceID,
+                                           relayNextHop: relayNextHop,
+                                           establishmentTimeout: establishmentTimeout, linkCost: cost,
+                                           ed25519PrivateKey: signing.rawRepresentation,
+                                           ed25519PublicKey: signing.publicKey.rawRepresentation)
+                state.stampingLinks.append(pending)
+                let material = destinationHash + pending.ed25519PublicKey
+                let clock = clock
+                return .run { send in
+                    // Whichever ends first: the search, or `linkStampTimeout` (reference's
+                    // `stamp_watchdog`, Link.py:348-353). The loser is cancelled; `generateKey` stops
+                    // within `searchYieldInterval` rounds of that.
+                    let found = await withTaskGroup(of: (privateKey: Data, publicKey: Data)?.self) { group in
+                        group.addTask {
+                            guard let key = await NetworkStamp.generateKey(material: material, cost: cost)
+                            else { return nil }
+                            return (key.privateKey, key.publicKey)
+                        }
+                        group.addTask {
+                            try? await clock.sleep(for: .seconds(NetworkStamp.linkStampTimeout))
+                            return nil
+                        }
+                        let first = await group.next() ?? nil
+                        group.cancelAll()
+                        return first
+                    }
+                    // Cancelled from outside: `cancelStampSearches` / `interfaceDisconnected` report the
+                    // failure, and `abandonStampSearches` reports nothing.
+                    guard !Task.isCancelled else { return }
+                    if let found {
+                        await send(.stampedKeyFound(id: newID, x25519PrivateKey: found.privateKey,
+                                                    x25519PublicKey: found.publicKey))
+                    } else {
+                        await send(.stampSearchTimedOut(id: newID))
+                    }
+                }
+                .cancellable(id: CancelID.stampSearch(newID))
+
+            case let .stampedKeyFound(id, x25519PrivateKey, x25519PublicKey):
+                guard let pending = state.stampingLinks.remove(id: id) else { return .none }
+                // Reference re-derives the key and aborts on a mismatch (Link.py:373-376). The
+                // ephemeral identity is X25519 private ‖ Ed25519 private, the same layout as any
+                // `Identity`, so `LinkSession` sends its public half as the LINKREQUEST payload.
+                guard let ephemeral = Identity(privateKey: x25519PrivateKey + pending.ed25519PrivateKey),
+                      ephemeral.publicKey == x25519PublicKey + pending.ed25519PublicKey
+                else { return Self.stampFailed(pending.destinationHash) }
+                state.links.append(Self.initiatorLink(id: id, to: pending.destinationIdentity,
+                                                      destinationHash: pending.destinationHash,
+                                                      interfaceID: pending.interfaceID,
+                                                      ephemeral: ephemeral,
+                                                      establishmentTimeout: pending.establishmentTimeout,
+                                                      relayNextHop: pending.relayNextHop))
+                // `.establish` arms the establishment timer, so it starts now, after the search.
+                return .send(.link(.element(id: id, action: .establish)))
+
+            case let .stampSearchTimedOut(id):
+                guard let pending = state.stampingLinks.remove(id: id) else { return .none }
+                return Self.stampFailed(pending.destinationHash)
+
+            case .cancelStampSearches:
+                return failStampSearches(state.stampingLinks, from: &state)
+
+            case let .abandonStampSearches(destinationHash):
+                // Silent: no `linkFailed`. The host has already moved on.
+                let abandoned = state.stampingLinks.filter { $0.destinationHash == destinationHash }
+                for pending in abandoned { state.stampingLinks.remove(id: pending.id) }
+                return .merge(abandoned.map { .cancel(id: CancelID.stampSearch($0.id)) })
 
             case let .acceptLinkRequest(owner, destinationHash, interfaceID, data, arrivalBitrate):
                 // A responder cannot sign the LRPROOF without a private key: `Link.buildProof` →
@@ -294,7 +471,11 @@ public struct LinkPlane {
                 for id in state.links.ids where state.links[id: id]?.interfaceID == interfaceID {
                     state.links[id: id]?.rehomePermitted = true
                 }
-                return .none
+                // A key search, unlike a link, has sent nothing yet, so there is nothing to re-home:
+                // it would mint its link on this dead interface when it ends, up to 15 s from now,
+                // and the link would then sit out its establishment deadline. End it now instead.
+                let orphaned = state.stampingLinks.filter { $0.interfaceID == interfaceID }
+                return failStampSearches(orphaned, from: &state)
 
             case let .sendOverLink(linkID, data):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }

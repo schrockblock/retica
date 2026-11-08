@@ -1,4 +1,5 @@
 import Foundation
+import ReTiCA
 
 /// RNS interface operating mode. Raw values are the reference wire constants
 /// (RNS Interface.py:45-51). `internal` is a Swift keyword, hence `interfaceInternal`.
@@ -31,9 +32,24 @@ public struct InterfaceProfile: Equatable, Sendable {
     /// outbound packets are masked by the Endpoint. `Equatable` still holds because `IFAC`
     /// is `Equatable`.
     public var ifac: IFAC? = nil
+    /// The stamp value an announce arriving on this interface is checked against (reference
+    /// per-interface `destination_cost`, Interface.py:350-353). `nil` uses the Transport-wide
+    /// `Transport.State.destinationCost`. Clamped to 0...`NetworkStamp.stampCostCap`, NaN to 0, when
+    /// set, as reference's config parser clamps it (Reticulum.py:963-966).
+    public var destinationCost: Double? {
+        didSet { destinationCost = destinationCost.map(Self.clampedStampCost) }
+    }
+    /// The stamp value a path request arriving on this interface must carry when stamps are enforced
+    /// (reference per-interface `pr_cost`, Interface.py:355-358, read at Transport.py:2103). `nil`
+    /// uses the Transport-wide `Transport.State.pathRequestCost`. Clamped as `destinationCost` is
+    /// (Reticulum.py:968-971).
+    public var pathRequestCost: Double? {
+        didSet { pathRequestCost = pathRequestCost.map(Self.clampedStampCost) }
+    }
 
     public init(name: String, bitrate: Int, mode: InterfaceMode = .full,
-                hwMTU: Int? = nil, announceCap: Double = 0.02, ifac: IFAC? = nil) {
+                hwMTU: Int? = nil, announceCap: Double = 0.02, ifac: IFAC? = nil,
+                destinationCost: Double? = nil, pathRequestCost: Double? = nil) {
         precondition(bitrate > 0, "InterfaceProfile.bitrate must be > 0")
         precondition(announceCap > 0 && announceCap <= 1,
                      "announceCap is a fraction in (0, 1], e.g. 0.02 — not a percent")
@@ -43,6 +59,13 @@ public struct InterfaceProfile: Equatable, Sendable {
         self.hwMTU = hwMTU
         self.announceCap = announceCap
         self.ifac = ifac
+        self.destinationCost = destinationCost.map(Self.clampedStampCost)
+        self.pathRequestCost = pathRequestCost.map(Self.clampedStampCost)
+    }
+
+    /// `max(0, min(v, STAMP_COST_CAP))` as Python evaluates it: NaN comes out as 0.
+    static func clampedStampCost(_ value: Double) -> Double {
+        value.isNaN ? 0 : min(max(value, 0), Double(NetworkStamp.stampCostCap))
     }
 
     /// Reference TCPInterface declared values (TCPInterface.py:76, 42).

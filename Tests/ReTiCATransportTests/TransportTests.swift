@@ -2634,7 +2634,8 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     return try! packet.packed()
 }
 
-/// requestPath broadcasts a DATA PATH_REQUEST to the control dest with destHash ‖ tag payload.
+/// requestPath broadcasts a DATA PATH_REQUEST to the control dest with a 48-byte
+/// destHash ‖ senderID ‖ tag payload (RNS 1.6.0).
 @Test @MainActor func requestPathBuildsBroadcastPathRequest() async {
     let destHash = Data(repeating: 0x22, count: 16)
     let tag = Data(repeating: 0xAB, count: 16)
@@ -2657,7 +2658,9 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     #expect(p.destinationType == .plain)
     #expect(p.destinationHash == Transport.pathRequestDestinationHash)
     #expect(Data(p.payload.prefix(16)) == destHash)
-    #expect(Data(p.payload.dropFirst(16)) == tag)         // non-relay → no transport_id
+    // RNS 1.6.0: even a leaf carries a sender ID (Transport.py:3699).
+    #expect(Data(p.payload.dropFirst(16).prefix(16)) == store.state.pathRequestSenderID)
+    #expect(Data(p.payload.dropFirst(32)) == tag)
 }
 
 /// A relay's PATH_REQUEST includes its transport_id: destHash ‖ transportId ‖ tag.

@@ -115,6 +115,14 @@ private let ifA = InterfaceID("iface-a")
     // .interfaceDisconnected — NOT aliased; rides .linkPlane(...)
     #expect(roundTrips(.interfaceDisconnected(InterfaceID("gone"))))
 
+    // Link-request stamp search — NOT aliased; rides .linkPlane(...)
+    #expect(roundTrips(.openLink(initiatorTo: ident, destinationHash: destHash, interfaceID: ifaceID,
+                                 relayNextHop: nil, linkCost: 3.25)))
+    #expect(roundTrips(.stampedKeyFound(id: elementID, x25519PrivateKey: Data([0x01]), x25519PublicKey: Data([0x02]))))
+    #expect(roundTrips(.stampSearchTimedOut(id: elementID)))
+    #expect(roundTrips(.cancelStampSearches))
+    #expect(roundTrips(.delegate(.linkFailed(destinationHash: destHash, reason: .stampFailure))))
+
     // .delegate — NOT aliased; rides .linkPlane(...)
     #expect(roundTrips(.delegate(.transmit(ifaceID, Data([0xFF])))))
     #expect(roundTrips(.delegate(.linkEstablished(linkID: linkID, destinationHash: destHash))))

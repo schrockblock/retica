@@ -40,7 +40,8 @@ public struct MeshtasticEndpoint {
     @ObservableState
     public struct State: Equatable {
         public var interface: MeshtasticInterface.State
-        /// Supplies ONLY the IFAC and the mode. The bitrate is the radio's, known at `.connected`.
+        /// Supplies ONLY the IFAC, the mode and the per-interface stamp costs. The bitrate is the
+        /// radio's, known at `.connected`.
         public let profile: InterfaceProfile
 
         public var interfaceID: InterfaceID { meshtasticInterfaceID(radio: interface.config.radio) }
@@ -58,6 +59,8 @@ public struct MeshtasticEndpoint {
             var registered = InterfaceProfile.meshtastic(modemPreset: modemPreset)
             registered.mode = profile.mode
             registered.ifac = profile.ifac
+            registered.destinationCost = profile.destinationCost
+            registered.pathRequestCost = profile.pathRequestCost
             return registered
         }
     }

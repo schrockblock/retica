@@ -157,7 +157,7 @@ import ComposableArchitecture
                                aspects: ["propagation"], identity: identity)!
     await store.send(.registerPropagation)
     await store.receive { action in
-        if case let .client(.endpoint(.registerLocalDestination(d))) = action {
+        if case let .client(.endpoint(.registerLocalDestination(d, _))) = action {
             #expect(d.hash == expected.hash); return true
         }
         return false

@@ -239,6 +239,7 @@ private func handedOff(_ msg: LXMessage, _ state: LXMFRouter.State,
 /// The confirmation, exhaustively: one `deliveryConfirmed`, and the delivery copy's retries stop.
 @MainActor
 private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>, _ h: Data,
+                         abandoning abandoned: Data? = nil,
                          _ update: @escaping (inout LXMFRouter.State) -> Void) async {
     store.exhaustivity = .on
     await store.send(.opportunisticDelivered(messageHash: h)) {
@@ -246,6 +247,7 @@ private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>
         $0.succeededMessages.insert(h)
         update(&$0)
     }
+    if let abandoned { await store.receive(.delegate(.abandonLink(destinationHash: abandoned))) }
     await store.receive(.delegate(.deliveryConfirmed(messageHash: h)))
 }
 
@@ -274,7 +276,8 @@ private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>
     await store.send(.sendViaPropagation(message: msg, propagationPacked: container))
     await store.skipReceivedActions(strict: false)
     #expect(store.state.propagationQueue[pn]?.count == 1)
-    await confirmOnce(store, h) { $0.propagationQueue[pn] = nil }
+    // The queued copy was all the node's establishing link was for: it is abandoned.
+    await confirmOnce(store, h, abandoning: pn) { $0.propagationQueue[pn] = nil }
     await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds * LXMFDelivery.maxAttempts))
     // The link comes up with nothing to send: no sendPropagatedPacket, so no propagationAccepted.
     await store.send(.linkEstablished(destinationHash: pn, linkID: pnLink)) {
@@ -352,4 +355,65 @@ private func confirmOnce(_ store: TestStore<LXMFRouter.State, LXMFRouter.Action>
         $0.pendingDeliveries[.delivery(h)] = nil
     }
     await store.receive(.delegate(.deliveryFailed(messageHash: h)))
+}
+
+// MARK: - A delivery copy taken back to be stamped
+
+private struct FailureCountingRouter: Reducer {
+    typealias State = LXMFRouter.State
+    typealias Action = LXMFRouter.Action
+    let failures: LockIsolated<Int>
+
+    var body: some Reducer<State, Action> {
+        Reduce { _, action in
+            if case .delegate(.deliveryFailed) = action { failures.withValue { $0 += 1 } }
+            return .none
+        }
+        LXMFRouter()
+    }
+}
+
+/// `LXMFNode` takes the unsent delivery copy back to stamp it while the propagated copy is out. That
+/// copy failing meanwhile must not end the message, and the stamped copy, once back, ends it once.
+/// Failures are counted in a reducer: a `receive` cannot count actions an earlier send skipped.
+@Test @MainActor func aWithdrawnDeliveryCopyKeepsTheMessageAliveUntilItComesBack() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let clock = TestClock()
+    let failures = LockIsolated(0)
+    let store = TestStore(initialState: LXMFRouter.State()) {
+        FailureCountingRouter(failures: failures)
+    } withDependencies: { $0.continuousClock = clock }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))   // no path: nothing reaches the wire
+    await store.send(.propagatedCopyPending(messageHash: h))
+    await store.send(.withdrawUnsentDeliveryCopy(messageHash: h))
+    #expect(store.state.pendingDeliveries[.delivery(h)] == nil, "the copy was given back")
+
+    await store.send(.propagatedCopyFailed(messageHash: h))
+    await store.skipReceivedActions(strict: false)
+    #expect(failures.value == 0, "the delivery copy is being stamped, so the message is not over")
+
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    for _ in 0..<(2 * LXMFDelivery.maxAttempts) {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+        await store.skipReceivedActions(strict: false)
+    }
+    #expect(failures.value == 1, "the stamped copy running out ends the message, once")
+    #expect(!store.state.hasOutboundState(for: h), "the copy came back, so the router holds nothing for it")
+}
+
+/// A link copy already sent on an active link has gone out: it is not given back.
+@Test @MainActor func aDeliveryCopyAlreadySentOnALinkIsNotWithdrawn() async {
+    let msg = makeMessage()
+    let h = msg.hash
+    let dest = msg.destinationHash
+    var state = LXMFRouter.State()
+    state.directLinks[dest] = .active(linkID: link)
+    let store = makeStore(state, clock: TestClock())
+    await store.send(.send(message: msg, desiredMethod: .direct))
+    #expect(store.state.pendingDeliveries[.delivery(h)] != nil)
+    await store.send(.withdrawUnsentDeliveryCopy(messageHash: h))
+    #expect(store.state.pendingDeliveries[.delivery(h)] != nil)
+    #expect(!store.state.withdrawnDeliveryCopies.contains(h))
 }

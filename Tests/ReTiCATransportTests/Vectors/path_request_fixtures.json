@@ -1,0 +1,19 @@
+{
+  "identity_private_key": "c0c007b25482e5f13a25a9b4f077ba52ad6b62377eb197c4ce6ecc7401d6774fb8ca5da2375cdf6f4deccc478b3cb66cdc509817df2bb44775919d57a6243e87",
+  "app_name": "retica",
+  "aspects": [
+    "prtest"
+  ],
+  "destination_hash": "26a3b60de12eb1a241e9f007075dcc55",
+  "transport_id": "653e2962e3c5b7278e8bd2be6b6a06b5",
+  "tag": "4943d0dc27c2ca483fd91c3f3bc9b344",
+  "ext_payload": "c100fbc6cd1ff57433d42bdb93bd2bcc",
+  "pr_cost": 15.8,
+  "pr_value": 15.8,
+  "path_request_destination_hash": "6b9f66014d9853faab220fba47d02761",
+  "stamped_raw": "08006b9f66014d9853faab220fba47d027610026a3b60de12eb1a241e9f007075dcc55653e2962e3c5b7278e8bd2be6b6a06b54943d0dc27c2ca483fd91c3f3bc9b344c100fbc6cd1ff57433d42bdb93bd2bcc",
+  "unstamped_raw": "08006b9f66014d9853faab220fba47d027610026a3b60de12eb1a241e9f007075dcc55653e2962e3c5b7278e8bd2be6b6a06b54943d0dc27c2ca483fd91c3f3bc9b344",
+  "versions": {
+    "rns": "1.6.0"
+  }
+}

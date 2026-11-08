@@ -1,0 +1,145 @@
+{
+  "versions": {
+    "rns": "1.6.0"
+  },
+  "required_value": 23.5,
+  "msgpack": "92c405416c696365c0",
+  "cases": {
+    "stripped": {
+      "destination_hash": "a1333203f3c9c4cbd673cefc09c9a821",
+      "context_flag": false,
+      "payload": "f387070ee701d410cfa2ae3116f71471a77d751eff5512925b7303eee7ec0032a5ec8c79302ab708a52ddb8a3e76e3ed73c39c55a8e3bc8e36f2d7395131d4948aad03d1a67d2f38660dfe10c625e6006aefa40b3e0810a67094052f76e7d4905084c00d70c35951b755a40c342d97b90caf56ec36dc0498406235e2565175d711b0c947a252749ee69071896049d69fbed6560b92c405416c696365c0c100b5f82b2ae018fd1a88a5df48e4654003",
+      "app_data": "92c405416c696365c0",
+      "stamp": "b5f82b2ae018fd1a88a5df48e465",
+      "stamp_value": 26.30859375,
+      "lr_cost": 3.25
+    },
+    "stamp_only": {
+      "destination_hash": "a1333203f3c9c4cbd673cefc09c9a821",
+      "context_flag": false,
+      "payload": "f387070ee701d410cfa2ae3116f71471a77d751eff5512925b7303eee7ec0032a5ec8c79302ab708a52ddb8a3e76e3ed73c39c55a8e3bc8e36f2d7395131d4948aad03d1a67d2f38660d52a529954d006aefa40b7ba3f8142e151c71315189a4a7be1ea0f5c17f39d00e7f73402f0fa2fe89f3788865904a8e0e7167d60d94df612f26c5d133210aef1960b1ffb2718994168e07c100b5f82b2ae018fd1a88a5df48e4654003",
+      "app_data": null,
+      "stamp": "b5f82b2ae018fd1a88a5df48e465",
+      "stamp_value": 26.30859375,
+      "lr_cost": 3.25
+    },
+    "below_cost": {
+      "destination_hash": "c4671307c0ea4981ed7ffdb1f6cb29c7",
+      "context_flag": false,
+      "payload": "5ae69fe964a16f35d0d387dfa0e57ccf70be6518ee7a5dd040edf688882ab91a77600743bc1e358b9201844ee2d6a57c85d809b08b19d5fb713e0c351d1e9906405c2e2c811c87c43e8bf8bf5a2f9d006aefa40b39c301d2a6cac4d85c714d773c98dea906bb877087840a124f48daaa79a2281a93144dafbdcd69dde2ef6bea24db794c88f03edc27ca397df67d071aa51afd0f92c405416c696365c0c10095579a52adff7fd1db9ddebe1d49800c",
+      "app_data": "92c405416c696365c0c10095579a52adff7fd1db9ddebe1d49800c",
+      "stamp": "95579a52adff7fd1db9ddebe1d49",
+      "stamp_value": 9.09375,
+      "lr_cost": null
+    },
+    "marker_invalid_stamp": {
+      "destination_hash": "c4671307c0ea4981ed7ffdb1f6cb29c7",
+      "context_flag": false,
+      "payload": "5ae69fe964a16f35d0d387dfa0e57ccf70be6518ee7a5dd040edf688882ab91a77600743bc1e358b9201844ee2d6a57c85d809b08b19d5fb713e0c351d1e9906405c2e2c811c87c43e8bc5b791b7c0006aefa40bc40eb8cadaca08df83d9c54576a74ddc4876d5e09a06a2f7ff04cdcc7f8b999da925bcd9d867bcee001a8e24bdac5ce917ae4054e18d7a2791f1f9960c21c80a92c405416c696365c0c100d089a3847e69aebb7537c6b7e1104003",
+      "app_data": "92c405416c696365c0c100d089a3847e69aebb7537c6b7e1104003",
+      "stamp": "d089a3847e69aebb7537c6b7e110",
+      "stamp_value": 2.16015625,
+      "lr_cost": null
+    },
+    "extended_flag": {
+      "destination_hash": "a1333203f3c9c4cbd673cefc09c9a821",
+      "context_flag": false,
+      "payload": "f387070ee701d410cfa2ae3116f71471a77d751eff5512925b7303eee7ec0032a5ec8c79302ab708a52ddb8a3e76e3ed73c39c55a8e3bc8e36f2d7395131d4948aad03d1a67d2f38660dc6bc84ac66006aefa40ba4bb3203e8cf004e1b58c78778b934c2c23bcd400ab679913c094423db19d0d879f88f5fb5f5a82fab589deac997e348f07cfec7a1b113002938d8363dfac70992c405416c696365c0c100b5f82b2ae018fd1a88a5df48e4654083",
+      "app_data": "92c405416c696365c0c100b5f82b2ae018fd1a88a5df48e4654083",
+      "stamp": null,
+      "stamp_value": null,
+      "lr_cost": null
+    },
+    "over_cap": {
+      "destination_hash": "a1333203f3c9c4cbd673cefc09c9a821",
+      "context_flag": false,
+      "payload": "f387070ee701d410cfa2ae3116f71471a77d751eff5512925b7303eee7ec0032a5ec8c79302ab708a52ddb8a3e76e3ed73c39c55a8e3bc8e36f2d7395131d4948aad03d1a67d2f38660da5d9b6de86006aefa40b8e0b5a416d908f7a2f238ad3d50336040d3c8947157fd7498282479c8c32f0c84e46bdd0951a4f83799672a8352b6ccdfbc016f6f47556e770c049ec2e7abe0692c405416c696365c0c100b5f82b2ae018fd1a88a5df48e4650164",
+      "app_data": "92c405416c696365c0c100b5f82b2ae018fd1a88a5df48e4650164",
+      "stamp": null,
+      "stamp_value": null,
+      "lr_cost": null
+    },
+    "at_cap": {
+      "destination_hash": "a1333203f3c9c4cbd673cefc09c9a821",
+      "context_flag": false,
+      "payload": "f387070ee701d410cfa2ae3116f71471a77d751eff5512925b7303eee7ec0032a5ec8c79302ab708a52ddb8a3e76e3ed73c39c55a8e3bc8e36f2d7395131d4948aad03d1a67d2f38660d351a69af07006aefa40b5e895103ee03a540d9df95eb70f96ff659a8a7069f9ac5693b3ebdf628bf4f21ba3ed2093cd93c0d6ff2fe649a331fc8a6492daa3971e56b85763401d747310f92c405416c696365c0c100b5f82b2ae018fd1a88a5df48e4650064",
+      "app_data": "92c405416c696365c0",
+      "stamp": "b5f82b2ae018fd1a88a5df48e465",
+      "stamp_value": 26.30859375,
+      "lr_cost": 100.0
+    },
+    "wrong_marker": {
+      "destination_hash": "a1333203f3c9c4cbd673cefc09c9a821",
+      "context_flag": false,
+      "payload": "f387070ee701d410cfa2ae3116f71471a77d751eff5512925b7303eee7ec0032a5ec8c79302ab708a52ddb8a3e76e3ed73c39c55a8e3bc8e36f2d7395131d4948aad03d1a67d2f38660d01cd7e6abf006aefa40b75643c17546fa4ae2886a047aae423b0945d907f1aae76a2e05959d4384f2014f3f2196f01a4989f7dc63f26b580f88144282820f8c77e37150c5cb126cf610392c405416c696365c0c000b5f82b2ae018fd1a88a5df48e4654003",
+      "app_data": "92c405416c696365c0c000b5f82b2ae018fd1a88a5df48e4654003",
+      "stamp": null,
+      "stamp_value": null,
+      "lr_cost": null
+    },
+    "nonzero_flags": {
+      "destination_hash": "a1333203f3c9c4cbd673cefc09c9a821",
+      "context_flag": false,
+      "payload": "f387070ee701d410cfa2ae3116f71471a77d751eff5512925b7303eee7ec0032a5ec8c79302ab708a52ddb8a3e76e3ed73c39c55a8e3bc8e36f2d7395131d4948aad03d1a67d2f38660dde062cea69006aefa40be589f6377a36a7dcf7f5454d3e0354e4f6e3f3436dee3673b78f99bf18397aae54870ea1f69a4eb49ea916130d8bf708a85bac0ae94686525175d2dfa7e0f00792c405416c696365c0c15ab5f82b2ae018fd1a88a5df48e4654003",
+      "app_data": "92c405416c696365c0",
+      "stamp": "b5f82b2ae018fd1a88a5df48e465",
+      "stamp_value": 26.30859375,
+      "lr_cost": 3.25
+    },
+    "ratchet_stripped": {
+      "destination_hash": "a1333203f3c9c4cbd673cefc09c9a821",
+      "context_flag": true,
+      "payload": "f387070ee701d410cfa2ae3116f71471a77d751eff5512925b7303eee7ec0032a5ec8c79302ab708a52ddb8a3e76e3ed73c39c55a8e3bc8e36f2d7395131d4948aad03d1a67d2f38660ddd303d7bfb006aefa40bf08dec64f943094d3ac569f5a27051192776a6572526f34806888ac6a6c16e730106fe2d95b5bf35e308e5ffe93a04e4ffb85fd16577410346af8c986f28359a36c87724e6faa69d21d4286c484285ab2caebb695290eb111e14352c83c02f0292c405416c696365c0c100b5f82b2ae018fd1a88a5df48e4654003",
+      "app_data": "92c405416c696365c0",
+      "stamp": "b5f82b2ae018fd1a88a5df48e465",
+      "stamp_value": 26.30859375,
+      "lr_cost": 3.25
+    },
+    "lxmf_delivery_cost_20": {
+      "destination_hash": "a1c539948566974f5626cc85dbd71856",
+      "context_flag": false,
+      "payload": "cb24994369c63ae9957a869a0f21aa700860d9ea0b424e4bb37e4eda1d1150199aeecc56185c2f92da420fb4e450a6b544609fa35116ad3bd6a23c9ca09fafd86ec60bc318e2c0f0d90868883393df006aefa42e23b0540f0ddb5275d842eb46346ab972e72eecf305ff489d512d8ddeba105e0ae268a2e3a7a43234c6f38c9c836f74085d8a74584e3b4c77afed35c8d3cfcb0092c405416c696365c0c1007bfba9c034d5ef2be0c8b3dda2580014",
+      "app_data": "92c405416c696365c0",
+      "stamp": "7bfba9c034d5ef2be0c8b3dda258",
+      "stamp_value": 25.26953125,
+      "lr_cost": 20.0
+    }
+  },
+  "cost_from_bytes": [
+    {
+      "bytes": "0000",
+      "fp": 0,
+      "cost": 0.0
+    },
+    {
+      "bytes": "0340",
+      "fp": 832,
+      "cost": 3.25
+    },
+    {
+      "bytes": "0c80",
+      "fp": 3200,
+      "cost": 12.5
+    },
+    {
+      "bytes": "6400",
+      "fp": 25600,
+      "cost": 100.0
+    },
+    {
+      "bytes": "6401",
+      "fp": 25601,
+      "cost": 100.00390625
+    },
+    {
+      "bytes": "7fff",
+      "fp": 32767,
+      "cost": 127.99609375
+    },
+    {
+      "bytes": "ffff",
+      "fp": 65535,
+      "cost": 255.99609375
+    }
+  ]
+}

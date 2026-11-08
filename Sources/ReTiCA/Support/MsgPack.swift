@@ -210,6 +210,18 @@ public enum MsgPack {
         guard let (v, next) = parse(b, 0), next == b.count else { return nil }
         return v
     }
+
+    /// Decode the first msgpack object and ignore whatever follows it, as reference's
+    /// `umsgpack.unpackb` does.
+    ///
+    /// For announce app-data only, where trailing bytes are expected: RNS 1.6.0 appends an 18-byte
+    /// network-stamp extension after the msgpack (Destination.py:354-357). RNS strips it only when
+    /// the stamp meets the local cost (Identity.py:867-868), so reference's LXMF helpers also see
+    /// it, and tolerate it. Everything else keeps the strict `decodeValue`: trailing bytes in a
+    /// signed payload or a stored container are a defect, not an extension.
+    public static func decodeLeadingValue(_ data: Data) -> MsgPackValue? {
+        parse([UInt8](data), 0)?.0
+    }
     private static func parse(_ b: [UInt8], _ i: Int, _ depth: Int = 0) -> (MsgPackValue, Int)? {
         guard depth <= maxParseDepth, i < b.count else { return nil }
         let tag = b[i]
