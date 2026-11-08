@@ -46,6 +46,10 @@ public struct TransportEndpoint {
         /// holds the §5.5 limiter, which only this reducer mutates (in `transmit` and on inbound
         /// packets); it survives drops and stop/start and dies with the slot.
         public var meshCore: MeshCoreEndpoint.State?
+        /// The RNode radio slot: at most one radio, with ONE `InterfaceID` (`rnode:<UUID>`) and
+        /// the same TCP-client lifecycle as the other radio slots. Counters and telemetry live in
+        /// the slot and die with it.
+        public var rnode: RNodeEndpoint.State?
 
         /// Learned-destination table of the shared router (identity / appData / path).
         public var learned: [Data: LearnedDestination] { transport.learned }
@@ -85,7 +89,8 @@ public struct TransportEndpoint {
                     tcpServer: TCPServerEndpoint.State? = nil,
                     ble: BLEEndpoint.State? = nil,
                     meshtastic: MeshtasticEndpoint.State? = nil,
-                    meshCore: MeshCoreEndpoint.State? = nil) {
+                    meshCore: MeshCoreEndpoint.State? = nil,
+                    rnode: RNodeEndpoint.State? = nil) {
             self.transport = transport
             self.linkPlane = linkPlane
             self.tcpClients = tcpClients
@@ -93,6 +98,7 @@ public struct TransportEndpoint {
             self.ble = ble
             self.meshtastic = meshtastic
             self.meshCore = meshCore
+            self.rnode = rnode
         }
 
         /// Convenience factory: an endpoint running over a single TCP-client driver.
@@ -119,6 +125,11 @@ public struct TransportEndpoint {
         public static func meshCore(_ driver: MeshCoreEndpoint.State) -> State {
             State(meshCore: driver)
         }
+
+        /// Convenience factory: an endpoint running over one RNode.
+        public static func rnode(_ driver: RNodeEndpoint.State) -> State {
+            State(rnode: driver)
+        }
     }
 
     public enum Action: Equatable {
@@ -132,6 +143,7 @@ public struct TransportEndpoint {
         case ble(BLEEndpoint.Action)
         case meshtastic(MeshtasticEndpoint.Action)
         case meshCore(MeshCoreEndpoint.Action)
+        case rnode(RNodeEndpoint.Action)
         case transport(Transport.Action)
         case linkPlane(LinkPlane.Action)
         case link(IdentifiedActionOf<LinkSession>)
@@ -218,13 +230,15 @@ public struct TransportEndpoint {
                               + [state.tcpServer != nil ? .send(.tcpServer(.start)) : .none,
                                  state.ble != nil ? .send(.ble(.start)) : .none,
                                  state.meshtastic != nil ? .send(.meshtastic(.start)) : .none,
-                                 state.meshCore != nil ? .send(.meshCore(.start)) : .none])
+                                 state.meshCore != nil ? .send(.meshCore(.start)) : .none,
+                                 state.rnode != nil ? .send(.rnode(.start)) : .none])
             case .stop:
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .disconnect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
                                  state.ble != nil ? .send(.ble(.stop)) : .none,
                                  state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none,
-                                 state.meshCore != nil ? .send(.meshCore(.stop)) : .none])
+                                 state.meshCore != nil ? .send(.meshCore(.stop)) : .none,
+                                 state.rnode != nil ? .send(.rnode(.stop)) : .none])
             case let .registerLocalDestination(d):  return .send(.transport(.registerLocalDestination(d)))
             case let .deregisterLocalDestination(hash):
                 // Router first, so a LINKREQUEST racing this action is no longer handed up. Then
@@ -457,6 +471,40 @@ public struct TransportEndpoint {
             case let .meshCore(.interface(.delegate(.adapterUnavailable(cause)))):
                 return .send(.meshCore(.delegate(.adapterUnavailable(cause))))
 
+            // --- RNode radio lifecycle → shared router interface set (+ maintenance) ---
+            // The Meshtastic shape: ONE InterfaceID per radio, registered at `.online` with the
+            // profile the params the radio echoed give, deregistered at `.offline`. Every
+            // `.connected` reports online, so a reconnect with differently clamped params
+            // re-registers with their bitrate; maintenance is not re-armed while any interface
+            // is up.
+            case let .rnode(.interface(.delegate(.online(report)))):
+                guard let radio = state.rnode else { return .none }
+                let id = radio.interfaceID
+                let startEffects = maintenanceStartEffect(state)
+                return .merge([.send(.transport(.interfaceConnected(id, radio.registeredProfile(params: report.params))))]
+                              + startEffects
+                              + [.send(.rnode(.delegate(.radioOnline(report))))])
+
+            case let .rnode(.interface(.delegate(.offline(reason)))):
+                guard let radio = state.rnode else { return .none }
+                let id = radio.interfaceID
+                var effects: [Effect<Action>] = []
+                if state.transport.interfaces[id] != nil {
+                    effects.append(.send(.transport(.interfaceDisconnected(id))))
+                    effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
+                    effects.append(contentsOf: maintenanceStopEffect(state, departing: id))
+                }
+                effects.append(.send(.rnode(.delegate(.radioOffline(reason: reason)))))
+                return .merge(effects)
+
+            case let .rnode(.interface(.delegate(.packetReceived(packet)))):
+                guard let radio = state.rnode else { return .none }
+                return .send(.transport(.received(radio.interfaceID, packet)))
+
+            // Like the other radios', adapter unavailability is RNode-hatch-only.
+            case let .rnode(.interface(.delegate(.adapterUnavailable(cause)))):
+                return .send(.rnode(.delegate(.adapterUnavailable(cause))))
+
             // --- shared router delegates → interface / unified delegate ---
             case let .transport(.delegate(.transmit(txID, raw))):
                 // C5 IFAC outbound masking, on the interface's OWN profile. `transport.interfaces`
@@ -540,7 +588,7 @@ public struct TransportEndpoint {
 
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).
-            case .tcpClients, .tcpServer, .ble, .meshtastic, .meshCore, .transport, .linkPlane, .link, .delegate,
+            case .tcpClients, .tcpServer, .ble, .meshtastic, .meshCore, .rnode, .transport, .linkPlane, .link, .delegate,
                  .sendOverLink, .sendResourceOverLink, .cancelResource, .identifyOverLink, .sendRequestOverLink,
                  .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
                  .closeLink, .registerRequestHandler, .deregisterRequestHandler:
@@ -552,6 +600,7 @@ public struct TransportEndpoint {
         .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
         .ifLet(\.meshtastic, action: \.meshtastic) { MeshtasticEndpoint() }
         .ifLet(\.meshCore, action: \.meshCore) { MeshCoreEndpoint() }
+        .ifLet(\.rnode, action: \.rnode) { RNodeEndpoint() }
     }
 
     /// The ONE maintenance loop (path-expiry / link-table / discovery-request GC) is shared by the
@@ -619,10 +668,16 @@ public struct TransportEndpoint {
             else { return .none }
             return .send(.meshCore(.interface(.send(masked))))
         }
+        // The RNode's ONE id, while online. Whole packets, masked: the radio carries IFAC-sized
+        // packets up to 508 bytes, so no limiter and no fragmenting here.
+        let rnodeOwnsID = state.rnode?.interfaceID == txID
+        if rnodeOwnsID, state.rnode?.interface.isOnline == true {
+            return .send(.rnode(.interface(.send(masked))))
+        }
         // Not deliverable. `Packet(raw:)` recovers the destination hash; for established link
         // traffic that value IS the link ID, so the failure correlates. An unparseable packet
         // drops silently (no destination to report).
-        guard state.ble != nil || meshOwnsID || coreOwnsID, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
+        guard state.ble != nil || meshOwnsID || coreOwnsID || rnodeOwnsID, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
         return .send(.delegate(.sendFailed(destinationHash: destHash, reason: .interfaceUnavailable)))
     }
 }
