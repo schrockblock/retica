@@ -287,8 +287,9 @@ cannot tell you to delete expired rows from disk; prune those yourself with
 `Transport.pathExpiry` (7 days), `Transport.knownDestinationExpiry` (8.75 days) and
 `LXMFNode.stampCostExpiry` (45 days). `LearnedDestination` and `KnownDestination` are not
 `Codable`; store their public fields (the identity as `identity.publicKey`) and rebuild them with
-their public initialisers. A destination stamp is mined once per destination and takes minutes at
-the default value, so without it every cold start mines again before the first announce goes out.
+their public initialisers. A destination stamp is mined once per destination: about 45 s at the
+default value on a Mac (see [Network stamps](#network-stamps-rns-16)); on a phone it has not been
+measured. Without it every cold start mines again before the first announce goes out.
 A rehydrated stamp is checked against `destinationValue` and mined again if it falls short.
 
 ## Network stamps (RNS 1.6)
@@ -320,8 +321,10 @@ What it costs. Hash rates measured on a Mac (release build, about +/-15%) are in
 `NetworkStamp.swift`: about 790,000 stamp rounds a second and 14,000 link keys a second. From
 those, a path-request stamp (15.8) takes well under a second, a destination stamp at 23.5 about
 15 s and at the default 25 roughly three times that, and a link key at 12.5 about 0.4 s.
-**Rates on a phone have not been measured.** Checking a stamp is one SHA-256, and with
-`enforceStamps` on an announce's stamp is checked before its signature, so junk costs one hash.
+**Rates on a phone have not been measured.** Checking a path-request or link-request stamp is one
+SHA-256, and an announce's two (its validity and its value). With `enforceStamps` on, all three are
+checked before any public-key work (the signature, the DH, the ratchet's trial agreement), so junk
+costs those hashes and nothing more.
 
 ## iOS lifecycle
 

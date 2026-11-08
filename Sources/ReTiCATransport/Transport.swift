@@ -147,8 +147,9 @@ public struct Transport {
         /// `STAMPS_ENFORCED` and `LR_STAMPS_ENFORCED`, Reticulum.py:507-511). Off by default, as in
         /// 1.6.0. When on:
         ///   * an announce whose stamp does not meet `destinationCost` is neither learned, remembered
-        ///     nor relayed (Identity.py:883-889, Transport.py:2046-2049). The stamp, one SHA-256, is
-        ///     checked before the Ed25519 signature, so a junk announce costs one hash;
+        ///     nor relayed (Identity.py:883-889, Transport.py:2046-2049). The stamp is checked
+        ///     before any public-key work (the Ed25519 signature, and the ratchet's trial X25519
+        ///     agreement), so a junk announce costs at most two SHA-256;
         ///   * a path request without a stamp meeting `pathRequestCost` over `destination + tag` is
         ///     neither answered nor forwarded (Transport.py:2099-2129);
         ///   * a link request to a local destination whose X25519 key, the stamp, does not meet that

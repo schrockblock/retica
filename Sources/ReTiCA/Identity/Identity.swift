@@ -69,7 +69,21 @@ public struct Identity: Equatable, Sendable {
     /// CryptoKit accepts low-order Curve25519 points at `PublicKey(rawRepresentation:)` but throws
     /// at `sharedSecretFromKeyAgreement`. This trial agreement is the only reliable gate.
     static func isUsableX25519PublicKey(_ key: Curve25519.KeyAgreement.PublicKey) -> Bool {
-        (try? Curve25519.KeyAgreement.PrivateKey().sharedSecretFromKeyAgreement(with: key)) != nil
+        usabilityCheckProbe?.withValue { $0 += 1 }
+        return (try? Curve25519.KeyAgreement.PrivateKey().sharedSecretFromKeyAgreement(with: key)) != nil
+    }
+
+    /// Test seam: when a test binds a counter here, each trial agreement above increments it, so a
+    /// test can show that a path does not pay for one. Task-local, so parallel tests do not mix
+    /// counts; unbound (nil) in production, where it costs one task-local read.
+    @TaskLocal static var usabilityCheckProbe: LockedCounter? = nil
+
+    /// A thread-safe count, for `usabilityCheckProbe`.
+    final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var value: Int { lock.withLock { count } }
+        func withValue(_ body: (inout Int) -> Void) { lock.withLock { body(&count) } }
     }
 
     // MARK: Accessors

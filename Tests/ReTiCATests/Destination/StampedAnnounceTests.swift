@@ -204,3 +204,48 @@ private func expectMatchesReference(_ c: StampedAnnounceCase,
     #expect(parsed.stampValue == nil)
     #expect(parsed.linkCost == nil)
 }
+
+/// Enforcing, an unstamped announce must cost one hash. Setting the context flag must not buy a trial
+/// X25519 agreement (`Identity.isUsableX25519PublicKey`, a key generation plus a DH) before the stamp
+/// is checked: reference only slices the ratchet bytes before its stamp check (Identity.py:840-889).
+/// Observed with the task-local `Identity.usabilityCheckProbe` counter, which counts every trial
+/// agreement, the ratchet's and the announced key's alike.
+@Test func enforcingRefusesARatchetFlaggedUnstampedAnnounceWithoutATrialAgreement() throws {
+    let id = Identity()
+    let nameHash = Destination.nameHash(appName: "app", aspects: ["svc"])
+    let destHash = Data(Crypto.fullHash(nameHash + id.hash).prefix(16))
+    let randomHash = Announce.randomHash(now: 1, randomPrefix: Data(repeating: 0x02, count: 5))
+    let lowOrderRatchet = Data(repeating: 0, count: 32)
+    let payload = Announce.buildPayload(identity: id, destinationHash: destHash, nameHash: nameHash,
+                                        randomHash: randomHash, ratchet: lowOrderRatchet, appData: Data([0x90]))
+
+    let enforcing = Identity.LockedCounter()
+    let refused = Identity.$usabilityCheckProbe.withValue(enforcing) {
+        Announce.parse(payload: payload, destinationHash: destHash, contextFlagSet: true, enforceStamp: true)
+    }
+    #expect(refused == nil, "no stamp")
+    #expect(enforcing.value == 0, "refused on one hash, before any trial agreement")
+
+    // The control: not enforcing, the same announce is accepted, its low-order ratchet dropped, and
+    // the probe sees the agreements, so a zero above is not a dead probe.
+    let lenient = Identity.LockedCounter()
+    let accepted = Identity.$usabilityCheckProbe.withValue(lenient) {
+        Announce.parse(payload: payload, destinationHash: destHash, contextFlagSet: true, enforceStamp: false)
+    }
+    let parsed = try #require(accepted)
+    #expect(parsed.ratchet == nil, "a low-order ratchet is still dropped")
+    #expect(lenient.value >= 2, "the ratchet's and the announced key's trial agreements")
+}
+
+/// Moving the ratchet check after the stamp gate changes no output: the genuine stamped, ratcheted
+/// announce parses under enforcement exactly as the reference recorded, with its ratchet kept.
+@Test func enforcingKeepsTheRatchetOfAStampedAnnounce() throws {
+    let f = try Fixtures.load()
+    let c = f["ratchet_stripped"]
+    let parsed = try #require(Announce.parse(payload: c.payloadBytes, destinationHash: c.destinationHash,
+                                             contextFlagSet: c.context_flag, enforceStamp: true))
+    #expect(parsed.ratchet != nil)
+    #expect(parsed.ratchet == Data(c.payloadBytes.dropFirst(64 + 10 + 10).prefix(32)))
+    #expect(parsed.appData == c.appDataBytes)
+    #expect(parsed.linkCost == c.lr_cost)
+}

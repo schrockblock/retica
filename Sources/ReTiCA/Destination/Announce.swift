@@ -94,8 +94,10 @@ public struct Announce {
     /// With `enforceStamp` false (the default, as reference enforcement is off by default) nothing is
     /// rejected for its stamp. With it true, an announce without a stamp meeting `requiredStampValue`
     /// returns nil, and that is decided BEFORE the signature is verified, as reference does
-    /// (Identity.py:883-889 precede the validate at 900): a junk announce costs one SHA-256, not an
-    /// Ed25519 verification. The stamp material is wire bytes only, so nothing is trusted early.
+    /// (Identity.py:883-889 precede the validate at 900): a junk announce costs at most two SHA-256
+    /// (the stamp's validity and its value, as reference computes both), not an Ed25519 verification
+    /// or an X25519 agreement. Nothing before the gate does public-key work: the ratchet's usability
+    /// check runs after it. The stamp material is wire bytes only, so nothing is trusted early.
     public static func parse(payload rawPayload: Data, destinationHash: Data,
                              contextFlagSet: Bool,
                              requiredStampValue: Double = NetworkStamp.defaultDestinationCost,
@@ -113,19 +115,8 @@ public struct Announce {
         // signed-data reconstruction so the signature verifies against what the sender signed.
         // ratchet: the value we actually store — nil if the ratchet is not agreement-safe (see below).
         var wireRatchet = Data()
-        var ratchet: Data? = nil
         if contextFlagSet {
-            let rawRatchet = payload.subdata(in: idx..<idx + ratchetSize); idx += ratchetSize
-            wireRatchet = rawRatchet
-            // Only store the ratchet if it can actually perform key agreement. CryptoKit accepts
-            // low-order X25519 points at PublicKey(rawRepresentation:) but throws at agreement,
-            // which is force-unwrapped in Identity.encrypt — a process abort. Drop the ratchet
-            // and keep the announce: the peer is still reachable via its static key, exactly as
-            // for peers that announce no ratchet at all.
-            if let pub = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: rawRatchet),
-               Identity.isUsableX25519PublicKey(pub) {
-                ratchet = rawRatchet
-            }
+            wireRatchet = payload.subdata(in: idx..<idx + ratchetSize); idx += ratchetSize
         }
         let signature = payload.subdata(in: idx..<idx + signatureLength); idx += signatureLength
         let appData: Data? = idx < payload.count ? payload.subdata(in: idx..<payload.count) : nil
@@ -139,6 +130,23 @@ public struct Announce {
             let ext = readStampExtension(appData: appData, material: material, requiredValue: requiredStampValue)
             guard ext.linkCost != nil else { return nil }
             early = ext
+        }
+
+        // Only store the ratchet if it can actually perform key agreement. CryptoKit accepts
+        // low-order X25519 points at PublicKey(rawRepresentation:) but throws at agreement,
+        // which is force-unwrapped in Identity.encrypt — a process abort. Drop the ratchet
+        // and keep the announce: the peer is still reachable via its static key, exactly as
+        // for peers that announce no ratchet at all.
+        //
+        // After the stamp gate, not where the bytes are sliced: the trial agreement is a key
+        // generation plus a DH, and before the gate any sender could buy one for an unstamped
+        // announce by setting the context flag. It only decides whether `ratchet` is set, never
+        // accepts or rejects, so where it runs changes no output.
+        var ratchet: Data? = nil
+        if contextFlagSet,
+           let pub = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: wireRatchet),
+           Identity.isUsableX25519PublicKey(pub) {
+            ratchet = wireRatchet
         }
 
         guard let identity = Identity(publicKey: publicKey) else { return nil }
