@@ -117,7 +117,9 @@ private func makeMeshCoreEndpoint(profile: InterfaceProfile = .meshCore(params: 
 }
 
 /// Groups datagrams by packet ID, in first-seen order, and joins each complete packet's bodies.
-private func meshCoreReassembleOnAir(_ datagrams: [Data]) -> [Data] {
+/// Independent of `MeshCoreReassembler`, so a mutated production reassembler can't hide what went
+/// on the air. Datagrams from one sender only.
+func meshCoreReassembleOnAir(_ datagrams: [Data]) -> [Data] {
     let codec = ScotMeshRawCodec()
     var order: [UInt16] = []
     var bodies: [UInt16: [UInt8: Data]] = [:]
