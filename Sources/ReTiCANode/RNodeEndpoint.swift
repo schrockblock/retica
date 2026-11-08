@@ -60,11 +60,14 @@ public struct RNodeEndpoint {
         }
 
         /// The profile registered with the shared router when the radio comes online: the params
-        /// it echoed set the bitrate; IFAC and mode come from the endpoint's profile.
+        /// it echoed set the bitrate; IFAC, mode and the per-interface stamp costs come from the
+        /// endpoint's profile (as `MeshtasticEndpoint.State.registeredProfile` does).
         public func registeredProfile(params: RNodeLoRaParams) -> InterfaceProfile {
             var registered = InterfaceProfile.rnode(params: params)
             registered.mode = profile.mode
             registered.ifac = profile.ifac
+            registered.destinationCost = profile.destinationCost
+            registered.pathRequestCost = profile.pathRequestCost
             return registered
         }
     }

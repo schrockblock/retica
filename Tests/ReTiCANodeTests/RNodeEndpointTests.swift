@@ -57,6 +57,15 @@ private enum Call: Equatable {
         #expect(state.registeredProfile(params: sidebandParams).mode == .roaming)
     }
 
+    @Test func registeredProfileTakesStampCostsFromTheEndpointProfile() {
+        var profile = InterfaceProfile.rnode(params: nil)
+        profile.destinationCost = 9
+        profile.pathRequestCost = 12
+        let state = RNodeEndpoint.State(config: config, profile: profile)
+        #expect(state.registeredProfile(params: sidebandParams).destinationCost == 9)
+        #expect(state.registeredProfile(params: sidebandParams).pathRequestCost == 12)
+    }
+
     /// The endpoint's own profile bitrate is ignored: the params the radio echoed decide it.
     @Test func registeredProfileTakesBitrateFromTheReportedParams() {
         let profile = InterfaceProfile(name: "rnode", bitrate: 999, hwMTU: 508)

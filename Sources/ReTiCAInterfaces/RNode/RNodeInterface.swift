@@ -367,8 +367,13 @@ public struct RNodeInterface {
         let generation = epoch.current
         return .run { [driver] send in
             // As in `startDriver`: a `.stop` reduced since this effect was built (in the same
-            // burst, before this task registered its cancel id) wins. The send never reaches the
-            // driver after it and reports nothing, so it can't outlive `isIdle`.
+            // burst, before this task registered its cancel id) and before this check makes the
+            // send skip the driver and report nothing. That is all this check guarantees. Unlike
+            // `startDriver` no lock is held across the `await`, so a `.stop` reduced just after the
+            // check still lets `driver.send` run (its result is then dropped by cancellation), and
+            // `epoch` does not move on `.disconnected` at all, so a send escaping a `.disconnected`
+            // burst can still reach the driver (its result is then ignored by the traffic
+            // generation). The live driver must therefore reject calls from a dead session.
             guard epoch.current == generation else { return }
             let ok = await driver.send(packet)
             await send(.packetSent(ok: ok, epoch: traffic))
