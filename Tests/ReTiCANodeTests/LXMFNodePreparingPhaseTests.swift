@@ -185,11 +185,11 @@ private func makePropagationClient(stampCost: Int, recorder: PhaseRecordingNode)
         await waitForHandOver(store, stamped: true, skipRest: false)
         await waitForHandOver(store, stamped: true)
 
-        for m in [one, two] {
-            let own = reports.value.filter { $0.hash == m.hash }.map(\.phase)
-            #expect(own == [.waitingForPeer, .stamping, .handedOver])
-        }
-        #expect(reports.value.count == 6)
+        // One stamp search at a time: the second waits behind the first.
+        #expect(reports.value.filter { $0.hash == one.hash }.map(\.phase) == [.waitingForPeer, .stamping, .handedOver])
+        #expect(reports.value.filter { $0.hash == two.hash }.map(\.phase)
+                == [.waitingForPeer, .queued, .stamping, .handedOver])
+        #expect(reports.value.count == 7)
     }
 
     /// Review Focus 3: the wait ran out and the router holds the message unstamped; the late announce

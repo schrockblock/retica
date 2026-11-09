@@ -218,18 +218,38 @@ public struct LXMFNode {
         /// LXMF 1.1.0); the `failed_callback` is invoked later by `process_deferred_stamps` on the
         /// router's own thread, once `get_stamp()` has returned None (LXMRouter.py:2620-2630).
         ///
-        /// Entries are appended when a search starts and removed when `.router(.send)` carries the
-        /// message onward, so a search that already completed is never failed retroactively.
+        /// Entries are appended when a delivery-stamp job enters `stampQueue` (whether it starts at
+        /// once or waits) and removed when `.router(.send)` carries the message onward, so a search
+        /// that already completed is never failed retroactively.
         ///
         /// A send in `waitingForPeerCost` is listed here too. It has not reached the router either,
         /// so the same cancel and fallback handling applies to it.
         public internal(set) var inFlightDeliveryStamps: [Data] = []
 
         /// The last `deliveryPreparing` phase reported per message that has not reached the router
-        /// (`.waitingForPeer` or `.stamping`; `.handedOver` is never stored). Lets each phase be
-        /// reported once, and `.handedOver` only for a message that reported an earlier phase.
+        /// (`.waitingForPeer`, `.queued` or `.stamping`; `.handedOver` is never stored). Lets each
+        /// phase be reported once, and `.handedOver` only for a message that reported an earlier phase.
         /// Removed at hand-over and at every terminal outcome or cancel.
         public internal(set) var preparingPhases: [Data: PreparingPhase] = [:]
+
+        /// LXMF stamp jobs waiting for `runningStampJob` to end, oldest first. One search runs at a
+        /// time, router-wide, as reference does (`process_deferred_stamps` takes `stamp_gen_lock` and
+        /// works on the oldest entry of `pending_deferred_stamps`, LXMRouter.py:2944-3033, LXMF 1.3.0).
+        /// When the running job ends — its stamp found, its search cancelled, or nothing found — the
+        /// first job here starts in the same reduction.
+        ///
+        /// A queued job is "in flight" for every cancel: a delivery job is in `inFlightDeliveryStamps`
+        /// and an explicit propagated send has its `preparingPhases` entry, from the moment it is
+        /// queued, so `.cancelDeliveryStamps`, `.cancelPropagationStamps`, `.setPropagationNode`
+        /// and `.cancelOutbound` report it exactly as they report a running one, and remove it here.
+        /// Sends stamped with a ticket and sends to a peer with no cost never enter the queue.
+        /// Link-request key searches are not LXMF stamps and are not queued here.
+        public internal(set) var stampQueue: [StampJob] = []
+        /// The one LXMF stamp search running, or nil. See `stampQueue`.
+        public internal(set) var runningStampJob: StampJob?
+        /// The serial the next `StampJob` gets. A search's effect is cancelled by its serial, and its
+        /// result names it, so a result from a job that was stopped is never taken for another's.
+        var nextStampJobSerial = 0
 
         /// First sends to a peer we have no path to and no cost for, by destination, oldest first.
         /// The announce that brings the path also brings the cost, so they wait for it instead of
@@ -363,7 +383,7 @@ public struct LXMFNode {
         case cancelPropagationStamps
         /// Cancel any in-flight delivery-stamp searches. Call when the app backgrounds, the user
         /// abandons a send, or the destination is no longer reachable. Mirrors `cancelPropagationStamps`
-        /// for the delivery-stamp `CancelID.deliveryStamp` effect set.
+        /// for delivery-stamp searches, running or queued (`State.stampQueue`).
         ///
         /// **Every message still searching is FAILED, not sent unstamped.** One
         /// `.delegate(.deliveryFailed(messageHash:))` is emitted per entry in
@@ -395,6 +415,10 @@ public struct LXMFNode {
         /// **Release on foreground too**, not only when an interface reconnects. Otherwise, with the
         /// app open and no connectivity, the hold stays on and no send ever fails or falls back.
         case holdOutbound(Bool)
+        /// Internal: the running stamp search `serial` ended. `outcome` is nil when it returned no
+        /// stamp without being cancelled (a cancelled search sends nothing: TCA drops sends from a
+        /// cancelled effect). See `State.stampQueue`.
+        case stampSearchEnded(serial: Int, outcome: StampSearchOutcome?)
         case delegate(Delegate)
 
         /// **Terminal outcomes of an outbound message**: `deliveryConfirmed`, `propagationAccepted`,
@@ -433,8 +457,9 @@ public struct LXMFNode {
             case propagationRefused(messageHash: Data, reason: LXMFRouter.RefusalReason)
             /// A send is being prepared before the router has it, in the phase named. Reported once per
             /// transition, and only for sends that need preparing: one that goes straight to the router
-            /// reports nothing. `.handedOver` follows a `.waitingForPeer` or `.stamping` report when the
-            /// message reaches the router. A re-stamp of a copy taken back after hand-over reports
+            /// reports nothing. `.handedOver` follows a `.waitingForPeer`, `.queued` or `.stamping` report
+            /// when the message reaches the router. A send queued behind another stamp search reports
+            /// `.queued`, then `.stamping` when its own search starts. A re-stamp of a copy taken back after hand-over reports
             /// `.stamping` again, then `.handedOver` again. A message that ends or is cancelled while
             /// preparing reports its terminal outcome and no `.handedOver`.
             case deliveryPreparing(messageHash: Data, phase: PreparingPhase)
@@ -458,6 +483,9 @@ public struct LXMFNode {
     public enum PreparingPhase: Equatable, Sendable {
         /// A first send to a peer we have no path and no stamp cost for, waiting for its announce.
         case waitingForPeer
+        /// Its stamp search waits behind another message's: one LXMF stamp search runs at a time,
+        /// oldest first (`State.stampQueue`).
+        case queued
         /// A stamp search is running (the delivery stamp, or the work for an explicit propagated send).
         case stamping
         /// The message reached the router.
@@ -553,20 +581,46 @@ public struct LXMFNode {
     /// The highest progress a transfer reports before its copy is confirmed.
     public static let maxTransferProgress = 0.99
 
-    /// Cancellation identities for the stamp searches.
+    /// One LXMF stamp job in `State.stampQueue`: a message's delivery stamp, or — for a propagated
+    /// copy — its delivery stamp (when one is still needed) then its propagation stamp, as one job, as
+    /// reference does both for one message before anything for the next (LXMRouter.py:2979-3029).
+    public struct StampJob: Equatable, Sendable {
+        public enum Work: Equatable, Sendable {
+            /// The delivery stamp at `cost`; the stamped message goes to the router with `method`.
+            case delivery(method: LXMFRouter.DeliveryMethod, cost: Int)
+            /// A propagated copy: the delivery stamp at `deliveryCost` (none when nil), then packed for
+            /// the propagation node with a stamp at `propagationCost`. `explicit`: a
+            /// `.sendViaPropagation`, which reports phases; otherwise a fallback copy, which does not.
+            case propagated(explicit: Bool, deliveryCost: Int?, recipient: Identity,
+                            propagationCost: Int, timestamp: Double)
+        }
+        public let serial: Int
+        public let message: LXMessage
+        public let work: Work
+
+        var isDelivery: Bool { if case .delivery = work { return true } else { return false } }
+        /// Delivery jobs and explicit propagated sends report `deliveryPreparing`; fallback copies do not.
+        var reportsPhases: Bool {
+            if case .propagated(explicit: false, _, _, _, _) = work { return false }
+            return true
+        }
+    }
+
+    /// What a stamp search that was not cancelled produced. See `Action.stampSearchEnded`.
+    public enum StampSearchOutcome: Equatable, Sendable {
+        /// The message with its delivery stamp.
+        case delivery(LXMessage)
+        /// The message (with its delivery stamp, if it needed one) and its packed propagated copy.
+        case propagated(LXMessage, propagationPacked: Data)
+    }
+
+    /// Cancellation identities.
     ///
-    /// `propagationStamp` / `deliveryStamp` cover ALL in-flight searches of that kind
-    /// (`.cancelPropagationStamps`, `.cancelDeliveryStamps`, `.setPropagationNode`). A search for a
-    /// message the caller built (`.sendMessage`, `.send`) is ALSO registered under its per-message id,
-    /// which `.cancelOutbound(messageHash:)` cancels — reference's `LXStamper.cancel_work` is keyed per
-    /// message the same way (LXStamper.py:146). `.sendViaPropagation` builds its message internally, so
-    /// the caller has no hash to name and it has only the shared id. Effects are registered
-    /// **without** `cancelInFlight`, so concurrent sends coexist.
+    /// `stampSearch(serial)` is the running stamp job's search (`State.runningStampJob`): every
+    /// cancel that stops a running job cancels it by its serial, so exactly that search stops.
+    /// Reference's `LXStamper.cancel_work` is keyed per message (LXStamper.py:146).
     enum CancelID: Hashable {
-        case propagationStamp
-        case deliveryStamp
-        case propagationStampFor(Data)
-        case deliveryStampFor(Data)
+        case stampSearch(Int)
         case peerCostWait(Data)
     }
 
@@ -590,6 +644,8 @@ public struct LXMFNode {
     @Dependency(\.continuousClock) var clock
     /// A minted ticket's bytes. Live: `SecRandomCopyBytes`. Test: the ramp `00 01 02 …`.
     @Dependency(\.randomBytes) var randomBytes
+    /// The stamp searches the stamp queue runs. Live: `LXStamper` / `LXMFPropagation.pack`.
+    @Dependency(\.lxmfStampGenerator) var stampGenerator
     public init() {}
 
     public var body: some ReducerOf<Self> {
@@ -819,13 +875,14 @@ public struct LXMFNode {
                 let strandedSends = forgetPropagationStamping(&state)
                 // Every in-flight stamp was sized to the PREVIOUS node's advertised cost, and a stamp
                 // below a node's enforced minimum is dropped by its ingest — so finishing that search
-                // could only burn a core for a message the new node would reject. Constructed on this
-                // branch only: `Effect.cancel(id:)` performs the cancellation when it is BUILT, so
-                // hoisting it out of the switch would cancel on every action (fixed once already, 86ee622).
+                // could only burn a core for a message the new node would reject. Queued propagated
+                // jobs are dropped; the running one is cancelled inside `dropStampJobs`, on this branch
+                // only (`Effect.cancel(id:)` cancels when BUILT, 86ee622), and the next job starts.
                 // The copies whose searches this abandons have failed (through the router's `fail`,
                 // so a message whose delivery copy is still pending is not reported failed).
-                return .merge(.cancel(id: CancelID.propagationStamp), abandonPendingPropagatedCopies(state),
-                              strandedSends,
+                let abandoned = abandonPendingPropagatedCopies(state)
+                let dropped = dropStampJobs(&state) { !$0.isDelivery }
+                return .merge(dropped, abandoned, strandedSends,
                               .send(.router(.setOutboundPropagationNode(destinationHash))))
 
             case let .sendViaPropagation(destinationHash, title, content):
@@ -842,24 +899,15 @@ public struct LXMFNode {
                 refreshOutboundPropagationNodeRetryWait(&state)
                 let ts = date.now.timeIntervalSince1970
                 // The recipient's ticket, if we hold one, is the delivery stamp: no delivery search.
-                // The propagation stamp is still searched, so the send still reports `.stamping`.
+                // The propagation stamp is still searched, so the send is still queued and reports
+                // `.queued` / `.stamping` (reference defers every PROPAGATED message, LXMRouter.py:2117-2123).
                 let msg = ticketStamped(state, created) ?? created
                 let deliveryCost = msg.stamp == nil ? deliveryStampCost(state, destinationHash: destinationHash) : nil
-                let preparing = reportPhase(&state, msg.hash, .stamping)
-                // The recipient's ratchet as of now, as reference reads it when it packs.
-                let ratchet = state.endpoint.transport.recallRatchet(destinationHash: destinationHash,
-                                                                     now: transportDate.now)
-                let work: Effect<Action> = .run { send in
-                    guard let stamped = await LXMFNode.withDeliveryStamp(msg, cost: deliveryCost),
-                          let (packed, _) = await LXMFPropagation.pack(
-                              message: stamped, recipientIdentity: recipient, ratchet: ratchet,
-                              timestamp: ts, stampCost: cost)
-                    else { return }                                  // cancelled mid-search
-                    await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
-                }
-                .cancellable(id: CancelID.propagationStampFor(msg.hash))
-                .cancellable(id: CancelID.propagationStamp)
-                return .merge(issued, preparing, work)
+                let work = enqueueStampJob(&state, message: msg,
+                                           work: .propagated(explicit: true, deliveryCost: deliveryCost,
+                                                             recipient: recipient, propagationCost: cost,
+                                                             timestamp: ts))
+                return .merge(issued, work)
 
             case let .sendMessage(message, fallbackToPropagation):
                 // The delivery copy is stamped on exactly the same terms as `.send` — this is the
@@ -904,6 +952,23 @@ public struct LXMFNode {
             case let .holdOutbound(held):
                 return .send(.router(.setHold(held)))
 
+            case let .stampSearchEnded(serial, outcome):
+                // A job stopped by a cancel is no longer running; its result (if a send got through
+                // before the cancel) is not this job's.
+                guard let job = state.runningStampJob, job.serial == serial else { return .none }
+                state.runningStampJob = nil
+                let result: Effect<Action>
+                switch (job.work, outcome) {
+                case let (.delivery(method, _), .delivery(stamped)?):
+                    result = .send(.router(.send(message: stamped, desiredMethod: method)))
+                case let (.propagated, .propagated(stamped, packed)?):
+                    result = .send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
+                default:
+                    result = failStampJob(&state, job)
+                }
+                // The hand-over first, so a message's `.handedOver` precedes the next one's `.stamping`.
+                return .concatenate(result, startNextStampJob(&state))
+
             case .cancelPropagationStamps:
                 // The app's explicit reclaim: backgrounding, sign-out, or abandoning a send. Even an
                 // accepted cost is minutes of hashing, so this must exist — `LXStamper.search` reads
@@ -912,9 +977,11 @@ public struct LXMFNode {
                 // `LXMRouter.cancel_outbound` → `LXStamper.cancel_work` (LXStamper.py:146-175).
                 // ...and the copies those searches were for have failed, through the router's `fail`.
                 // An explicit `.sendViaPropagation` still stamping is reported `deliveryFailed` here.
+                // Queued propagated jobs are dropped with the running one, which starts the next job.
                 let strandedSends = forgetPropagationStamping(&state)
-                return .merge(.cancel(id: CancelID.propagationStamp), abandonPendingPropagatedCopies(state),
-                              strandedSends)
+                let abandoned = abandonPendingPropagatedCopies(state)
+                let dropped = dropStampJobs(&state) { !$0.isDelivery }
+                return .merge(dropped, abandoned, strandedSends)
 
             case .cancelDeliveryStamps:
                 // The app's explicit reclaim for in-flight delivery-stamp searches. Even an accepted
@@ -943,10 +1010,14 @@ public struct LXMFNode {
                 // succeeded. The router drops a fallback the message was waiting on (a later hand-off
                 // would revive a failed message), and refuses a stamped copy that a search missed by
                 // this cancel hands over late.
+                //
+                // Queued delivery jobs are in `inFlightDeliveryStamps` too, so they are failed the same
+                // way; they leave the queue, the running delivery job is cancelled, and the next job (a
+                // propagated one, if any) starts.
                 let abandoned = state.inFlightDeliveryStamps
                 state.inFlightDeliveryStamps = []
                 for hash in abandoned { state.preparingPhases[hash] = nil }
-                var effects: [Effect<Action>] = [.cancel(id: CancelID.deliveryStamp)]
+                var effects: [Effect<Action>] = [dropStampJobs(&state) { $0.isDelivery }]
                 for dest in state.waitingForPeerCost.keys {
                     effects.append(.cancel(id: CancelID.peerCostWait(dest)))
                 }
@@ -964,16 +1035,16 @@ public struct LXMFNode {
                 // nothing else for the message the cancel is reported here — once either way.
                 // An explicit `.sendViaPropagation` still stamping has a phase but is in neither the
                 // delivery list nor the router; its per-message ID, cancelled below, stops the work.
+                // A queued job counts as searching: it leaves the queue without its search starting.
                 let wasSearching = state.inFlightDeliveryStamps.contains(hash)
-                    || state.preparingPhases[hash] == .stamping
+                    || state.preparingPhases[hash] == .stamping || state.preparingPhases[hash] == .queued
                 state.inFlightDeliveryStamps.removeAll { $0 == hash }
                 state.preparingPhases[hash] = nil
                 state.pendingFallbacks[hash] = nil      // the router drops its eligibility below
                 forgetUnstampedHandOver(&state, hash)
                 let routerReports = state.router.hasOutboundState(for: hash)
                 var effects: [Effect<Action>] = [
-                    .cancel(id: CancelID.deliveryStampFor(hash)),
-                    .cancel(id: CancelID.propagationStampFor(hash)),
+                    dropStampJobs(&state) { $0.message.hash == hash },
                     .send(.router(.cancelOutbound(messageHash: hash))),
                 ]
                 for (dest, waiting) in state.waitingForPeerCost where waiting.contains(where: { $0.message.hash == hash }) {
@@ -1157,8 +1228,8 @@ public struct LXMFNode {
                 // send them as they are.
                 let (withdraw, restamp) = restampUnsentHandOvers(&state, destinationHash: h)
                 // After the cost above is stored, and after the router has heard about the path. The
-                // searches run side by side: chained, the second started only when the first ended,
-                // after a `.cancelDeliveryStamps` meant for it.
+                // searches enter `stampQueue` in the order of these calls (re-stamps first) and run one
+                // at a time.
                 return .concatenate(withdraw, .merge(effects),
                                     .merge(restamp, handOverWaitingSends(&state, destinationHash: h)))
 
@@ -1308,7 +1379,8 @@ public struct LXMFNode {
                     state.lastTicketDeliveries[dest] = at
                     ticketDelivered = .send(.delegate(.ticketDelivered(destinationHash: dest, at: at)))
                 }
-                return .merge(.cancel(id: CancelID.propagationStampFor(hash)), done, ticketDelivered,
+                let dropped = dropStampJobs(&state) { !$0.isDelivery && $0.message.hash == hash }
+                return .merge(dropped, done, ticketDelivered,
                               .send(.delegate(.deliveryConfirmed(messageHash: hash))))
 
             case let .router(.delegate(.propagationFallbackDue(hash))):
@@ -1655,19 +1727,10 @@ public struct LXMFNode {
         // A ticket learned since the delivery copy left stamps the copy without a search.
         let message = ticketStamped(state, message) ?? message
         let deliveryCost = message.stamp == nil ? deliveryStampCost(state, destinationHash: message.destinationHash) : nil
-        // The recipient's ratchet as of now, as reference reads it when it packs.
-        let ratchet = state.endpoint.transport.recallRatchet(destinationHash: message.destinationHash,
-                                                             now: transportDate.now)
-        return .run { send in
-            guard let stamped = await LXMFNode.withDeliveryStamp(message, cost: deliveryCost),
-                  let (packed, _) = await LXMFPropagation.pack(
-                      message: stamped, recipientIdentity: recipient, ratchet: ratchet,
-                      timestamp: ts, stampCost: cost)
-            else { return }                          // cancelled mid-search
-            await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
-        }
-        .cancellable(id: CancelID.propagationStampFor(message.hash))
-        .cancellable(id: CancelID.propagationStamp)
+        // A later job than any already queued: it waits behind them (`stampQueue`).
+        return enqueueStampJob(&state, message: message,
+                               work: .propagated(explicit: false, deliveryCost: deliveryCost, recipient: recipient,
+                                                 propagationCost: cost, timestamp: ts))
     }
 
     /// Copy Transport's CURRENT next hop for `destinationHash` into the router's retry-wait table
@@ -1773,16 +1836,90 @@ public struct LXMFNode {
         if !state.inFlightDeliveryStamps.contains(message.hash) {
             state.inFlightDeliveryStamps.append(message.hash)
         }
-        let preparing = reportPhase(&state, message.hash, .stamping)
-        let search: Effect<Action> = .run { send in
-            // nil ⟹ cancelled (the only way `search` returns nil). Nothing to send: see above.
-            guard let stamp = await LXStamper.generateStamp(messageId: message.hash, targetCost: cost)
-            else { return }
-            await send(.router(.send(message: message.withStamp(stamp), desiredMethod: method)))
+        // One search at a time, oldest first: it waits in `stampQueue` behind any running search.
+        return enqueueStampJob(&state, message: message, work: .delivery(method: method, cost: cost))
+    }
+
+    /// Put a stamp job at the back of `stampQueue`: it starts now if no search is running (reporting
+    /// `.stamping`), else it waits (reporting `.queued`). Fallback copies report neither.
+    private func enqueueStampJob(_ state: inout State, message: LXMessage, work: StampJob.Work) -> Effect<Action> {
+        let job = StampJob(serial: state.nextStampJobSerial, message: message, work: work)
+        state.nextStampJobSerial += 1
+        guard state.runningStampJob != nil else { return startStampJob(&state, job) }
+        state.stampQueue.append(job)
+        return job.reportsPhases ? reportPhase(&state, message.hash, .queued) : .none
+    }
+
+    /// Start the oldest queued job, if none is running.
+    private func startNextStampJob(_ state: inout State) -> Effect<Action> {
+        guard state.runningStampJob == nil, !state.stampQueue.isEmpty else { return .none }
+        return startStampJob(&state, state.stampQueue.removeFirst())
+    }
+
+    /// Run `job`'s search. Its result comes back as `.stampSearchEnded`; a cancelled search sends
+    /// nothing (TCA drops sends from a cancelled effect), so whoever cancels it starts the next job.
+    private func startStampJob(_ state: inout State, _ job: StampJob) -> Effect<Action> {
+        state.runningStampJob = job
+        let preparing = job.reportsPhases ? reportPhase(&state, job.message.hash, .stamping) : .none
+        let message = job.message, serial = job.serial
+        let search: Effect<Action>
+        switch job.work {
+        case let .delivery(_, cost):
+            search = .run { [stampGenerator] send in
+                let stamp = await stampGenerator.deliveryStamp(message.hash, cost)
+                await send(.stampSearchEnded(serial: serial, outcome: stamp.map { .delivery(message.withStamp($0)) }))
+            }
+        case let .propagated(_, deliveryCost, recipient, propagationCost, timestamp):
+            // The recipient's ratchet as of now, as reference reads it when it packs after the stamp.
+            let ratchet = state.endpoint.transport.recallRatchet(destinationHash: message.destinationHash,
+                                                                 now: transportDate.now)
+            search = .run { [stampGenerator] send in
+                var stamped = message
+                if let deliveryCost {
+                    guard let stamp = await stampGenerator.deliveryStamp(message.hash, deliveryCost) else {
+                        await send(.stampSearchEnded(serial: serial, outcome: nil))
+                        return
+                    }
+                    stamped = message.withStamp(stamp)
+                }
+                let packed = await stampGenerator.propagationPack(stamped, recipient, ratchet, timestamp, propagationCost)
+                await send(.stampSearchEnded(serial: serial,
+                                             outcome: packed.map { .propagated(stamped, propagationPacked: $0) }))
+            }
         }
-        .cancellable(id: CancelID.deliveryStampFor(message.hash))
-        .cancellable(id: CancelID.deliveryStamp)
-        return .merge(preparing, search)
+        return .merge(preparing, search.cancellable(id: CancelID.stampSearch(serial)))
+    }
+
+    /// Remove the jobs `matching` from `stampQueue`, and stop the running job if it matches and start
+    /// the next. Reports nothing: each caller reports the messages it stops as it did before the queue.
+    /// Call it from the reducer branch that stops the jobs: the `.cancel(id:)` it builds cancels when
+    /// it is constructed (86ee622).
+    private func dropStampJobs(_ state: inout State, where matching: (StampJob) -> Bool) -> Effect<Action> {
+        state.stampQueue.removeAll(where: matching)
+        guard let running = state.runningStampJob, matching(running) else { return .none }
+        state.runningStampJob = nil
+        return .merge(.cancel(id: CancelID.stampSearch(running.serial)), startNextStampJob(&state))
+    }
+
+    /// A search ended without a stamp and was not cancelled: the copy it was for has failed, reported
+    /// as reference's `fail_message` would (LXMRouter.py:2996-2999) for this job's message — not, as
+    /// reference's cancel branches do, for whichever message is last in its queue (LXMRouter.py:2965).
+    /// A delivery copy fails as a cancelled one does (through the router's `fail`), an explicit
+    /// propagated send is reported `deliveryFailed`, and a fallback copy fails in the router.
+    private func failStampJob(_ state: inout State, _ job: StampJob) -> Effect<Action> {
+        let hash = job.message.hash
+        switch job.work {
+        case .delivery:
+            state.inFlightDeliveryStamps.removeAll { $0 == hash }
+            state.preparingPhases[hash] = nil
+            state.pendingFallbacks[hash] = nil
+            return .send(.router(.deliveryCopyAbandoned(messageHash: hash)))
+        case .propagated(explicit: true, _, _, _, _):
+            state.preparingPhases[hash] = nil
+            return .send(.delegate(.deliveryFailed(messageHash: hash)))
+        case .propagated(explicit: false, _, _, _, _):
+            return .send(.router(.propagatedCopyFailed(messageHash: hash)))
+        }
     }
 
     /// `message` stamped with the ticket its recipient gave us, or nil when it already has a stamp or
@@ -1805,14 +1942,14 @@ public struct LXMFNode {
         return .send(.delegate(.deliveryPreparing(messageHash: hash, phase: phase)))
     }
 
-    /// `.handedOver`, only for a message that reported `.waitingForPeer` or `.stamping`.
+    /// `.handedOver`, only for a message that reported `.waitingForPeer`, `.queued` or `.stamping`.
     private func reportHandedOver(_ state: inout State, _ hash: Data) -> Effect<Action> {
         guard state.preparingPhases.removeValue(forKey: hash) != nil else { return .none }
         return .send(.delegate(.deliveryPreparing(messageHash: hash, phase: .handedOver)))
     }
 
     /// The propagation stamp work was cancelled or its node changed: a message that reported
-    /// `.stamping` for an explicit propagated send, and so is not in `inFlightDeliveryStamps`, will
+    /// `.queued` or `.stamping` for an explicit propagated send, and so is not in `inFlightDeliveryStamps`, will
     /// not reach the router, so its phase is forgotten and it is reported `deliveryFailed`, once.
     /// The router has no record of such a message before its hand-over (it is in neither
     /// `pendingPropagatedCopies` nor `inFlightDeliveryStamps`), so nothing else can report it.
@@ -1822,12 +1959,6 @@ public struct LXMFNode {
             .sorted { $0.lexicographicallyPrecedes($1) }
         for hash in stranded { state.preparingPhases[hash] = nil }
         return .merge(stranded.map { .send(.delegate(.deliveryFailed(messageHash: $0))) })
-    }
-
-    /// `message` stamped at `cost`, or unchanged when `cost` is nil. Nil only if the search was cancelled.
-    private static func withDeliveryStamp(_ message: LXMessage, cost: Int?) async -> LXMessage? {
-        guard let cost else { return message }
-        return await LXStamper.generateStamp(messageId: message.hash, targetCost: cost).map(message.withStamp)
     }
 
     /// Park a first send and, for the first one to this destination, start asking for a path.

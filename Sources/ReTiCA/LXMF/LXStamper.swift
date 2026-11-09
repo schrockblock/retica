@@ -77,8 +77,8 @@ public enum LXStamper {
     /// (This note previously read "no production caller today"; that held until delivery stamps were
     /// wired.) The two requirements it anticipated are now met at that call site, and both remain
     /// load-bearing:
-    ///   * the effect is registered `.cancellable(id: CancelID.deliveryStamp)`, so the `search` loop
-    ///     below can be reclaimed; and
+    ///   * the effect is registered `.cancellable` (by its stamp job's serial, `LXMFNode.CancelID`), so
+    ///     the `search` loop below can be reclaimed; and
     ///   * the cost is bounded by `LXMFNode.maxDeliveryStampCost` **before** the search starts, at the
     ///     point the peer's unauthenticated advertised `stamp_cost` is read
     ///     (`LXMFNode.deliveryStampCost`) — cancellability alone does not stop a hostile peer

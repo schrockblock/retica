@@ -450,7 +450,11 @@ costs those hashes and nothing more.
   ```
 
 - **Stamp work.** Delivery and propagation stamps are proof-of-work searches that can take
-  minutes. `.cancelDeliveryStamps` and `.cancelPropagationStamps` stop them; a message whose
+  minutes. One runs at a time, oldest message first (its delivery stamp, then its propagation stamp
+  if it is sent propagated), as reference LXMF does; the others wait in `State.stampQueue`. A send
+  stamped with a ticket, or to a peer that asks for no stamp, does not wait. A queued message is
+  cancelled and reported exactly like one whose search is running.
+  `.cancelDeliveryStamps` and `.cancelPropagationStamps` stop them; a message whose
   search is cancelled is reported `deliveryFailed`, not sent unstamped, unless its propagated copy
   is still out (that copy's outcome is reported instead) or a copy already succeeded. A
   `.sendViaPropagation` still stamping when `.cancelPropagationStamps` arrives, or when
@@ -461,7 +465,8 @@ costs those hashes and nothing more.
   waiting for its key fails with `.pathStale`, and an announce waiting for its stamp is dropped.
   While a send is prepared before the router has it, the node reports
   `.delegate(.deliveryPreparing(messageHash:phase:))`: `.waitingForPeer` for a first send waiting
-  for the peer's announce (its stamp cost), `.stamping` while a stamp search runs (also for
+  for the peer's announce (its stamp cost), `.queued` while its stamp search waits behind another
+  message's, `.stamping` while its stamp search runs (also for
   `.sendViaPropagation`, and again for a copy taken back and re-stamped after a late announce), and
   `.handedOver` when the message reaches the router. A send that goes straight to the router reports
   nothing, and `.handedOver` is reported only for a message that reported an earlier phase. A

@@ -247,6 +247,7 @@ private func received(_ hash: Data, done: Int, total: Int, on linkID: Data) -> L
     await store.send(.cancelOutbound(messageHash: m.hash)) {
         $0.inFlightDeliveryStamps = []
         $0.preparingPhases = [:]
+        $0.runningStampJob = nil                               // its search stopped, nothing queued
     }
     await store.receive(.router(.cancelOutbound(messageHash: m.hash)))
     await store.send(probe)                                    // no deliveryCancelled after the success
