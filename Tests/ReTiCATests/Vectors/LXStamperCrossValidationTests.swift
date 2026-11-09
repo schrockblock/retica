@@ -11,7 +11,8 @@ import Foundation
     let wb = LXStamper.stampWorkblock(material: messageId)
     #expect(Crypto.fullHash(wb) == Data(hexString: f.workblockHash)!)          // workblock byte-parity
     #expect(LXStamper.stampValid(stamp: stamp, targetCost: f.stampCost, workblock: wb) == true)
-    #expect(LXStamper.stampValue(workblock: wb, stamp: stamp) == f.stampValue)
+    // lxmf 1.1.0 reported the leading-zero count; the 1.3.0 value adds a fraction on top of it.
+    #expect(Int(LXStamper.stampValue(workblock: wb, stamp: stamp).rounded(.down)) == f.stampValue)
 }
 
 @Test func lxStamperGeneratesValidStamp() async throws {

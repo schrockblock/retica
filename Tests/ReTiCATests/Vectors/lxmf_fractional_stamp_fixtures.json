@@ -1,0 +1,739 @@
+{
+  "versions": {
+    "rns": "1.6.0",
+    "lxmf": "1.3.0"
+  },
+  "generated_cases": [
+    {
+      "kind": "delivery",
+      "rounds": 3000,
+      "cost": 8,
+      "material": "9655a2075b46427d3dd4f349f93bd8884f2040687e4166955c7f30ce75c14f49",
+      "workblock_hash": "d5856c953f64d8ebc062f14cfb055f74df65113ca195fa64cbda744494ff1368",
+      "stamp": "c388456d1952e16d340fae3bde2b90957044f4ff36fd218ce1add38de7895f4f",
+      "value": 10.66015625,
+      "probes": [
+        {
+          "cost": 7.99609375,
+          "valid": true
+        },
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.00390625,
+          "valid": true
+        },
+        {
+          "cost": 10.66015625,
+          "valid": true
+        },
+        {
+          "cost": 10.6640625,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "kind": "delivery",
+      "rounds": 3000,
+      "cost": 8.5,
+      "material": "ab3f46bdec65246bc23ae923011d54f91cfb929ee77f8f25000d40ef5ded21c6",
+      "workblock_hash": "95a40396306917dc09fa694149d17db69378c216ac46f4c218fc8fc7976851bb",
+      "stamp": "8f77d7eaafd5f9962de3a9474cdefb841efb8194b35c5db6d9a4024cb14c4c7b",
+      "value": 8.92578125,
+      "probes": [
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.49609375,
+          "valid": true
+        },
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.50390625,
+          "valid": true
+        },
+        {
+          "cost": 8.92578125,
+          "valid": true
+        },
+        {
+          "cost": 8.9296875,
+          "valid": false
+        },
+        {
+          "cost": 9,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "kind": "delivery",
+      "rounds": 3000,
+      "cost": 13.25,
+      "material": "c39b4cacb90b789e67b2c32bce3a6078703290bc56c1de572b9ba7f83040b47d",
+      "workblock_hash": "33180085ecf1e208fcf9f35e1bbc1494ad21db511d1ac4673de94f11fdb6075d",
+      "stamp": "c53a0c45ade0494f762998416d9f7b892f3524355e363274ab145c7c1a5667dc",
+      "value": 13.40625,
+      "probes": [
+        {
+          "cost": 13,
+          "valid": true
+        },
+        {
+          "cost": 13.24609375,
+          "valid": true
+        },
+        {
+          "cost": 13.25,
+          "valid": true
+        },
+        {
+          "cost": 13.25390625,
+          "valid": true
+        },
+        {
+          "cost": 13.40625,
+          "valid": true
+        },
+        {
+          "cost": 13.41015625,
+          "valid": false
+        },
+        {
+          "cost": 14,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "kind": "pn",
+      "rounds": 1000,
+      "cost": 8,
+      "material": "efd4ecdd6d5564722d9d87bcdf3338d5c0304301774b56fef4a72495879cc3e1",
+      "workblock_hash": "5512c9384b6811f62431c7707a3aa69ac4489354b46a06b8f43ed754d2ef03f1",
+      "stamp": "ce412d004c0e5c6d361a560dfef78bca896f3f5475faac2c3c066e30fca26f63",
+      "value": 8.97265625,
+      "probes": [
+        {
+          "cost": 7.99609375,
+          "valid": true
+        },
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.00390625,
+          "valid": true
+        },
+        {
+          "cost": 8.97265625,
+          "valid": true
+        },
+        {
+          "cost": 8.9765625,
+          "valid": false
+        }
+      ],
+      "lxm_data": "4685966ad1d7c966b06aa7b2c5b1172927c9c4b14e6f4dfa1e1dc23487ddbf254685966ad1d7c966b06aa7b2c5b1172927c9c4b14e6f4dfa1e1dc23487ddbf254685966ad1d7c966b06aa7b2c5b1172927c9c4b14e6f4dfa1e1dc23487ddbf254685966ad1d7c966b06aa7b2c5b1172927c9c4b14e6f4dfa1e1dc23487ddbf254685966ad1d7c966b06aa7b2c5b1172927c9c4b14e6f4dfa1e1dc23487ddbf25",
+      "validate_pn_stamp_value": 8.97265625,
+      "validate_pn_stamp_above_value": false
+    },
+    {
+      "kind": "pn",
+      "rounds": 1000,
+      "cost": 8.5,
+      "material": "04a4c6baaf4df9c0865cf7a24f9caae796f126faaa08a5fc01d7e4c94b5c6acc",
+      "workblock_hash": "775fc3f3dc1fad0efa8bbd56608b7a74c6408f8b4ea6a13444ac1993e024a4d0",
+      "stamp": "e897f15109de56333a9f6ab10c5a9c270b7b8c536fd15a45e65d2d92a0cccf2d",
+      "value": 8.9765625,
+      "probes": [
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.49609375,
+          "valid": true
+        },
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.50390625,
+          "valid": true
+        },
+        {
+          "cost": 8.9765625,
+          "valid": true
+        },
+        {
+          "cost": 8.98046875,
+          "valid": false
+        },
+        {
+          "cost": 9,
+          "valid": false
+        }
+      ],
+      "lxm_data": "22eb94d35e3b16222db40150947ad77751efccea036e1a2217a886246a3217af22eb94d35e3b16222db40150947ad77751efccea036e1a2217a886246a3217af22eb94d35e3b16222db40150947ad77751efccea036e1a2217a886246a3217af22eb94d35e3b16222db40150947ad77751efccea036e1a2217a886246a3217af22eb94d35e3b16222db40150947ad77751efccea036e1a2217a886246a3217af",
+      "validate_pn_stamp_value": 8.9765625,
+      "validate_pn_stamp_above_value": false
+    },
+    {
+      "kind": "pn",
+      "rounds": 1000,
+      "cost": 13.25,
+      "material": "a3da19a88b6ef798cd06817dd8c268fed18572ee70bfbe0cff08eb3d4846d910",
+      "workblock_hash": "e0dad8ad33f41d76554a6ce59791ed2915268f2c12ae608575905c14082ef45c",
+      "stamp": "77c15ded07c5b639b627d05adb6dd8d8f48c69bd7a07e02270f01736f1071175",
+      "value": 16.31640625,
+      "probes": [
+        {
+          "cost": 13,
+          "valid": true
+        },
+        {
+          "cost": 13.24609375,
+          "valid": true
+        },
+        {
+          "cost": 13.25,
+          "valid": true
+        },
+        {
+          "cost": 13.25390625,
+          "valid": true
+        },
+        {
+          "cost": 14,
+          "valid": true
+        },
+        {
+          "cost": 16.31640625,
+          "valid": true
+        },
+        {
+          "cost": 16.3203125,
+          "valid": false
+        }
+      ],
+      "lxm_data": "ceacddeb5ed704f3d779dd85bf8444819fdd56836229f8c2fc653150702a5919ceacddeb5ed704f3d779dd85bf8444819fdd56836229f8c2fc653150702a5919ceacddeb5ed704f3d779dd85bf8444819fdd56836229f8c2fc653150702a5919ceacddeb5ed704f3d779dd85bf8444819fdd56836229f8c2fc653150702a5919ceacddeb5ed704f3d779dd85bf8444819fdd56836229f8c2fc653150702a5919",
+      "validate_pn_stamp_value": 16.31640625,
+      "validate_pn_stamp_above_value": false
+    },
+    {
+      "kind": "peering",
+      "rounds": 25,
+      "cost": 8,
+      "material": "94e6a97b66c54163495815d099c7502b28b73167133f57fcb86a085dcb5ad109",
+      "workblock_hash": "3f26258a78d8ff954175b4e9646003692537313ca360f4e88c31fa9e466b2d8b",
+      "stamp": "444fb32c44c0c7dbd1e9c9a14f57107665be904b4f736dde408fb305718abbc8",
+      "value": 8.16796875,
+      "probes": [
+        {
+          "cost": 7.99609375,
+          "valid": true
+        },
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.00390625,
+          "valid": true
+        },
+        {
+          "cost": 8.16796875,
+          "valid": true
+        },
+        {
+          "cost": 8.171875,
+          "valid": false
+        }
+      ],
+      "validate_peering_key": true,
+      "validate_peering_key_above_value": false
+    },
+    {
+      "kind": "peering",
+      "rounds": 25,
+      "cost": 8.5,
+      "material": "47f904ed5abd3123ddd86c0ec643321f4ec6808ba89d7c4336c00172502cd480",
+      "workblock_hash": "06fa3495c0c4d7ab85e5e8cde057bcbdd2630e1640c6c93dea0d6e3e24ebf81a",
+      "stamp": "07ad669b46c8b5677ab20f00aa19a578cbd3689f483ef05df4fa73cd78ec173c",
+      "value": 8.96875,
+      "probes": [
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.49609375,
+          "valid": true
+        },
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.50390625,
+          "valid": true
+        },
+        {
+          "cost": 8.96875,
+          "valid": true
+        },
+        {
+          "cost": 8.97265625,
+          "valid": false
+        },
+        {
+          "cost": 9,
+          "valid": false
+        }
+      ],
+      "validate_peering_key": true,
+      "validate_peering_key_above_value": false
+    },
+    {
+      "kind": "peering",
+      "rounds": 25,
+      "cost": 13.25,
+      "material": "eba7e5d10ed4bae81bfb00d1d1ffcd922ded81306082ab2455a893bc57ad5001",
+      "workblock_hash": "15ae8a5a2376f11a78091227bf3963cef780a51c6b24bf5f7fce353b24dc396b",
+      "stamp": "242065b8cb67e1d2d8b1007923ce8dc51ad9abbcf5957911eb21814a10b55c53",
+      "value": 13.46875,
+      "probes": [
+        {
+          "cost": 13,
+          "valid": true
+        },
+        {
+          "cost": 13.24609375,
+          "valid": true
+        },
+        {
+          "cost": 13.25,
+          "valid": true
+        },
+        {
+          "cost": 13.25390625,
+          "valid": true
+        },
+        {
+          "cost": 13.46875,
+          "valid": true
+        },
+        {
+          "cost": 13.47265625,
+          "valid": false
+        },
+        {
+          "cost": 14,
+          "valid": false
+        }
+      ],
+      "validate_peering_key": true,
+      "validate_peering_key_above_value": false
+    }
+  ],
+  "slice_material": "b740fce619fca28b67696360c2818f90d41b691b06c6d2d65525a7845eec6042",
+  "slice_cases": [
+    {
+      "lower": 8.5,
+      "upper": 8.50390625,
+      "stamp": "3f1a4aea01e34c0c161377138a0f885ebffe356fe22498ba335f5ba350aa82f3",
+      "value": 8.5,
+      "probes": [
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.50390625,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "lower": 8.5,
+      "upper": 8.50390625,
+      "stamp": "cbbab994d0d861707af5d8a0b1292e84680ccae24b0e16fdac1101374a402600",
+      "value": 8.5,
+      "probes": [
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.50390625,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "lower": 8,
+      "upper": 8.5,
+      "stamp": "19c5896118bb8d257ce5a8298a2e36b789912ef71f67e026aba17c9c2c045ac1",
+      "value": 8.0,
+      "probes": [
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.00390625,
+          "valid": false
+        },
+        {
+          "cost": 8.5,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "lower": 8,
+      "upper": 8.5,
+      "stamp": "8d9f71e1a0fd71a76349de1267b8c94140637475273d9eb5c07feae3b0b931d0",
+      "value": 8.328125,
+      "probes": [
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.328125,
+          "valid": true
+        },
+        {
+          "cost": 8.33203125,
+          "valid": false
+        },
+        {
+          "cost": 8.5,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "lower": 8.5,
+      "upper": 9,
+      "stamp": "c2a5266ad64f4e5e8d60c6288db3788ef70d413d926346a4f690904ad5183846",
+      "value": 8.546875,
+      "probes": [
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.546875,
+          "valid": true
+        },
+        {
+          "cost": 8.55078125,
+          "valid": false
+        },
+        {
+          "cost": 9,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "lower": 8.5,
+      "upper": 9,
+      "stamp": "bf4ba2e42fd87882a8c3766f89e43d98aa315cfd9500d2c580a9d01aaf1aee95",
+      "value": 8.80078125,
+      "probes": [
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.80078125,
+          "valid": true
+        },
+        {
+          "cost": 8.8046875,
+          "valid": false
+        },
+        {
+          "cost": 9,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "lower": 13.24609375,
+      "upper": 13.25,
+      "stamp": "484d9f1d4669632aef38f5f58cf764cfc0456fac1855840f2c75e232675df7c2",
+      "value": 13.24609375,
+      "probes": [
+        {
+          "cost": 13.24609375,
+          "valid": true
+        },
+        {
+          "cost": 13.25,
+          "valid": false
+        }
+      ]
+    }
+  ],
+  "hash_cases": [
+    {
+      "label": "target(8)-1",
+      "hash": "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "value": 8.0,
+      "probes": [
+        {
+          "cost": 7.99609375,
+          "valid": true
+        },
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.00390625,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "label": "target(8)+0",
+      "hash": "0100000000000000000000000000000000000000000000000000000000000000",
+      "value": 7.99609375,
+      "probes": [
+        {
+          "cost": 7.99609375,
+          "valid": true
+        },
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.00390625,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "label": "target(8)+1",
+      "hash": "0100000000000000000000000000000000000000000000000000000000000001",
+      "value": 7.99609375,
+      "probes": [
+        {
+          "cost": 7.99609375,
+          "valid": true
+        },
+        {
+          "cost": 8,
+          "valid": false
+        },
+        {
+          "cost": 8.00390625,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "label": "target(8.5)-1",
+      "hash": "00b504f333bfffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "value": 8.5,
+      "probes": [
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.49609375,
+          "valid": true
+        },
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.50390625,
+          "valid": false
+        },
+        {
+          "cost": 9,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "label": "target(8.5)+0",
+      "hash": "00b504f333c00000000000000000000000000000000000000000000000000000",
+      "value": 8.49609375,
+      "probes": [
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.49609375,
+          "valid": true
+        },
+        {
+          "cost": 8.5,
+          "valid": true
+        },
+        {
+          "cost": 8.50390625,
+          "valid": false
+        },
+        {
+          "cost": 9,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "label": "target(8.5)+1",
+      "hash": "00b504f333c00000000000000000000000000000000000000000000000000001",
+      "value": 8.49609375,
+      "probes": [
+        {
+          "cost": 8,
+          "valid": true
+        },
+        {
+          "cost": 8.49609375,
+          "valid": true
+        },
+        {
+          "cost": 8.5,
+          "valid": false
+        },
+        {
+          "cost": 8.50390625,
+          "valid": false
+        },
+        {
+          "cost": 9,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "label": "target(13.25)-1",
+      "hash": "0006ba27e655ffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "value": 13.25,
+      "probes": [
+        {
+          "cost": 13,
+          "valid": true
+        },
+        {
+          "cost": 13.24609375,
+          "valid": true
+        },
+        {
+          "cost": 13.25,
+          "valid": true
+        },
+        {
+          "cost": 13.25390625,
+          "valid": false
+        },
+        {
+          "cost": 14,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "label": "target(13.25)+0",
+      "hash": "0006ba27e6560000000000000000000000000000000000000000000000000000",
+      "value": 13.24609375,
+      "probes": [
+        {
+          "cost": 13,
+          "valid": true
+        },
+        {
+          "cost": 13.24609375,
+          "valid": true
+        },
+        {
+          "cost": 13.25,
+          "valid": true
+        },
+        {
+          "cost": 13.25390625,
+          "valid": false
+        },
+        {
+          "cost": 14,
+          "valid": false
+        }
+      ]
+    },
+    {
+      "label": "target(13.25)+1",
+      "hash": "0006ba27e6560000000000000000000000000000000000000000000000000001",
+      "value": 13.24609375,
+      "probes": [
+        {
+          "cost": 13,
+          "valid": true
+        },
+        {
+          "cost": 13.24609375,
+          "valid": true
+        },
+        {
+          "cost": 13.25,
+          "valid": false
+        },
+        {
+          "cost": 13.25390625,
+          "valid": false
+        },
+        {
+          "cost": 14,
+          "valid": false
+        }
+      ]
+    }
+  ],
+  "message": {
+    "packed": "9db5ebe209d793bfff3a55af00e82fd79feea02687a44ddcd43b1483c2d6ba266cdad29f2f473c6f1c0d4f99debd0230f348481f51995f8602c70ab7aba2c3fa00336c32a7916b70e58e31cd9a87261e31b1a37fa14ecf7977de57000773a10295cb41d954fc40100000c4057374616d70c40a6672616374696f6e616c80c4206d99ba879243d6d7c617e15dfb8bc1a0e801b7a8d8fb574064281f9a86961d0c",
+    "hash": "98edb3162406e46d10cb4638ff2930f67e56361479624770a460947a14d4c4e2",
+    "stamp": "6d99ba879243d6d7c617e15dfb8bc1a0e801b7a8d8fb574064281f9a86961d0c",
+    "cost": 8.5,
+    "value": 8.61328125,
+    "validate_stamp": [
+      {
+        "cost": 8.5,
+        "valid": true
+      },
+      {
+        "cost": 8.61328125,
+        "valid": true
+      },
+      {
+        "cost": 8.6171875,
+        "valid": false
+      },
+      {
+        "cost": 9,
+        "valid": false
+      }
+    ]
+  }
+}

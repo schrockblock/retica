@@ -28,7 +28,8 @@ import Foundation
     #expect(result != nil)
     #expect(result?.transientId == Data(hexString: f.transientId)!)
     #expect(result?.lxmfData == Data(hexString: f.lxmfData)!)
-    #expect(result?.value == f.pnValue)
+    // The fixture's lxmf 1.1.0 value is the leading-zero count: the integer part of the 1.3.0 value.
+    #expect(result.map { Int($0.value.rounded(.down)) } == f.pnValue)
     // Workblock byte-parity (medium 1000-round), keyed on the recovered transient_id.
     let wb = LXStamper.stampWorkblock(material: Data(hexString: f.transientId)!,
                                       expandRounds: LXStamper.workblockExpandRoundsPN)

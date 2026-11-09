@@ -155,18 +155,27 @@ public struct LXMessage: Equatable, Sendable {
 
     /// Validate the attached stamp against `targetCost` (workblock derived from this message's hash).
     ///
-    /// **Not free, despite being O(1) in `targetCost`.** The cost parameter only sets how many
-    /// leading zero bits are required of a single hash; the expensive part is deriving the workblock,
+    /// `targetCost` may be fractional (LXMF 1.3.0 `validate_stamp` passes its float cost to RNS
+    /// `stamp_valid`); see `LXStamper` for the fixed-point rule and how out-of-range costs clamp.
+    ///
+    /// **Not free, despite being O(1) in `targetCost`.** The cost parameter only sets the threshold
+    /// a single hash must meet; the expensive part is deriving the workblock,
     /// which is a fixed ~3000 HKDF rounds producing 768 KB (`LXStamper.stampWorkblock`) on every
     /// call, at any cost. Order ~60 ms, extrapolated from the ~21 ms measured for the 1000-round
     /// (256 KB) propagation workblock at `LXStamper.swift:22-23`. Reference has the identical
     /// property (`LXMessage.py:288-289` derives the workblock then checks bits), so this is parity,
     /// not a regression — but anyone sizing an inbound flood should budget it rather than assume a
     /// cheap bit-test.
-    public func validateStamp(targetCost: Int) -> Bool {
+    public func validateStamp(targetCost: Double) -> Bool {
         guard let stamp else { return false }
         return LXStamper.stampValid(stamp: stamp, targetCost: targetCost,
                                     workblock: LXStamper.stampWorkblock(material: hash))
+    }
+
+    /// `validateStamp` at an integer cost: the same as passing `Double(targetCost)`.
+    @_disfavoredOverload
+    public func validateStamp(targetCost: Int) -> Bool {
+        validateStamp(targetCost: Double(targetCost))
     }
 
     // MARK: - Stamp tickets (LXMF 1.3.0)
@@ -195,11 +204,17 @@ public struct LXMessage: Equatable, Sendable {
     /// Validate the stamp against `tickets` first, then as proof-of-work at `targetCost`
     /// (reference `validate_stamp(target_cost, tickets)`, `LXMessage.py:280-301`). A ticket match
     /// skips the workblock derivation entirely.
-    public func validateStamp(targetCost: Int, tickets: [Data]) -> Bool {
+    public func validateStamp(targetCost: Double, tickets: [Data]) -> Bool {
         if let stamp, tickets.contains(where: { LXMessage.ticketStamp(ticket: $0, messageHash: hash) == stamp }) {
             return true
         }
         return validateStamp(targetCost: targetCost)
+    }
+
+    /// `validateStamp(targetCost:tickets:)` at an integer cost: the same as passing `Double(targetCost)`.
+    @_disfavoredOverload
+    public func validateStamp(targetCost: Int, tickets: [Data]) -> Bool {
+        validateStamp(targetCost: Double(targetCost), tickets: tickets)
     }
 
     /// The `FIELD_TICKET` entry, if this message carries a well-formed one: an array of at least two

@@ -110,7 +110,13 @@ public enum NetworkStamp {
     /// A real number: the leading-zero count of the hash plus a 1/256-step fraction from its mantissa.
     /// Does not check the stamp's length; callers reject a stamp whose length is not `stampLength`.
     public static func value(stamp: Data, material: Data) -> Double {
-        let hash = [UInt8](Crypto.fullHash(material + stamp))
+        value(hash: Crypto.fullHash(material + stamp))
+    }
+
+    /// The stamp value of a 32-byte hash already in hand: `value(stamp:material:)` after the hashing.
+    /// `LXStamper` shares it, since an LXMF stamp's value is this over `full_hash(workblock ‖ stamp)`.
+    static func value(hash hashData: Data) -> Double {
+        let hash = [UInt8](hashData)
         guard let firstNonZero = hash.firstIndex(where: { $0 != 0 }) else { return 256 }
         let leadingZeros = firstNonZero * 8 + hash[firstNonZero].leadingZeroBitCount
         let bitLength = 256 - leadingZeros
