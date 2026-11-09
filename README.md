@@ -289,6 +289,9 @@ Ordering matters for `seenHashes`: it is a ring of 10,000, so supplying newest-f
 wrong half. The rehydrate actions drop expired, malformed or future-dated rows and never
 overwrite an entry the network has already refreshed, so they are safe to send after
 `.endpoint(.start)` (ReTiCAMsgr runs its database reads alongside starting the interfaces).
+A ticket restored after `.endpoint(.start)` still applies to a send that is waiting for the peer's
+stamp cost: that send is handed over with the ticket stamp as soon as the ticket lands. A send
+that already started its proof-of-work search keeps searching, and finishes with a valid stamp.
 One exception: `.rehydrateTickets` does **not** drop a ticket whose expiry is far in the future.
 A peer chooses the expiry of a ticket it gives you, and reference accepts any value. A ticket you
 issued only expires later than 21 days from now if your clock went backwards, and dropping it
@@ -308,7 +311,8 @@ A rehydrated stamp is checked against `destinationValue` and mined again if it f
 
 ## Stamp tickets (LXMF 1.3)
 
-A ticket a peer gives you is always kept and used: sends to that peer are stamped with it instead
+A ticket a peer gives you in a message whose signature validated (so the sender's identity must
+already be known) is kept and used: sends to that peer are stamped with it instead
 of proof-of-work until it expires. Issuing tickets yourself is **off by default**, as in reference,
 where the client opts in per message (`include_ticket`). Turn it on with `.setIssueTickets(true)`.
 Then every message the node builds (`.send`, `.sendViaPropagation`) carries a ticket for its

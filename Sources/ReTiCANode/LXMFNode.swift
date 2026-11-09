@@ -699,9 +699,11 @@ public struct LXMFNode {
                 func wellFormed(_ t: Ticket) -> Bool {
                     t.ticket.count == LXMessage.ticketLength && t.expires.timeIntervalSinceReferenceDate.isFinite
                 }
+                var restoredOutbound: [Data] = []
                 for (hash, ticket) in outbound where state.outboundTickets[hash] == nil {
                     guard wellFormed(ticket), ticket.expires >= now else { continue }
                     state.outboundTickets[hash] = ticket
+                    if ticket.expires > now { restoredOutbound.append(hash) }
                 }
                 let inboundCutoff = now - LXMessage.ticketGrace
                 for (hash, tickets) in inbound {
@@ -717,7 +719,10 @@ public struct LXMFNode {
                     if let live = state.lastTicketDeliveries[hash], live >= at { continue }
                     state.lastTicketDeliveries[hash] = at
                 }
-                return .none
+                // A send parked in the first-send cost wait for a peer whose ticket was just restored
+                // gets the ticket stamp at once. A stamp search already running for that peer is not
+                // restarted: it finishes with a valid stamp.
+                return .merge(restoredOutbound.map { handOverWaitingSends(&state, destinationHash: $0) })
 
             case .registerDelivery:
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
@@ -1152,8 +1157,13 @@ public struct LXMFNode {
                     let ticket = Ticket(ticket: entry.ticket, expires: Date(timeIntervalSince1970: entry.expires))
                     if state.outboundTickets[message.sourceHash] != ticket {
                         state.outboundTickets[message.sourceHash] = ticket
-                        ticketEffect = .send(.delegate(.ticketReceived(destinationHash: message.sourceHash,
-                                                                       ticket: ticket)))
+                        // A send parked in the first-send cost wait for this peer now gets the
+                        // ticket stamp at once instead of waiting out the timer. A stamp search
+                        // already running for the peer is not restarted: it finishes with a valid stamp.
+                        ticketEffect = .merge(
+                            .send(.delegate(.ticketReceived(destinationHash: message.sourceHash,
+                                                            ticket: ticket))),
+                            handOverWaitingSends(&state, destinationHash: message.sourceHash))
                     }
                 }
 
