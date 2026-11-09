@@ -20,12 +20,16 @@ let package = Package(
         // The live MeshCore driver (spec 2026-11-07 Contract 2). The ONLY ReTiCA code that
         // imports MeshCoreKit.
         .library(name: "ReTiCAMeshCoreLive", targets: ["ReTiCAMeshCoreLive"]),
+        // The live RNode driver (spec 2026-11-08 Contract 2). The ONLY ReTiCA library code
+        // that imports RNodeKit (tests import it too).
+        .library(name: "ReTiCARNodeLive", targets: ["ReTiCARNodeLive"]),
     ],
     dependencies: [
         .package(url: "https://github.com/pointfreeco/swift-composable-architecture", from: "1.15.0"),
         .package(path: "../FCB"),
         .package(path: "../MeshtasticKit"),
         .package(path: "../MeshCoreKit"),
+        .package(path: "../RNodeKit"),
         .package(url: "https://github.com/NordicSemiconductor/IOS-CoreBluetooth-Mock.git", from: "1.0.0"),
         .package(url: "https://github.com/leif-ibsen/SwiftEdDSA", exact: "4.1.0"),
     ],
@@ -58,6 +62,15 @@ let package = Package(
                 .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
             ]
         ),
+        .target(
+            name: "ReTiCARNodeLive",
+            dependencies: [
+                "ReTiCAInterfaces",
+                .product(name: "RNodeKit", package: "RNodeKit"),
+                .product(name: "FCBComposable", package: "FCB"),
+                .product(name: "ComposableArchitecture", package: "swift-composable-architecture"),
+            ]
+        ),
         .testTarget(
             name: "ReTiCATests",
             dependencies: ["ReTiCA"],
@@ -72,6 +85,9 @@ let package = Package(
                 // never overlap the BLE adapter's CBM tests.
                 "ReTiCAMeshtasticLive",
                 "ReTiCAMeshCoreLive",
+                "ReTiCARNodeLive",
+                .product(name: "RNodeKit", package: "RNodeKit"),
+                .product(name: "RNodeMock", package: "RNodeKit"),
                 .product(name: "MeshCoreKit", package: "MeshCoreKit"),
                 .product(name: "MeshCoreMock", package: "MeshCoreKit"),
                 .product(name: "MeshtasticKit", package: "MeshtasticKit"),
