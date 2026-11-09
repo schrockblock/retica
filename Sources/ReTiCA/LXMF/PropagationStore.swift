@@ -10,6 +10,12 @@ public struct PropagationStore: Equatable {
         public var transientId: Data
         public var destinationHash: Data
         public var lxmfData: Data
+        /// The entry's propagation stamp value, on the 1/256 grid, recorded when `ingest` validated it
+        /// (reference stores `quantize_cost` of the validated value, LXMRouter.py:2582/2768, and reads
+        /// it back with `get_stamp_value` when filtering a peer offer, LXMPeer.py:345). nil when the
+        /// store accepted the entry without validation (`targetStampCost == 0`); an offer counts nil as
+        /// 0. Not persisted by hosts: rehydration re-runs `ingest`, which recomputes it.
+        public internal(set) var stampValue: Double?
         var sequence: Int
 
         /// Public construction for hosts mirroring the store (persistence, tests). `sequence` is the
@@ -19,14 +25,16 @@ public struct PropagationStore: Equatable {
             self.transientId = transientId
             self.destinationHash = destinationHash
             self.lxmfData = lxmfData
+            self.stampValue = nil
             self.sequence = 0
         }
 
         /// Internal construction used by the store itself, preserving the insertion-order sequence.
-        init(transientId: Data, destinationHash: Data, lxmfData: Data, sequence: Int) {
+        init(transientId: Data, destinationHash: Data, lxmfData: Data, stampValue: Double?, sequence: Int) {
             self.transientId = transientId
             self.destinationHash = destinationHash
             self.lxmfData = lxmfData
+            self.stampValue = stampValue
             self.sequence = sequence
         }
     }
@@ -134,6 +142,7 @@ public struct PropagationStore: Equatable {
         for lxmfData in lxmfDatas {
             let tid: Data
             let destData: Data
+            var stampValue: Double? = nil
             if targetStampCost > 0 {
                 // Cheap pre-filter: compute transient_id without PoW and reject duplicates before
                 // spending any effort. Entries of 144 bytes or fewer are skipped here — they
@@ -180,6 +189,7 @@ public struct PropagationStore: Equatable {
                 }
                 tid = validated.transientId
                 destData = dest
+                stampValue = validated.value
             } else {
                 // targetStampCost == 0: accept without stamp validation (backward-compat / test helper path).
                 // Strip the trailing stamp if present (> destHash(16) + stamp(32) bytes), otherwise use as-is.
@@ -191,7 +201,8 @@ public struct PropagationStore: Equatable {
             if stored[tid] != nil { continue }   // dedup by transient_id
             // Store the full stamped bytes (lxmfData) so PN→PN sync re-delivers the stamped entry,
             // letting the receiving PN validate and arrive at the same transient_id.
-            stored[tid] = Entry(transientId: tid, destinationHash: destData, lxmfData: lxmfData, sequence: nextSequence)
+            stored[tid] = Entry(transientId: tid, destinationHash: destData, lxmfData: lxmfData,
+                                stampValue: stampValue, sequence: nextSequence)
             nextSequence += 1
             added.append(tid)
         }
@@ -215,9 +226,28 @@ public struct PropagationStore: Equatable {
         stored[transientId] = nil
     }
 
-    /// All stored transient_ids, oldest-first — a propagation node's "offer" set to a peer.
+    /// Test seam: overwrite a stored entry's `stampValue`. Offer-filter tests need entries worth 13 to
+    /// 25, which no test can afford to mine for real (each step of 1 doubles the work over a 256 KB
+    /// workblock); the real values `ingest` records are tested separately.
+    mutating func setStampValue(_ value: Double?, forTransientId transientId: Data) {
+        stored[transientId]?.stampValue = value
+    }
+
+    /// All stored transient_ids, oldest-first. NOT an offer set: a peer refuses entries below its own
+    /// acceptance cost, so an offer goes through `transientIds(acceptedAt:)`.
     public var transientIds: [Data] {
         stored.values.sorted { $0.sequence < $1.sequence }.map { $0.transientId }
+    }
+
+    /// The stored transient_ids a peer accepting at `minimum` will take, oldest-first: those whose
+    /// `stampValue` (nil counts as 0) is at least `minimum`. Reference drops every entry with
+    /// `get_stamp_value(tid) < min_accepted_cost` from a peer's offer (LXMPeer.py:343-361), because a
+    /// receiving reference node tears the link down and throttles the sender on any entry it finds
+    /// invalid (LXMRouter.py:2786-2793). `minimum` comes from `LXMFPropagation.peerMinimumAcceptedCost`;
+    /// +infinity keeps nothing.
+    public func transientIds(acceptedAt minimum: Double) -> [Data] {
+        stored.values.filter { ($0.stampValue ?? 0) >= minimum }
+            .sorted { $0.sequence < $1.sequence }.map { $0.transientId }
     }
 
     /// Of a peer's offered transient_ids, the ones this store is missing (and would pull). Preserves the

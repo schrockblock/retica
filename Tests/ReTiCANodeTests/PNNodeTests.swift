@@ -245,9 +245,18 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Double = 0, targetSt
     let aIdentity = Identity(); let peerIdentity = Identity()
     let cost: Double = 8
     let peerDest = Data(repeating: 0xD0, count: 16); let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: aIdentity, endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
+    var initial = PNNode.State(identity: aIdentity, endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false),
+                               targetStampCost: 0)
+    // Something to offer (an offer with nothing in it is not made), to a peer accepting at 0, whose
+    // announce we hold (a sync waits for it).
+    let held = Data(repeating: 0xAB, count: 16) + Data("held".utf8)
+    _ = initial.node.store.ingest(container: LXMFPropagation.container(timestamp: 1700000000, entries: [held]))
+    let heldId = LXMFPropagation.transientId(lxmfData: held)
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
-        identity: peerIdentity, appData: nil, ratchet: nil, interfaceID: initial.endpoint.tcpClients[0].interfaceID,
+        identity: peerIdentity,
+        appData: PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 256, perSyncLimit: 10240,
+                            targetStampCost: 0, stampCostFlexibility: 0, peeringCost: cost).packed,
+        ratchet: nil, interfaceID: initial.endpoint.tcpClients[0].interfaceID,
         hops: 1, nextHop: nil, announceEmitted: 0)
     // A learned path implies the interface it was heard on exists; seeding one without the other
     // builds a state the runtime cannot reach. `openLink` now gates on `reachableLearned`, which
@@ -266,16 +275,19 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Double = 0, targetSt
     await store.send(.endpoint(.delegate(.linkEstablished(linkID: linkID, destinationHash: peerDest))))
     await store.receive { if case let .endpoint(.identifyOverLink(lid, _)) = $0 { return lid == linkID }; return false }
     let gotKey = LockIsolated<Data?>(nil)
+    let gotIds = LockIsolated<[Data]>([])
     await store.receive { action in                              // driven by the async offerKeyReady effect
         if case let .endpoint(.sendRequestOverLink(lid, path, data)) = action, lid == linkID, path == "/offer" {
             if case let .array(items)? = MsgPack.decodeValue(data), case let .bin(k) = items[0] { gotKey.setValue(k) }
+            if case let .array(items)? = MsgPack.decodeValue(data) { gotIds.setValue(PNNodeOfferTestSupport.ids(items[1])) }
             return true
         }
         return false
     }
+    #expect(gotIds.value == [heldId])
     // The generated key validates at the peer's cost over the same responder-first peeringId.
     #expect(LXStamper.validatePeeringKey(peeringId: peerIdentity.hash + aIdentity.hash,
-                                         peeringKey: gotKey.value!, targetCost: cost))
+                                         peeringKey: gotKey.value ?? Data(), targetCost: cost))
 }
 
 /// Offer response (list): transfer the wanted subset as a container Resource.

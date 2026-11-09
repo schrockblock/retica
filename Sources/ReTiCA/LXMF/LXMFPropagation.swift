@@ -61,6 +61,19 @@ public enum LXMFPropagation {
         cost >= 0 && cost <= maxPeeringCost
     }
 
+    /// The lowest stamp value a peer propagation node accepts, from its announce: reference's
+    /// `min_accepted_cost = max(0, cost - flex)` (LXMPeer.py:336), which decides what we may offer it.
+    ///
+    /// The announce's costs are unauthenticated and unclamped (`PNAnnounce.parse`), so this reproduces
+    /// Python's `max(0, x)` on every value, not just finite ones: NaN (including infinity minus
+    /// infinity) gives 0, because `max` keeps 0 when `nan > 0` is false; -infinity gives 0; +infinity
+    /// gives +infinity, which no stamp value reaches, so nothing is offered. Cross-validated against a
+    /// real `LXMPeer.sync` in `peerOfferFilterMatchesReferenceSync`.
+    public static func peerMinimumAcceptedCost(_ announce: PNAnnounce) -> Double {
+        let minimum = announce.targetStampCost - announce.stampCostFlexibility
+        return minimum.isNaN ? 0 : max(0, minimum)
+    }
+
     /// Highest propagation stamp cost we will do proof-of-work for when a propagation node advertises
     /// one in its announce app-data.
     ///

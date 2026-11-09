@@ -26,6 +26,9 @@
 #                       whether propagation_packet proves the packet.
 #   pn_length           LXStamper.validate_pn_stamp at cost 0 on entries of 144 and 145 bytes: the
 #                       length rule (LXStamper.py:33) alone.
+#   peer_offer          LXMFPropagationAnnounceHandler.received_announce → LXMRouter.peer → LXMPeer.sync
+#                       on hostile and ordinary announce blobs: which stored stamp values the real
+#                       offer keeps (max(0, cost - flex), LXMPeer.py:336), or no offer at all.
 #
 # Non-finite numbers are written as strings ("nan", "inf", "-inf") because JSON has no token for them.
 
@@ -34,6 +37,7 @@ import math
 import os
 import shutil
 import tempfile
+import time
 
 import RNS
 import RNS.vendor.umsgpack as msgpack
@@ -198,8 +202,74 @@ for total in (143, 144, 145, 146):
     tid, _, _, _ = LXStamper.validate_pn_stamp(transient_data, 0)
     pn_length.append({"length": total, "accepted": tid is not None})
 
+# ---- PN peer offer filter ------------------------------------------------------------------------
+# A real LXMFPropagationAnnounceHandler.received_announce takes each blob into a real LXMRouter.peer,
+# which records the peer's costs on a real LXMPeer; LXMPeer.sync then builds the offer, dropping
+# entries whose stored stamp value is below max(0, cost - flex) (LXMPeer.py:336-361) and sending
+# nothing when none is left (:386-388). Only the network edges are replaced: Transport.has_path /
+# hops_to answer "reachable", the peer's destination is a placeholder, its link records the request,
+# and the peering key is marked ready. Entries are 100 bytes, far below the transfer and sync limits.
+from LXMF.Handlers import LXMFPropagationAnnounceHandler
+from LXMF.LXMPeer import LXMPeer
+
+offer_values = [0.0, 12.99609375, 13.0, 13.24609375, 13.25, 16.0, 19.99609375, 20.0, 24.5]
+
+
+class PlaceholderDestination:
+    def __init__(self, h): self.hash = h
+
+
+class RecordingLink:
+    def __init__(self): self.offers = []
+    def request(self, path, data, response_callback=None, failed_callback=None): self.offers.append((path, data))
+
+
+real_has_path, real_hops_to = RNS.Transport.has_path, RNS.Transport.hops_to
+
+
+def reference_offer(blob):
+    """The stamp values of the entries a real LXMPeer.sync offers the peer that announced `blob`,
+    or None when it sends no offer."""
+    r = router(f"offer-{len(peer_offer)}")
+    r.propagation_node = True
+    r.autopeer = True
+    peer_hash = RNS.Identity.full_hash(b"retica-offer-peer")[:16]
+    RNS.Transport.has_path = lambda h: True
+    RNS.Transport.hops_to = lambda h: 1
+    try:
+        LXMFPropagationAnnounceHandler(r).received_announce(peer_hash, None, blob, b"", False)
+        peer = r.peers[peer_hash]
+        by_id = {}
+        for i, value in enumerate(offer_values):
+            tid = RNS.Identity.full_hash(b"retica-offer-entry-%d" % i)
+            r.propagation_entries[tid] = [b"\x00" * 16, "/nonexistent", time.time(), 100, [], [peer_hash], value]
+            by_id[tid] = value
+        peer.destination = PlaceholderDestination(peer_hash)
+        peer.peering_key = [b"\x00" * 32, peer.peering_cost]
+        peer.link = RecordingLink()
+        peer.state = LXMPeer.LINK_READY
+        peer.sync()
+    finally:
+        RNS.Transport.has_path, RNS.Transport.hops_to = real_has_path, real_hops_to
+        r.propagation_node = False
+    if not peer.link.offers: return None
+    path, offer = peer.link.offers[0]
+    assert path == LXMPeer.OFFER_REQUEST_PATH
+    return sorted(by_id[tid] for tid in offer[1])
+
+
+peer_offer = []
+for costs7 in [[20.0, 0.0, 1.0], [16.0, 3.0, 1.0], [16.5, 3.25, 1.0], [float("nan"), 3.0, 1.0],
+               [float("-inf"), 0.0, 1.0], [float("inf"), 0.0, 1.0], [float("inf"), float("inf"), 1.0],
+               [8.0, 12.0, 1.0], [25.0, 0.0, 1.0], [16.0, float("nan"), 1.0], [16.0, float("-inf"), 1.0]]:
+    blob = msgpack.packb(base + [[16, 3, 1], {}, costs7])
+    peer_offer.append({"packed": blob.hex(), "values": offer_values, "offered": reference_offer(blob)})
+blob = msgpack.packb(base + [[16, 3, 1], {}])               # seven elements: integer costs from [5]
+peer_offer.append({"packed": blob.hex(), "values": offer_values, "offered": reference_offer(blob)})
+
 fixtures = {"delivery_emit": delivery_emit, "inbound_setter": inbound_setter, "delivery_parse": delivery_parse,
             "pn_emit": pn_emit, "pn_parse": pn_parse, "pn_ingest": pn_ingest, "pn_length": pn_length,
+            "peer_offer": peer_offer,
             "versions": {"rns": RNS.__version__, "lxmf": LXMF.__version__}}
 
 # Guards on the generator: these only prove anything if reference really behaves this way.
@@ -216,6 +286,11 @@ assert pn16[0]["value"] == 13.0 and pn16[2]["value"] < 13.0
 assert [e["accepted"] for e in pn_ingest if e["cost"] == 16.5] == [True, True, False]
 assert [e["accepted"] for e in pn_ingest if e["cost"] == 13.0] == [True]
 assert [e["accepted"] for e in pn_length] == [False, False, True, True]
+assert peer_offer[0]["offered"] == [20.0, 24.5]
+assert peer_offer[1]["offered"] == [13.0, 13.24609375, 13.25, 16.0, 19.99609375, 20.0, 24.5]
+assert peer_offer[3]["offered"] == offer_values                  # NaN cost: max(0, nan) is 0
+assert peer_offer[5]["offered"] is None                          # +inf: nothing, so no offer
+assert peer_offer[-1]["offered"] == [13.0, 13.24609375, 13.25, 16.0, 19.99609375, 20.0, 24.5]
 
 print(json.dumps(fixtures, indent=2))
 shutil.rmtree(workdir, ignore_errors=True)

@@ -32,7 +32,10 @@ public struct PropagationNode {
         case messageListRequested(destinationHash: Data)
         case messagesDelivered(transientIds: [Data])
         case peerOffered(peerHash: Data, transientIds: [Data])
-        case offerToPeer(peerHash: Data)
+        /// Emit the ids to offer a peer: those whose stamp value meets `peerMinimumAcceptedCost`, the
+        /// peer's `max(0, cost - flex)` from its announce (`LXMFPropagation.peerMinimumAcceptedCost`).
+        /// An empty list means there is nothing to offer (reference sends no offer then).
+        case offerToPeer(peerHash: Data, peerMinimumAcceptedCost: Double)
         case validatePeeringKey(peerHash: Data, peeringId: Data, peeringKey: Data, targetCost: Double)
         case delegate(Delegate)
 
@@ -112,8 +115,9 @@ public struct PropagationNode {
                 return .send(.delegate(.requestFromPeer(peerHash: peerHash,
                                                         transientIds: state.store.wanted(fromOffered: offered))))
 
-            case let .offerToPeer(peerHash):
-                return .send(.delegate(.offerTransientIds(peerHash: peerHash, transientIds: state.store.transientIds)))
+            case let .offerToPeer(peerHash, minimum):
+                return .send(.delegate(.offerTransientIds(peerHash: peerHash,
+                                                          transientIds: state.store.transientIds(acceptedAt: minimum))))
 
             case let .validatePeeringKey(peerHash, peeringId, peeringKey, targetCost):
                 let valid = LXStamper.validatePeeringKey(peeringId: peeringId, peeringKey: peeringKey, targetCost: targetCost)

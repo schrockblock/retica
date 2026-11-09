@@ -302,10 +302,10 @@ private let pastLengthRule = Data(repeating: 0x5E, count: LXMessage.lxmfOverhead
 /// A stamp whose value lies in `range`, found by generating at `range.lowerBound` and keeping the
 /// first stamp whose value is below the upper bound. Selecting on the computed value makes the test
 /// deterministic (no luck in which side of a boundary a stamp lands).
-private func stampedEntry(valueIn range: Range<Double>) async throws -> (entry: Data, value: Double) {
+private func stampedEntry(valueIn range: Range<Double>, label: String = "flex") async throws -> (entry: Data, value: Double) {
     for attempt in 0..<64 {
         let core = Data(repeating: 0xEE, count: LXMessage.destinationLength)
-            + Data("flex-\(attempt)".utf8) + pastLengthRule
+            + Data("\(label)-\(attempt)".utf8) + pastLengthRule
         let tid = LXMFPropagation.transientId(lxmfData: core)
         let stamp = try #require(await LXStamper.generatePnStamp(transientId: tid, targetCost: range.lowerBound))
         let validated = try #require(LXStamper.validatePnStamp(transientData: core + stamp,
@@ -336,6 +336,31 @@ private func stampedEntry(valueIn range: Range<Double>) async throws -> (entry: 
     var strict = PropagationStore(targetStampCost: 12.5)
     #expect(strict.minAcceptedStampCost == 12.5)
     #expect(strict.ingest(container: container([stamped])).added.isEmpty)
+}
+
+/// I1: `ingest` records each validated entry's real stamp value, and the offer set for a peer keeps an
+/// entry exactly when that value meets the peer's minimum (reference drops `get_stamp_value(tid) <
+/// min_accepted_cost`, LXMPeer.py:345). Two real stamps with different values: at the higher value only
+/// that entry is offered, one 1/256 step above it neither is, at the lower value both are.
+///
+/// Anti-vacuity: the values are asserted distinct and recorded from validation, so a store that did not
+/// record them (nil, counted as 0) offers nothing at the lower value, and one that ignored `minimum`
+/// offers both at the higher.
+@Test func offerSetKeepsEntriesWhoseRecordedStampValueMeetsThePeerMinimum() async throws {
+    let low = try await stampedEntry(valueIn: 8..<10, label: "offer-low")
+    let high = try await stampedEntry(valueIn: 10..<64, label: "offer-high")
+    #expect(low.value < high.value)
+    var store = PropagationStore(targetStampCost: 8)
+    let added = store.ingest(container: container([low.entry, high.entry])).added
+    #expect(added.count == 2)
+    let lowId = try #require(store.preflightTransientId(ofStampedEntry: low.entry))
+    let highId = try #require(store.preflightTransientId(ofStampedEntry: high.entry))
+    #expect(store.entries(forTransientIds: [lowId, highId]).map(\.stampValue) == [low.value, high.value])
+
+    #expect(store.transientIds(acceptedAt: high.value) == [highId])
+    #expect(store.transientIds(acceptedAt: high.value + 1.0 / 256).isEmpty)
+    #expect(store.transientIds(acceptedAt: low.value) == [lowId, highId])           // oldest-first
+    #expect(store.transientIds(acceptedAt: .infinity).isEmpty)
 }
 
 /// Flexibility at or above the target gives an acceptance cost of 0 (reference's `max(0, …)`), not a

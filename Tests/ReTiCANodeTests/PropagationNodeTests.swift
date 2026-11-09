@@ -143,10 +143,19 @@ private func container(_ entries: [Data]) -> Data {
     await store.send(.ingestContainer(container([e1, e2])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
     let peer = Data(repeating: 0x11, count: 16)
-    await store.send(.offerToPeer(peerHash: peer))
+    await store.send(.offerToPeer(peerHash: peer, peerMinimumAcceptedCost: 0))
     await store.receive { action in
         if case let .delegate(.offerTransientIds(p, ids)) = action {
             #expect(p == peer); #expect(ids == [tid(e1), tid(e2)]); return true   // oldest-first
+        }
+        return false
+    }
+    // These entries were accepted unvalidated (cost 0), so their value counts as 0: a peer that
+    // accepts at anything above 0 is offered none of them.
+    await store.send(.offerToPeer(peerHash: peer, peerMinimumAcceptedCost: 1.0 / 256))
+    await store.receive { action in
+        if case let .delegate(.offerTransientIds(p, ids)) = action {
+            #expect(p == peer); #expect(ids.isEmpty); return true
         }
         return false
     }

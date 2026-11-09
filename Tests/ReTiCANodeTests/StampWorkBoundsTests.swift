@@ -148,9 +148,17 @@ private let peerLinkID = Data(repeating: 0xD1, count: 16)
 @MainActor
 private func makePeeringNode(pendingCostForPeer: Double? = nil) -> TestStore<PNNode.State, PNNode.Action> {
     var initial = PNNode.State(identity: Identity(),
-                               endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
+                               endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false),
+                               targetStampCost: 0)
+    // One entry the peer accepts and its announce, so a sync proceeds to the key search: with nothing
+    // to offer, or no announce, it stops before the search (PNNodeOfferFilterTests).
+    let held = Data(repeating: 0xAB, count: 16) + Data("held".utf8)
+    _ = initial.node.store.ingest(container: LXMFPropagation.container(timestamp: 1700000000, entries: [held]))
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
-        identity: Identity(), appData: nil, ratchet: nil, interfaceID: initial.endpoint.tcpClients[0].interfaceID,
+        identity: Identity(),
+        appData: PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 256, perSyncLimit: 10240,
+                            targetStampCost: 0, stampCostFlexibility: 0, peeringCost: 0).packed,
+        ratchet: nil, interfaceID: initial.endpoint.tcpClients[0].interfaceID,
         hops: 1, nextHop: nil, announceEmitted: 0)
     // See the note in PNNodeTests: `openLink` gates on `reachableLearned`, which reads the
     // interface table as well as the path table, so both have to be seeded together.

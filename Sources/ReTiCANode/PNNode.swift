@@ -87,6 +87,12 @@ public struct PNNode {
     @Dependency(\.date) var date
     public init() {}
 
+    /// The peer propagation node's announce, as we last learned it; nil when we have none or it does
+    /// not parse.
+    private static func peerAnnounce(_ state: State, _ destinationHash: Data) -> PNAnnounce? {
+        state.endpoint.learned[destinationHash]?.appData.flatMap(PNAnnounce.parse)
+    }
+
     private static func arrayOfBin(_ value: MsgPackValue) -> [Data] {
         guard case let .array(items) = value else { return [] }
         return items.compactMap { if case let .bin(d) = $0 { return d } else { return nil } }
@@ -137,6 +143,11 @@ public struct PNNode {
                 // Also refused: NaN and negatives, where reference's key generation raises (see
                 // `peeringCostAcceptable`). `cost <= max` alone let a negative cost through.
                 guard LXMFPropagation.peeringCostAcceptable(peeringCost) else { return .none }
+                // Reference postpones a sync while the peer's stamp costs are unknown
+                // (`stamp_costs_known`, LXMPeer.py:274-284): without its announce we cannot tell which
+                // entries it accepts, and offering one it refuses gets the link torn down and us
+                // throttled (LXMRouter.py:2786-2793). No link is opened.
+                guard Self.peerAnnounce(state, destinationHash) != nil else { return .none }
                 state.pendingSyncPeers[destinationHash] = peeringCost
                 return .send(.endpoint(.openLink(destinationHash: destinationHash)))
 
@@ -211,11 +222,22 @@ public struct PNNode {
                 // is public state, so `syncToPeer`'s refusal is not the only way a cost can get here.
                 guard LXMFPropagation.peeringCostAcceptable(cost) else { return .none }   // decline to peer
                 guard let peerIdentity = state.endpoint.learned[dest]?.identity else { return .none }
-                state.offerLinks[linkID] = state.node.store.transientIds
-                let peeringId = peerIdentity.hash + state.identity.hash              // responder-first (matches P4a)
                 let selfIdentity = state.identity
+                let identify = Effect<Action>.send(.endpoint(.identifyOverLink(linkID: linkID, identity: selfIdentity)))
+                // Offer only what the peer accepts: entries whose stamp value meets its
+                // `max(0, cost - flex)`, read from its announce again here because it may have changed
+                // since `syncToPeer` (LXMPeer.py:336-361). An unknown announce offers nothing.
+                let offerable = Self.peerAnnounce(state, dest).map {
+                    state.node.store.transientIds(acceptedAt: LXMFPropagation.peerMinimumAcceptedCost($0))
+                } ?? []
+                // Nothing qualifies: no offer, so no peering key either, as reference returns before
+                // offering (LXMPeer.py:386-388). The identify still goes out, as reference identifies on
+                // every established sync link (LXMPeer.py:540).
+                guard !offerable.isEmpty else { return identify }
+                state.offerLinks[linkID] = offerable
+                let peeringId = peerIdentity.hash + state.identity.hash              // responder-first (matches P4a)
                 return .merge(
-                    .send(.endpoint(.identifyOverLink(linkID: linkID, identity: selfIdentity))),
+                    identify,
                     .run { send in
                         guard let key = await LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: cost)
                         else { return }                              // cancelled mid-search
@@ -235,7 +257,12 @@ public struct PNNode {
                 switch MsgPack.decodeValue(data) {
                 case .bool(false):      wanted = []                          // peer has all → nothing
                 case .bool(true):       wanted = offeredIds                  // peer wants all offered
-                case let .array(items): wanted = items.compactMap { if case let .bin(d) = $0 { return d } else { return nil } }
+                case let .array(items):
+                    // Only ids we offered, which were filtered to what the peer accepts. Narrower than
+                    // reference, which sends any id in the response that its store holds, offered or
+                    // not (LXMPeer.py:455-457), and raises on one it does not hold.
+                    let offered = Set(offeredIds)
+                    wanted = items.compactMap { if case let .bin(d) = $0, offered.contains(d) { return d } else { return nil } }
                 default:                return .none                         // malformed
                 }
                 guard !wanted.isEmpty else { return .none }

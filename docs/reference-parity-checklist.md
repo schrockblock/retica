@@ -484,8 +484,7 @@ exactly the class Tier 1 just closed.*
       (Identity.py:745-791); ReTiCA keeps no such cache and re-checks each copy, which under
       enforcement gives the same answer. Enforcing link requests while not stamping our announces
       refuses every link a 1.6.0 peer opens to us, as in reference.
-      **Still open in this area:** exact fractional LXMF stamps (searched at the ceiling), tickets
-      (above), ratchets on our own destinations, RNS 1.6's table culling and SQLite storage, and
+      **Still open in this area:** tickets (above), ratchets on our own destinations, RNS 1.6's table culling and SQLite storage, and
       app-side settings in ReTiCaMsgr for these switches.
 
 ## Tier 4 — durability

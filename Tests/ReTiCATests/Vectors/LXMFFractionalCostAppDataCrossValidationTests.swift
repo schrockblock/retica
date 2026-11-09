@@ -49,6 +49,7 @@ private struct PNIngest: Decodable {
     let cost: Double; let flexibility: Double; let hash: String; let value: Double; let accepted: Bool
 }
 private struct PNLength: Decodable { let length: Int; let accepted: Bool }
+private struct PeerOffer: Decodable { let packed: String; let values: [Double]; let offered: [Double]? }
 
 private struct Fixtures: Decodable {
     let delivery_emit: [DeliveryEmit]
@@ -57,6 +58,7 @@ private struct Fixtures: Decodable {
     let pn_parse: [PNParse]
     let pn_ingest: [PNIngest]
     let pn_length: [PNLength]
+    let peer_offer: [PeerOffer]
 
     static func load() throws -> Fixtures {
         let url = try #require(Bundle.module.url(forResource: "lxmf_fractional_cost_app_data_fixtures",
@@ -198,6 +200,30 @@ private func sameNumber(_ a: Double, _ b: Double) -> Bool { a == b || (a.isNaN &
     #expect(at13.map(\.accepted) == [true, true, false])
     #expect(at13.first?.value == 13.0)
     #expect(at13.last.map { $0.value < 13 } == true)
+}
+
+// MARK: - Peer offer filter: max(0, cost - flex) of the PEER's announce
+
+/// I1, against a real `LXMPeer.sync`: for each announce blob (fractional, NaN, ±infinity, infinity minus
+/// infinity, flexibility above the cost, a seven-element integer announce), the stamp values reference
+/// offers are exactly those at or above our `peerMinimumAcceptedCost` of the parsed announce, and where
+/// reference sends no offer ours keeps nothing. The same rule run through a store
+/// (`transientIds(acceptedAt:)`) is in PropagationStoreTests and PNNodeOfferFilterTests.
+///
+/// Anti-vacuity: the cases include an all-offered, a none-offered and several partial sets, so a
+/// formula that ignored the flexibility, clamped NaN to anything but 0, or let +infinity through fails.
+@Test func peerOfferFilterMatchesReferenceSync() throws {
+    let cases = try Fixtures.load().peer_offer
+    #expect(cases.count == 12)
+    for c in cases {
+        let announce = try #require(PNAnnounce.parse(hex(c.packed)), "\(c.packed)")
+        let minimum = LXMFPropagation.peerMinimumAcceptedCost(announce)
+        let ours = c.values.filter { $0 >= minimum }
+        #expect(ours == (c.offered ?? []), "\(c.packed): minimum \(minimum)")
+    }
+    #expect(cases.contains { $0.offered == nil })
+    #expect(cases.contains { $0.offered == $0.values })
+    #expect(cases.contains { ($0.offered?.count ?? 0) > 0 && $0.offered != $0.values })
 }
 
 /// Reference's length rule on its own (cost 0, so any stamp is valid): 143 and 144 bytes refused,

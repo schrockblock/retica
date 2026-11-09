@@ -42,3 +42,20 @@
 
 **Files (app worktree):** `LearnedPeerRow` (stamp cost column → REAL via a new migration that converts existing integers), any other row storing a cost; tests.
 - [ ] Review Focus 4: an old integer row loads as that Double; a fractional cost round-trips. Commit on the branch; app suite.
+
+---
+
+## Status
+
+Tasks 1-3 landed (ReTiCA 2632744, 2d20a07; ReTiCAMsgr 66b09f9). The final review's fix landed after them:
+I1 (predates the plan): a `PNNode` sync offers a peer only the entries whose recorded stamp value meets
+the peer's `max(0, cost - flex)` from its announce, waits for that announce before opening a link, and
+skips the key search and offer when nothing qualifies. `PropagationNode.offerToPeer` takes the peer's
+minimum and filters the same way. Docs M1 and M2 are fixed in the same commit.
+
+**Follow-up (review M3, predates the plan, not done):** offers still ignore the peer's per-transfer and
+per-sync limits. Reference skips an entry larger than `propagation_transfer_limit*1000` and marks it
+handled for that peer, and stops adding entries at `propagation_sync_limit*1000`, filling in weight
+order (size times age, prioritised destinations lighter; LXMPeer.py:363-384, LXMRouter.py:1188-1199).
+We keep no per-entry receive time and no per-peer handled set, so a version on the same line would
+pick a different subset under the sync limit. It needs both before it can match.
