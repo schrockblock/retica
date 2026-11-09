@@ -35,6 +35,54 @@ import ComposableArchitecture
         await store.finish()
     }
 
+    /// The network stamp worker: one search running (A's destination stamp, held open), an announce
+    /// of B and a path request queued. The stop cancels the running search and empties both queues,
+    /// and starts nothing that was queued.
+    @Test func stoppingTheEndpointCancelsTheRunningNetworkStampSearchAndEmptiesBothQueues() async {
+        let a = Destination(kind: .single, direction: .in, appName: "retica", aspects: ["a"], identity: Identity())!
+        let b = Destination(kind: .single, direction: .in, appName: "retica", aspects: ["b"], identity: Identity())!
+        let x = Data(repeating: 0x22, count: 16)
+        let started = LockIsolated<[Data]>([])
+        // Held open until cancelled, so the search is certainly running at the stop.
+        let held: @Sendable (Data) async -> Void = { material in
+            started.withValue { $0.append(material) }
+            while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(2)) }
+        }
+        var initial = TransportEndpoint.State()
+        initial.transport.stampDestinations = true
+        initial.transport.stampPathRequests = true
+        initial.transport.destinationValue = 100
+        let store = TestStore(initialState: initial) { TransportEndpoint() } withDependencies: {
+            $0.uuid = .incrementing
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+            $0.destinationStampGenerator = DestinationStampGenerator { material, _ in await held(material); return nil }
+            $0.pathRequestStampGenerator = PathRequestStampGenerator { material, _ in await held(material); return nil }
+        }
+        store.exhaustivity = .off
+        await store.send(.transport(.interfaceConnected(InterfaceID("i0"), .default)))
+        await store.send(.registerLocalDestination(a))
+        await store.send(.registerLocalDestination(b))
+        await store.send(.announce(destinationHash: a.hash, appData: nil))
+        await store.send(.announce(destinationHash: b.hash, appData: nil))
+        await store.send(.requestPath(destinationHash: x))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.transport.stampingDestinations == [a.hash])
+        #expect(store.state.transport.queuedPathRequestStamps.map(\.destinationHash) == [x])
+        #expect(store.state.transport.pendingStampedAnnounces.map(\.destinationHash) == [a.hash, b.hash])
+
+        await store.send(.stop)
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.transport.stampingDestinations.isEmpty)
+        #expect(store.state.transport.stampingPathRequests.isEmpty, "the queued path request did not start")
+        #expect(store.state.transport.queuedPathRequestStamps.isEmpty)
+        #expect(store.state.transport.pendingStampedAnnounces.isEmpty)
+        // The held search returns only when cancelled: one still running would outlive `finish`.
+        store.exhaustivity = .on
+        await store.finish()
+        #expect(started.value.count <= 1, "nothing queued was started")
+    }
+
     @Test func theGeneratedStampReachesTheHostAndARehydratedOneIsUsed() async throws {
         let dest = Destination(kind: .single, direction: .in, appName: "retica", aspects: ["host"], identity: Identity())!
         var initial = TransportEndpoint.State()

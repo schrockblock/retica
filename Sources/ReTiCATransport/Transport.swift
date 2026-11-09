@@ -117,8 +117,9 @@ public struct Transport {
 
         /// Stamp our own path requests (RNS `Transport.STAMP_PRS`, `[stamps] stamp_path_requests`).
         /// Off by default, as in 1.6.0. When on, `.requestPath` first searches for a stamp of
-        /// `pathRequestValue` over `destinationHash + tag`, up to `NetworkStamp.pathStampTimeout`, and
-        /// sends the 64-byte request only once one is found; a relay also marks unstamped requests it
+        /// `pathRequestValue` over `destinationHash + tag` (queued behind any running network stamp
+        /// search, see `queuedPathRequestStamps`), up to `NetworkStamp.pathStampTimeout` from the
+        /// search's start, and sends the 64-byte request only once one is found; a relay also marks unstamped requests it
         /// forwards with the lenient extension (`Transport.lenientPathRequestExtension`). A host sets
         /// it at construction, on `TransportEndpoint.State.transport`.
         public var stampPathRequests = false
@@ -131,10 +132,40 @@ public struct Transport {
         /// A relay compares this field with its next hop (the loop guard), and a
         /// random value matches no real next hop.
         public var pathRequestSenderID: Data?
-        /// Destinations whose path-request stamp search is in flight, each with the tag of the request
-        /// that search is for. A further `.requestPath` for one of them is coalesced into it. Cleared
-        /// when the search ends or `.cancelPathRequestStamps`.
+        /// The destination whose path-request stamp search is in flight, with the tag of the request
+        /// that search is for. At most one entry, and only while no destination stamp search runs:
+        /// network stamp searches run one at a time (see `queuedPathRequestStamps`). A further
+        /// `.requestPath` for it is coalesced into it. Cleared when the search ends,
+        /// `.cancelPathRequestStamps` or `.cancelNetworkStamps`.
         public var stampingPathRequests: [Data: Data] = [:]
+        /// Path requests waiting for the network-stamp worker, oldest first (reference
+        /// `enqueue_stamped_pr` into `stamp_queues` priority 0, Transport.py:1466-1473). One network
+        /// stamp search runs at a time, path requests and path responses ahead of announces, as
+        /// reference's single `stamper_job` thread draining `WorkerQueues` (Transport.py:99-130,
+        /// 1476-1493). Keyed by destination: a newer request replaces the queued one and goes to
+        /// the back. Shares `Transport.stampedPathResponseQueueLimit` with the waiting path responses;
+        /// past it the new request is dropped.
+        public var queuedPathRequestStamps: [QueuedPathRequestStamp] = []
+
+        /// A path request waiting for its stamp search to start.
+        public struct QueuedPathRequestStamp: Equatable, Sendable {
+            public var destinationHash: Data
+            public var tag: Data
+            /// The 48-byte request the stamp is appended to.
+            public var request: Data
+            /// Arrival order among everything queued for a network stamp (`State.networkStampSequence`).
+            var sequence: UInt64 = 0
+        }
+
+        /// Next arrival number for queued network stamp work: path requests and path responses are
+        /// picked in arrival order between them.
+        var networkStampSequence: UInt64 = 0
+
+        /// True while a network stamp search runs or anything waits for one.
+        public var hasNetworkStampWork: Bool {
+            !stampingPathRequests.isEmpty || !stampingDestinations.isEmpty
+                || !queuedPathRequestStamps.isEmpty || !pendingStampedAnnounces.isEmpty
+        }
 
         /// Stamp our own announces (RNS `Transport.STAMP_DESTINATIONS`, `[stamps] stamp_destinations`).
         /// Off by default, as in 1.6.0, and then announce bytes are exactly as before. When on, every
@@ -157,7 +188,9 @@ public struct Transport {
         /// 0...`NetworkStamp.linkCostCap` (reference `set_link_cost`, Destination.py:399-405). Absent
         /// means `NetworkStamp.defaultLinkRequestCost` (reference `get_link_cost`, Destination.py:407-417).
         public var localLinkCosts: [Data: Double] = [:]
-        /// Local destinations whose stamp search is in flight. One search per destination.
+        /// The local destination whose stamp search is in flight. At most one, and only while no
+        /// path-request stamp search runs: network stamp searches run one at a time, path requests
+        /// and path responses first (see `queuedPathRequestStamps`).
         public var stampingDestinations: Set<Data> = []
         /// Enforce network stamps on what we receive (RNS `[stamps] enforce_stamps`, which sets both
         /// `STAMPS_ENFORCED` and `LR_STAMPS_ENFORCED`, Reticulum.py:507-511). Off by default, as in
@@ -188,9 +221,14 @@ public struct Transport {
         /// that instead (reference `pr_cost`, Interface.py:355-358); see `resolvedPathRequestCost(on:)`.
         public var pathRequestCost: Double = NetworkStamp.defaultPathRequestCost
         /// Announces and path responses waiting for their destination's stamp (reference
-        /// `stamp_queues`, Transport.py:1453-1463). At most one announce per destination and target
-        /// interface (the newest), and bounded overall by `Transport.stampedAnnounceQueueLimit` and
-        /// `Transport.stampedPathResponseQueueLimit`; dropped if the search ends without a stamp.
+        /// `stamp_queues`, Transport.py:1453-1463), in arrival order: those whose search runs now
+        /// and those whose search has not started. At most one announce per destination and target
+        /// interface (the newest, moved to the back), and bounded overall by
+        /// `Transport.stampedAnnounceQueueLimit` and `Transport.stampedPathResponseQueueLimit` (the
+        /// latter shared with `queuedPathRequestStamps`); dropped if the search ends without a stamp.
+        /// The worker starts a destination's search when that destination's oldest path response is
+        /// next among the path requests and path responses, or, with none of those waiting, when its
+        /// oldest announce is next; the stamp then releases everything waiting for it.
         public var pendingStampedAnnounces: [PendingStampedAnnounce] = []
 
         /// An announce or path response held until its destination's stamp exists.
@@ -203,6 +241,8 @@ public struct Transport {
             }
             public var destinationHash: Data
             public var kind: Kind
+            /// Arrival order among everything queued for a network stamp (`State.networkStampSequence`).
+            var sequence: UInt64 = 0
             public var isPathResponse: Bool {
                 if case .pathResponse = kind { return true }
                 return false
@@ -492,20 +532,24 @@ public struct Transport {
         /// A path-request stamp search for `destinationHash` ended: `request` is the stamped 64-byte
         /// payload to send, or nil when the search ran out `NetworkStamp.pathStampTimeout`.
         case pathRequestStampSearchEnded(destinationHash: Data, tag: Data, request: Data?)
-        /// Cancel every path-request stamp search; none of them sends. The host sends this when it stops.
+        /// Cancel every path-request stamp search, running or queued; none of them sends. The worker
+        /// then starts the next destination stamp search, if any announce waits for one.
         case cancelPathRequestStamps
         /// Hand back a destination stamp the host persisted from `.delegate(.destinationStampGenerated)`.
         /// One that is not `NetworkStamp.stampLength` bytes is discarded; the rest is checked against
         /// `destinationValue` before use, and one that falls short is mined again (Stamps.py:907-930).
-        /// If a search for the destination is running and this stamp meets the value, it ends the
-        /// search and releases what was waiting.
+        /// If announces wait for the destination's stamp (its search running or still queued) and this
+        /// stamp meets the value, it releases them, and ends a running search.
         case rehydrateDestinationStamp(destinationHash: Data, stamp: Data)
         /// A destination stamp search ended with `stamp` (nil if it ended without one) of `value`.
         case destinationStampSearchEnded(destinationHash: Data, stamp: Data?, value: Double)
-        /// Cancel every destination stamp search and drop what waited for it, as reference drops
-        /// announces whose stamp generation fails (Destination.py:349-351). The next announce searches
-        /// again. The host sends this when it stops.
+        /// Cancel every destination stamp search, running or queued, and drop what waited for it, as
+        /// reference drops announces whose stamp generation fails (Destination.py:349-351). The next
+        /// announce searches again. The worker then starts the next queued path-request stamp search.
         case cancelDestinationStamps
+        /// Cancel every network stamp search, running or queued, path request or destination, and
+        /// drop what waited for them; nothing new starts. The endpoint sends this when it stops.
+        case cancelNetworkStamps
         /// Encrypt `plaintext` to a learned destination and send it as one packet. With a non-nil
         /// `receiptToken`, also record a `PendingReceipt` so a valid proof for this packet emits
         /// `.delegate(.singlePacketDelivered(token:))`. The token is opaque to Transport.
@@ -614,6 +658,7 @@ public struct Transport {
     @Dependency(\.continuousClock) var clock
     @Dependency(\.randomBytes) var randomBytes
     @Dependency(\.destinationStampGenerator) var destinationStampGenerator
+    @Dependency(\.pathRequestStampGenerator) var pathRequestStampGenerator
 
     private enum CancelID: Hashable {
         case announceRetransmit(Data); case maintenance; case announceDrain(InterfaceID)
@@ -625,7 +670,7 @@ public struct Transport {
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { [clock, date, randomBytes, destinationStampGenerator] state, action in
+        Reduce { [clock, date, randomBytes, destinationStampGenerator, pathRequestStampGenerator] state, action in
             // Shared helper: rewrite a packet for forwarding toward its destination.
             // Final hop → HEADER_1 direct; onward → HEADER_2 to next hop. The final hop is the
             // destination itself OR a local client of the next hop (`LearnedDestination.relayNextHop`,
@@ -761,9 +806,16 @@ public struct Transport {
                 return .merge(rotated, .send(.delegate(.transmit(interfaceID, raw))))
             }
 
-            // One search per destination, no timeout (reference sets none for destination stamps; at
-            // the default value it takes about 45 s on a Mac, unmeasured on a phone). Bounded by
-            // cancellation: the endpoint's
+            // --- The network-stamp worker (reference `stamper_job`, Transport.py:1476-1493) ---
+            //
+            // One network stamp search at a time: a destination stamp or a path-request stamp. Started
+            // only by `startNextNetworkStampSearch`, which picks path requests and path responses
+            // (reference priority 0) in arrival order, and announces (priority 1) only when none of
+            // those waits. Link-request key searches are not part of it (LinkPlane, one per link, as
+            // reference runs one thread per link, Link.py:335-363).
+
+            // No timeout (reference sets none for destination stamps; at the default value it takes
+            // about 45 s on a Mac, unmeasured on a phone). Bounded by cancellation: the endpoint's
             // stop, `.cancelDestinationStamps`, deregistration, or a rehydrated stamp.
             func startDestinationStampSearch(_ dest: Destination, _ identity: Identity,
                                              _ state: inout State) -> Effect<Action> {
@@ -781,45 +833,37 @@ public struct Transport {
                 .cancellable(id: CancelID.destinationStamp(hash))
             }
 
-            // Hold `item` until its destination's stamp exists, within the reference queue lengths;
-            // past them the item is dropped, as reference drops it (Transport.py:1458-1461).
-            //
-            // Announces are KEYED by (destination, target interface): a newer one replaces the queued
-            // one in place, keeping the newest app data. Reference keys by destination alone
-            // (Transport.py:1456); the target is added so a per-interface re-announce (Contract 4) is
-            // not swallowed by a broadcast one. A search takes about 45 s on a Mac at the default value
-            // (unmeasured on a phone), so without the key
-            // repeated announces of one destination filled every slot, crowding out other local
-            // destinations, and then burst onto the air together. A queued announce for an interface
-            // that is not connected would send nothing, so it is not queued. Path responses are not
-            // keyed, as in reference: each answers its own request.
-            func waitForStamp(_ item: State.PendingStampedAnnounce, _ dest: Destination, _ identity: Identity,
-                              _ state: inout State) -> Effect<Action> {
-                if case let .announce(_, interface) = item.kind {
-                    if let interface, state.interfaces[interface] == nil { return .none }
-                    if let queued = state.pendingStampedAnnounces.firstIndex(where: {
-                        guard $0.destinationHash == item.destinationHash,
-                              case let .announce(_, queuedInterface) = $0.kind else { return false }
-                        return queuedInterface == interface
-                    }) {
-                        state.pendingStampedAnnounces[queued] = item
-                        return startDestinationStampSearch(dest, identity, &state)
+            // Search for `job`'s stamp: whichever ends first, the search or `pathStampTimeout`
+            // (reference's `stamp_watchdog`, Transport.py:4028-4033). The loser is cancelled.
+            func startPathRequestStampSearch(_ job: State.QueuedPathRequestStamp,
+                                             _ state: inout State) -> Effect<Action> {
+                let destinationHash = job.destinationHash
+                let tag = job.tag
+                let request = job.request
+                state.stampingPathRequests[destinationHash] = tag
+                let material = destinationHash + tag                    // pr_stamp_material
+                let cost = state.pathRequestValue
+                return .run { send in
+                    let stamp = await withTaskGroup(of: Data?.self) { group in
+                        group.addTask { await pathRequestStampGenerator.generate(material, cost) }  // NetworkStamp.generate, live
+                        group.addTask {
+                            try? await clock.sleep(for: .seconds(NetworkStamp.pathStampTimeout))
+                            return nil
+                        }
+                        let first = await group.next() ?? nil
+                        group.cancelAll()
+                        return first
                     }
+                    // Cancelled from outside (`.cancelPathRequestStamps`): nothing to report.
+                    guard !Task.isCancelled else { return }
+                    let stamped = stamp.flatMap { stamp in
+                        stamp.count == NetworkStamp.stampLength
+                            ? request + Data([NetworkStamp.extensionMarker, Transport.pathRequestStampFlags]) + stamp
+                            : nil
+                    }
+                    await send(.pathRequestStampSearchEnded(destinationHash: destinationHash, tag: tag, request: stamped))
                 }
-                let limit = item.isPathResponse ? Transport.stampedPathResponseQueueLimit
-                                                : Transport.stampedAnnounceQueueLimit
-                // A destination may hold at most `stampedQueuePerDestinationLimit` of a class's slots
-                // (reference has no such quota), so one destination announcing on many interfaces cannot
-                // fill the queue. Past it the NEWEST is dropped, as reference drops the newest when the
-                // queue is full (WorkerQueues.put raises Full, Transport.py:117); a replacement above
-                // does not grow the queue and so never reaches this.
-                let sameClass = state.pendingStampedAnnounces.filter { $0.isPathResponse == item.isPathResponse }
-                if sameClass.count < limit,
-                   sameClass.filter({ $0.destinationHash == item.destinationHash }).count
-                       < Transport.stampedQueuePerDestinationLimit {
-                    state.pendingStampedAnnounces.append(item)
-                }
-                return startDestinationStampSearch(dest, identity, &state)
+                .cancellable(id: CancelID.pathRequestStamp(destinationHash))
             }
 
             // The stamp for `hash` exists: send everything that waited for it, path responses first
@@ -841,6 +885,79 @@ public struct Transport {
                     }
                 }
                 return .merge(effects)
+            }
+
+            func nextNetworkStampSequence(_ state: inout State) -> UInt64 {
+                state.networkStampSequence &+= 1
+                return state.networkStampSequence
+            }
+
+            // With no network stamp search running, start the next one (reference `WorkerQueues.get`
+            // scans queue 0 before queue 1, Transport.py:122-132): the oldest of the queued path
+            // requests and the waiting path responses, else the oldest waiting announce. Call it after
+            // anything that queues work or ends, cancels or drops a search.
+            func startNextNetworkStampSearch(_ state: inout State) -> Effect<Action> {
+                while state.stampingDestinations.isEmpty, state.stampingPathRequests.isEmpty {
+                    let pathRequest = state.queuedPathRequestStamps.first
+                    let pathResponse = state.pendingStampedAnnounces.first(where: \.isPathResponse)
+                    if let pathRequest, pathResponse.map({ pathRequest.sequence < $0.sequence }) ?? true {
+                        state.queuedPathRequestStamps.removeFirst()
+                        return startPathRequestStampSearch(pathRequest, &state)
+                    }
+                    guard let item = pathResponse ?? state.pendingStampedAnnounces.first else { return .none }
+                    let hash = item.destinationHash
+                    guard let dest = state.localDestinations[hash],
+                          let identity = dest.identity, identity.privateKey != nil else {
+                        // Deregistration drops what waits for a destination, so this is a guard: what
+                        // could never be sent must not hold the worker.
+                        state.pendingStampedAnnounces.removeAll { $0.destinationHash == hash }
+                        continue
+                    }
+                    return startDestinationStampSearch(dest, identity, &state)
+                }
+                return .none
+            }
+
+            // Hold `item` until its destination's stamp exists, within the reference queue lengths;
+            // past them the NEW item is dropped, as reference drops it (WorkerQueues.put raises Full,
+            // Transport.py:117, 1458-1461).
+            //
+            // Announces are KEYED by (destination, target interface): a newer one removes the queued
+            // one and goes to the back with the newest app data, as reference's `put` removes a
+            // same-key item before appending (Transport.py:111-119). Reference keys by destination
+            // alone (Transport.py:1456); the target is added so a per-interface re-announce
+            // (Contract 4) is not swallowed by a broadcast one. A search takes about 45 s on a Mac at
+            // the default value (unmeasured on a phone), so without the key repeated announces of one
+            // destination filled every slot, crowding out other local destinations, and then burst
+            // onto the air together. A queued announce for an interface that is not connected would
+            // send nothing, so it is not queued. Path responses are not keyed, as in reference: each
+            // answers its own request.
+            func waitForStamp(_ item: State.PendingStampedAnnounce, _ state: inout State) -> Effect<Action> {
+                var item = item
+                if case let .announce(_, interface) = item.kind {
+                    if let interface, state.interfaces[interface] == nil { return .none }
+                    state.pendingStampedAnnounces.removeAll {
+                        guard $0.destinationHash == item.destinationHash,
+                              case let .announce(_, queuedInterface) = $0.kind else { return false }
+                        return queuedInterface == interface
+                    }
+                }
+                // Path responses share reference's priority-0 queue with our queued path requests.
+                let sameClass = state.pendingStampedAnnounces.filter { $0.isPathResponse == item.isPathResponse }
+                let occupied = sameClass.count + (item.isPathResponse ? state.queuedPathRequestStamps.count : 0)
+                let limit = item.isPathResponse ? Transport.stampedPathResponseQueueLimit
+                                                : Transport.stampedAnnounceQueueLimit
+                // A destination may hold at most `stampedQueuePerDestinationLimit` of a class's slots
+                // (reference has no such quota), so one destination announcing on many interfaces cannot
+                // fill the queue. Past it the NEWEST is dropped, as when the queue is full; a
+                // replacement above freed its own slot and so always fits.
+                if occupied < limit,
+                   sameClass.filter({ $0.destinationHash == item.destinationHash }).count
+                       < Transport.stampedQueuePerDestinationLimit {
+                    item.sequence = nextNetworkStampSequence(&state)
+                    state.pendingStampedAnnounces.append(item)
+                }
+                return startNextNetworkStampSearch(&state)
             }
 
             switch action {
@@ -917,7 +1034,8 @@ public struct Transport {
                 // stamp itself is kept, so a re-registration need not mine again.
                 state.pendingStampedAnnounces.removeAll { $0.destinationHash == destinationHash }
                 guard state.stampingDestinations.remove(destinationHash) != nil else { return .none }
-                return .cancel(id: CancelID.destinationStamp(destinationHash))
+                return .merge(.cancel(id: CancelID.destinationStamp(destinationHash)),
+                              startNextNetworkStampSearch(&state))
 
             case let .setTransportIdentity(identity):
                 state.transportIdentity = identity
@@ -1361,7 +1479,7 @@ public struct Transport {
                             }
                             return waitForStamp(State.PendingStampedAnnounce(destinationHash: dest.hash,
                                                                              kind: .pathResponse(interface: interfaceID)),
-                                                dest, identity, &state)
+                                                &state)
                         }
                         // (2) We are a relay that has learned + cached a path to the destination →
                         // re-emit the cached announce (verbatim payload, original signature) as a
@@ -1806,7 +1924,7 @@ public struct Transport {
                 if let appData { state.localAppData[destinationHash] = appData }
                 return waitForStamp(State.PendingStampedAnnounce(destinationHash: destinationHash,
                                                                  kind: .announce(appData: appData, interface: interface)),
-                                    dest, identity, &state)
+                                    &state)
 
             case let .requestPath(destinationHash):
                 // RNS 1.6.0 request_path (Transport.py:3685-3722): payload = destHash + sender ID + tag,
@@ -1831,39 +1949,25 @@ public struct Transport {
                 guard state.stampPathRequests else {
                     return transmitPathRequest(request, on: Array(state.interfaces.keys))
                 }
-                // Reference queues one stamp job per destination (enqueue_stamped_pr keys its queue
-                // by destination, Transport.py:1466-1468): a search already running for it answers
-                // this request too.
+                // A search already running for this destination answers this request too.
+                // DIVERGENCE: reference would queue a second job behind the running one (its `put`
+                // only replaces a job still queued, Transport.py:111-115); one stamped request per
+                // destination in flight is enough to learn the path.
                 guard state.stampingPathRequests[destinationHash] == nil else { return .none }
                 // Nothing to send on: no search either (the pending entry above stays).
                 guard !state.interfaces.isEmpty else { return .none }
-                state.stampingPathRequests[destinationHash] = tag
-                let material = destinationHash + tag                    // pr_stamp_material
-                let cost = state.pathRequestValue
-                return .run { send in
-                    // Whichever ends first: the search, or `pathStampTimeout` (reference's
-                    // `stamp_watchdog`, Transport.py:4028-4033). The loser is cancelled; `generate`
-                    // stops within its yield interval of that.
-                    let stamp = await withTaskGroup(of: Data?.self) { group in
-                        group.addTask { await NetworkStamp.generate(material: material, cost: cost)?.stamp }
-                        group.addTask {
-                            try? await clock.sleep(for: .seconds(NetworkStamp.pathStampTimeout))
-                            return nil
-                        }
-                        let first = await group.next() ?? nil
-                        group.cancelAll()
-                        return first
-                    }
-                    // Cancelled from outside (`.cancelPathRequestStamps`): nothing to report.
-                    guard !Task.isCancelled else { return }
-                    let stamped = stamp.flatMap { stamp in
-                        stamp.count == NetworkStamp.stampLength
-                            ? request + Data([NetworkStamp.extensionMarker, Transport.pathRequestStampFlags]) + stamp
-                            : nil
-                    }
-                    await send(.pathRequestStampSearchEnded(destinationHash: destinationHash, tag: tag, request: stamped))
-                }
-                .cancellable(id: CancelID.pathRequestStamp(destinationHash))
+                // Keyed by destination (enqueue_stamped_pr, Transport.py:1466-1468; our requests go
+                // on every interface, so no interface in the key): a newer request replaces the
+                // queued one and goes to the back with its own tag. Past the queue length the new
+                // request is dropped (Transport.py:117, 1469-1471).
+                state.queuedPathRequestStamps.removeAll { $0.destinationHash == destinationHash }
+                let occupied = state.queuedPathRequestStamps.count
+                    + state.pendingStampedAnnounces.filter(\.isPathResponse).count
+                guard occupied < Transport.stampedPathResponseQueueLimit else { return .none }
+                state.queuedPathRequestStamps.append(State.QueuedPathRequestStamp(
+                    destinationHash: destinationHash, tag: tag, request: request,
+                    sequence: nextNetworkStampSequence(&state)))
+                return startNextNetworkStampSearch(&state)
 
             case let .pathRequestStampSearchEnded(destinationHash, tag, request):
                 // Cancelled meanwhile (`.cancelPathRequestStamps`): the search no longer counts. A
@@ -1871,28 +1975,44 @@ public struct Transport {
                 // for the same destination; only the end carrying the recorded search's tag counts.
                 guard state.stampingPathRequests[destinationHash] == tag else { return .none }
                 state.stampingPathRequests[destinationHash] = nil
+                // A search reports once, as its effect's last act; cancelling here only stops a stray.
+                let stop = Effect<Action>.cancel(id: CancelID.pathRequestStamp(destinationHash))
                 // Ran out `pathStampTimeout`: reference logs and sends nothing (Transport.py:4038-4041).
-                guard let request else { return .none }
-                return transmitPathRequest(request, on: Array(state.interfaces.keys))
+                let send = request.map { transmitPathRequest($0, on: Array(state.interfaces.keys)) } ?? .none
+                return .merge(stop, send, startNextNetworkStampSearch(&state))
 
             case .cancelPathRequestStamps:
                 let cancelled = state.stampingPathRequests.keys
                 state.stampingPathRequests = [:]
-                return .merge(cancelled.map { .cancel(id: CancelID.pathRequestStamp($0)) })
+                state.queuedPathRequestStamps = []
+                return .merge(cancelled.map { .cancel(id: CancelID.pathRequestStamp($0)) }
+                              + [startNextNetworkStampSearch(&state)])
+
+            case .cancelNetworkStamps:
+                let cancels = state.stampingPathRequests.keys.map { Effect<Action>.cancel(id: CancelID.pathRequestStamp($0)) }
+                    + state.stampingDestinations.map { Effect<Action>.cancel(id: CancelID.destinationStamp($0)) }
+                state.stampingPathRequests = [:]
+                state.stampingDestinations = []
+                state.queuedPathRequestStamps = []
+                state.pendingStampedAnnounces = []
+                return .merge(cancels)
 
             case let .rehydrateDestinationStamp(destinationHash, stamp):
                 guard stamp.count == NetworkStamp.stampLength else { return .none }
                 state.destinationStamps[destinationHash] = stamp
-                // A search already running for it (the host's read landed after the first announce):
-                // if this stamp is good enough, it ends the search and releases what waited.
-                guard state.stampingDestinations.contains(destinationHash),
+                // Announces already waiting for it (the host's read landed after the first announce),
+                // their search running or still queued: if this stamp is good enough, it releases
+                // them, and ends a running search.
+                guard state.stampingDestinations.contains(destinationHash)
+                        || state.pendingStampedAnnounces.contains(where: { $0.destinationHash == destinationHash }),
                       let dest = state.localDestinations[destinationHash],
                       let identity = dest.identity, identity.privateKey != nil,
                       let usable = usableStamp(dest, identity, &state)
                 else { return .none }
-                state.stampingDestinations.remove(destinationHash)
-                return .merge(.cancel(id: CancelID.destinationStamp(destinationHash)),
-                              releaseWaiting(destinationHash, stamp: usable, &state))
+                let released = releaseWaiting(destinationHash, stamp: usable, &state)
+                guard state.stampingDestinations.remove(destinationHash) != nil else { return released }
+                return .merge(.cancel(id: CancelID.destinationStamp(destinationHash)), released,
+                              startNextNetworkStampSearch(&state))
 
             case let .destinationStampSearchEnded(destinationHash, stamp, value):
                 // Cancelled meanwhile: the search no longer counts.
@@ -1903,19 +2023,21 @@ public struct Transport {
                     // Ended without a stamp: what waited is dropped, as reference drops an announce
                     // whose stamp generation fails (Destination.py:349-351).
                     state.pendingStampedAnnounces.removeAll { $0.destinationHash == destinationHash }
-                    return stop
+                    return .merge(stop, startNextNetworkStampSearch(&state))
                 }
                 state.destinationStamps[destinationHash] = stamp
                 return .merge(stop,
                               .send(.delegate(.destinationStampGenerated(destinationHash: destinationHash,
                                                                          stamp: stamp, value: value))),
-                              releaseWaiting(destinationHash, stamp: stamp, &state))
+                              releaseWaiting(destinationHash, stamp: stamp, &state),
+                              startNextNetworkStampSearch(&state))
 
             case .cancelDestinationStamps:
                 let cancelled = state.stampingDestinations
                 state.stampingDestinations = []
-                state.pendingStampedAnnounces.removeAll { cancelled.contains($0.destinationHash) }
-                return .merge(cancelled.map { .cancel(id: CancelID.destinationStamp($0)) })
+                state.pendingStampedAnnounces = []
+                return .merge(cancelled.map { .cancel(id: CancelID.destinationStamp($0)) }
+                              + [startNextNetworkStampSearch(&state)])
 
             case let .proveSingle(packetHash, interfaceID, identity):
                 guard identity.privateKey != nil, state.interfaces[interfaceID] != nil else { return .none }
@@ -2237,7 +2359,8 @@ public struct Transport {
     static let destinationStampFlags: UInt8 = 0x00
     /// RNS STAMPER_AN_QUEUE_LENGTH (Transport.py:210): announces that may wait for a stamp.
     public static let stampedAnnounceQueueLimit = 32
-    /// RNS STAMPER_PR_QUEUE_LENGTH (Transport.py:209): path responses that may wait for a stamp.
+    /// RNS STAMPER_PR_QUEUE_LENGTH (Transport.py:209): path responses waiting for a destination stamp
+    /// and our path requests queued for theirs, together (reference's priority-0 queue).
     public static let stampedPathResponseQueueLimit = 32
     /// Most announces (and, separately, path responses) one destination may have queued for its stamp.
     /// ReTiCA's own bound inside the two limits above.

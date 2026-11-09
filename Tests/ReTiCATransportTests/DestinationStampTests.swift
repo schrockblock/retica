@@ -429,9 +429,14 @@ private struct Fixtures: Decodable {
         await store.send(.announce(destinationHash: propagation.hash, appData: Data([0xC1, 0x0C])))
         #expect(store.state.pendingStampedAnnounces.filter { $0.destinationHash == propagation.hash }.count == 1)
 
+        // One search at a time: delivery's runs first, then propagation's.
         let stamp = Data(repeating: 7, count: 14)
+        #expect(store.state.stampingDestinations == [delivery.hash])
+        await store.send(.destinationStampSearchEnded(destinationHash: delivery.hash, stamp: stamp, value: 100))
+        #expect(store.state.stampingDestinations == [propagation.hash])
+        let deliverySent = recorder.announces.count
         await store.send(.destinationStampSearchEnded(destinationHash: propagation.hash, stamp: stamp, value: 100))
-        let sent = recorder.announces
+        let sent = recorder.announces.dropFirst(deliverySent)
         #expect(sent.count == 1)
         #expect(sent.first?.1.destinationHash == propagation.hash)
         await store.send(.cancelDestinationStamps)

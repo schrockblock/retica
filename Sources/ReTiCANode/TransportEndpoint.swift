@@ -251,9 +251,11 @@ public struct TransportEndpoint {
                 // cancel them here, not when each interface reports its disconnect, because a
                 // Meshtastic radio reports offline only after `driver.stop()` returns. Each link
                 // fails with `.pathStale` (see `LinkPlane.failStampSearches` for why not
-                // `.stampFailure`). Path-request stamp searches likewise; a cancelled one sends nothing.
-                // So do destination stamp searches, and what waited for them is dropped; the next
-                // announce after a restart searches again (or uses the stamp the host rehydrates).
+                // `.stampFailure`). The network stamp worker likewise, in one action so that cancelling
+                // one kind of search does not start a queued search of the other: its running search
+                // (path request or destination) is cancelled and both queues are emptied. A cancelled
+                // path request sends nothing; what waited for a destination stamp is dropped, and the
+                // next announce after a restart searches again (or uses the stamp the host rehydrates).
                 return .merge(state.tcpClients.ids.map { .send(.tcpClients(.element(id: $0, action: .disconnect))) }
                               + [state.tcpServer != nil ? .send(.tcpServer(.stop)) : .none,
                                  state.ble != nil ? .send(.ble(.stop)) : .none,
@@ -261,10 +263,8 @@ public struct TransportEndpoint {
                                  state.meshCore != nil ? .send(.meshCore(.stop)) : .none,
                                  state.rnode != nil ? .send(.rnode(.stop)) : .none,
                                  state.linkPlane.stampingLinks.isEmpty ? .none : .send(.linkPlane(.cancelStampSearches)),
-                                 state.transport.stampingPathRequests.isEmpty ? .none
-                                     : .send(.transport(.cancelPathRequestStamps)),
-                                 state.transport.stampingDestinations.isEmpty ? .none
-                                     : .send(.transport(.cancelDestinationStamps))])
+                                 state.transport.hasNetworkStampWork
+                                     ? .send(.transport(.cancelNetworkStamps)) : .none])
             case let .registerLocalDestination(d, linkCost):
                 return .send(.transport(.registerLocalDestination(d, linkCost: linkCost)))
             case let .rehydrateDestinationStamp(h, stamp):
