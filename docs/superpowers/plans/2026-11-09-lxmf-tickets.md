@@ -1,5 +1,14 @@
 # LXMF stamp tickets Implementation Plan
 
+**Status 2026-11-09: done.** ReTiCA dd102a0, 1465505, 44353b4, 8455e84, bf510b5; ReTiCAMsgr 0f280e5. Rulings:
+an ignored sender's ticket is still remembered (reference order); rehydrate keeps future-dated ticket
+expiries (clock rollback). Deferred minors: the `ticketCarryingMessages` sweep is O(entries x router
+outbound) per terminal; two narrow sweep orderings can miss one `lastTicketDeliveries` update; no direct
+test that an explicit `sendViaPropagation` acceptance removes its own entry; a stamp search already running
+for a peer is not restarted when its ticket arrives; a copy handed over unstamped is not re-stamped when a
+ticket arrives later; an explicit propagated send with a ticket still reports `.stamping` (its propagation
+stamp) — worth a doc note.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** ReTiCA uses, validates and (optionally) issues LXMF 1.3.0 stamp tickets, and ReTiCAMsgr remembers the tickets peers give it across launches, so messages to a peer that gave us a ticket need no proof-of-work.
