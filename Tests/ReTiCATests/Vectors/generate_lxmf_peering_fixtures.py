@@ -21,7 +21,9 @@ peering_key  = peering_result[0] if isinstance(peering_result, tuple) else peeri
 peering_wb   = LXStamper.stamp_workblock(peering_id, expand_rounds=LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING)
 
 # --- PN stamp: a stamp appended to lxmf_data, over transient_id, with the 1000-round workblock ---
-lxmf_data    = bytes.fromhex("aabbccddeeff00112233445566778899") + b"encrypted-lxmf-payload-placeholder"
+# Longer than LXMF_OVERHEAD (112), so the stamped entry passes validate_pn_stamp's length rule
+# (len > LXMF_OVERHEAD + STAMP_SIZE, LXStamper.py:86); the assert below checks the real validator.
+lxmf_data    = bytes.fromhex("aabbccddeeff00112233445566778899") + b"encrypted-lxmf-payload-placeholder" * 4
 transient_id = RNS.Identity.full_hash(lxmf_data)
 pn_cost      = 4
 pn_result    = LXStamper.generate_stamp(transient_id, pn_cost, expand_rounds=LXStamper.WORKBLOCK_EXPAND_ROUNDS_PN)
@@ -29,6 +31,8 @@ pn_stamp     = pn_result[0] if isinstance(pn_result, tuple) else pn_result
 pn_wb        = LXStamper.stamp_workblock(transient_id, expand_rounds=LXStamper.WORKBLOCK_EXPAND_ROUNDS_PN)
 transient_data = lxmf_data + pn_stamp
 pn_value     = LXStamper.stamp_value(pn_wb, pn_stamp)
+assert LXStamper.validate_pn_stamp(transient_data, pn_cost)[0] == transient_id, "reference must accept the entry"
+assert LXStamper.validate_peering_key(peering_id, peering_key, peering_cost), "reference must accept the key"
 
 print(json.dumps({
     "workblock_expand_rounds_peering": LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING,

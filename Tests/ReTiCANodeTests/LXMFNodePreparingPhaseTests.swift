@@ -11,7 +11,7 @@ import ComposableArchitecture
 
 private let iface = InterfaceID("preparing-iface")
 private let sentAt: TimeInterval = 1700000000.5
-private let cheapCost = 8
+private let cheapCost: Double = 8
 
 private struct Reported: Equatable {
     let hash: Data
@@ -60,7 +60,7 @@ private func makeNode(_ identity: Identity, _ clock: TestClock<Duration>,
     return store
 }
 
-private func deliveryAnnounce(of peer: Identity, stampCost: Int?) -> Data {
+private func deliveryAnnounce(of peer: Identity, stampCost: Double?) -> Data {
     let dest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
                            aspects: LXMessage.deliveryAspects, identity: peer)!
     let randomHash = Announce.randomHash(now: 1_700_000_000, randomPrefix: Data(repeating: 0x02, count: 5))
@@ -76,7 +76,7 @@ private func message(from me: Identity, to peer: Identity, _ text: String = "hi"
 }
 
 @MainActor
-private func hearAnnounce(_ store: TestStoreOf<LXMFNode>, of peer: Identity, stampCost: Int?) async {
+private func hearAnnounce(_ store: TestStoreOf<LXMFNode>, of peer: Identity, stampCost: Double?) async {
     await store.send(.endpoint(.transport(.received(iface, deliveryAnnounce(of: peer, stampCost: stampCost)))))
     await store.receive({ action in
         if case .endpoint(.delegate(.pathLearned)) = action { return true }
@@ -107,7 +107,7 @@ private let propagationRecipient = Data(repeating: 0xA1, count: 16)
 
 /// A node with a propagation node set at `stampCost` and a recipient it can pack for.
 @MainActor
-private func makePropagationClient(stampCost: Int, recorder: PhaseRecordingNode) -> TestStoreOf<LXMFNode> {
+private func makePropagationClient(stampCost: Double, recorder: PhaseRecordingNode) -> TestStoreOf<LXMFNode> {
     var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     ep.transport.learned[propagationRecipient] = LearnedDestination(
         identity: Identity(), appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),

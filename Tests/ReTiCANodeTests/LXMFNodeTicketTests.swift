@@ -13,7 +13,7 @@ import ComposableArchitecture
 
 private let iface = InterfaceID("ticket-iface")
 private let now: TimeInterval = 1700000000.5
-private let cheapCost = 8
+private let cheapCost: Double = 8
 private let ticketA = Data((0..<16).map { UInt8($0) })
 private let ticketB = Data((0..<16).map { UInt8(0xF0 - $0) })
 
@@ -85,7 +85,7 @@ private func deliver(_ store: TestStoreOf<LXMFNode>, _ m: LXMessage, validated: 
     await store.skipReceivedActions(strict: false)
 }
 
-private func deliveryAnnounce(of peer: Identity, stampCost: Int?) -> Data {
+private func deliveryAnnounce(of peer: Identity, stampCost: Double?) -> Data {
     let dest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
                            aspects: LXMessage.deliveryAspects, identity: peer)!
     let randomHash = Announce.randomHash(now: 1_700_000_000, randomPrefix: Data(repeating: 0x02, count: 5))
@@ -96,7 +96,7 @@ private func deliveryAnnounce(of peer: Identity, stampCost: Int?) -> Data {
 }
 
 @MainActor
-private func hearAnnounce(_ store: TestStoreOf<LXMFNode>, of peer: Identity, stampCost: Int?) async {
+private func hearAnnounce(_ store: TestStoreOf<LXMFNode>, of peer: Identity, stampCost: Double?) async {
     await store.send(.endpoint(.transport(.received(iface, deliveryAnnounce(of: peer, stampCost: stampCost)))))
     await store.receive({ action in
         if case .endpoint(.delegate(.pathLearned)) = action { return true }
@@ -320,7 +320,7 @@ private func waitForHandOver(_ store: TestStoreOf<LXMFNode>) async {
 // MARK: - Propagated copies
 
 private let pnHash = Data(repeating: 0xC0, count: 16)
-private let pnStampCost = 2
+private let pnStampCost: Double = 2
 
 /// A node that knows `recipient`'s identity and path, with a propagation node set.
 @MainActor

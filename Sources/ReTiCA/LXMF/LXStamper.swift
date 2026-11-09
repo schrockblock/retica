@@ -12,12 +12,28 @@ import Foundation
 /// "at least c leading zero bits" rule except for the single hash equal to 2^(256-c), which has c-1
 /// leading zeros and is now valid, as in reference.
 ///
-/// Costs clamp as `NetworkStamp.fixedPoint(cost:)` does: NaN and anything at or below zero mean "every
-/// stamp is valid", anything at or above 100 means cost 100. Reference raises on NaN and infinities
-/// (and `generate_stamp` refuses costs outside 0...100); callers bound a wire cost before it gets here.
+/// Finite costs clamp as `NetworkStamp.fixedPoint(cost:)` does: anything at or below zero means "every
+/// stamp is valid", anything at or above 100 means cost 100. A non-finite cost (NaN, either infinity)
+/// validates nothing and generates nothing: reference's `cost_to_fp` raises on those
+/// (`math.floor` of NaN or infinity), so its validation and generation both fail there. Callers still
+/// bound a wire cost before it gets here (`costInRange`); this is the second line.
 public enum LXStamper {
     public static let workblockExpandRounds = 3000     // RNS WORKBLOCK_EXPAND_ROUNDS
     public static let stampSize = 32                   // RNS STAMP_SIZE (HASHLENGTH/8)
+
+    /// Reference's cost gate, `cost > 0 and cost < STAMP_COST_CAP` (LXMF 1.3.0 LXMRouter.py:1173,
+    /// cap 100 from RNS Transport.py:198). False for NaN and both infinities, since every comparison
+    /// with NaN is false and infinity fails one side.
+    public static func costInRange(_ cost: Double) -> Bool {
+        cost > 0 && cost < Double(NetworkStamp.stampCostCap)
+    }
+
+    /// The cost on the 1/256 grid, RNS `quantize_cost` (`cost_from_fp(cost_to_fp(cost))`,
+    /// RNS/Stamps.py:842-843): rounded half up, clamped to 0...100. NaN gives 0, as
+    /// `NetworkStamp.fixedPoint(cost:)` reads it (reference raises; callers gate first).
+    public static func quantizedCost(_ cost: Double) -> Double {
+        Double(NetworkStamp.fixedPoint(cost: cost)) / 256
+    }
 
     /// Counts `stampWorkblock` derivations within a task-local scope (`$workblockCounter`).
     ///
@@ -70,15 +86,11 @@ public enum LXStamper {
         hashValid(Crypto.fullHash(workblock + stamp), targetCost: targetCost)
     }
 
-    /// `stampValid` at an integer cost: the same as passing `Double(targetCost)`.
-    @_disfavoredOverload
-    public static func stampValid(stamp: Data, targetCost: Int, workblock: Data) -> Bool {
-        stampValid(stamp: stamp, targetCost: Double(targetCost), workblock: workblock)
-    }
-
-    /// The validity rule on a hash already in hand: `hash <= target(fixedPoint(targetCost))`.
+    /// The validity rule on a hash already in hand: `hash <= target(fixedPoint(targetCost))`. False
+    /// for a non-finite cost (see the type's note).
     static func hashValid(_ hash: Data, targetCost: Double) -> Bool {
-        NetworkStamp.hashMeets(hash, target: target(cost: targetCost))
+        guard targetCost.isFinite else { return false }
+        return NetworkStamp.hashMeets(hash, target: target(cost: targetCost))
     }
 
     private static func target(cost: Double) -> [UInt8] {
@@ -109,12 +121,6 @@ public enum LXStamper {
         await search(workblock: stampWorkblock(material: messageId), targetCost: targetCost)
     }
 
-    /// `generateStamp` at an integer cost: the same as passing `Double(targetCost)`.
-    @_disfavoredOverload
-    public static func generateStamp(messageId: Data, targetCost: Int) async -> Data? {
-        await generateStamp(messageId: messageId, targetCost: Double(targetCost))
-    }
-
     /// Rounds between yields in `search`. Bounds how long the search can hold its executor thread
     /// before a cancellation (or anything else queued behind it) gets a turn: at most 32 rounds, which
     /// is ~6 ms on the 256 KB propagation workblock and microseconds on the 6.4 KB peering one. Small
@@ -141,7 +147,10 @@ public enum LXStamper {
     ///   transport itself runs on. Reference sidesteps this by running generation in separate
     ///   threads/processes (`LXStamper.job_linux_managed` / `job_simple`); yielding is the equivalent
     ///   under structured concurrency.
+    ///
+    /// A non-finite cost returns nil at once, where reference raises (see the type's note).
     private static func search(workblock: Data, targetCost: Double) async -> Data? {
+        guard targetCost.isFinite else { return nil }
         let target = target(cost: targetCost)
         var round = 0
         while !Task.isCancelled {
@@ -163,12 +172,6 @@ public enum LXStamper {
                    workblock: stampWorkblock(material: peeringId, expandRounds: workblockExpandRoundsPeering))
     }
 
-    /// `validatePeeringKey` at an integer cost: the same as passing `Double(targetCost)`.
-    @_disfavoredOverload
-    public static func validatePeeringKey(peeringId: Data, peeringKey: Data, targetCost: Int) -> Bool {
-        validatePeeringKey(peeringId: peeringId, peeringKey: peeringKey, targetCost: Double(targetCost))
-    }
-
     /// Generate a peering key: search random 32-byte stamps until one is valid for `targetCost` over
     /// `peeringId`'s short (25-round) peering workblock — the initiator's counterpart to
     /// `validatePeeringKey` (RNS LXMPeer.generate_peering_key). Mirrors `generateStamp`. Cost averages
@@ -177,12 +180,6 @@ public enum LXStamper {
     public static func generatePeeringKey(peeringId: Data, targetCost: Double) async -> Data? {
         await search(workblock: stampWorkblock(material: peeringId, expandRounds: workblockExpandRoundsPeering),
                      targetCost: targetCost)
-    }
-
-    /// `generatePeeringKey` at an integer cost: the same as passing `Double(targetCost)`.
-    @_disfavoredOverload
-    public static func generatePeeringKey(peeringId: Data, targetCost: Int) async -> Data? {
-        await generatePeeringKey(peeringId: peeringId, targetCost: Double(targetCost))
     }
 
     /// Generate a propagation-node stamp: search random 32-byte stamps until one is valid for `targetCost`
@@ -194,31 +191,27 @@ public enum LXStamper {
                      targetCost: targetCost)
     }
 
-    /// `generatePnStamp` at an integer cost: the same as passing `Double(targetCost)`.
-    @_disfavoredOverload
-    public static func generatePnStamp(transientId: Data, targetCost: Int) async -> Data? {
-        await generatePnStamp(transientId: transientId, targetCost: Double(targetCost))
-    }
+    /// The shortest stamped propagation entry reference accepts is one byte longer than this:
+    /// `validate_pn_stamp` refuses `len(transient_data) <= LXMF_OVERHEAD + STAMP_SIZE`
+    /// (LXStamper.py:33), i.e. 112 + 32 = 144 bytes. Shared with `PropagationStore` so the dedup key
+    /// and the validated id use one rule.
+    public static let minimumStampedEntryLength = LXMessage.lxmfOverhead + stampSize + 1
 
     /// Validate a propagation-node stamp appended to lxmf_data (`transientData = lxmf_data ‖ stamp[32]`):
     /// strip the trailing 32-byte stamp, recompute `transient_id = full_hash(lxm_data)`, and validate over
     /// the medium (1000-round) workblock. Returns (transientId, lxmfData, value, stamp) or nil
     /// (RNS LXStamper.validate_pn_stamp). `value` is `stampValue`, on the 1/256 grid.
+    ///
+    /// An entry of 144 bytes or fewer is refused before any workblock is derived, as reference refuses
+    /// it on length (`minimumStampedEntryLength`).
     public static func validatePnStamp(transientData: Data, targetCost: Double)
         -> (transientId: Data, lxmfData: Data, value: Double, stamp: Data)? {
-        guard transientData.count > stampSize else { return nil }
+        guard transientData.count >= minimumStampedEntryLength else { return nil }
         let lxmfData = Data(transientData.dropLast(stampSize))
         let stamp = Data(transientData.suffix(stampSize))
         let transientId = Crypto.fullHash(lxmfData)
         let wb = stampWorkblock(material: transientId, expandRounds: workblockExpandRoundsPN)
         guard stampValid(stamp: stamp, targetCost: targetCost, workblock: wb) else { return nil }
         return (transientId, lxmfData, stampValue(workblock: wb, stamp: stamp), stamp)
-    }
-
-    /// `validatePnStamp` at an integer cost: the same as passing `Double(targetCost)`.
-    @_disfavoredOverload
-    public static func validatePnStamp(transientData: Data, targetCost: Int)
-        -> (transientId: Data, lxmfData: Data, value: Double, stamp: Data)? {
-        validatePnStamp(transientData: transientData, targetCost: Double(targetCost))
     }
 }

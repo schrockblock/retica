@@ -33,8 +33,9 @@ public enum LXMFPropagation {
         MsgPack.encode(.array([.double(timestamp), .array(entries.map { .bin($0) })]))
     }
 
-    /// Default propagation stamp cost for client→PN offers (RNS PROPAGATION_COST = 16).
-    public static let defaultPropagationStampCost = 16
+    /// Default propagation stamp cost for client→PN offers (LXMF 1.3.0 `PROPAGATION_COST = 16.0`,
+    /// LXMRouter.py:67).
+    public static let defaultPropagationStampCost: Double = 16
 
     /// Highest peering cost we will do proof-of-work for, from `LXMRouter.MAX_PEERING_COST = 26`
     /// (lxmf 1.1.0 LXMRouter.py:51; reference's own default `PEERING_COST` is 18, LXMRouter.py:50).
@@ -46,7 +47,19 @@ public enum LXMFPropagation {
     /// key generated at a lower cost is one the peer will reject (`LXMPeer.py:228-233` compares the
     /// key's value against `self.peering_cost`). Declining is a clean refusal; clamping is a silent
     /// failure. Cost is exponential — a peering cost of 64 is ~2^64 expected hash iterations.
-    public static let maxPeeringCost = 26
+    ///
+    /// A Double because LXMF 1.3.0 peering costs are fractional (`MAX_PEERING_COST = 26.0`,
+    /// LXMRouter.py:64; the peer's cost comes from its announce element [7]).
+    public static let maxPeeringCost: Double = 26
+
+    /// Whether we will do proof-of-work for a peer's announced peering cost: finite and in
+    /// 0...`maxPeeringCost`. Reference declines above `max_peering_cost` (LXMRouter.py:2341); below
+    /// 0, or NaN, its key generation raises (`generate_stamped_key` refuses a negative cost,
+    /// RNS/Stamps.py:320, and `cost_to_fp` raises on NaN), so it never peers there either. Zero is a
+    /// cost reference accepts (lxmd clamps a configured peering cost to >= 0, lxmd.py:209-210).
+    public static func peeringCostAcceptable(_ cost: Double) -> Bool {
+        cost >= 0 && cost <= maxPeeringCost
+    }
 
     /// Highest propagation stamp cost we will do proof-of-work for when a propagation node advertises
     /// one in its announce app-data.
@@ -73,9 +86,9 @@ public enum LXMFPropagation {
     ///
     /// Refusal, not clamping, for the same reason as `maxPeeringCost`: a stamp generated below the
     /// node's advertised cost is one that node's own ingest will reject (`PropagationStore.ingest`
-    /// enforces `minStampCost`; reference LXMRouter.py:2242 likewise), so clamping would spend the
+    /// enforces `minAcceptedStampCost`; reference LXMRouter.py:2577 likewise), so clamping would spend the
     /// work and still lose the message, silently.
-    public static let maxPropagationStampCost = 20
+    public static let maxPropagationStampCost: Double = 20
 
     /// Per-MESSAGE propagation transfer limit in KILOBYTES, announced as PN app-data field [3]
     /// (`LXMRouter.PROPAGATION_LIMIT = 256`, LXMRouter.py:55).

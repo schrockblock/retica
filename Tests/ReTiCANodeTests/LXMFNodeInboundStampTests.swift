@@ -32,7 +32,7 @@ import ComposableArchitecture
 /// - `enforce_stamps` **defaults to False** (`LXMRouter.__init__`, LXMRouter.py:99). An invalid
 ///   stamp with enforcement off is DELIVERED, not dropped.
 /// - Validation is **O(1)** in the cost: `stamp_workblock` + `stamp_valid` is one workblock
-///   derivation and one leading-zero-bit check (LXMessage.py:288-289). There is no ceiling needed here.
+///   derivation and one hash-against-target check (LXMessage.py:295-299, LXMF 1.3.0). There is no ceiling needed here.
 /// - A nil `deliveryStampCost` means "no cost configured" — no validation is attempted.
 ///
 /// **The result is carried on the message, not in the delegate signature** — mirroring reference,
@@ -68,7 +68,7 @@ import ComposableArchitecture
 // MARK: - Helpers
 
 /// A message with a genuine stamp valid at `cost`. Fast because cost 1 has p=1/2 per candidate.
-private func messageWithValidStamp(cost: Int = 1) async -> LXMessage {
+private func messageWithValidStamp(cost: Double = 1) async -> LXMessage {
     let sender = Identity()
     let recipientDeliveryHash = Data(repeating: 0xBB, count: 16)
     let base = LXMessage.create(source: sender, destinationHash: recipientDeliveryHash,
@@ -99,7 +99,7 @@ private func messageWithNoStamp() -> LXMessage {
 ///
 /// The `#expect` below is the guard that keeps it settled: if anything upstream changes the hash
 /// derivation, this fails loudly instead of flaking.
-private func messageWithInvalidStamp(atCost cost: Int) -> LXMessage {
+private func messageWithInvalidStamp(atCost cost: Double) -> LXMessage {
     // 64 fixed bytes = X25519(32) ‖ Ed25519(32); any 32 bytes are a valid raw scalar for both.
     let seed = Data(repeating: 0x11, count: 32) + Data(repeating: 0x22, count: 32)
     let sender = Identity(privateKey: seed)!
@@ -113,7 +113,7 @@ private func messageWithInvalidStamp(atCost cost: Int) -> LXMessage {
 
 @MainActor
 private func makeInboundStampStore(
-    deliveryStampCost: Int?,
+    deliveryStampCost: Double?,
     enforceDeliveryStamps: Bool = false
 ) -> TestStore<LXMFNode.State, LXMFNode.Action> {
     var node = LXMFNode.State(
@@ -188,7 +188,7 @@ private func makeInboundStampStore(
 /// Anti-vacuity: the matching closure runs only when `.delegate(.messageReceived)` is emitted;
 /// `got` stays nil if the message is dropped, causing every `#expect` to fail.
 @MainActor @Test func inboundStamp_costConfigured_validStamp_messageIsDeliveredCheckedValid() async {
-    let cost = 1
+    let cost: Double = 1
     let store = makeInboundStampStore(deliveryStampCost: cost, enforceDeliveryStamps: false)
     let message = await messageWithValidStamp(cost: cost)
     let got = LockIsolated<(hash: Data, sigValidated: Bool, checked: Bool, valid: Bool)?>(nil)
@@ -304,7 +304,7 @@ private func makeInboundStampStore(
 ///
 /// Anti-vacuity: same as other delivered tests — `got` stays nil if dropped, failing every `#expect`.
 @MainActor @Test func inboundStamp_costConfigured_validStamp_enforcementOn_messageIsDelivered() async {
-    let cost = 1
+    let cost: Double = 1
     let store = makeInboundStampStore(deliveryStampCost: cost, enforceDeliveryStamps: true)
     let message = await messageWithValidStamp(cost: cost)
     let got = LockIsolated<(hash: Data, checked: Bool, valid: Bool)?>(nil)
@@ -356,13 +356,14 @@ private func makeInboundStampStore(
     #expect(got.value?.checked == false)         // and never checked — no cost is configured
 }
 
-/// A configured cost of **-1** must not make garbage validate. `LXStamper.stampValid` is
-/// `stampValue >= targetCost` (LXStamper.swift:57-58) and a leading-zero-bit count is never
-/// negative, so at -1 *every* stamp passes: the app was told `stampValid == true` for an all-0xFF
+/// A configured cost of **-1** must not make garbage validate. `LXStamper.stampValid` accepts a hash
+/// at or below the fixed-point target, and a negative cost clamps to fixed point 0, whose target every
+/// hash meets (as reference's `cost_to_fp` clamps), so at -1 *every* stamp passes: the app was told
+/// `stampValid == true` for an all-0xFF
 /// stamp. Of everything a bad cost can do, reporting a forged stamp as verified is the worst,
 /// because the app renders it as a trust signal.
 ///
-/// Fixed at the setter (`< 1 → None`, LXMRouter.py:385-386, LXMF 1.1.0), so no validation runs at
+/// Fixed at the setter (`< 1 → None`, LXMRouter.py:452 and :457, LXMF 1.3.0), so no validation runs at
 /// all and the message arrives flagged never-checked.
 ///
 /// Anti-vacuity: asserts BOTH flags. `checked == false` fails if the sanitisation is removed

@@ -14,27 +14,37 @@ public struct PNNode {
         public var endpoint: TransportEndpoint.State
         public var node: PropagationNode.State
         public var identity: Identity
-        public var peeringCost: Int = 0                        // required cost for inbound /offer peering keys
+        /// Required cost for inbound `/offer` peering keys, advertised in our announce (LXMF 1.3.0
+        /// `peering_cost`, fractional). Sanitized on every write as a configured flexibility is
+        /// (`PropagationStore.sanitizedNonNegative`): negative → 0, NaN / +infinity / 100 or more
+        /// refused and the previous value kept (0 at `init`).
+        public var peeringCost: Double = 0 {
+            didSet { peeringCost = PropagationStore.sanitizedNonNegative(peeringCost, otherwise: oldValue) }
+        }
         public var clientIdentities: [Data: Identity] = [:]   // linkID → IDENTIFY'd client
         public var pendingGet: [Data: PendingGet] = [:]        // client delivery hash → (linkID, requestID)
         public var pendingOffer: [Data: PendingOffer] = [:]   // peerHash → (linkID, requestID, offeredIds)
-        public var pendingSyncPeers: [Data: Int] = [:]     // peer dest → the peer's peering cost, awaiting linkEstablished
+        public var pendingSyncPeers: [Data: Double] = [:]  // peer dest → the peer's peering cost, awaiting linkEstablished
         public var offerLinks: [Data: [Data]] = [:]        // outbound offer linkID → offeredIds we sent
         public init(identity: Identity, endpoint: TransportEndpoint.State, storageLimitBytes: Int? = nil,
-                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost, peeringCost: Int = 0) {
+                    targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
+                    stampCostFlexibility: Double = 0, peeringCost: Double = 0) {
             self.identity = identity
             self.endpoint = endpoint
-            self.peeringCost = peeringCost
-            self.node = PropagationNode.State(storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
+            self.peeringCost = PropagationStore.sanitizedNonNegative(peeringCost, otherwise: 0)
+            self.node = PropagationNode.State(storageLimitBytes: storageLimitBytes, targetStampCost: targetStampCost,
+                                              stampCostFlexibility: stampCostFlexibility)
         }
 
         /// Convenience: run this propagation node over a single TCP-client driver. Mirrors
         /// `LXMFNode.init(endpoint: TCPEndpoint.State)` — callers keep constructing a bare TCP
         /// driver while the endpoint now owns the shared router / link plane.
         public init(identity: Identity, endpoint: TCPEndpoint.State, storageLimitBytes: Int? = nil,
-                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost, peeringCost: Int = 0) {
+                    targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
+                    stampCostFlexibility: Double = 0, peeringCost: Double = 0) {
             self.init(identity: identity, endpoint: .tcp(endpoint), storageLimitBytes: storageLimitBytes,
-                      minStampCost: minStampCost, peeringCost: peeringCost)
+                      targetStampCost: targetStampCost, stampCostFlexibility: stampCostFlexibility,
+                      peeringCost: peeringCost)
         }
     }
 
@@ -53,7 +63,7 @@ public struct PNNode {
         case endpoint(TransportEndpoint.Action)
         case node(PropagationNode.Action)
         case registerPropagation
-        case syncToPeer(destinationHash: Data, peeringCost: Int)
+        case syncToPeer(destinationHash: Data, peeringCost: Double)
         case offerKeyReady(linkID: Data, key: Data)
         case delegate(Delegate)
 
@@ -111,8 +121,9 @@ public struct PNNode {
                 let appData = PNAnnounce(timebase: Int(date.now.timeIntervalSince1970), nodeState: true,
                                          perTransferLimit: LXMFPropagation.defaultPropagationTransferLimitKB,
                                          perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
-                                         targetStampCost: state.node.store.minStampCost,
-                                         stampCostFlexibility: 0, peeringCost: state.peeringCost).packed
+                                         targetStampCost: state.node.store.targetStampCost,
+                                         stampCostFlexibility: state.node.store.stampCostFlexibility,
+                                         peeringCost: state.peeringCost).packed
                 // LXMF 1.3.0's propagation link cost (LXMRouter.py:634), on the wire when stamping.
                 return .merge(.send(.endpoint(.registerLocalDestination(d, linkCost: LXMFPropagation.propagationLinkCost))),
                               .send(.endpoint(.announce(destinationHash: d.hash, appData: appData))))
@@ -123,7 +134,9 @@ public struct PNNode {
                 // is the only honest answer: a key generated at a cost below what the peer requires is
                 // one it rejects (LXMPeer.py:228-233), so clamping would spend the work and still fail —
                 // silently. Cost is exponential, so an unbounded value pins a core indefinitely.
-                guard peeringCost <= LXMFPropagation.maxPeeringCost else { return .none }
+                // Also refused: NaN and negatives, where reference's key generation raises (see
+                // `peeringCostAcceptable`). `cost <= max` alone let a negative cost through.
+                guard LXMFPropagation.peeringCostAcceptable(peeringCost) else { return .none }
                 state.pendingSyncPeers[destinationHash] = peeringCost
                 return .send(.endpoint(.openLink(destinationHash: destinationHash)))
 
@@ -196,7 +209,7 @@ public struct PNNode {
                 state.pendingSyncPeers[dest] = nil
                 // Second gate, at the point the unbounded search would actually start. `pendingSyncPeers`
                 // is public state, so `syncToPeer`'s refusal is not the only way a cost can get here.
-                guard cost <= LXMFPropagation.maxPeeringCost else { return .none }   // decline to peer
+                guard LXMFPropagation.peeringCostAcceptable(cost) else { return .none }   // decline to peer
                 guard let peerIdentity = state.endpoint.learned[dest]?.identity else { return .none }
                 state.offerLinks[linkID] = state.node.store.transientIds
                 let peeringId = peerIdentity.hash + state.identity.hash              // responder-first (matches P4a)

@@ -81,7 +81,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 0)                       // 0 → accept synthetic unstamped test entries
+        targetStampCost: 0)                       // 0 → accept synthetic unstamped test entries
     initial.nodeModeEnabled = nodeMode
     return makeServiceNodeStore(initial)
 }
@@ -96,7 +96,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 12)
+        targetStampCost: 12)
     initial.nodeModeEnabled = true
     let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
         $0.continuousClock = TestClock()
@@ -143,7 +143,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 12)
+        targetStampCost: 12)
     initial.nodeModeEnabled = true
     let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
         $0.continuousClock = TestClock()
@@ -177,16 +177,16 @@ import ComposableArchitecture
 }
 
 /// The announced stamp cost must track the store's enforced cost even if only the store is mutated
-/// after construction. This is a regression guard against re-introducing a mirrored copy of minStampCost
+/// after construction. This is a regression guard against re-introducing a mirrored copy of targetStampCost
 /// in LXMFServiceNode.State that can drift from the store's enforced value — the exact bug that
 /// PNNode had before Task 1 removed its mirror.
 @Test @MainActor func serviceNodeAnnouncesStoreEnforcedCostAfterMutation() async {
     let identity = Identity()
     var initial = LXMFServiceNode.State(identity: identity,
                                         endpoint: tcpDriverEndpoint(host: "h", port: 1),
-                                        minStampCost: 16)
+                                        targetStampCost: 16)
     initial.nodeModeEnabled = true
-    initial.pn.store.minStampCost = 21                    // mutate ONLY the store
+    initial.pn.store.targetStampCost = 21                    // mutate ONLY the store
 
     let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
         $0.continuousClock = TestClock()
@@ -255,7 +255,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 0)
+        targetStampCost: 0)
     initial.nodeModeEnabled = false
     initial.client.propagationDestinationHash = propDest.hash   // isPropagationLink would pass…
     initial.client.linkDestinations[linkID] = propDest.hash     // …for this link
@@ -465,7 +465,7 @@ import ComposableArchitecture
         var initial = LXMFServiceNode.State(
             identity: nodeIdentity,
             endpoint: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false),
-            minStampCost: 4)
+            targetStampCost: 4)
         initial.nodeModeEnabled = true
         let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
@@ -692,7 +692,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 0)
+        targetStampCost: 0)
     initial.nodeModeEnabled = false
     initial.client.propagationDestinationHash = propDest.hash   // isPropagationLink would pass…
     initial.client.linkDestinations[linkID] = propDest.hash     // …for this link
@@ -917,7 +917,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 0)
+        targetStampCost: 0)
     initial.nodeModeEnabled = true
     initial.clientIdentities[deliveryLink] = client    // bypass the IDENTIFY guard — only isPropagationLink matters
     let store = makeServiceNodeStore(initial)
@@ -987,7 +987,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 0)
+        targetStampCost: 0)
     initial.nodeModeEnabled = true
     initial.client.propagationDestinationHash = propDest.hash
     initial.client.linkDestinations[linkID1] = propDest.hash
@@ -1363,18 +1363,18 @@ import ComposableArchitecture
 
 // MARK: - FIX 2: stamp rejection — ERROR_INVALID_STAMP on under-cost packet offer
 
-/// A PACKET-framed offer whose stamp fails validation (absent or below minStampCost) must NOT be
+/// A PACKET-framed offer whose stamp fails validation (absent or below targetStampCost) must NOT be
 /// proved. Instead the node sends ERROR_INVALID_STAMP (LXMPeer.ERROR_INVALID_STAMP = 0xF5,
 /// LXMRouter.py:2258) as a plain data packet on the link, then tears it down. Without this fix the
 /// node proved the packet, giving the sender a false delivery confirmation while storing nothing.
 ///
-/// Uses minStampCost: 4 and an unstamped entry (effectively cost 0 — would be rejected by the store).
+/// Uses targetStampCost: 4 and an unstamped entry (effectively cost 0 — would be rejected by the store).
 @MainActor @Test func serviceNodeRejectsPacketOfferWithInvalidStamp() async {
     let identity = Identity()
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 4)   // enforce: any un-/under-stamped entry is invalid
+        targetStampCost: 4)   // enforce: any un-/under-stamped entry is invalid
     initial.nodeModeEnabled = true
     let store = makeServiceNodeStore(initial)
 
@@ -1382,7 +1382,7 @@ import ComposableArchitecture
                                aspects: ["propagation"], identity: identity)!
     let linkID = Data(repeating: 0xC1, count: 16)
     let packetHash = Data(repeating: 0xF7, count: 32)
-    // Unstamped entry: 16-byte dest prefix + payload — stamp cost is effectively 0 < minStampCost=4.
+    // Unstamped entry: 16-byte dest prefix + payload — stamp cost is effectively 0 < targetStampCost=4.
     let badEntry = Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("bad-stamp".utf8)
     let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [badEntry])
 
@@ -1431,7 +1431,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 0)
+        targetStampCost: 0)
     initial.nodeModeEnabled = true
     let store = makeServiceNodeStore(initial)
 
@@ -1466,7 +1466,7 @@ import ComposableArchitecture
 /// duplicate would be silently dropped while the client waited for a receipt that never comes.
 @MainActor @Test func serviceNodeProvesDuplicatePacketOffer() async {
     let identity = Identity()
-    let store = makeServiceNode(identity, nodeMode: true)   // minStampCost: 0 → accept any entry
+    let store = makeServiceNode(identity, nodeMode: true)   // targetStampCost: 0 → accept any entry
     let e = Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("dup-offer".utf8)
     let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
     let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
@@ -1517,7 +1517,7 @@ import ComposableArchitecture
     var initial = LXMFServiceNode.State(
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-        minStampCost: 4)   // > 0, so the stamp pre-scan runs
+        targetStampCost: 4)   // > 0, so the stamp pre-scan runs
     initial.nodeModeEnabled = true
     let store = makeServiceNodeStore(initial)
 
@@ -1526,6 +1526,7 @@ import ComposableArchitecture
     let linkID = Data(repeating: 0xC1, count: 16)
     // A genuinely stamped entry: the pre-scan must be able to accept it, or the replay never stores.
     let core = Data(repeating: 0xAA, count: LXMessage.destinationLength) + Data("replay-offer".utf8)
+        + Data(repeating: 0x5E, count: LXMessage.lxmfOverhead)          // past the 144-byte length rule
     let stamp = await LXStamper.generatePnStamp(
         transientId: LXMFPropagation.transientId(lxmfData: core), targetCost: 4)!
     let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [core + stamp])
@@ -1616,7 +1617,7 @@ import ComposableArchitecture
     let nodeIdentity = Identity()
     let cIdentity = Identity()
     let cDeliveryHash = LXMessage.deliveryHash(identityHash: cIdentity.hash)
-    // Unstamped container (minStampCost:0 on node), small enough to go as a packet.
+    // Unstamped container (targetStampCost:0 on node), small enough to go as a packet.
     let e = cDeliveryHash + Data("hello-packet".utf8)
     let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [e])
 
@@ -1626,7 +1627,7 @@ import ComposableArchitecture
         var initial = LXMFServiceNode.State(
             identity: nodeIdentity,
             endpoint: tcpDriverEndpoint(host: host, port: 4242, reconnectOnDrop: false),
-            minStampCost: 0)   // accept unstamped entries
+            targetStampCost: 0)   // accept unstamped entries
         initial.nodeModeEnabled = true
         let store = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
@@ -1714,4 +1715,64 @@ import ComposableArchitecture
     }
 
     await node.send(.client(.endpoint(.tcpClients(.element(id: InterfaceID("tcp"), action: .disconnect))))); await c.send(.stop)
+}
+
+// MARK: - Fractional acceptance cost on the packet path (LXMF 1.3.0)
+
+/// The packet path's pre-scan decides prove versus ERROR_INVALID_STAMP before ingest, so it must use
+/// the same acceptance cost the store does: `max(0, cost - flex)` (reference LXMRouter.py:2577). A node
+/// asking 12.5 with flexibility 3.25 proves an offer whose stamp is worth between 9.25 and 12.5; the
+/// same node with no flexibility refuses it. Its announce advertises both values exactly.
+///
+/// Anti-vacuity: the stamp's value is selected (not hoped) to lie in [9.25, 12.5), so the two
+/// outcomes can only come from the flexibility. A pre-scan reading `targetStampCost` fails the first
+/// half; one that ignored the store's cost entirely fails the second.
+@MainActor @Test func serviceNodePacketPathAcceptsWithinTheFlexibility() async throws {
+    var stamped = Data()
+    for attempt in 0..<64 {
+        let core = Data(repeating: 0xAA, count: LXMessage.destinationLength)
+            + Data("flex-offer-\(attempt)".utf8) + Data(repeating: 0x5E, count: LXMessage.lxmfOverhead)
+        let tid = LXMFPropagation.transientId(lxmfData: core)
+        let stamp = try #require(await LXStamper.generatePnStamp(transientId: tid, targetCost: 9.25))
+        let value = try #require(LXStamper.validatePnStamp(transientData: core + stamp, targetCost: 9.25)).value
+        if value < 12.5 { stamped = core + stamp; break }
+    }
+    #expect(!stamped.isEmpty, "setup: a stamp worth between 9.25 and 12.5")
+    let container = LXMFPropagation.container(timestamp: 1700000000.5, entries: [stamped])
+
+    for flexibility in [3.25, 0] {
+        let identity = Identity()
+        var initial = LXMFServiceNode.State(
+            identity: identity, endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
+            targetStampCost: 12.5, stampCostFlexibility: flexibility)
+        initial.nodeModeEnabled = true
+        let store = makeServiceNodeStore(initial)
+        let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                                   aspects: ["propagation"], identity: identity)!
+        let linkID = Data(repeating: 0xC4, count: 16)
+
+        let announced = LockIsolated<Data?>(nil)
+        await store.send(.registerPropagation)
+        await store.receive { if case let .client(.endpoint(.announce(_, appData))) = $0 {
+                                  announced.setValue(appData); return true }
+                              return false }
+        let blob = try #require(announced.value)
+        let pn = try #require(PNAnnounce.parse(blob))
+        #expect(pn.targetStampCost == 12.5)
+        #expect(pn.stampCostFlexibility == flexibility)
+
+        await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID,
+                                                                      destinationHash: propDest.hash)))))
+        await store.send(.client(.endpoint(.delegate(.linkDataReceived(
+            linkID: linkID, data: container, packetHash: Data(repeating: 0xF9, count: 32))))))
+        if flexibility > 0 {
+            await store.receive { if case .client(.endpoint(.provePacketOverLink)) = $0 { return true }
+                                  return false }
+            #expect(store.state.pn.store.count == 1)
+        } else {
+            await store.receive { if case .client(.endpoint(.closeLink)) = $0 { return true }; return false }
+            #expect(store.state.pn.store.count == 0)
+        }
+        await store.skipReceivedActions(strict: false)
+    }
 }

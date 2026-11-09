@@ -35,15 +35,55 @@ public struct PropagationStore: Equatable {
     private var nextSequence: Int = 0
     /// Total-storage cap in bytes; nil = unbounded (RNS default). Sum of stored lxmf_data sizes.
     public var storageLimitBytes: Int?
-    /// Minimum PoW stamp cost required on each inbound propagation entry (RNS PROPAGATION_COST = 16).
-    /// Entries whose stamp is absent or below this cost are silently rejected. Set to 0 to accept all
-    /// entries regardless of stamp (e.g. in tests using synthetic unstamped entries).
-    public var minStampCost: Int
+    /// The propagation stamp cost this node asks for and advertises (LXMF 1.3.0
+    /// `propagation_stamp_cost`, default 16.0). Entries are validated at `minAcceptedStampCost`, which
+    /// subtracts `stampCostFlexibility` from this.
+    ///
+    /// 0 turns stamp validation off entirely: entries are accepted unstamped (tests using synthetic
+    /// entries). Reference has no such switch; it floors a configured cost at
+    /// `PROPAGATION_COST_MIN = 13` (LXMRouter.py:165), which we do not, so tests can use cheap costs.
+    ///
+    /// **Sanitized on every write**, because `PNAnnounce.packed` and `LXStamper` both read it: a value
+    /// that is not in 0..<100 (negative, 100 or more, NaN, an infinity) is refused and the previous
+    /// value kept, as reference's `set_inbound_stamp_cost` keeps its cost on a refused one
+    /// (LXMRouter.py:454). At `init` a refused value falls back to the default.
+    public var targetStampCost: Double {
+        didSet { targetStampCost = Self.sanitizedTarget(targetStampCost, otherwise: oldValue) }
+    }
+
+    /// How far below `targetStampCost` an entry's stamp may fall and still be accepted (LXMF 1.3.0
+    /// `propagation_stamp_cost_flexibility`; reference's default is 3.0, ours 0, which keeps the
+    /// acceptance cost equal to the advertised one unless a host opts in).
+    ///
+    /// Sanitized on every write: a negative value becomes 0, as lxmd clamps it (lxmd.py:195-196); NaN,
+    /// +infinity and 100 or more are refused and the previous value kept (0 at `init`).
+    public var stampCostFlexibility: Double {
+        didSet { stampCostFlexibility = Self.sanitizedNonNegative(stampCostFlexibility, otherwise: oldValue) }
+    }
+
+    /// The cost each inbound entry's stamp is validated at: `max(0, cost - flex)`, reference's
+    /// `min_accepted_cost` (LXMRouter.py:2577, :2740). Fractional.
+    public var minAcceptedStampCost: Double { max(0, targetStampCost - stampCostFlexibility) }
 
     public init(storageLimitBytes: Int? = nil,
-                minStampCost: Int = LXMFPropagation.defaultPropagationStampCost) {
+                targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
+                stampCostFlexibility: Double = 0) {
         self.storageLimitBytes = storageLimitBytes
-        self.minStampCost = minStampCost
+        self.targetStampCost = Self.sanitizedTarget(targetStampCost,
+                                                    otherwise: LXMFPropagation.defaultPropagationStampCost)
+        self.stampCostFlexibility = Self.sanitizedNonNegative(stampCostFlexibility, otherwise: 0)
+    }
+
+    /// `value` when it is in 0..<100, else `otherwise`. False comparisons make NaN fall through.
+    static func sanitizedTarget(_ value: Double, otherwise: Double) -> Double {
+        value >= 0 && value < Double(NetworkStamp.stampCostCap) ? value : otherwise
+    }
+
+    /// `value` in 0..<100; a negative value (including -infinity) is 0; NaN, +infinity and 100 or
+    /// more give `otherwise`. The rule for a configured flexibility or peering cost.
+    public static func sanitizedNonNegative(_ value: Double, otherwise: Double) -> Double {
+        if value < 0 { return 0 }
+        return value < Double(NetworkStamp.stampCostCap) ? value : otherwise
     }
 
     public var count: Int { stored.count }
@@ -53,13 +93,15 @@ public struct PropagationStore: Equatable {
 
     /// The dedup key a stamped container entry (`lxmf_data ‖ stamp[32]`) would get, computed WITHOUT
     /// deriving a stamp workblock — the cheap half of `ingest`'s admission test. nil when the entry is
-    /// too short to carry a stamp (`validatePnStamp` rejects such an entry regardless).
+    /// too short for `validatePnStamp`, which refuses 144 bytes or fewer
+    /// (`LXStamper.minimumStampedEntryLength`, reference LXStamper.py:33) — the same rule, so the
+    /// dedup key exists exactly when validation can run.
     ///
     /// Public because a caller that pre-screens a container before handing it to `ingest`
     /// (`LXMFServiceNode`'s packet path) has to apply the SAME rule, and a second hand-written copy of
     /// "strip the trailing 32 bytes, hash the rest" is the thing that drifts.
     public func preflightTransientId(ofStampedEntry transientData: Data) -> Data? {
-        guard transientData.count > LXStamper.stampSize else { return nil }
+        guard transientData.count >= LXStamper.minimumStampedEntryLength else { return nil }
         return LXMFPropagation.transientId(lxmfData: Data(transientData.dropLast(LXStamper.stampSize)))
     }
 
@@ -80,7 +122,7 @@ public struct PropagationStore: Equatable {
     /// - `added` are transient_ids newly accepted and retained after eviction,
     /// - `evicted` are transient_ids accepted then immediately evicted to stay under `storageLimitBytes`.
     ///
-    /// Entries whose stamp is absent or below `minStampCost` are silently skipped (not counted).
+    /// Entries whose stamp is absent or below `minAcceptedStampCost` are silently skipped (not counted).
     /// A **duplicate** entry (already-stored transient_id) is also silently skipped — it contributes
     /// nothing to `added`.
     ///
@@ -92,9 +134,9 @@ public struct PropagationStore: Equatable {
         for lxmfData in lxmfDatas {
             let tid: Data
             let destData: Data
-            if minStampCost > 0 {
+            if targetStampCost > 0 {
                 // Cheap pre-filter: compute transient_id without PoW and reject duplicates before
-                // spending any effort. Entries too short to carry a stamp are skipped here — they
+                // spending any effort. Entries of 144 bytes or fewer are skipped here — they
                 // would be rejected by validatePnStamp regardless.
                 //
                 // WHAT THIS CLOSES, AND WHAT IT DOES NOT. It closes a REPLAY flood: re-offering
@@ -103,7 +145,9 @@ public struct PropagationStore: Equatable {
                 // when `stored[preflightTid] != nil`, which requires a previously ACCEPTED — hence
                 // validly stamped — entry. An attacker who never produces a valid stamp is never
                 // stored, never deduped, and pays the full workblock every time. Measured 21.98 ms
-                // per 33-byte entry: 1.56 KiB/s of container bytes still saturates one core. That
+                // per entry, on 33-byte entries; entries of 144 bytes or fewer are now refused on
+                // length first, so the cheapest such entry is 145 bytes (~6.4 KiB/s of container
+                // bytes, by the same measurement, still saturates one core). That
                 // residue is filed for admission control (docs/wire-narrowing-inventory.md,
                 // "Task 5, precisely: a replay flood is closed, the junk flood is not");
                 // reference's defence is not a cheaper check but a THROTTLE — an offer is postponed
@@ -120,11 +164,15 @@ public struct PropagationStore: Equatable {
                 guard let preflightTid = preflightTransientId(ofStampedEntry: lxmfData) else { continue }
                 if stored[preflightTid] != nil { continue }   // duplicate: skip before PoW
 
-                // Require a valid PN stamp at or above minStampCost. validatePnStamp strips the trailing
+                // Require a valid PN stamp at minAcceptedStampCost (max(0, cost - flex), as reference).
+                // validatePnStamp strips the trailing
                 // 32-byte stamp and returns transient_id = full_hash(stampless_entry) — the canonical dedup
                 // key matching the sender (LXMFPropagation.pack) and peer re-sync. Entries with an absent
-                // or under-cost stamp are silently skipped.
-                guard let validated = LXStamper.validatePnStamp(transientData: lxmfData, targetCost: minStampCost) else {
+                // or under-cost stamp are silently skipped. With flexibility at least the target the
+                // acceptance cost is 0: every stamp is valid, but the length rule still applies, as in
+                // reference.
+                guard let validated = LXStamper.validatePnStamp(transientData: lxmfData,
+                                                                targetCost: minAcceptedStampCost) else {
                     continue
                 }
                 guard let dest = LXMFPropagation.destinationHash(lxmfData: validated.lxmfData) else {
@@ -133,7 +181,7 @@ public struct PropagationStore: Equatable {
                 tid = validated.transientId
                 destData = dest
             } else {
-                // minStampCost == 0: accept without stamp validation (backward-compat / test helper path).
+                // targetStampCost == 0: accept without stamp validation (backward-compat / test helper path).
                 // Strip the trailing stamp if present (> destHash(16) + stamp(32) bytes), otherwise use as-is.
                 guard let dest = LXMFPropagation.destinationHash(lxmfData: lxmfData) else { continue }
                 let lxmfCore = LXMFPropagation.strippedCore(lxmfData: lxmfData)

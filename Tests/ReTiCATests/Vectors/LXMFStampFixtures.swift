@@ -6,7 +6,7 @@ struct LXMFStampFixtures: Decodable {
     let timestamp: Double
     let title: String
     let content: String
-    let stampCost: Int
+    let stampCost: Double
     let messageId: String
     let stamp: String
     let workblockHash: String

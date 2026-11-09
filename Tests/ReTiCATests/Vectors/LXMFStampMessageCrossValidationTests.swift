@@ -12,7 +12,7 @@ import Foundation
     #expect(unpacked?.hash == Data(hexString: f.hash)!)                    // hash over payload[:4]
     #expect(unpacked?.content == Data(hexString: f.content)!)
     #expect(unpacked?.validateSignature(source: source) == true)
-    #expect(unpacked?.validateStamp(targetCost: f.stampCost) == true)
+    #expect(unpacked?.validateStamp(targetCost: Double(f.stampCost)) == true)
 }
 
 @Test func stampAttachmentMatchesReferenceBytes() throws {
@@ -30,7 +30,7 @@ import Foundation
 
 @Test func generatedStampRoundTrips() async throws {
     let source = Identity()
-    let cost = 4
+    let cost: Double = 4
     let base = LXMessage.create(source: source,
                                 destinationHash: LXMessage.deliveryHash(identityHash: Identity().hash),
                                 timestamp: 1700000000.5, title: Data("t".utf8), content: Data("c".utf8))

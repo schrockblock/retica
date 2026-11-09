@@ -10,7 +10,7 @@ import ComposableArchitecture
 /// actions on construction and these tests only care about `ignoredDestinations` and delivery.
 @MainActor
 func makeIgnoreListStore(
-    deliveryStampCost: Int? = nil,
+    deliveryStampCost: Double? = nil,
     enforceDeliveryStamps: Bool = false,
     ignored: Set<Data> = []
 ) -> TestStore<LXMFNode.State, LXMFNode.Action> {
@@ -180,7 +180,7 @@ func deliveredHash(_ store: TestStore<LXMFNode.State, LXMFNode.Action>,
 /// setup for a non-ignored sender proves the stamp path still runs when the set is non-empty.
 /// (That the guard sits before the stamp work is a cost property, not observable here.)
 @MainActor @Test func ignoreList_ignoredSource_droppedEvenWhenStampPathWouldDeliver() async {
-    let cost = 8
+    let cost: Double = 8
     let seed = Data(repeating: 0x11, count: 32) + Data(repeating: 0x22, count: 32)
     let sender = Identity(privateKey: seed)!
     let base = ignoreListMessage(from: sender)

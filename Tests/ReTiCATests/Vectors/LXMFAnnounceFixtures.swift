@@ -2,7 +2,7 @@ import Foundation
 
 struct LXMFAnnounceFixture: Decodable {
     let displayName: String?
-    let stampCost: Int?
+    let stampCost: Double?
     let supportsCompression: Bool
     let packed: String
 

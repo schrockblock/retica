@@ -44,12 +44,14 @@ public struct LXMFNode {
     public struct LearnedPeer: Equatable, Sendable {
         /// Display name from the peer's announce app-data, or nil if absent.
         public var displayName: String?
-        /// Stamp cost the peer advertised, or nil.
+        /// Stamp cost the peer advertised, or nil. Fractional since LXMF 1.3.0.
         ///
         /// **Unauthenticated, potentially hostile.** See the note on this struct and on
-        /// `LXMFAnnounceData.stampCost` before acting on this value. Treat it as bounded only by
-        /// `Int.max`; it has NOT been validated against any ceiling here.
-        public var stampCost: Int?
+        /// `LXMFAnnounceData.stampCost` before acting on this value. A value parsed from an announce
+        /// is in `0 < cost < 100` (`LXMFAnnounceData.parse` gates it), but this initializer is public
+        /// and a host restoring persisted rows can put anything here; it has NOT been validated
+        /// against the outbound ceiling.
+        public var stampCost: Double?
         /// Whether the peer's announce indicates compression support.
         public var supportsCompression: Bool
         /// Wall-clock time this entry was last written, from the `\.date` dependency.
@@ -68,7 +70,7 @@ public struct LXMFNode {
         /// path to it was re-learned.
         public var learnedAt: Date
 
-        public init(displayName: String?, stampCost: Int?, supportsCompression: Bool, learnedAt: Date) {
+        public init(displayName: String?, stampCost: Double?, supportsCompression: Bool, learnedAt: Date) {
             self.displayName = displayName
             self.stampCost = stampCost
             self.supportsCompression = supportsCompression
@@ -184,10 +186,11 @@ public struct LXMFNode {
         /// LXMF 1.1.0 LXMRouter.py:1034-1050 which always calls `msgpack.packb(peer_data)`).
         public var displayName: String?
 
-        /// Delivery stamp cost advertised in every delivery-destination announce.
-        /// Nil or out-of-range values (outside 1...99) are emitted as null per reference's
-        /// `> 0 and < STAMP_COST_CAP` gate (LXMRouter.py:1172-1174, LXMF 1.3.0).
-        public var deliveryStampCost: Int?
+        /// Delivery stamp cost advertised in every delivery-destination announce and demanded of
+        /// inbound messages. Fractional (LXMF 1.3.0). `setDisplayName` keeps it in 1..<100; a value
+        /// written here directly outside reference's `> 0 and < STAMP_COST_CAP` emit gate
+        /// (LXMRouter.py:1172-1174) is announced as null.
+        public var deliveryStampCost: Double?
 
         /// Whether to DROP inbound messages whose stamp fails validation (or is absent) when a
         /// `deliveryStampCost` is configured.
@@ -349,7 +352,7 @@ public struct LXMFNode {
         /// bound straight through to this action would have put one announce on the air per
         /// keystroke. Reference draws the same line: `delivery_destination.display_name = x` is a
         /// plain assignment and `LXMRouter.announce(destination_hash)` is a separate explicit call.
-        case setDisplayName(String?, stampCost: Int?)
+        case setDisplayName(String?, stampCost: Double?)
         /// Announce the delivery destination now, carrying the current `displayName` and
         /// `deliveryStampCost`. Broadcasts on EVERY connected interface with no throttle, so call
         /// it when a change is settled — not on every keystroke of an edit.
@@ -534,8 +537,9 @@ public struct LXMFNode {
     ///
     /// **The trade this ceiling makes is real, and it is not "we only refuse absurd values".**
     /// Reference sets **no default delivery stamp cost** (`register_delivery_identity(...,
-    /// stamp_cost = None)`, LXMRouter.py:348) and `set_inbound_stamp_cost` accepts **any int in
-    /// 1…254** (LXMRouter.py:378-388). So a perfectly conforming peer may demand 21–254, and we
+    /// stamp_cost = None)`, LXMRouter.py:348) and `set_inbound_stamp_cost` accepts **any int or float
+    /// in 1..<100** (LXMF 1.3.0 LXMRouter.py:444-462; 1…254 in 1.1.0). So a perfectly conforming peer
+    /// may demand anything above 20 and below 100, and we
     /// refuse to stamp for every one of them — those peers, if they `enforce_stamps()`, will drop
     /// our messages. We are choosing bounded CPU over deliverability to that (unbounded-cost) tail.
     /// An earlier version of this comment cited `PROPAGATION_COST + PROPAGATION_COST_FLEX = 19` as
@@ -544,7 +548,9 @@ public struct LXMFNode {
     ///
     /// Refusal, not clamping: a stamp generated below the peer's advertised cost is one that peer
     /// will drop — a silent failure after all that work. Refusing is clean.
-    public static let maxDeliveryStampCost = 20
+    ///
+    /// A Double since peer costs are fractional (LXMF 1.3.0); still 20, and a cost of 20.5 is refused.
+    public static let maxDeliveryStampCost: Double = 20
 
     /// Age at which a `learnedPeers` entry is swept. Matches reference's
     /// `STAMP_COST_EXPIRY = 45 * 24 * 60 * 60` (LXMRouter.py:39, LXMF 1.1.0).
@@ -587,13 +593,13 @@ public struct LXMFNode {
     public struct StampJob: Equatable, Sendable {
         public enum Work: Equatable, Sendable {
             /// The delivery stamp at `cost`; the stamped message goes to the router with `method`.
-            case delivery(method: LXMFRouter.DeliveryMethod, cost: Int)
+            case delivery(method: LXMFRouter.DeliveryMethod, cost: Double)
             /// A propagated copy: the delivery stamp at `deliveryCost` (none when nil), then packed for
             /// the propagation node with a stamp at the node's cost as read when the job STARTS
             /// (reference reads `get_outbound_propagation_cost` in `process_deferred_stamps`,
             /// LXMRouter.py:3003). `explicit`: a `.sendViaPropagation`, which reports phases;
             /// otherwise a fallback copy, which does not.
-            case propagated(explicit: Bool, deliveryCost: Int?, recipient: Identity, timestamp: Double)
+            case propagated(explicit: Bool, deliveryCost: Double?, recipient: Identity, timestamp: Double)
         }
         public let serial: Int
         public let message: LXMessage
@@ -806,41 +812,46 @@ public struct LXMFNode {
                 state.displayName = name
                 // Range-sanitise the cost HERE, because this is the only write to the field that the
                 // whole inbound half keys on. Reference does it in the same place —
-                // `set_inbound_stamp_cost` (LXMRouter.py:378-392, LXMF 1.1.0):
+                // `set_inbound_stamp_cost` (LXMF 1.3.0 LXMRouter.py:444-462), the same rule for an int
+                // and a float:
                 //
                 //     if stamp_cost == None:  stamp_cost = None; return True
-                //     elif type(stamp_cost) == int:
+                //     elif type(stamp_cost) == int (or float):
                 //         if   stamp_cost < 1:   stamp_cost = None
-                //         elif stamp_cost < 255: stamp_cost = stamp_cost
+                //         elif stamp_cost < cap: stamp_cost = stamp_cost      # cap = 100
                 //         else:                  return False      # rejected, previous value KEPT
+                //
+                // So a fractional cost is kept exactly (99.5 is accepted), anything below 1 —
+                // including 0.5, 0, negatives and -infinity — clears the cost, and 100, +infinity and
+                // NaN are rejected with the previous cost kept. NaN takes the `default` arm because
+                // both comparisons are false for it, as both are false in reference.
                 //
                 // Storing the raw value made the announce and the enforcement disagree, because
                 // `LXMFAnnounceData.pack` already applies reference's emit gate (`> 0` and below the
-                // cap, see below). Measured, on this reducer:
+                // cap). Measured, on this reducer, before this sanitising existed:
                 //   • cost 0  — announced as "no cost required", yet `validateStamp(targetCost: 0)`
-                //     is reached for every inbound message and returns false for an ABSENT stamp
-                //     (`guard let stamp else { return false }`, LXMessage.swift:167), so with
+                //     was reached for every inbound message and returned false for an ABSENT stamp
+                //     (`guard let stamp else { return false }` in `LXMessage.validateStamp`), so with
                 //     enforcement on we dropped every message from every conforming peer.
-                //   • cost -1 — `stampValid` is `stampValue >= targetCost` (LXStamper.swift:57-58)
-                //     and a bit count is never negative, so an all-0xFF stamp validated. We reported
-                //     `stampValid == true` to the app: a false trust signal, the worst outcome here.
+                //   • cost -1 — at a negative cost every stamp is valid (the fixed-point target
+                //     clamps to cost 0, as reference's `cost_to_fp` does), so an all-0xFF stamp
+                //     validated. We reported `stampValid == true` to the app: a false trust signal,
+                //     the worst outcome here.
                 //
-                // The upper bound is RNS 1.6.0's `Transport.STAMP_COST_CAP` (100), and LXMF 1.3.0's
-                // `set_inbound_stamp_cost` (LXMRouter.py:444-462) compares STRICTLY:
-                // `elif stamp_cost < cap: ... else: return False`. So 99 is the highest accepted
-                // cost and 100 itself is rejected. (The 255 bound above was LXMF 1.1.0's.) A host
-                // advertising 101...254 made every reference sender fail: `generate_stamp` raises
-                // ValueError above the cap (RNS/Stamps.py:255).
+                // The upper bound is RNS 1.6.0's `Transport.STAMP_COST_CAP` (100), compared STRICTLY,
+                // so 100 itself is rejected (LXMF 1.1.0's bound was 255). A host advertising more
+                // than 100 made every reference sender fail: `generate_stamp` raises ValueError above
+                // the cap (RNS/Stamps.py:255).
                 //
                 // A rejected cost keeps the previous cost rather than clearing it, exactly as
                 // reference's `return False` leaves `delivery_destination.stamp_cost` untouched.
                 // Silently disabling a configured cost because a later call was out of range would
                 // be a downgrade an attacker-influenced settings value could trigger.
                 switch stampCost {
-                case .none:                                                  state.deliveryStampCost = nil
-                case let .some(c) where c < 1:                               state.deliveryStampCost = nil
-                case let .some(c) where c < NetworkStamp.stampCostCap:       state.deliveryStampCost = c
-                default:                                                     break    // rejected; previous value kept
+                case .none:                                                       state.deliveryStampCost = nil
+                case let .some(c) where c < 1:                                    state.deliveryStampCost = nil
+                case let .some(c) where c < Double(NetworkStamp.stampCostCap):    state.deliveryStampCost = c
+                default:                                                          break    // rejected; previous value kept
                 }
                 return .none
 
@@ -1668,19 +1679,26 @@ public struct LXMFNode {
 
     /// The propagation stamp cost to work at, or **nil meaning "do not send via this node"**.
     ///
-    /// `ann.targetStampCost` comes from the propagation node's announce app-data, which is
-    /// unauthenticated: any peer can advertise 64, and the search is exponential in the cost, so 64 is
-    /// ~2^64 hash rounds over a 256 KB workblock. Reference reads the same field with no ceiling
-    /// (`LXMRouter.get_outbound_propagation_cost`, LXMRouter.py:421-442; `pn_announce_data_is_valid`
-    /// only checks it is int-able, LXMF.py:238-239) — see `LXMFPropagation.maxPropagationStampCost`
-    /// for the ceiling and why refusing beats clamping.
-    private func propagationStampCost(_ state: State) -> Int? {
+    /// `ann.targetStampCost` comes from the propagation node's announce app-data — element [7][0]
+    /// when present, else [5][0], fractional — which is unauthenticated: any peer can advertise 64,
+    /// and the search is exponential in the cost, so 64 is ~2^64 hash rounds over a 256 KB workblock.
+    ///
+    /// Reference (`get_outbound_propagation_cost`, LXMF 1.3.0 LXMRouter.py:494-519) clamps the value
+    /// to `max(0, min(cost, STAMP_COST_CAP))`, and by Python's `min`/`max` argument order a NaN comes
+    /// out of that as 0; so do negatives and -infinity. We clamp the same way, then refuse anything
+    /// above `LXMFPropagation.maxPropagationStampCost` (a deliberate divergence: reference has no
+    /// ceiling; see that constant for why refusing beats clamping). So a NaN, negative or -infinite
+    /// cost gives 0 (a stamp at cost 0, which every stamp meets), as reference's does, and +infinity
+    /// gives 100, which we refuse.
+    private func propagationStampCost(_ state: State) -> Double? {
         guard let pn = state.router.outboundPropagationNode,
               let appData = state.endpoint.learned[pn]?.appData,
               let ann = PNAnnounce.parse(appData)
         else { return LXMFPropagation.defaultPropagationStampCost }
-        guard ann.targetStampCost <= LXMFPropagation.maxPropagationStampCost else { return nil }
-        return ann.targetStampCost
+        let raw = ann.targetStampCost
+        let cost = raw.isNaN ? 0 : min(max(raw, 0), Double(NetworkStamp.stampCostCap))
+        guard cost <= LXMFPropagation.maxPropagationStampCost else { return nil }
+        return cost
     }
 
     /// The configured propagation node's per-transfer limit in bytes, or nil when unknown.
@@ -1767,26 +1785,26 @@ public struct LXMFNode {
     }
 
     /// The delivery stamp cost to apply when sending to `destinationHash`, or **nil meaning
-    /// "no stamp"** (either no cost is known or the announced cost exceeds the ceiling).
+    /// "no stamp"** (no cost is known, the cost is outside reference's gate, or it exceeds the
+    /// ceiling). Fractional: a peer's 8.5 is searched at 8.5.
     ///
     /// `peer.stampCost` comes from the `lxmf.delivery` announce app-data, which is unauthenticated:
     /// any reachable peer can advertise any value. The search is exponential — 64 is ~2^64 rounds
     /// over a 768 KB (3000-round) workblock — so the ceiling is mandatory. See
     /// `LXMFNode.maxDeliveryStampCost` for the ceiling and why refusing beats clamping.
     ///
-    /// A cost of 0 is treated as "no stamp required", matching reference's own emit gate at
-    /// `get_announce_app_data` (LXMRouter.py:1172-1174, LXMF 1.3.0): it only emits a stamp_cost when
-    /// `> 0 and < STAMP_COST_CAP`,
-    /// so 0 in `outbound_stamp_costs` means "peer said no cost", and `handle_outbound`
-    /// (LXMRouter.py:1752-1757) only calls `get_stamp()` when `stamp_cost != None` — a 0 stored
-    /// there would still trigger the search, but no conforming peer emits 0, so in practice 0 means
-    /// the field was absent. We map it explicitly: cost=0 → no stamp.
-    private func deliveryStampCost(_ state: State, destinationHash: Data) -> Int? {
+    /// The cost must also pass `LXStamper.costInRange` (`0 < cost < 100`; false for NaN and
+    /// infinities). `LXMFAnnounceData.parse` already applies it, but `learnedPeers` is also written
+    /// by `.rehydrateLearnedPeers` from host storage, so it is checked again here, where the search
+    /// starts. A cost of 0 means "no stamp required", matching reference's emit gate at
+    /// `get_announce_app_data` (LXMRouter.py:1172-1174, LXMF 1.3.0): a conforming peer never emits 0.
+    /// A negative cost gets no stamp, where reference's `generate_stamp` raises (RNS/Stamps.py:255).
+    private func deliveryStampCost(_ state: State, destinationHash: Data) -> Double? {
         guard let peer = state.learnedPeers[destinationHash],
               let cost = peer.stampCost,
-              cost > 0
+              LXStamper.costInRange(cost),
+              cost <= LXMFNode.maxDeliveryStampCost
         else { return nil }
-        guard cost <= LXMFNode.maxDeliveryStampCost else { return nil }
         return cost
     }
 
@@ -1876,7 +1894,7 @@ public struct LXMFNode {
     /// When the node now advertises a cost we refuse (or above our ceiling), the job fails without
     /// searching (reference fails the message when the cost is unknown) and the next job starts.
     private func startStampJob(_ state: inout State, _ job: StampJob) -> Effect<Action> {
-        let propagationCost: Int
+        let propagationCost: Double
         if case .propagated = job.work {
             guard let cost = propagationStampCost(state) else {
                 return .merge(failStampJob(&state, job), startNextStampJob(&state))

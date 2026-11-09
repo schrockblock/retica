@@ -126,8 +126,8 @@ private let pnProbe = LXMFNode.Action.endpoint(.delegate(.resourceConcluded(link
                                                                             resourceHash: Data(repeating: 0x11, count: 32))))
 
 @MainActor
-private func pnNode(limitKB: Int, stampCost: Int, clock: TestClock<Duration> = TestClock(),
-                    deliveryStampCost: Int? = nil) -> (TestStore<LXMFNode.State, LXMFNode.Action>, Identity) {
+private func pnNode(limitKB: Int, stampCost: Double, clock: TestClock<Duration> = TestClock(),
+                    deliveryStampCost: Double? = nil) -> (TestStore<LXMFNode.State, LXMFNode.Action>, Identity) {
     let recipient = Identity()
     var state = LXMFNode.State(identity: Identity(),
                                endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
@@ -188,10 +188,10 @@ private func stallTheDeliveryCopy(_ store: TestStore<LXMFNode.State, LXMFNode.Ac
 // then dropped. The assertions open the copy as the recipient would.
 
 /// Small enough that real searches take well under a second.
-private let cheapCost = 2
+private let cheapCost: Double = 2
 /// MeshChatX's default. High enough that random bytes pass 1 time in 256: at `cheapCost` they pass 1
 /// in 4, and a garbage stamp survived these tests that way.
-private let deliveryCost = 8
+private let deliveryCost: Double = 8
 
 /// Wait for the copy handed to the router and open it with the recipient's key.
 @MainActor

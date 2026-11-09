@@ -29,9 +29,9 @@ import Foundation
     }
 }
 
-// MARK: — Stamp cost gate (strict both ends: > 0 && < 255)
+// MARK: — Stamp cost gate (strict both ends: > 0 && < 100)
 
-/// Cost 0 is below the gate: must advertise as nil (reference: `> 0 and < 255`).
+/// Cost 0 is below the gate: must advertise as nil (reference: `> 0 and < STAMP_COST_CAP`, cap 100).
 @Test func lxmfAnnounceDataStampCostZeroAdvertisesAsNil() {
     let packed = LXMFAnnounceData.pack(displayName: nil, stampCost: 0)
     let result = LXMFAnnounceData.parse(packed)
@@ -66,18 +66,37 @@ import Foundation
 /// 100 and above advertise as nil. A reference sender cannot stamp at a cost above 100
 /// (`generate_stamp` raises), so advertising one would make us undeliverable.
 @Test func lxmfAnnounceDataStampCostAtAndAboveTheCapAdvertisesAsNil() {
-    for cost in [100, 101, 254] {
+    for cost: Double in [100, 101, 254, .nan, .infinity, -.infinity, -1, 0] {
         let parsed = LXMFAnnounceData.parse(LXMFAnnounceData.pack(displayName: nil, stampCost: cost))
         #expect(parsed != nil)
         #expect(parsed?.stampCost == nil, "cost \(cost) must not be advertised")
     }
 }
 
-/// The parser applies no cap to a PEER's advertised cost, as LXMF 1.3.0's `stamp_cost_from_app_data`
-/// (LXMF.py:183-199) returns `peer_data[1]` verbatim. A hand-built 101 survives parsing.
-@Test func lxmfAnnounceDataParseDoesNotCapAPeersAdvertisedCost() {
+/// The parser surfaces a PEER's cost only inside reference's emit gate (`0 < cost < 100`). This
+/// narrows LXMF 1.3.0's `stamp_cost_from_app_data` (LXMF.py:183-199), which returns the element
+/// verbatim, so reference reads a hand-built 101 as 101 (cross-validated in
+/// LXMFFractionalCostAppDataCrossValidationTests); we read nil, and send no stamp, as we would for
+/// any cost above our outbound ceiling.
+@Test func lxmfAnnounceDataParseNarrowsAPeersAdvertisedCostToTheGate() {
     let blob = MsgPack.encode(.array([.null, .uint(101), .array([.uint(0)])]))
-    #expect(LXMFAnnounceData.parse(blob)?.stampCost == 101)
+    #expect(LXMFAnnounceData.parse(blob)?.stampCost == nil)
+    let inside = MsgPack.encode(.array([.null, .uint(99), .array([.uint(0)])]))
+    #expect(LXMFAnnounceData.parse(inside)?.stampCost == 99)
+}
+
+/// A fractional cost round-trips exactly, on the 1/256 grid, in element [3] as a float64, with its
+/// ceiling in element [1] (LXMRouter.py:1179).
+@Test func lxmfAnnounceDataFractionalCostRoundTripsAndCarriesItsCeiling() throws {
+    let packed = LXMFAnnounceData.pack(displayName: nil, stampCost: 8.5)
+    guard case let .array(items)? = MsgPack.decodeValue(packed) else { Issue.record("not an array"); return }
+    try #require(items.count == 4)              // require: the index reads below would trap
+    #expect(items[1] == .uint(9))
+    #expect(items[3] == .double(8.5))
+    #expect(LXMFAnnounceData.parse(packed)?.stampCost == 8.5)
+    // Off the grid: quantized half up, as reference's quantize_cost.
+    #expect(LXMFAnnounceData.parse(LXMFAnnounceData.pack(displayName: nil, stampCost: 13.3))?.stampCost
+            == 13.30078125)
 }
 
 // MARK: — Pre-0.5.0 legacy format (first byte outside 0x90-0x9F / 0xDC)
@@ -182,13 +201,12 @@ import Foundation
     #expect(LXMFAnnounceData.parse(blob) == nil)
 }
 
-/// A stamp cost of UInt64.max is REJECTED (surfaces as nil), not truncated, and does not trap.
+/// A stamp cost of UInt64.max is REJECTED (surfaces as nil) and does not trap.
 ///
 /// Both halves of the name are asserted:
-/// - "without trapping" — the test reaching its assertions at all is the proof; `Int(_:)` on
-///   UInt64.max aborts the process, so a regression here kills the run rather than failing.
-/// - "rejected" — `stampCost == nil`. This is the load-bearing assertion and the one that
-///   distinguishes `Int(exactly:)` from a truncating conversion, which would yield -1.
+/// - "without trapping" — the test reaching its assertions at all is the proof.
+/// - "rejected" — `stampCost == nil`: the value, read as a Double, is outside the `0 < cost < 100`
+///   gate (`LXStamper.costInRange`).
 ///
 /// The rest of the struct must still parse: an out-of-range cost degrades that one field,
 /// it does not fail the whole announce.
@@ -198,7 +216,7 @@ import Foundation
     let blob = Data([0x93, 0xC0, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x90])
     let result = LXMFAnnounceData.parse(blob)
     #expect(result != nil)                       // the announce still parses
-    #expect(result?.stampCost == nil)            // rejected, NOT truncated to -1
+    #expect(result?.stampCost == nil)            // rejected
     #expect(result?.displayName == nil)          // [0] is null
     #expect(result?.supportsCompression == false) // [2] is an empty list → no SF_COMPRESSION
 }
@@ -288,10 +306,15 @@ import Foundation
 // MARK: — Display-name length bound
 
 /// The name budget when the stamp cost is null: `maxAppDataBytes` (315: 333 left in the packet, less
-/// the 18-byte RNS 1.6 stamp extension reserved for when the host stamps announces) minus 6 bytes of
-/// non-name overhead (fixarray header + 2-byte bin8 header + null cost + 2-byte functionality array)
-/// minus the 1 byte the bin header grows by above 255 name bytes = 308 UTF-8 bytes.
-private let nameBudgetWithNullCost = 308
+/// the 18-byte RNS 1.6 stamp extension reserved for when the host stamps announces) minus 7 bytes of
+/// non-name overhead (fixarray header + 2-byte bin8 header + null ceiling + 2-byte functionality
+/// array + null fractional cost) minus the 1 byte the bin header grows by above 255 name bytes = 307
+/// UTF-8 bytes.
+private let nameBudgetWithNullCost = 307
+
+/// With a cost, [1] is a one-byte ceiling (at most 100) and [3] a 9-byte float64: 8 bytes more than
+/// the two nulls, so 299.
+private let nameBudgetWithCost = 299
 
 @Test func lxmfAnnounceDataReservesTheStampExtension() {
     #expect(LXMFAnnounceData.maxAppDataBytes == 333 - NetworkStamp.extensionLength)
@@ -332,30 +355,30 @@ private let nameBudgetWithNullCost = 308
     #expect(parsed.displayName == name)
 }
 
-/// The largest cost `pack` emits is 99 (cap 100, strict), which msgpack encodes in one byte, as
-/// null does. So the name budget with the highest emittable cost equals the null-cost budget. (A
-/// cost above 127 would take two bytes, but `pack` no longer emits one; `displayNameBudget` still
-/// measures the encoding rather than assuming it.)
+/// The largest cost `pack` emits rounds to at most 100, so its ceiling takes one msgpack byte, but
+/// the LXMF 1.3.0 fractional element [3] adds a float64, so the name budget with a cost is
+/// `nameBudgetWithCost`, 8 bytes under the null-cost one. `displayNameBudget` measures the
+/// encoding rather than assuming it.
 ///
-/// Anti-vacuity: asserts the packed size fits AND that exactly the null-cost budget of name bytes
-/// survived AND that the cost itself round-trips.
-@Test func lxmfAnnounceDataPackKeepsTheNullCostNameBudgetForTheHighestEmittableCost() throws {
+/// Anti-vacuity: asserts the packed size fits exactly AND that exactly the with-cost budget of name
+/// bytes survived AND that the cost itself round-trips.
+@Test func lxmfAnnounceDataPackShrinksTheNameBudgetForACost() throws {
     let name = String(repeating: "C", count: 400)
-    let packed = LXMFAnnounceData.pack(displayName: name, stampCost: 99)
+    let packed = LXMFAnnounceData.pack(displayName: name, stampCost: 99.5)
 
-    #expect(packed.count <= LXMFAnnounceData.maxAppDataBytes)
+    #expect(packed.count == LXMFAnnounceData.maxAppDataBytes)
     let parsed = try #require(LXMFAnnounceData.parse(packed))
     let recovered = try #require(parsed.displayName)
-    #expect(recovered.utf8.count == nameBudgetWithNullCost)
-    #expect(parsed.stampCost == 99)
+    #expect(recovered.utf8.count == nameBudgetWithCost)
+    #expect(parsed.stampCost == 99.5)
 }
 
 /// Truncation must cut on an extended grapheme cluster boundary. A byte-wise cut lands inside the
 /// family emoji's ZWJ sequence, producing invalid UTF-8 that reference's `dn.decode("utf-8")`
 /// (LXMF.py:165) rejects — the peer would then see NO name rather than a shortened one.
 ///
-/// 300 ASCII bytes + a 25-byte emoji = 325, over the 308-byte budget; a byte-wise cut at 308 would
-/// keep 8 bytes of the emoji.
+/// 300 ASCII bytes + a 25-byte emoji = 325, over the 307-byte budget; a byte-wise cut at 307 would
+/// keep 7 bytes of the emoji.
 ///
 /// Anti-vacuity: `try #require` on the recovered name fails outright if the blob decodes to
 /// nothing, which is exactly what a mid-scalar cut produces.
@@ -374,17 +397,18 @@ private let nameBudgetWithNullCost = 308
 /// A multi-BYTE scalar straddling the budget must be dropped whole. Distinct from the cluster test
 /// above: here the cut point falls mid-scalar, the case that produces invalid UTF-8 directly.
 @Test func lxmfAnnounceDataPackDropsAStraddlingMultiByteScalarWhole() throws {
-    // "é" is 2 UTF-8 bytes. One leading ASCII byte makes the boundary odd, so the scalar that would
-    // reach byte 308 starts at 308 and ends at 309 — i.e. it straddles.
-    let name = "E" + String(repeating: "é", count: 200)
+    // "é" is 2 UTF-8 bytes and the budget (307) is odd, so the scalar that would reach byte 307
+    // starts at 307 and ends at 308 — i.e. it straddles.
+    #expect(nameBudgetWithNullCost % 2 == 1)    // pins the parity this test depends on
+    let name = String(repeating: "é", count: 200)
     let packed = LXMFAnnounceData.pack(displayName: name, stampCost: nil)
 
     #expect(packed.count <= LXMFAnnounceData.maxAppDataBytes)
     let parsed = try #require(LXMFAnnounceData.parse(packed))
     let recovered = try #require(parsed.displayName, "a mid-scalar cut yields undecodable UTF-8")
-    // 1 + 2n <= 308 → n = 153, total 307 bytes; the 154th "é" would have straddled 308.
-    #expect(recovered == "E" + String(repeating: "é", count: 153))
-    #expect(recovered.utf8.count == 307)
+    // 2n <= 307 → n = 153, total 306 bytes; the 154th "é" would have straddled 307.
+    #expect(recovered == String(repeating: "é", count: 153))
+    #expect(recovered.utf8.count == 306)
 }
 
 /// End-to-end: a 400-character name must produce an announce packet that actually PACKS, with the
@@ -429,8 +453,8 @@ private let nameBudgetWithNullCost = 308
 
 /// A NEGATIVE signed stamp cost is surfaced as nil. DELIBERATE, documented divergence: reference
 /// returns `peer_data[1]` verbatim, negatives included. Pinned as a test so the divergence is a
-/// decision rather than an accident — no caller acts on a parsed cost yet, and nil is the same
-/// decision a caller would make for a negative anyway.
+/// decision rather than an accident: it is outside the `0 < cost < 100` gate, and reference's own
+/// `generate_stamp` refuses a negative cost (RNS/Stamps.py:255), so it would send no stamp either.
 @Test func lxmfAnnounceDataParsesANegativeStampCostAsNil() throws {
     // [null, int8(-1), [0]] — 0xD0 0xFF is int8(-1).
     let blob = Data([0x93, 0xC0, 0xD0, 0xFF, 0x91, 0x00])

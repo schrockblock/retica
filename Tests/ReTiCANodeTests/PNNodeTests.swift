@@ -6,10 +6,10 @@ import ComposableArchitecture
 @testable import ReTiCAInterfaces
 @testable import ReTiCATransport
 
-private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCost: Int = 4) -> TestStore<PNNode.State, PNNode.Action> {
+private func makeStore(_ pnIdentity: Identity, peeringCost: Double = 0, targetStampCost: Double = 4) -> TestStore<PNNode.State, PNNode.Action> {
     let store = TestStore(initialState: PNNode.State(
         identity: pnIdentity, endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false),
-        minStampCost: minStampCost, peeringCost: peeringCost)
+        targetStampCost: targetStampCost, peeringCost: peeringCost)
     ) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
@@ -22,20 +22,25 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
 /// A propagation node MUST advertise the stamp cost it enforces. Reference clients treat an
 /// advertised 0 as "unavailable" (LXMRouter.py:428 — `if not target_propagation_cost`) and fail
 /// the send outright, so advertising 0 while enforcing 16 breaks every reference client.
-@Test @MainActor func pnNodeAdvertisesTheStampCostItEnforces() async {
+///
+/// Fractional (LXMF 1.3.0): the exact target, flexibility and peering cost go in element [7], their
+/// ceilings in [5]. Anti-vacuity: none of the three is an integer or a default, so advertising the
+/// ceiling, 0, or a constant in place of any of them fails.
+@Test @MainActor func pnNodeAdvertisesTheStampCostItEnforces() async throws {
     let identity = Identity()
-    let enforced = 18                                     // deliberately not the default
+    let enforced = 18.5                                   // deliberately not the default
     let store = TestStore(
         initialState: PNNode.State(identity: identity,
                                    endpoint: TCPEndpoint.State(host: "h", port: 1, reconnectOnDrop: false),
-                                   minStampCost: enforced)
+                                   targetStampCost: enforced, stampCostFlexibility: 2.25, peeringCost: 7.75)
     ) { PNNode() } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
         $0.uuid = .incrementing
     }
     store.exhaustivity = .off
 
-    #expect(store.state.node.store.minStampCost == enforced)
+    #expect(store.state.node.store.targetStampCost == enforced)
+    #expect(store.state.node.store.minAcceptedStampCost == 16.25)
 
     let captured = LockIsolated<Data?>(nil)
     await store.send(.registerPropagation)
@@ -44,8 +49,15 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
         return false
     }
 
-    let announced = PNAnnounce.parse(captured.value!)
-    #expect(announced?.targetStampCost == enforced)
+    let blob = try #require(captured.value)
+    let announced = try #require(PNAnnounce.parse(blob))
+    #expect(announced.targetStampCost == enforced)
+    #expect(announced.stampCostFlexibility == 2.25)
+    #expect(announced.peeringCost == 7.75)
+    guard case let .array(items)? = MsgPack.decodeValue(blob) else { Issue.record("not an array"); return }
+    try #require(items.count == 8)                        // require: the index reads below would trap
+    #expect(items[5] == .array([.uint(19), .uint(3), .uint(8)]))
+    #expect(items[7] == .array([.double(18.5), .double(2.25), .double(7.75)]))
 }
 
 /// A propagation node MUST advertise propagation limits a peer can actually act on. These fields are
@@ -82,7 +94,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
             // No OTHER announce field may change as a side effect of this fix.
             #expect(announced.timebase == 1700000000)
             #expect(announced.nodeState == true)
-            #expect(announced.targetStampCost == store.state.node.store.minStampCost)
+            #expect(announced.targetStampCost == store.state.node.store.targetStampCost)
             #expect(announced.stampCostFlexibility == 0)
             #expect(announced.peeringCost == store.state.peeringCost)
             #expect(announced.metadata == .map([]))
@@ -231,7 +243,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
 /// Initiator generates a peering key valid at the peer's cost and puts it in the /offer.
 @Test @MainActor func pnNodeInitiatorGeneratesValidPeeringKey() async {
     let aIdentity = Identity(); let peerIdentity = Identity()
-    let cost = 8
+    let cost: Double = 8
     let peerDest = Data(repeating: 0xD0, count: 16); let linkID = Data(repeating: 0xD1, count: 16)
     var initial = PNNode.State(identity: aIdentity, endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
@@ -274,7 +286,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     let (container, tid) = await LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)!
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), minStampCost: 4)
+    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), targetStampCost: 4)
     _ = initial.node.store.ingest(container: container)
     initial.offerLinks[linkID] = [tid]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
@@ -302,7 +314,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     let (container, tid) = await LXMFPropagation.pack(message: msg, recipientIdentity: recipient, timestamp: 1700000000.5, stampCost: 4)!
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
-    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), minStampCost: 4)
+    var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), targetStampCost: 4)
     _ = initial.node.store.ingest(container: container)
     initial.offerLinks[linkID] = [tid]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
@@ -347,7 +359,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
 /// Responder validates the offer's peering key at the configured cost: a valid key is accepted (wanted response).
 @Test @MainActor func pnNodeOfferAcceptedWithValidPeeringKey() async {
     let pnIdentity = Identity(); let peer = Identity()
-    let cost = 8
+    let cost: Double = 8
     let peeringId = pnIdentity.hash + peer.hash                       // responder-first: responder + initiator
     let key = await LXStamper.generatePeeringKey(peeringId: peeringId, targetCost: cost)!
     let offerPath = Crypto.truncatedHash(Data("/offer".utf8))
@@ -428,7 +440,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Int = 0, minStampCos
     // contaminate the queue. The handler under test only needs the pending entry as a precondition.
     var initial = PNNode.State(identity: Identity(),
                                endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false),
-                               minStampCost: 4)
+                               targetStampCost: 4)
     initial.pendingSyncPeers[peerDest] = 3
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock()

@@ -632,8 +632,8 @@ private struct Fixtures: Decodable {
             let parsed = Announce.parse(payload: packet.payload, destinationHash: dest.hash,
                                         contextFlagSet: false, requiredStampValue: 0)
             #expect(parsed?.appData == appData, "stamping \(on): the same name either way")
-            #expect(LXMFAnnounceData.parse(appData)?.displayName?.utf8.count == 308,
-                    "the name budget with the highest emittable (one-byte) cost is 315 - 7")
+            #expect(LXMFAnnounceData.parse(appData)?.displayName?.utf8.count == 299,
+                    "the name budget with a cost (one-byte ceiling plus float64) is 315 - 16")
         }
         #expect(lengths[true] == Packet.mtu, "the budget is exact with the extension")
         #expect(lengths[false] == Packet.mtu - 18)

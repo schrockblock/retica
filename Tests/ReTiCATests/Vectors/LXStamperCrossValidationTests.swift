@@ -18,7 +18,7 @@ import Foundation
 @Test func lxStamperGeneratesValidStamp() async throws {
     // Low cost keeps the search + 768 KB workblock cheap.
     let messageId = Crypto.fullHash(Data("stamp-gen-material".utf8))
-    let cost = 4
+    let cost: Double = 4
     let stamp = await LXStamper.generateStamp(messageId: messageId, targetCost: cost)!
     #expect(stamp.count == LXStamper.stampSize)
     let wb = LXStamper.stampWorkblock(material: messageId)
@@ -26,7 +26,7 @@ import Foundation
 }
 
 @Test func generatePnStampRoundTripsValidatePnStamp() async {
-    let lxmData = Data("pn-stamp-gen-material".utf8)
+    let lxmData = Data(String(repeating: "pn-stamp-gen-material ", count: 6).utf8)   // past the 144-byte length rule
     let transientId = Crypto.fullHash(lxmData)
     let stamp = await LXStamper.generatePnStamp(transientId: transientId, targetCost: 4)!
     #expect(stamp.count == LXStamper.stampSize)

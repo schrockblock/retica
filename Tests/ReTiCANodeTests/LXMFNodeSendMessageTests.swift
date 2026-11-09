@@ -11,7 +11,7 @@ private let pnHash = Data(repeating: 0xC0, count: 16)
 @MainActor
 private func makeNode(identity: Identity, seedLearned: Identity?, seedKnownOnly: Identity? = nil,
                       dest: Data, pn: Data?,
-                      pnStampCost: Int = 4, limitKB: Int = 0, deliveryStampCost: Int? = nil,
+                      pnStampCost: Double = 4, limitKB: Int = 0, deliveryStampCost: Double? = nil,
                       _ configure: (inout LXMFNode.State) -> Void = { _ in })
     -> TestStore<LXMFNode.State, LXMFNode.Action> {
     var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))

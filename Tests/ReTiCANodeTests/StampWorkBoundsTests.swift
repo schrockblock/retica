@@ -43,7 +43,7 @@ private let pnHash = Data(repeating: 0xC0, count: 16)
 private let recipientDest = Data(repeating: 0xA1, count: 16)
 
 @MainActor
-private func makePropagationClient(advertisedStampCost: Int) -> TestStore<LXMFNode.State, LXMFNode.Action> {
+private func makePropagationClient(advertisedStampCost: Double) -> TestStore<LXMFNode.State, LXMFNode.Action> {
     var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     ep.transport.learned[recipientDest] = LearnedDestination(
         identity: Identity(), appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),
@@ -129,7 +129,7 @@ private func makePropagationClient(advertisedStampCost: Int) -> TestStore<LXMFNo
 
 /// Pointing the client at a different propagation node also reclaims the work: every in-flight stamp
 /// was sized to the *previous* node's advertised cost, and a stamp below a node's enforced
-/// `minStampCost` is dropped by that node's ingest — so continuing to compute it can only waste the core.
+/// `targetStampCost` is dropped by that node's ingest — so continuing to compute it can only waste the core.
 @MainActor @Test(.timeLimit(.minutes(1))) func lxmfNodeCancelsPropagationStampGenerationWhenTheNodeChanges() async {
     let store = makePropagationClient(advertisedStampCost: LXMFPropagation.maxPropagationStampCost)
     await store.send(.sendViaPropagation(destinationHash: recipientDest, title: Data("t".utf8),
@@ -146,7 +146,7 @@ private let peerDest = Data(repeating: 0xD0, count: 16)
 private let peerLinkID = Data(repeating: 0xD1, count: 16)
 
 @MainActor
-private func makePeeringNode(pendingCostForPeer: Int? = nil) -> TestStore<PNNode.State, PNNode.Action> {
+private func makePeeringNode(pendingCostForPeer: Double? = nil) -> TestStore<PNNode.State, PNNode.Action> {
     var initial = PNNode.State(identity: Identity(),
                                endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false))
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
@@ -213,4 +213,83 @@ private func makePeeringNode(pendingCostForPeer: Int? = nil) -> TestStore<PNNode
     await store.send(.endpoint(.delegate(.requestFailed(linkID: peerLinkID, requestID: Data([1])))))
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(10))
+}
+
+// MARK: - The client's propagation cost: reference's clamp, then our ceiling
+
+/// The cost handed to the propagation-stamp search for each cost a node advertises in element [7]:
+/// reference's `get_outbound_propagation_cost` clamp (`max(0, min(cost, 100))`, LXMRouter.py:518;
+/// NaN comes out as 0 by Python's argument order — outputs cross-validated in
+/// `pnOutboundCostClampMatchesReference`), then our refusal above `maxPropagationStampCost` (20).
+/// So 16.5 is searched at 16.5, 20 at 20, NaN / negatives / -infinity at 0, and 20.25, +infinity
+/// and 1e300 start nothing.
+///
+/// Anti-vacuity: the generator records each cost it is asked for, so a client that took the ceiling,
+/// let NaN through unclamped, or refused 0 / 20 fails.
+@MainActor @Test func lxmfNodeClampsTheAdvertisedPropagationCostAsReferenceDoes() async {
+    let cases: [(Double, Double?)] = [
+        (16.5, 16.5), (20, 20), (.nan, 0), (-1, 0), (-.infinity, 0),
+        (20.25, nil), (.infinity, nil), (1e300, nil),
+    ]
+    for (advertised, expected) in cases {
+        var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        ep.transport.learned[recipientDest] = LearnedDestination(
+            identity: Identity(), appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),
+            hops: 1, nextHop: nil, announceEmitted: 0)
+        ep.transport.learned[pnHash] = LearnedDestination(
+            identity: Identity(),
+            appData: PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
+                                targetStampCost: advertised, stampCostFlexibility: 0, peeringCost: 0).packed,
+            ratchet: nil, interfaceID: InterfaceID("tcp"), hops: 1, nextHop: nil, announceEmitted: 0)
+        var node = LXMFNode.State(identity: Identity(), endpoint: ep)
+        node.router.outboundPropagationNode = pnHash
+        let asked = LockIsolated<[Double]>([])
+        let store = TestStore(initialState: node) { LXMFNode() } withDependencies: {
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
+            $0.continuousClock = TestClock()
+            $0.uuid = .incrementing
+            $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+            $0.lxmfStampGenerator = LXMFStampGenerator(
+                deliveryStamp: { _, _ in nil },
+                propagationPack: { _, _, _, _, cost in
+                    asked.withValue { $0.append(cost) }
+                    return Data("packed".utf8)
+                })
+        }
+        store.exhaustivity = .off
+        await store.send(.sendViaPropagation(destinationHash: recipientDest, title: Data("t".utf8),
+                                             content: Data("x".utf8)))
+        if let expected {
+            await store.receive({ if case .router(.sendViaPropagation) = $0 { return true }; return false },
+                                timeout: .seconds(10))
+            #expect(asked.value == [expected], "advertised \(advertised)")
+        } else {
+            await store.skipReceivedActions(strict: false)
+            #expect(asked.value.isEmpty, "advertised \(advertised): nothing may start")
+        }
+        await store.skipReceivedActions(strict: false)
+    }
+}
+
+/// A peer's peering cost of NaN or below 0 is declined, as reference's key generation would fail
+/// there (`generate_stamped_key` refuses a negative cost, `cost_to_fp` raises on NaN); 0 and 26 are
+/// accepted. `cost <= 26` alone let a negative through.
+@MainActor @Test func pnNodeDeclinesToPeerAtANaNOrNegativePeeringCost() async {
+    for cost: Double in [.nan, -1, -.infinity] {
+        let store = makePeeringNode()
+        await store.send(.syncToPeer(destinationHash: peerDest, peeringCost: cost))
+        #expect(store.state.pendingSyncPeers[peerDest] == nil, "cost \(cost)")
+        store.exhaustivity = .on                       // an `openLink` would fail teardown
+        await store.finish(timeout: .seconds(2))
+
+        let established = makePeeringNode(pendingCostForPeer: cost)
+        await established.send(.endpoint(.delegate(.linkEstablished(linkID: peerLinkID, destinationHash: peerDest))))
+        #expect(established.state.offerLinks[peerLinkID] == nil, "cost \(cost): no offer for a declined peer")
+        established.exhaustivity = .on
+        await established.finish(timeout: .seconds(2))
+    }
+    let zero = makePeeringNode()
+    await zero.send(.syncToPeer(destinationHash: peerDest, peeringCost: 0))
+    #expect(zero.state.pendingSyncPeers[peerDest] == 0)
+    await zero.skipReceivedActions(strict: false)
 }

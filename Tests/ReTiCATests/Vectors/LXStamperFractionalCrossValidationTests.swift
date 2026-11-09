@@ -242,21 +242,28 @@ private func powerOfTwo(_ e: Int, plus delta: Int) -> Data {
     #expect(validated.value >= 8.25 - step)
 }
 
-/// Costs off the wire are untrusted: NaN, infinities, negatives and huge values clamp and never trap.
-/// NaN and anything <= 0 accept every stamp (fixed point 0); +inf and huge clamp to cost 100.
-@Test func hostileCostsClampWithoutTrapping() {
+/// Costs off the wire are untrusted: NaN, infinities, negatives and huge values never trap.
+/// Finite costs clamp: anything <= 0 accepts every stamp (fixed point 0), huge values clamp to cost
+/// 100. A non-finite cost (NaN, +/-infinity) validates nothing and generates nothing, where reference's
+/// `cost_to_fp` raises (`math.floor` of NaN or infinity) and the stamp is not accepted.
+@Test func hostileCostsClampWithoutTrapping() async {
     let material = Crypto.fullHash(Data("hostile".utf8))
     let wb = LXStamper.stampWorkblock(material: material, expandRounds: LXStamper.workblockExpandRoundsPeering)
     let stamp = Data(repeating: 0xFF, count: LXStamper.stampSize)
-    for cost: Double in [.nan, -Double.infinity, -1, -1e300, 0] {
+    for cost: Double in [-1, -1e300, 0] {
         #expect(LXStamper.stampValid(stamp: stamp, targetCost: cost, workblock: wb), "\(cost)")
     }
-    for cost in [Double.infinity, 1e300, 100, 255] {
+    for cost in [Double.nan, .infinity, -.infinity, 1e300, 100, 255] {
         #expect(!LXStamper.stampValid(stamp: stamp, targetCost: cost, workblock: wb), "\(cost)")
         #expect(!LXStamper.validatePeeringKey(peeringId: material, peeringKey: stamp, targetCost: cost))
     }
-    #expect(LXStamper.validatePnStamp(transientData: Data(repeating: 1, count: 200), targetCost: .infinity) == nil)
-    #expect(LXStamper.validatePnStamp(transientData: Data(repeating: 1, count: 200), targetCost: .nan) != nil)
+    for cost in [Double.nan, .infinity, -.infinity] {
+        #expect(LXStamper.validatePnStamp(transientData: Data(repeating: 1, count: 200), targetCost: cost) == nil)
+        #expect(await LXStamper.generatePeeringKey(peeringId: material, targetCost: cost) == nil, "\(cost)")
+    }
+    // A finite cost <= 0 still validates (every stamp meets it), so the non-finite refusal is not a
+    // blanket refusal of the entry.
+    #expect(LXStamper.validatePnStamp(transientData: Data(repeating: 1, count: 200), targetCost: -1) != nil)
 }
 
 // MARK: - Reverse direction: the reference validates OUR fractional stamps (gated)

@@ -4,11 +4,11 @@ struct LXMFPeeringFixtures: Decodable {
     let workblockExpandRoundsPeering: Int
     let workblockExpandRoundsPN: Int
     let peeringId: String
-    let peeringCost: Int
+    let peeringCost: Double
     let peeringKey: String
     let peeringWorkblockHash: String
     let lxmfData: String
-    let pnCost: Int
+    let pnCost: Double
     let pnStamp: String
     let transientData: String
     let transientId: String

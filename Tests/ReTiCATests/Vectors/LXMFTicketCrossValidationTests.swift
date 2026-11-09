@@ -16,7 +16,7 @@ private struct TicketFixtures: Decodable {
         let timestamp: Double
         let title, content, ticket, messageId, stamp, packed: String
     }
-    let targetCost: Int
+    let targetCost: Double
     let costTicket: Int
     let inbound: Inbound
     let outbound: Outbound

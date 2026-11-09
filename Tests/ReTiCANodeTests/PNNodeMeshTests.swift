@@ -32,7 +32,7 @@ import ComposableArchitecture
         let events = AsyncStream<TCPEvent>.makeStream()
         let store = TestStore(initialState: PNNode.State(
             identity: identity, endpoint: TCPEndpoint.State(host: host, port: 4242, reconnectOnDrop: false),
-            minStampCost: 4, peeringCost: host == "b" ? 8 : 0)
+            targetStampCost: 4, peeringCost: host == "b" ? 8 : 0)
         ) { PNNode() } withDependencies: {
             $0.tcpConnection = TCPConnection(open: { _, _ in events.stream },
                                              send: { d in sent.withValue { $0.append(d) } }, close: { })

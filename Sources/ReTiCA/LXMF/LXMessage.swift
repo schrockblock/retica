@@ -7,6 +7,9 @@ import Foundation
 public struct LXMessage: Equatable, Sendable {
     public static let destinationLength = 16      // RNS TRUNCATED_HASHLENGTH/8
     public static let signatureLength = 64        // RNS SIGLENGTH/8
+    /// Reference `LXMF_OVERHEAD = 2*DESTINATION_LENGTH + SIGNATURE_LENGTH + TIMESTAMP_SIZE +
+    /// STRUCT_OVERHEAD` (LXMessage.py:61-63) = 16·2 + 64 + 8 + 8 = 112.
+    public static let lxmfOverhead = 2 * destinationLength + signatureLength + 8 + 8
 
     public let destinationHash: Data              // 16
     public let sourceHash: Data                   // 16
@@ -172,12 +175,6 @@ public struct LXMessage: Equatable, Sendable {
                                     workblock: LXStamper.stampWorkblock(material: hash))
     }
 
-    /// `validateStamp` at an integer cost: the same as passing `Double(targetCost)`.
-    @_disfavoredOverload
-    public func validateStamp(targetCost: Int) -> Bool {
-        validateStamp(targetCost: Double(targetCost))
-    }
-
     // MARK: - Stamp tickets (LXMF 1.3.0)
 
     /// `FIELD_TICKET` (reference `LXMF.py:19`). Its value is `[expires, ticket]`: `expires` a unix
@@ -209,12 +206,6 @@ public struct LXMessage: Equatable, Sendable {
             return true
         }
         return validateStamp(targetCost: targetCost)
-    }
-
-    /// `validateStamp(targetCost:tickets:)` at an integer cost: the same as passing `Double(targetCost)`.
-    @_disfavoredOverload
-    public func validateStamp(targetCost: Int, tickets: [Data]) -> Bool {
-        validateStamp(targetCost: Double(targetCost), tickets: tickets)
     }
 
     /// The `FIELD_TICKET` entry, if this message carries a well-formed one: an array of at least two

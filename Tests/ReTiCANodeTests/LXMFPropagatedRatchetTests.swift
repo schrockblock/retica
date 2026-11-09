@@ -15,7 +15,7 @@ import ComposableArchitecture
 private let dest = Data(repeating: 0xD6, count: 16)
 private let pn = Data(repeating: 0xBC, count: 16)
 private let now = Date(timeIntervalSince1970: 1700000000.5)
-private let cheapCost = 2
+private let cheapCost: Double = 2
 
 private struct Recipient {
     let identity = Identity()

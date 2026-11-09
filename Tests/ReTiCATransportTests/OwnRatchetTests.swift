@@ -360,7 +360,7 @@ private func dataPacket(to dest: Destination, _ plaintext: Data, ratchetPublic: 
         let withoutRatchet = LXMFAnnounceData.pack(displayName: name, stampCost: 99)
         #expect(withRatchet.count == LXMFAnnounceData.maxAppDataBytesWithRatchet)
         #expect(withoutRatchet.count == LXMFAnnounceData.maxAppDataBytes)
-        #expect(LXMFAnnounceData.parse(withRatchet)?.displayName?.utf8.count == 308 - 32)
+        #expect(LXMFAnnounceData.parse(withRatchet)?.displayName?.utf8.count == 299 - 32)   // with a cost
 
         let dest = Destination(kind: .single, direction: .in, appName: "lxmf", aspects: ["delivery"],
                                identity: Identity())!

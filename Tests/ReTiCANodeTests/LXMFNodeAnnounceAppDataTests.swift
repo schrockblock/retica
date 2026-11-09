@@ -12,7 +12,7 @@ import ComposableArchitecture
 private func makeAnnounceStore(
     identity: Identity,
     displayName: String? = nil,
-    stampCost: Int? = nil
+    stampCost: Double? = nil
 ) -> TestStore<LXMFNode.State, LXMFNode.Action> {
     var node = LXMFNode.State(
         identity: identity,
@@ -214,10 +214,37 @@ private func makeAnnounceStore(
     #expect(store.state.deliveryStampCost == nil)        // < 1 → None
     await store.send(.setDisplayName(nil, stampCost: -1))
     #expect(store.state.deliveryStampCost == nil)        // < 1 → None
-    for rejected in [100, 101, 254, 255] {
+    for rejected: Double in [100, 101, 254, 255] {
         await store.send(.setDisplayName(nil, stampCost: rejected))
         #expect(store.state.deliveryStampCost == nil,    // >= cap → rejected, nothing to keep
                 "cost \(rejected) must be rejected")
+    }
+}
+
+/// Fractional and non-finite costs, against reference `set_inbound_stamp_cost` (LXMF 1.3.0
+/// LXMRouter.py:444-462). The expected outcomes are pasted from the `inbound_setter` cases of
+/// `Tests/ReTiCATests/Vectors/lxmf_fractional_cost_app_data_fixtures.json`, which the generator
+/// `generate_lxmf_fractional_cost_app_data_fixtures.py` produced by calling the real setter on a real
+/// router with a previous cost of 42.0: `.stored(x)` is what reference stored, `.kept` that it
+/// refused and kept 42.0.
+///
+/// Anti-vacuity: the previous cost is reset to 42 before every case, so "kept" and "cleared" are
+/// distinguishable, and 99.5 / 99.999 fail an integer-only or `<= 99` gate.
+@MainActor @Test func setDisplayNameMatchesReferenceForFractionalAndNonFiniteCosts() async {
+    enum Outcome: Equatable { case stored(Double?), kept }
+    let cases: [(Double, Outcome)] = [
+        (8, .stored(8)), (8.5, .stored(8.5)), (99.5, .stored(99.5)), (99.999, .stored(99.999)),
+        (1, .stored(1)), (0.5, .stored(nil)), (0, .stored(nil)), (-1, .stored(nil)),
+        (-.infinity, .stored(nil)), (100, .kept), (255, .kept), (.infinity, .kept), (.nan, .kept),
+    ]
+    let store = makeAnnounceStore(identity: Identity())
+    for (cost, outcome) in cases {
+        await store.send(.setDisplayName(nil, stampCost: 42))
+        await store.send(.setDisplayName(nil, stampCost: cost))
+        switch outcome {
+        case let .stored(value): #expect(store.state.deliveryStampCost == value, "cost \(cost)")
+        case .kept:              #expect(store.state.deliveryStampCost == 42, "cost \(cost)")
+        }
     }
 }
 

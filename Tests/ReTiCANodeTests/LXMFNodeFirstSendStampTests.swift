@@ -18,7 +18,7 @@ import ComposableArchitecture
 private let iface = InterfaceID("first-send-iface")
 private let sentAt: TimeInterval = 1700000000.5
 /// MeshChatX's default. A real search stays quick, and random bytes pass only 1 time in 256.
-private let cheapCost = 8
+private let cheapCost: Double = 8
 
 /// Counted in a reducer: with exhaustivity off, `store.send` skips actions before a later `receive`
 /// predicate could see them.
@@ -76,7 +76,7 @@ private let slowCost = LXMFNode.maxDeliveryStampCost
 /// A few seconds of search on a Mac: long enough that a search just started is still running when
 /// the test acts on it, short enough that one the test failed to stop finishes, and shows, within
 /// the test's wait.
-private let quickButNotInstantCost = 14
+private let quickButNotInstantCost: Double = 14
 
 @MainActor
 private func makeNode(_ identity: Identity, _ clock: TestClock<Duration>,
@@ -97,7 +97,7 @@ private func makeNode(_ identity: Identity, _ clock: TestClock<Duration>,
     return store
 }
 
-private func deliveryAnnounce(of peer: Identity, stampCost: Int?) -> Data {
+private func deliveryAnnounce(of peer: Identity, stampCost: Double?) -> Data {
     let dest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
                            aspects: LXMessage.deliveryAspects, identity: peer)!
     let randomHash = Announce.randomHash(now: 1_700_000_000, randomPrefix: Data(repeating: 0x02, count: 5))
@@ -468,7 +468,7 @@ private func waitOutTheCostWait(_ store: TestStoreOf<LXMFNode>, _ clock: TestClo
 /// Deliver the peer's announce and wait until Transport has learned its path: the announce is
 /// checked in an effect, so the state does not show it when `send` returns.
 @MainActor
-private func hearAnnounce(_ store: TestStoreOf<LXMFNode>, of peer: Identity, stampCost: Int?) async {
+private func hearAnnounce(_ store: TestStoreOf<LXMFNode>, of peer: Identity, stampCost: Double?) async {
     await store.send(.endpoint(.transport(.received(iface, deliveryAnnounce(of: peer, stampCost: stampCost)))))
     await store.receive({ action in
         if case .endpoint(.delegate(.pathLearned)) = action { return true }

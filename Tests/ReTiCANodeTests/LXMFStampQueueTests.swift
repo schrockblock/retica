@@ -27,11 +27,11 @@ private final class StampGate: @unchecked Sendable {
     private var startedKeys: [Data] = []
     private var waiters: [Data: CheckedContinuation<Bool, Never>] = [:]
     private var ended: [Data: Bool] = [:]
-    private var costs: [Data: Int] = [:]
+    private var costs: [Data: Double] = [:]
 
     /// True when the test ended the search with a stamp; false when it ended it with none, or the
     /// search was cancelled. `cost` is recorded for `cost(of:)`.
-    func search(_ key: Data, cost: Int = 0) async -> Bool {
+    func search(_ key: Data, cost: Double = 0) async -> Bool {
         await withTaskCancellationHandler {
             await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
                 lock.withLock {
@@ -56,7 +56,7 @@ private final class StampGate: @unchecked Sendable {
     }
 
     var started: [Data] { lock.withLock { startedKeys } }
-    func cost(of key: Data) -> Int? { lock.withLock { costs[key] } }
+    func cost(of key: Data) -> Double? { lock.withLock { costs[key] } }
 
     func waitUntilStarted(_ key: Data) async {
         for _ in 0..<2000 {
@@ -140,7 +140,7 @@ private func makeNode(_ recorder: RecordingNode, delivery: StampGate, propagatio
     return store
 }
 
-private func pnAppData(cost: Int) -> Data {
+private func pnAppData(cost: Double) -> Data {
     PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
                targetStampCost: cost, stampCostFlexibility: 0, peeringCost: 0).packed
 }
@@ -148,7 +148,7 @@ private func pnAppData(cost: Int) -> Data {
 /// The propagation node re-announces, now advertising `cost`.
 @MainActor
 private func hearPropagationNode(_ store: TestStoreOf<RecordingNode>, _ dest: Destination, identity: Identity,
-                                 cost: Int) async {
+                                 cost: Double) async {
     let iface = InterfaceID("queue-iface")
     let randomHash = Announce.randomHash(now: 1_700_000_000, randomPrefix: Data(repeating: 0x06, count: 5))
     let payload = Announce.buildPayload(identity: identity, destinationHash: dest.hash, nameHash: dest.nameHash,

@@ -23,7 +23,7 @@ extension LXMFPropagation {
     /// agreement is force-unwrapped (see `Identity.encrypt`).
     public static func pack(message: LXMessage, recipientIdentity: Identity, ratchet: Data? = nil,
                             timestamp: Double,
-                            stampCost: Int = LXMFPropagation.defaultPropagationStampCost) async
+                            stampCost: Double = LXMFPropagation.defaultPropagationStampCost) async
         -> (propagationPacked: Data, transientId: Data)? {
         let entry = stamplessEntry(message: message, recipientIdentity: recipientIdentity, ratchet: ratchet,
                                    ephemeralPrivateKey: SecureRandom.bytes(32), iv: SecureRandom.bytes(16))

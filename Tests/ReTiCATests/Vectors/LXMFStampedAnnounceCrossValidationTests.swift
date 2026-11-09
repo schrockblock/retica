@@ -7,9 +7,10 @@ import Foundation
 // Fixtures come from generate_lxmf_stamped_announce_fixtures.py, which drives a real LXMRouter and
 // Destination.announce(send=False), then records what the reference's own helpers read back.
 //
-// The costs: reference reports a fractional cost (8.5). `stampCost` is an Int, and we surface the
-// CEILING, which is what reference itself publishes for clients that only read the integer element
-// (LXMRouter.py:1179). A stamp at the ceiling always satisfies the fractional target.
+// The costs: reference reports a fractional cost (8.5), and so do we, exactly (`stampCost` and
+// `targetStampCost` are Doubles). Every cost in these fixtures is inside reference's emit gate
+// (0 < cost < 100), so the delivery parse's narrowing to that gate does not apply here; the
+// hostile cases are in LXMFFractionalCostAppDataCrossValidationTests.
 
 private struct DeliveryCase: Decodable {
     let packed: String
@@ -50,14 +51,14 @@ private struct Fixtures: Decodable {
 private func expectMatchesReference(_ c: DeliveryCase, sourceLocation: SourceLocation = #_sourceLocation) throws {
     let parsed = try #require(LXMFAnnounceData.parse(Data(hexString: c.packed)!), sourceLocation: sourceLocation)
     #expect(parsed.displayName == c.display_name, sourceLocation: sourceLocation)
-    #expect(parsed.stampCost == c.stamp_cost.map { Int($0.rounded(.up)) }, sourceLocation: sourceLocation)
+    #expect(parsed.stampCost == c.stamp_cost, sourceLocation: sourceLocation)
     #expect(parsed.supportsCompression == c.supports_compression, sourceLocation: sourceLocation)
 }
 
 private func expectMatchesReference(_ c: PNCase, sourceLocation: SourceLocation = #_sourceLocation) throws {
     #expect(c.valid, "fixture must be one reference accepts", sourceLocation: sourceLocation)
     let parsed = try #require(PNAnnounce.parse(Data(hexString: c.packed)!), sourceLocation: sourceLocation)
-    #expect(parsed.targetStampCost == c.stamp_cost.map { Int($0.rounded(.up)) }, sourceLocation: sourceLocation)
+    #expect(parsed.targetStampCost == c.stamp_cost, sourceLocation: sourceLocation)
     #expect(parsed.perTransferLimit == c.transfer_limit, sourceLocation: sourceLocation)
     #expect(parsed.perSyncLimit == c.sync_limit, sourceLocation: sourceLocation)
 }
@@ -66,7 +67,7 @@ private func expectMatchesReference(_ c: PNCase, sourceLocation: SourceLocation 
     try expectMatchesReference(Fixtures.load().delivery_integer_cost)
 }
 
-@Test func stampedDeliveryAnnounceWithFractionalCostSurfacesCeiling() throws {
+@Test func stampedDeliveryAnnounceWithFractionalCostSurfacesExactCost() throws {
     let c = try Fixtures.load().delivery_fractional_cost
     #expect(c.stamp_cost == 8.5)
     try expectMatchesReference(c)
@@ -142,11 +143,18 @@ func hostileFloatStampCostIsNotSurfaced(_ cost: Double) {
     #expect(LXMFAnnounceData.parse(raw)?.stampCost == nil)
 }
 
+/// A hostile COST does not invalidate the announce: reference's validity test only asks `float()` to
+/// accept it (LXMF.py:252-258), which it does for all of these (cross-validated case by case in
+/// LXMFFractionalCostAppDataCrossValidationTests). The value is surfaced as-is, never trapping, and
+/// its consumers gate it. A hostile LIMIT still rejects the announce (a pre-existing narrowing:
+/// reference's `int()` accepts -1 and 1e300 there).
 @Test(arguments: [Double.nan, .infinity, -.infinity, -1, 1e300])
-func hostileFloatPropagationValuesAreRejected(_ value: Double) {
+func hostileFloatPropagationValuesDoNotTrap(_ value: Double) throws {
     let costs = MsgPack.encode(.array([.bool(false), .uint(1), .bool(true), .uint(256), .uint(10240),
                                        .array([.double(value), .uint(3), .uint(18)]), .map([])]))
-    #expect(PNAnnounce.parse(costs) == nil)
+    let parsed = try #require(PNAnnounce.parse(costs))
+    #expect(parsed.targetStampCost == value || (value.isNaN && parsed.targetStampCost.isNaN))
+    _ = parsed.packed                                           // re-packing a hostile cost must not trap
     let limit = MsgPack.encode(.array([.bool(false), .uint(1), .bool(true), .double(value), .uint(10240),
                                        .array([.uint(16), .uint(3), .uint(18)]), .map([])]))
     #expect(PNAnnounce.parse(limit) == nil)

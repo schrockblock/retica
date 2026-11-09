@@ -11,15 +11,15 @@ import ReTiCA
 /// enclosing task is cancelled.
 public struct LXMFStampGenerator: Sendable {
     /// A delivery stamp for `messageID` at `cost`.
-    public var deliveryStamp: @Sendable (_ messageID: Data, _ cost: Int) async -> Data?
+    public var deliveryStamp: @Sendable (_ messageID: Data, _ cost: Double) async -> Data?
     /// `message` packed for its propagation node: encrypted to `recipient` (and `ratchet` when given),
     /// with a propagation stamp at `cost`. The container bytes.
     public var propagationPack: @Sendable (_ message: LXMessage, _ recipient: Identity, _ ratchet: Data?,
-                                           _ timestamp: Double, _ cost: Int) async -> Data?
+                                           _ timestamp: Double, _ cost: Double) async -> Data?
 
-    public init(deliveryStamp: @escaping @Sendable (_ messageID: Data, _ cost: Int) async -> Data?,
+    public init(deliveryStamp: @escaping @Sendable (_ messageID: Data, _ cost: Double) async -> Data?,
                 propagationPack: @escaping @Sendable (_ message: LXMessage, _ recipient: Identity, _ ratchet: Data?,
-                                                      _ timestamp: Double, _ cost: Int) async -> Data?) {
+                                                      _ timestamp: Double, _ cost: Double) async -> Data?) {
         self.deliveryStamp = deliveryStamp
         self.propagationPack = propagationPack
     }

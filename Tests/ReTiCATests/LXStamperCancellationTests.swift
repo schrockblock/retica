@@ -15,7 +15,7 @@ import Foundation
 ///
 /// Reference parity: `LXStamper.job_simple` (lxmf 1.1.0 LXStamper.py:199-206) tests
 /// `active_jobs[message_id]` every round and returns `None` when `cancel_work` sets it.
-private let unreachableCost = 200   // a 256-bit digest with 200 leading zero bits: never found
+private let unreachableCost: Double = 200   // clamps to cost 100 (a hash at or below 2^156): never found
 
 @Test(.timeLimit(.minutes(1))) func generatePnStampAbandonsAnUnboundedSearchWhenTheTaskIsCancelled() async {
     let task = Task.detached {

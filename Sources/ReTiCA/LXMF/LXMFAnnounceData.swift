@@ -1,16 +1,17 @@
 import Foundation
 
-/// LXMF delivery-destination announce app-data codec. Mirrors LXMF 1.1.0
-/// `LXMRouter.get_announce_app_data` (LXMRouter.py:1034-1050) for packing and the three
+/// LXMF delivery-destination announce app-data codec. Mirrors LXMF 1.3.0
+/// `LXMRouter.get_announce_app_data` (LXMRouter.py:1163-1182) for packing and the three
 /// consumer helpers `display_name_from_app_data`, `stamp_cost_from_app_data`,
-/// `compression_support_from_app_data` (LXMF.py:151-200) for parsing.
+/// `compression_support_from_app_data` (LXMF.py:151-209) for parsing.
 ///
-/// **Wire format (0.5.0+):** msgpack array `[display_name, stamp_cost, [SF_COMPRESSION]]`
-/// where `display_name` is bin (Python `bytes`) or null, `stamp_cost` is a uint or null, and
-/// the third element is an array of supported functionality codes. `SF_COMPRESSION = 0x00`.
-/// Conforming peers emit a `stamp_cost` only in 1...99, but **that is a property of what
-/// reference sends, not of what it accepts** — nothing on the parse side enforces it, so do not
-/// read the range as a wire invariant. See `stampCost`.
+/// **Wire format (LXMF 1.3.0):** msgpack array
+/// `[display_name, ceil(stamp_cost), [SF_COMPRESSION], stamp_cost]` where `display_name` is bin
+/// (Python `bytes`) or null, element [1] is the integer ceiling of the cost or null, the third
+/// element is an array of supported functionality codes (`SF_COMPRESSION = 0x00`), and element [3]
+/// is the cost on the 1/256 grid as a float64, or null. Element [3] is transitional: reference says
+/// the float moves into [1] after RNS 1.6.2 (LXMRouter.py:1178-1180). Older peers send only the
+/// first three elements, with an integer [1]. See `stampCost` for what parsing accepts.
 ///
 /// **Legacy format (pre-0.5.0):** the entire blob is a raw UTF-8 display name. Identified
 /// by the first byte being outside the msgpack array gate (0x90-0x9F fixarray or 0xDC array16).
@@ -24,35 +25,33 @@ public struct LXMFAnnounceData: Equatable {
     /// (mirrors `dn.decode("utf-8").replace("\x00", "").strip()` at LXMF.py:165).
     public var displayName: String?
 
-    /// Stamp cost advertised by the delivery destination, or nil.
+    /// Stamp cost advertised by the delivery destination, or nil. Fractional since LXMF 1.3.0.
     ///
-    /// **The range is asymmetric between pack and parse. Read this before using the value.**
+    /// - **On pack** only a cost in reference's gate `> 0 and < STAMP_COST_CAP` (LXMF 1.3.0
+    ///   LXMRouter.py:1173, cap 100) is emitted, quantized to the 1/256 grid; anything else
+    ///   (nil, 0, negative, 100 or more, NaN, infinities) emits null in both [1] and [3].
     ///
-    /// - **On pack** this is gated to 1...99: `pack` applies reference's strict
-    ///   `> 0 and < STAMP_COST_CAP` (LXMF 1.3.0 LXMRouter.py:1173, cap 100), so 0, 100 and
-    ///   anything outside emit as null. Every value ReTiCA *emits* is therefore in 1...99 or
-    ///   absent. (Reference 1.6.0 `generate_stamp` raises above 100, RNS/Stamps.py:255.)
+    /// - **On parse** the same gate applies, and this is a DELIBERATE NARROWING of reference:
+    ///   `stamp_cost_from_app_data` (LXMF.py:183-199) returns the chosen element verbatim, of any
+    ///   value. We surface a cost only when it is a number with `0 < cost < 100`
+    ///   (`LXStamper.costInRange`), and nil otherwise. Reference would go on to fail stamp
+    ///   generation for a negative, NaN or above-100 cost (`generate_stamp` raises,
+    ///   RNS/Stamps.py:255, and `cost_to_fp` raises on NaN) and send no stamp for 0; we send no
+    ///   stamp for any of them. 100 itself, which reference would generate for, no conforming
+    ///   emitter sends, and it is above our outbound ceiling in any case.
     ///
-    /// - **On parse this range is NOT guaranteed.** Reference's `stamp_cost_from_app_data`
-    ///   (LXMF.py:174-185) applies no gate at all — it returns `peer_data[1]` verbatim — so a
-    ///   peer may advertise 0, 255, or 60000 and we surface it as-is. `parse` bounds this only
-    ///   to what an `Int` can hold: 0...Int.max (`parseStampCost` uses `Int(exactly:)`, which
-    ///   rejects > Int.max rather than truncating). Announce app-data is unauthenticated and
-    ///   arrives from any reachable peer, so treat a parsed value as hostile input.
-    ///
-    /// **Callers that store or act on a parsed value MUST validate it themselves.** In
-    /// particular, a stamp cost drives a proof-of-work search whose cost is *exponential* in
-    /// the value (`LXStamper`), so feeding an unvalidated parsed cost into stamp generation
-    /// turns a one-byte announce field into an unbounded CPU burn. An `Int` that looks bounded
-    /// because the emit side is bounded is exactly how that ceiling becomes invisible.
-    public var stampCost: Int?
+    /// **Still hostile input inside the gate.** Announce app-data is unauthenticated, and a cost
+    /// of 99 is a proof-of-work search far beyond what we will do. `LXMFNode.deliveryStampCost`
+    /// applies the outbound ceiling (`LXMFNode.maxDeliveryStampCost`); any other caller that
+    /// spends this value must apply its own.
+    public var stampCost: Double?
 
     /// Whether the destination supports LXMF compression (`SF_COMPRESSION = 0x00`).
     /// Defaults to true when the functionality list is absent or not an array
     /// (reference: `len < 3 → True`; `not type(peer_data[2]) == list → True`).
     public var supportsCompression: Bool
 
-    public init(displayName: String?, stampCost: Int?, supportsCompression: Bool) {
+    public init(displayName: String?, stampCost: Double?, supportsCompression: Bool) {
         self.displayName = displayName
         self.stampCost = stampCost
         self.supportsCompression = supportsCompression
@@ -75,8 +74,9 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// **The extension is reserved whether or not stamping is on**, so a display name has the same
     /// length either way and turning stamping on never makes an announce that used to fit unsendable
-    /// (nor truncates a name further). With a null stamp cost the name budget fell from 326 to 308
-    /// UTF-8 bytes, so a name of 309-326 bytes, which fitted before, is now cut to fit.
+    /// (nor truncates a name further). Reserving it cut the null-cost name budget from 326 to 308
+    /// UTF-8 bytes; the fourth (fractional cost) element of LXMF 1.3.0 costs one more byte when null
+    /// (307) and nine more with a cost (299), so the budget is now 299-307 bytes.
     ///
     /// **Without a ratchet.** A destination with its own ratchets enabled (`Transport`'s
     /// `.enableRatchets`) announces a fifth fixed payload field of `Announce.ratchetSize` (32) bytes;
@@ -100,17 +100,18 @@ public struct LXMFAnnounceData: Equatable {
     /// `maxAppDataBytes` less the 32-byte ratchet, for a destination announcing its own ratchet.
     public static let maxAppDataBytesWithRatchet = maxAppDataBytes - Announce.ratchetSize
 
-    /// Pack delivery-destination announce app-data in the 0.5.0+ msgpack format.
+    /// Pack delivery-destination announce app-data in the LXMF 1.3.0 four-element format.
     ///
     /// `displayName` is encoded as msgpack bin (Python `bytes`), not str, matching the
-    /// `.encode("utf-8")` call in `get_announce_app_data` (LXMRouter.py:1040).
+    /// `.encode("utf-8")` call in `get_announce_app_data` (LXMRouter.py:1169).
     ///
-    /// `stampCost` is silently clamped to nil if outside the strict reference gate
-    /// (`> 0 and < STAMP_COST_CAP`, LXMF 1.3.0 LXMRouter.py:1173, cap 100). 0 and 100 or more
-    /// advertise as null.
+    /// `stampCost` outside reference's gate (`> 0 and < STAMP_COST_CAP`, LXMRouter.py:1173, cap 100)
+    /// advertises as null in [1] and [3]. Inside it, [3] is `quantize_cost(cost)` as a float64 and
+    /// [1] is its integer ceiling, or null when the quantized cost is 0.0 (a cost below 1/512):
+    /// reference's `ceil(stamp_cost) if stamp_cost else None` (LXMRouter.py:1179).
     ///
     /// The functionality array always contains `SF_COMPRESSION` (0x00),
-    /// mirroring `supported_functionality = [SF_COMPRESSION]` at LXMRouter.py:1047.
+    /// mirroring `supported_functionality = [SF_COMPRESSION]` at LXMRouter.py:1176.
     ///
     /// **`displayName` is truncated to fit `maxAppDataBytes`** (or `maxAppDataBytesWithRatchet`) — see `displayNameBudget`. This is
     /// a DELIBERATE DIVERGENCE: reference `get_announce_app_data` (LXMRouter.py:1034-1050) applies
@@ -122,32 +123,37 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// `ratchet` says whether the announce carrying this blob also carries our own ratchet: the
     /// budget is then `maxAppDataBytesWithRatchet`.
-    public static func pack(displayName: String?, stampCost: Int?, ratchet: Bool = false) -> Data {
-        let costValue: MsgPackValue
-        if let cost = stampCost, cost > 0, cost < NetworkStamp.stampCostCap {
-            costValue = .uint(UInt64(cost))
+    public static func pack(displayName: String?, stampCost: Double?, ratchet: Bool = false) -> Data {
+        // Reference's gate, then `quantize_cost` (LXMRouter.py:1172-1174). `quantizedCost` is at
+        // most 100 inside the gate, so the ceiling fits a UInt64.
+        let quantized = stampCost.flatMap { LXStamper.costInRange($0) ? LXStamper.quantizedCost($0) : nil }
+        let ceilingValue: MsgPackValue
+        if let quantized, quantized != 0 {
+            ceilingValue = .uint(UInt64(quantized.rounded(.up)))
         } else {
-            costValue = .null
+            ceilingValue = .null
         }
+        let exactValue: MsgPackValue = quantized.map { .double($0) } ?? .null
 
         let functionalityValue: MsgPackValue = .array([.uint(UInt64(sfCompression))])
+        let tail = [ceilingValue, functionalityValue, exactValue]
 
         guard let displayName else {
-            return MsgPack.encode(.array([.null, costValue, functionalityValue]))
+            return MsgPack.encode(.array([.null] + tail))
         }
 
         var nameBytes = Data(displayName.utf8)
-        let budget = displayNameBudget(costValue: costValue, functionalityValue: functionalityValue,
+        let budget = displayNameBudget(tail: tail,
                                        maxBytes: ratchet ? maxAppDataBytesWithRatchet : maxAppDataBytes)
         if nameBytes.count > budget {
             nameBytes = Data(truncated(displayName, toUTF8Bytes: budget).utf8)
         }
-        return MsgPack.encode(.array([.bin(nameBytes), costValue, functionalityValue]))
+        return MsgPack.encode(.array([.bin(nameBytes)] + tail))
     }
 
     /// How many UTF-8 bytes of display name fit in `maxBytes` (`maxAppDataBytes`, or
-    /// `maxAppDataBytesWithRatchet`), given the rest of this particular blob (a 1-byte stamp cost
-    /// encodes shorter than a 2-byte one).
+    /// `maxAppDataBytesWithRatchet`), given the rest of this particular blob (`tail`: a null cost
+    /// encodes shorter than a ceiling plus a float64).
     ///
     /// The non-name overhead is MEASURED by encoding the blob with an empty name, not tallied by
     /// hand, so a change to the msgpack encoder or to the shape of the array cannot silently
@@ -155,11 +161,10 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// The extra `- 1` covers the bin header growing from bin8 (2 bytes) to bin16 (3 bytes) above
     /// 255 name bytes. It is unconditional because this budget only ever binds well above 255
-    /// (its smallest possible value here is 307, or 275 with a ratchet), so reserving the byte costs
+    /// (its smallest possible value here is 299, or 267 with a ratchet), so reserving the byte costs
     /// nothing real.
-    private static func displayNameBudget(costValue: MsgPackValue, functionalityValue: MsgPackValue,
-                                          maxBytes: Int) -> Int {
-        let overhead = MsgPack.encode(.array([.bin(Data()), costValue, functionalityValue])).count
+    private static func displayNameBudget(tail: [MsgPackValue], maxBytes: Int) -> Int {
+        let overhead = MsgPack.encode(.array([.bin(Data())] + tail)).count
         return maxBytes - overhead - 1
     }
 
@@ -254,62 +259,26 @@ public struct LXMFAnnounceData: Equatable {
         return trimmed
     }
 
-    /// Extract the stamp cost from `items[1]`.
+    /// Extract the stamp cost: element [3] when it is a number, else element [1]
+    /// (`stamp_cost_from_app_data`, LXMF 1.3.0 LXMF.py:183-199, which tests `type(peer_data[3])` for
+    /// `float` or `int`; a msgpack bool is neither there, and is not `isNumber` here).
     ///
-    /// Returns nil only when `items.count < 2`, when the element is not a uint, or when the
-    /// uint exceeds `Int.max`. **It does NOT gate the range** — an out-of-range cost such as
-    /// 0, 255 or 60000 is returned as-is, not rejected. (An earlier version of this first line
-    /// said "returns nil if ... not a uint in 1...254", which contradicted the rest of this same
-    /// comment and the code below. The summary was wider than the body.)
+    /// The element is chosen by TYPE first and only then gated, as reference chooses: a numeric [3]
+    /// outside the gate gives nil, not a fall-back to [1].
     ///
-    /// That permissiveness is deliberate parity **on the range only**: reference's
-    /// `stamp_cost_from_app_data` (LXMF.py:174-185) returns `peer_data[1]` verbatim with no gate.
-    /// The `> 0 && < STAMP_COST_CAP` gate exists only on the emit side, in `get_announce_app_data`
-    /// (LXMF 1.3.0 LXMRouter.py:1173; 1044 in 1.1.0), and ours lives correspondingly in `pack`.
-    /// LXMF 1.3.0's `stamp_cost_from_app_data` (LXMF.py:183-199) still applies no cap on the
-    /// peer's advertised cost, so a parsed 101 or more is surfaced, not rejected. The outbound
-    /// ceiling (`LXMFNode.maxDeliveryStampCost`) is what keeps us from searching for one.
+    /// The gate is `LXStamper.costInRange` (`0 < cost < 100`, false for NaN and infinities); see the
+    /// note on `stampCost` for how that narrows reference, which returns the element verbatim. A
+    /// non-numeric element (a string, a list) is also nil, where reference returns it as-is and lets
+    /// the caller trip over it.
     ///
-    /// Parity is NOT total, and the two gaps both narrow what we surface:
-    /// - a NEGATIVE cost — reference returns it verbatim (Python ints are signed and unbounded);
-    ///   we return nil.
-    /// - a NON-NUMERIC `peer_data[1]` (a string, a list) — reference returns that object as-is and
-    ///   lets the caller trip over it; `nonNegativeCeiling` returns nil.
-    ///
-    /// **These divergences became observable when delivery stamps were wired** (this note used to
-    /// say "no caller acts on a parsed cost yet — revisit if one ever does"; that revisit trigger
-    /// has now fired). The caller is `LXMFNode.deliveryStampCost`, via `LXMFNode.LearnedPeer`.
-    ///
-    /// Concretely, for a NEGATIVE advertised cost the two stacks now do different things:
-    /// - **Reference** carries it through `handle_outbound` into `LXMessage.get_stamp`, which skips
-    ///   generation only when the cost is `None` (LXMessage.py:307). The search's validity test is
-    ///   `target = 1 << (256 - cost)` (LXStamper.py:74) — for a negative cost that target exceeds
-    ///   every possible 256-bit hash, so the FIRST random stamp passes and reference attaches a
-    ///   trivially-valid stamp at essentially zero cost.
-    /// - **We** surface nil, so `deliveryStampCost` returns nil and no stamp is attached.
-    ///
-    /// This stays in the safe direction, and it is not a known deliverability loss: a negative cost
-    /// is unreachable from a CONFORMING peer in the first place — `set_inbound_stamp_cost` coerces
-    /// any cost `< 1` to `None` (LXMRouter.py:378-388) and `get_announce_app_data` emits a value
-    /// only when `> 0 and < STAMP_COST_CAP` (LXMF 1.3.0 LXMRouter.py:1173) — so a peer advertising one is already
-    /// non-conforming, and has no conforming route to then enforce a positive cost against us. The
-    /// difference is only in how much free work each stack does for a malformed announce.
-    ///
-    /// Wire safety: announce app-data is unauthenticated and arrives from any reachable peer.
-    /// `Int(exactly:)` converts from UInt64 so `UInt64.max` yields nil rather than trapping, and
-    /// nothing here truncates. The resulting `Int` is bounded only by `Int.max`, so **callers
-    /// must validate before acting on it** — see the note on the `stampCost` property, which
-    /// explains why feeding an unvalidated value into stamp generation is an unbounded CPU burn.
-    ///
-    /// **LXMF 1.3.0 costs can be fractional.** Reference reads element [3] when it is a number and
-    /// falls back to [1] (`stamp_cost_from_app_data`, LXMF.py:192-196), and after the 1.6.2
-    /// transition [1] itself becomes the float (LXMRouter.py:1178-1180). We surface the ceiling,
-    /// which is the value reference publishes in [1] during the transition: a stamp at the ceiling
-    /// always meets the fractional target, at up to double the expected work.
-    private static func parseStampCost(from items: [MsgPackValue]) -> Int? {
+    /// The value is surfaced exactly, not re-quantized: reference stores what it parsed
+    /// (`update_stamp_cost`, LXMRouter.py:1154-1157) and its stamp arithmetic quantizes when it uses
+    /// it, as `LXStamper` does.
+    private static func parseStampCost(from items: [MsgPackValue]) -> Double? {
         guard items.count >= 2 else { return nil }
-        if items.count > 3, items[3].isNumber { return items[3].nonNegativeCeiling }
-        return items[1].nonNegativeCeiling
+        let chosen = items.count > 3 && items[3].isNumber ? items[3] : items[1]
+        guard let cost = chosen.numberValue, LXStamper.costInRange(cost) else { return nil }
+        return cost
     }
 
     /// Determine compression support from `items[2]`.

@@ -36,25 +36,31 @@ public struct LXMFServiceNode {
 
         public init(identity: Identity, endpoint: TransportEndpoint.State,
                     storageLimitBytes: Int? = State.defaultStorageLimitBytes,
-                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost) {
+                    targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
+                    stampCostFlexibility: Double = 0) {
             self.client = LXMFNode.State(identity: identity, endpoint: endpoint)
-            self.pn = PropagationNode.State(storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
+            self.pn = PropagationNode.State(storageLimitBytes: storageLimitBytes, targetStampCost: targetStampCost,
+                                            stampCostFlexibility: stampCostFlexibility)
         }
 
         /// Convenience: run this node over TCP.
         public init(identity: Identity, endpoint: TCPEndpoint.State,
                     storageLimitBytes: Int? = State.defaultStorageLimitBytes,
-                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost) {
+                    targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
+                    stampCostFlexibility: Double = 0) {
             self.init(identity: identity, endpoint: .tcp(endpoint),
-                      storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
+                      storageLimitBytes: storageLimitBytes, targetStampCost: targetStampCost,
+                      stampCostFlexibility: stampCostFlexibility)
         }
 
         /// Convenience: run this node over BLE.
         public init(identity: Identity, endpoint: BLEEndpoint.State,
                     storageLimitBytes: Int? = State.defaultStorageLimitBytes,
-                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost) {
+                    targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
+                    stampCostFlexibility: Double = 0) {
             self.init(identity: identity, endpoint: .ble(endpoint),
-                      storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
+                      storageLimitBytes: storageLimitBytes, targetStampCost: targetStampCost,
+                      stampCostFlexibility: stampCostFlexibility)
         }
     }
 
@@ -158,9 +164,13 @@ public struct LXMFServiceNode {
                            nodeState: nodeState,
                            perTransferLimit: LXMFPropagation.defaultPropagationTransferLimitKB,
                            perSyncLimit: LXMFPropagation.defaultPropagationSyncLimitKB,
-                           // The value `PropagationStore.ingest` actually enforces.
-                           targetStampCost: state.pn.store.minStampCost,
-                           stampCostFlexibility: 0, peeringCost: 0).packed
+                           // The values `PropagationStore.ingest` actually enforces: it accepts
+                           // at max(0, cost - flex).
+                           targetStampCost: state.pn.store.targetStampCost,
+                           stampCostFlexibility: state.pn.store.stampCostFlexibility,
+                           // This node serves clients only and answers no `/offer`, so there is
+                           // no peering key it checks; 0 is what it has always advertised.
+                           peeringCost: 0).packed
             }
 
             switch action {
@@ -223,7 +233,7 @@ public struct LXMFServiceNode {
                 // Reference LXMRouter.py:2252-2260: validate ALL entries in the container before deciding
                 // whether to prove. If ANY entry fails stamp validation, send ERROR_INVALID_STAMP and tear
                 // the link down — without a prove, which would falsely confirm delivery to the client.
-                // If ALL entries pass (or the container is unstamped because minStampCost == 0), prove the
+                // If ALL entries pass (or the container is unstamped because targetStampCost == 0), prove the
                 // packet to complete the client's receipt (reference LXMRouter.py:2255).
                 //
                 // Deliberately scoped: this is the ONLY place ReTiCA proves an inbound data packet.
@@ -235,7 +245,7 @@ public struct LXMFServiceNode {
                 // Unparseable containers: guard on parseContainer so a malformed wire payload neither
                 // proves nor ingests (reference LXMRouter.py:2262 except block skips the prove).
                 guard let (_, entries) = LXMFPropagation.parseContainer(data) else { return .none }
-                if state.pn.store.minStampCost > 0 {
+                if state.pn.store.targetStampCost > 0 {
                     let anyRejected = entries.contains {
                         // Cheap dedup BEFORE the proof-of-work, and it has to be here rather than only
                         // in `PropagationStore.ingest`: this pre-scan runs first, so a replay used to
@@ -253,8 +263,8 @@ public struct LXMFServiceNode {
                         // workblock; that is the junk-flood residue filed with the admission-control
                         // gap, not something dedup can close.
                         //
-                        // One accepted edge: a stored entry was validated at whatever minStampCost
-                        // was in force when it was accepted, so raising minStampCost afterwards lets
+                        // One accepted edge: a stored entry was validated at whatever acceptance cost
+                        // was in force when it was accepted, so raising the cost afterwards lets
                         // a replay of a now-under-cost entry be proved rather than rejected.
                         // Deliberate — we already hold the entry, so "I have this" is the true
                         // answer, and re-validating what we have already stored buys nothing.
@@ -270,7 +280,8 @@ public struct LXMFServiceNode {
                         // attacker can only reach this path at all by doing the ~2^cost work of a
                         // valid stamp themselves. Filed with the admission-control gap.
                         !state.pn.store.containsIdenticalStampedEntry($0)
-                            && LXStamper.validatePnStamp(transientData: $0, targetCost: state.pn.store.minStampCost) == nil
+                            && LXStamper.validatePnStamp(transientData: $0,
+                                                         targetCost: state.pn.store.minAcceptedStampCost) == nil
                     }
                     if anyRejected {
                         // Reference LXMRouter.py:2258-2260: send the error as a plain data packet, then teardown.

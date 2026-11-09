@@ -198,9 +198,10 @@ What the example relies on:
   `LXMessage.deliveryHash(identityHash: identity.hash)` at any time.
 - **Registration order.** `.setDisplayName` only changes state; `.registerDelivery` registers the
   destination and announces it with the current name and stamp cost. The `stampCost` you pass
-  to `.setDisplayName` is stored only in 1...99 (reference LXMF 1.3.0 rejects 100 and above, because
-  RNS 1.6.0 caps stamp cost at 100 and its senders cannot stamp above that). A value below 1 clears
-  the cost; a value of 100 or more is ignored and the previous cost stays. To re-announce later, send
+  to `.setDisplayName` is a `Double` and may be fractional (LXMF 1.3.0); it is stored only from 1 up
+  to, but not including, 100 (reference LXMF 1.3.0 rejects 100 and above, because RNS 1.6.0 caps
+  stamp cost at 100 and its senders cannot stamp above that). A value below 1 clears the cost; 100 or
+  more, or NaN, is ignored and the previous cost stays. To re-announce later, send
   `.announceDelivery` (every interface) or `.announceDeliveryOnInterface(_:)` (one). Do not bind
   a text field straight to an announce: nothing throttles locally originated announces.
 - **Sending.** `.send(destinationHash:title:content:method:)` builds, signs and sends a message.
@@ -553,7 +554,9 @@ stamp cost and size limit are read from its announce; a copy larger than its lim
 
 ReTiCA can also be a propagation node: `LXMFServiceNode` (an LXMF client that turns node mode
 on with `.setNodeMode(true)`) or `PNNode` (a standalone node with peer sync). Neither writes its
-store to disk.
+store to disk. A node asks for `targetStampCost` (default 16) and accepts stamps worth at least
+`targetStampCost - stampCostFlexibility` (default flexibility 0; reference's default is 3), and
+advertises both, fractional, in its announce.
 
 ## Push wake-ups
 
@@ -632,8 +635,8 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Sync from a propagation node (`/get`) | Implemented | Identifies on the link first, as the reference node requires. |
 | Running a propagation node (serving clients) | Implemented | `LXMFServiceNode`, `PNNode`. In memory; the host persists. |
 | Propagation node peering (node-to-node sync, peering keys) | **Partial** | Offer/wanted exchange and peering-key generation and validation exist, and the keys are cross-validated. Stamp validation is not throttled (reference refuses with `ERROR_THROTTLED`), and peering has not been tested against a reference `lxmd` in this repo. |
-| Delivery announce app data (display name, stamp cost) | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | A fractional cost is read as its ceiling. |
-| Propagation node announces | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | Fractional costs are read as their ceiling, and float limits are accepted. |
+| Delivery announce app data (display name, stamp cost) | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | Fractional costs are read and written exactly (LXMF 1.3.0's four-element form). A peer's cost outside 0 < cost < 100 is read as no cost, where reference keeps the raw value. |
+| Propagation node announces | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | Fractional costs, flexibility and peering cost are read and written exactly (element [7], ceilings in [5]); float limits are accepted. |
 | Delivery stamps | Implemented, cross-validated, tested live against RNS 1.6.0 / LXMF 1.3.0 | Generated when a peer asks for a cost of 20 or less, on the delivery copy and on propagated copies; above 20 ReTiCA sends unstamped (reference has no ceiling). Inbound validation once you set a cost; enforcement off by default, as in reference. MeshChatX turns enforcement on with a default cost of 8. |
 | Propagation stamps | Implemented, cross-validated | Cost ceiling 20 (reference has none). |
 | Tickets | Implemented, cross-validated against LXMF 1.3.0 (ticket stamps, `FIELD_TICKET` read and written) | Received tickets are kept and used; inbound ticket stamps are validated. Issuing is **off by default** (`.setIssueTickets`). The host persists ticket state. Expired tickets are dropped when `.rehydrateTickets` runs at launch, not every ~8 minutes as in reference. Not tested against a live reference peer. |
@@ -692,6 +695,7 @@ byte-for-byte reproduces what the reference produced. Running the tests does not
 | LXMF 1.3.0 stamp tickets: ticket stamps both ways, and the `FIELD_TICKET` an issuer writes | `generate_lxmf_ticket_fixtures.py`; `Tests/ReTiCANodeTests/Vectors/generate_lxmf_ticket_issue_fixtures.py` | `lxmf_ticket_fixtures.json`; values pasted into the test | `LXMFTicketCrossValidationTests.swift`; `Tests/ReTiCANodeTests/LXMFNodeTicketIssueTests.swift` |
 | Propagation container | `generate_lxmf_propagation_fixtures.py` | `lxmf_propagation_fixtures.json` | `LXMFPropagationCrossValidationTests.swift` |
 | Delivery announce app data, propagation node announces | `generate_lxmf_announce_fixtures.py`, `generate_lxmf_pn_announce_fixtures.py` | `lxmf_announce_fixtures.json`, `lxmf_pn_announce_fixtures.json` | `Tests/ReTiCATests/LXMFAnnounceDataCrossValidationTests.swift`, `PNAnnounceCrossValidationTests.swift` |
+| LXMF 1.3.0 fractional costs: delivery and propagation node app data as emitted and parsed, the inbound-cost setter, the client's propagation-cost clamp, and propagation-node acceptance at cost minus flexibility (on constructed hashes) | `generate_lxmf_fractional_cost_app_data_fixtures.py` | `lxmf_fractional_cost_app_data_fixtures.json` | `LXMFFractionalCostAppDataCrossValidationTests.swift`; setter values pasted into `Tests/ReTiCANodeTests/LXMFNodeAnnounceAppDataTests.swift` |
 | Transport: announce ingest, rebroadcast, path requests, relaying, compression, multi-segment resources | `Tests/ReTiCATransportTests/Vectors/generate_transport_fixtures.py` | `transport_fixtures.json` | `TransportCrossValidationTests.swift`, `RelayCrossValidationTests.swift`, `CompressionCrossValidationTests.swift`, `MultiSegmentCrossValidationTests.swift` |
 | Single-packet proofs (RNS 1.4.2) | `generate_proof_fixtures.py` | `proof_fixtures.json` | `ProofCrossValidationTests.swift` |
 | IFAC (RNS 1.4.2) | `generate_ifac_fixtures.py` | values pasted into the test | `Tests/ReTiCATransportTests/IFACCrossValidationTests.swift` |

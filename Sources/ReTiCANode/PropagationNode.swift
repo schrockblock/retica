@@ -15,8 +15,10 @@ public struct PropagationNode {
     public struct State: Equatable {
         public var store: PropagationStore
         public init(storageLimitBytes: Int? = nil,
-                    minStampCost: Int = LXMFPropagation.defaultPropagationStampCost) {
-            store = PropagationStore(storageLimitBytes: storageLimitBytes, minStampCost: minStampCost)
+                    targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
+                    stampCostFlexibility: Double = 0) {
+            store = PropagationStore(storageLimitBytes: storageLimitBytes, targetStampCost: targetStampCost,
+                                     stampCostFlexibility: stampCostFlexibility)
         }
     }
 
@@ -31,7 +33,7 @@ public struct PropagationNode {
         case messagesDelivered(transientIds: [Data])
         case peerOffered(peerHash: Data, transientIds: [Data])
         case offerToPeer(peerHash: Data)
-        case validatePeeringKey(peerHash: Data, peeringId: Data, peeringKey: Data, targetCost: Int)
+        case validatePeeringKey(peerHash: Data, peeringId: Data, peeringKey: Data, targetCost: Double)
         case delegate(Delegate)
 
         public enum Delegate: Equatable {

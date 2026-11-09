@@ -147,7 +147,7 @@ import ComposableArchitecture
         #expect(LXMFPropagation.propagationLinkCost == 3.25)
         let pn = TestStore(initialState: PNNode.State(
             identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false),
-            minStampCost: 4, peeringCost: 0)
+            targetStampCost: 4, peeringCost: 0)
         ) { PNNode() } withDependencies: {
             $0.continuousClock = TestClock()
             $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
@@ -162,7 +162,7 @@ import ComposableArchitecture
 
         var initial = LXMFServiceNode.State(
             identity: Identity(), endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
-            minStampCost: 12)
+            targetStampCost: 12)
         initial.nodeModeEnabled = true
         let service = TestStore(initialState: initial) { LXMFServiceNode() } withDependencies: {
             $0.continuousClock = TestClock()

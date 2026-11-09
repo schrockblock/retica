@@ -5,9 +5,9 @@ struct LXMFPNAnnounceFixtures: Decodable {
     let nodeState: Bool
     let perTransferLimit: Int
     let perSyncLimit: Int
-    let targetStampCost: Int
-    let stampCostFlexibility: Int
-    let peeringCost: Int
+    let targetStampCost: Double
+    let stampCostFlexibility: Double
+    let peeringCost: Double
     let packed: String
     let invalidPacked: String
 

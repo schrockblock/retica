@@ -33,7 +33,7 @@ private func photo() -> LXMessage {
 /// a recipient that never answers link requests. The propagation node announces a 256 KB limit.
 /// With `pnLinkUp`, a link to the node is already active (the app's sync on connect opened it).
 @MainActor
-private func photoNode(stampCost: Int, pnLinkUp: Bool, clock: TestClock<Duration>)
+private func photoNode(stampCost: Double, pnLinkUp: Bool, clock: TestClock<Duration>)
     -> TestStore<LXMFNode.State, LXMFNode.Action> {
     var state = LXMFNode.State(identity: Identity(),
                                endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))

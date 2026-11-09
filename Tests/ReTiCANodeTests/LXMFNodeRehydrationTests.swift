@@ -43,7 +43,7 @@ private func makeRehydrationStore() -> TestStore<LXMFNode.State, LXMFNode.Action
     return store
 }
 
-private func peer(stampCost: Int?, learnedAt: Date) -> LXMFNode.LearnedPeer {
+private func peer(stampCost: Double?, learnedAt: Date) -> LXMFNode.LearnedPeer {
     LXMFNode.LearnedPeer(displayName: nil, stampCost: stampCost, supportsCompression: true,
                          learnedAt: learnedAt)
 }
@@ -61,7 +61,7 @@ private func peer(stampCost: Int?, learnedAt: Date) -> LXMFNode.LearnedPeer {
     // passing would be weak evidence that any search happened. At 8 it is p = 1/256 while the
     // expected search is ~256 rounds (~0.1 s) — same rationale as
     // `lxmfNodeAttachesStampWhenCostIsWithinCeiling`.
-    let cost = 8
+    let cost: Double = 8
     let store = makeRehydrationStore()
 
     // Cold start: the table is empty, so a send right now would go out unstamped.

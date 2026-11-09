@@ -12,11 +12,24 @@ import Foundation
 // directly rather than driving get_announce_app_data itself.
 //
 // Every test asserts BOTH directions:
-//   pack direction  — our LXMFAnnounceData.pack output is byte-identical to the fixture
+//   pack direction  — our LXMFAnnounceData.pack output, which is now LXMF 1.3.0's four elements,
+//                     keeps the 1.1.0 fixture's three elements as its prefix (element [3] is the
+//                     transitional fractional cost; the full 1.3.0 bytes are cross-validated
+//                     against the genuine get_announce_app_data in
+//                     LXMFFractionalCostAppDataCrossValidationTests)
 //   parse direction — our LXMFAnnounceData.parse recovers the expected values from the fixture
 //
 // Test-honesty rule: every assertion is preceded by a non-nil / non-empty guard so that a
 // nil/empty result causes an immediate failure, not a vacuous pass.
+
+/// True when `ours` decodes to a four-element array whose first three elements are exactly the
+/// elements of the 1.1.0 reference blob.
+private func keepsReferencePrefix(_ ours: Data, _ referenceHex: String) -> Bool {
+    guard case let .array(o)? = MsgPack.decodeValue(ours),
+          case let .array(r)? = MsgPack.decodeValue(Data(hexString: referenceHex)!),
+          o.count == 4, r.count == 3 else { return false }
+    return Array(o.prefix(3)) == r
+}
 
 // MARK: — Fixture 1: name + cost
 
@@ -27,7 +40,7 @@ import Foundation
     // pack direction: our bytes must match the genuine wire format
     let ourPacked = LXMFAnnounceData.pack(displayName: fixture.displayName, stampCost: fixture.stampCost)
     #expect(!ourPacked.isEmpty)
-    #expect(ourPacked == Data(hexString: fixture.packed)!)
+    #expect(keepsReferencePrefix(ourPacked, fixture.packed))
 
     // parse direction: genuine wire bytes must yield the expected field values
     let parsed = LXMFAnnounceData.parse(Data(hexString: fixture.packed)!)
@@ -48,7 +61,7 @@ import Foundation
     // pack direction
     let ourPacked = LXMFAnnounceData.pack(displayName: nil, stampCost: nil)
     #expect(!ourPacked.isEmpty)
-    #expect(ourPacked == Data(hexString: fixture.packed)!)
+    #expect(keepsReferencePrefix(ourPacked, fixture.packed))
 
     // parse direction
     let parsed = LXMFAnnounceData.parse(Data(hexString: fixture.packed)!)
@@ -69,7 +82,7 @@ import Foundation
     // pack direction
     let ourPacked = LXMFAnnounceData.pack(displayName: fixture.displayName, stampCost: nil)
     #expect(!ourPacked.isEmpty)
-    #expect(ourPacked == Data(hexString: fixture.packed)!)
+    #expect(keepsReferencePrefix(ourPacked, fixture.packed))
 
     // parse direction
     let parsed = LXMFAnnounceData.parse(Data(hexString: fixture.packed)!)
@@ -90,7 +103,7 @@ import Foundation
     // pack direction
     let ourPacked = LXMFAnnounceData.pack(displayName: nil, stampCost: fixture.stampCost)
     #expect(!ourPacked.isEmpty)
-    #expect(ourPacked == Data(hexString: fixture.packed)!)
+    #expect(keepsReferencePrefix(ourPacked, fixture.packed))
 
     // parse direction
     let parsed = LXMFAnnounceData.parse(Data(hexString: fixture.packed)!)

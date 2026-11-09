@@ -46,7 +46,7 @@ private let peerDestHash = Data(repeating: 0xA1, count: 16)
 /// Build a store that knows `peerDestHash` with the given `advertisedStampCost`.
 @MainActor
 private func makeDeliveryStampStore(
-    advertisedStampCost: Int?
+    advertisedStampCost: Double?
 ) -> TestStore<LXMFNode.State, LXMFNode.Action> {
     let ep = TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false)
     var node = LXMFNode.State(identity: Identity(), endpoint: ep)
@@ -131,7 +131,7 @@ private func makeDeliveryStampStore(
 /// while the expected search is only ~256 rounds (~0.1 s measured at ~2 200 rounds/s) — still
 /// comfortably sub-second.
 @MainActor @Test func lxmfNodeAttachesStampWhenCostIsWithinCeiling() async throws {
-    let cost = 8
+    let cost: Double = 8
     let store = makeDeliveryStampStore(advertisedStampCost: cost)
     let capturedMessage = LockIsolated<LXMessage?>(nil)
     await store.send(.send(destinationHash: peerDestHash, title: Data("t".utf8),
@@ -326,7 +326,7 @@ private func makeDeliveryStampStore(
 /// Anti-vacuity: asserts on the stamp of the message the ROUTER received, not on state — a state
 /// assertion would pass even if the effect forwarded the unstamped original.
 @MainActor @Test func lxmfNodeSendMessageAttachesStampWhenCostIsWithinCeiling() async throws {
-    let cost = 8
+    let cost: Double = 8
     let store = makeDeliveryStampStore(advertisedStampCost: cost)
     let sender = Identity()
     let msg = LXMessage.create(source: sender, destinationHash: peerDestHash, timestamp: 1700000000,
@@ -376,4 +376,71 @@ private func makeDeliveryStampStore(
     await store.skipReceivedActions(strict: false)
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(2))
+}
+
+// MARK: - Fractional and hostile learned costs (LXMF 1.3.0)
+
+/// The cost handed to the delivery-stamp search, for each learned cost: a fractional cost is searched
+/// at exactly that cost (8.5, not its ceiling 9), the ceiling 20 is accepted, and 20.5, 99, NaN,
+/// +infinity, a negative and 0 start no search and send unstamped. `learnedPeers` is written straight
+/// here, as `.rehydrateLearnedPeers` from host storage would, so this is the gate in
+/// `deliveryStampCost` itself and not the announce parse in front of it.
+///
+/// Anti-vacuity: the generator records every cost it is asked for, so a gate that rounded (9), let
+/// NaN through as "not above 20", or refused 20 fails; and the router must still receive each message.
+@MainActor @Test func lxmfNodeSearchesAtTheExactLearnedCostAndRefusesHostileOnes() async throws {
+    let cases: [(Double, Double?)] = [
+        (8.5, 8.5), (20, 20), (20.5, nil), (99, nil), (.nan, nil), (.infinity, nil), (-1, nil), (0, nil),
+    ]
+    for (learned, expected) in cases {
+        var node = LXMFNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "h", port: 4242,
+                                                                                    reconnectOnDrop: false))
+        node.learnedPeers[peerDestHash] = LXMFNode.LearnedPeer(displayName: nil, stampCost: learned,
+                                                               supportsCompression: true,
+                                                               learnedAt: Date(timeIntervalSince1970: 0))
+        let asked = LockIsolated<[Double]>([])
+        let store = TestStore(initialState: node) { LXMFNode() } withDependencies: {
+            $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
+            $0.continuousClock = TestClock()
+            $0.uuid = .incrementing
+            $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+            $0.lxmfStampGenerator = LXMFStampGenerator(
+                deliveryStamp: { _, cost in
+                    asked.withValue { $0.append(cost) }
+                    return Data(repeating: 0x5A, count: LXStamper.stampSize)
+                },
+                propagationPack: { _, _, _, _, _ in nil })
+        }
+        store.exhaustivity = .off
+        let received = LockIsolated<LXMessage?>(nil)
+        await store.send(.send(destinationHash: peerDestHash, title: Data("t".utf8),
+                               content: Data("c".utf8), method: .opportunistic))
+        await store.receive({ action in
+            if case let .router(.send(m, _)) = action { received.setValue(m); return true }
+            return false
+        }, timeout: .seconds(10))
+        let msg = try #require(received.value, "learned \(learned): the message must still be sent")
+        if let expected {
+            #expect(asked.value == [expected], "learned \(learned)")
+            #expect(msg.stamp != nil, "learned \(learned)")
+        } else {
+            #expect(asked.value.isEmpty, "learned \(learned): no search may start")
+            #expect(msg.stamp == nil, "learned \(learned)")
+        }
+        await store.skipReceivedActions(strict: false)
+    }
+}
+
+/// End to end with the real search: a peer asking 8.5 gets a stamp valid at 8.5.
+@MainActor @Test func lxmfNodeAttachesAStampValidAtAFractionalCost() async throws {
+    let store = makeDeliveryStampStore(advertisedStampCost: 8.5)
+    let captured = LockIsolated<LXMessage?>(nil)
+    await store.send(.send(destinationHash: peerDestHash, title: Data("t".utf8),
+                           content: Data("c".utf8), method: .opportunistic))
+    await store.receive({ action in
+        if case let .router(.send(m, _)) = action { captured.setValue(m); return true }
+        return false
+    }, timeout: .seconds(20))
+    let msg = try #require(captured.value)
+    #expect(msg.validateStamp(targetCost: 8.5))
 }
