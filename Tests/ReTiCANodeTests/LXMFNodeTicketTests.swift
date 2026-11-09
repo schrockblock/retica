@@ -399,7 +399,9 @@ private func openedPropagatedCopy(_ store: TestStoreOf<LXMFNode>, _ recipient: I
 @Suite @MainActor struct LXMFNodeTicketValidationTests {
     private func store(_ me: Identity, _ recorded: Recorded, inbound tickets: [Data: [LXMFNode.Ticket]]) async -> TestStoreOf<LXMFNode> {
         await makeNode(me, recorded) {
-            $0.deliveryStampCost = cheapCost
+            // High enough that a 16-byte stamp no ticket matches never passes the proof-of-work
+            // fallback by luck (at cost 8 it would 1 time in 256). Checking costs the same at any cost.
+            $0.deliveryStampCost = 64
             $0.enforceDeliveryStamps = true
             $0.inboundTickets = tickets
         }
