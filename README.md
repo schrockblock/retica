@@ -452,8 +452,10 @@ costs those hashes and nothing more.
 - **Stamp work.** Delivery and propagation stamps are proof-of-work searches that can take
   minutes. One runs at a time, oldest message first (its delivery stamp, then its propagation stamp
   if it is sent propagated), as reference LXMF does; the others wait in `State.stampQueue`. A send
-  stamped with a ticket, or to a peer that asks for no stamp, does not wait. A queued message is
-  cancelled and reported exactly like one whose search is running.
+  stamped with a ticket, or to a peer that asks for no stamp, does not wait. Sending a message that
+  is already queued or stamping does not queue it again. A propagated send reads the node's stamp
+  cost when its search starts. A queued message is cancelled and reported exactly like one whose
+  search is running.
   `.cancelDeliveryStamps` and `.cancelPropagationStamps` stop them; a message whose
   search is cancelled is reported `deliveryFailed`, not sent unstamped, unless its propagated copy
   is still out (that copy's outcome is reported instead) or a copy already succeeded. A

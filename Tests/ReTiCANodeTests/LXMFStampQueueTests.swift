@@ -27,14 +27,16 @@ private final class StampGate: @unchecked Sendable {
     private var startedKeys: [Data] = []
     private var waiters: [Data: CheckedContinuation<Bool, Never>] = [:]
     private var ended: [Data: Bool] = [:]
+    private var costs: [Data: Int] = [:]
 
     /// True when the test ended the search with a stamp; false when it ended it with none, or the
-    /// search was cancelled.
-    func search(_ key: Data) async -> Bool {
+    /// search was cancelled. `cost` is recorded for `cost(of:)`.
+    func search(_ key: Data, cost: Int = 0) async -> Bool {
         await withTaskCancellationHandler {
             await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
                 lock.withLock {
                     startedKeys.append(key)
+                    costs[key] = cost
                     if let found = ended[key] { c.resume(returning: found); return }
                     if Task.isCancelled { c.resume(returning: false); return }
                     waiters[key] = c
@@ -54,6 +56,7 @@ private final class StampGate: @unchecked Sendable {
     }
 
     var started: [Data] { lock.withLock { startedKeys } }
+    func cost(of key: Data) -> Int? { lock.withLock { costs[key] } }
 
     func waitUntilStarted(_ key: Data) async {
         for _ in 0..<2000 {
@@ -106,15 +109,14 @@ private func learned(_ identity: Identity = Identity(), appData: Data? = nil) ->
 /// A node whose delivery searches wait on `delivery` and propagated packs on `propagation`.
 @MainActor
 private func makeNode(_ recorder: RecordingNode, delivery: StampGate, propagation: StampGate,
-                      me: Identity) -> TestStoreOf<RecordingNode> {
+                      me: Identity, propagationNode: Destination? = nil) -> TestStoreOf<RecordingNode> {
     var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     ep.transport.learned[propagationRecipient] = learned()
     ep.transport.learned[freePeer] = learned()
-    ep.transport.learned[propagationNodeHash] = learned(appData:
-        PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
-                   targetStampCost: 8, stampCostFlexibility: 0, peeringCost: 0).packed)
+    let pnHash = propagationNode?.hash ?? propagationNodeHash
+    ep.transport.learned[pnHash] = learned(propagationNode?.identity ?? Identity(), appData: pnAppData(cost: 8))
     var node = LXMFNode.State(identity: me, endpoint: ep)
-    node.router.outboundPropagationNode = propagationNodeHash
+    node.router.outboundPropagationNode = pnHash
     for peer in [costlyPeer, ticketPeer] {
         node.learnedPeers[peer] = LXMFNode.LearnedPeer(displayName: nil, stampCost: 8, supportsCompression: false,
                                                        learnedAt: Date(timeIntervalSince1970: sentAt))
@@ -130,12 +132,30 @@ private func makeNode(_ recorder: RecordingNode, delivery: StampGate, propagatio
             deliveryStamp: { messageID, _ in
                 await delivery.search(messageID) ? Data(repeating: 0x5A, count: LXStamper.stampSize) : nil
             },
-            propagationPack: { message, _, _, _, _ in
-                await propagation.search(message.hash) ? Data("packed".utf8) : nil
+            propagationPack: { message, _, _, _, cost in
+                await propagation.search(message.hash, cost: cost) ? Data("packed".utf8) : nil
             })
     }
     store.exhaustivity = .off
     return store
+}
+
+private func pnAppData(cost: Int) -> Data {
+    PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
+               targetStampCost: cost, stampCostFlexibility: 0, peeringCost: 0).packed
+}
+
+/// The propagation node re-announces, now advertising `cost`.
+@MainActor
+private func hearPropagationNode(_ store: TestStoreOf<RecordingNode>, _ dest: Destination, identity: Identity,
+                                 cost: Int) async {
+    let iface = InterfaceID("queue-iface")
+    let randomHash = Announce.randomHash(now: 1_700_000_000, randomPrefix: Data(repeating: 0x06, count: 5))
+    let payload = Announce.buildPayload(identity: identity, destinationHash: dest.hash, nameHash: dest.nameHash,
+                                        randomHash: randomHash, appData: pnAppData(cost: cost))
+    await store.send(.endpoint(.transport(.interfaceConnected(iface, .tcp))))
+    await store.send(.endpoint(.transport(.received(iface, try! Packet.announce(from: dest, payload: payload).packed()))))
+    await store.skipReceivedActions(strict: false)
 }
 
 private func message(from me: Identity, to dest: Data, _ text: String) -> LXMessage {
@@ -361,5 +381,108 @@ private func waitForHandOver(_ store: TestStoreOf<RecordingNode>, _ recorder: Re
         #expect(recorder.failures.value == [a.hash])
         #expect(recorder.handOvers.value == [b.hash])
         #expect(!store.state.inFlightDeliveryStamps.contains(a.hash))
+    }
+
+    /// The same message sent again while its search runs is not queued a second time (reference keys
+    /// `pending_deferred_stamps` by message id): one search, one hand-over, and its phase never goes
+    /// back to `.queued`.
+    @Test func sendingAMessageAgainWhileItIsStampedDoesNotQueueItTwice() async {
+        let me = Identity(), recorder = RecordingNode(), delivery = StampGate()
+        let store = makeNode(recorder, delivery: delivery, propagation: StampGate(), me: me)
+        let m = message(from: me, to: costlyPeer, "m"), later = message(from: me, to: costlyPeer, "later")
+        await send(store, m)
+        await send(store, m)
+        await send(store, later)
+        await send(store, later)
+        #expect(store.state.stampQueue.map(\.message.hash) == [later.hash])
+        #expect(recorder.phases(of: m.hash) == [.stamping])
+
+        delivery.end(m.hash)
+        delivery.end(later.hash)
+        await waitForHandOver(store, recorder, later.hash)
+        try? await Task.sleep(for: .milliseconds(100))
+        await store.skipReceivedActions(strict: false)
+        #expect(delivery.started == [m.hash, later.hash])
+        #expect(recorder.handOvers.value == [m.hash, later.hash])
+        #expect(recorder.phases(of: m.hash) == [.stamping, .handedOver])
+        #expect(recorder.phases(of: later.hash) == [.queued, .stamping, .handedOver])
+    }
+
+    /// Review Focus 1 for a queued explicit `.sendViaPropagation`: `.cancelOutbound` reports exactly
+    /// one `deliveryCancelled` and its search never starts.
+    @Test func cancellingAQueuedExplicitSendReportsCancelledOnceAndNeverSearches() async {
+        let me = Identity(), recorder = RecordingNode(), delivery = StampGate(), propagation = StampGate()
+        let store = makeNode(recorder, delivery: delivery, propagation: propagation, me: me)
+        let d = message(from: me, to: costlyPeer, "d")
+        await send(store, d)
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data(), content: Data("p".utf8)))
+        guard let explicit = store.state.stampQueue.first?.message.hash else {
+            Issue.record("the explicit send is not queued"); return
+        }
+        #expect(recorder.phases(of: explicit) == [.queued])
+
+        await store.send(.cancelOutbound(messageHash: explicit))
+        await store.send(.cancelOutbound(messageHash: explicit))     // already cancelled: nothing more
+        propagation.end(explicit)
+        delivery.end(d.hash)
+        await waitForHandOver(store, recorder, d.hash)
+        try? await Task.sleep(for: .milliseconds(100))
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.cancellations.value == [explicit])
+        #expect(recorder.failures.value.isEmpty)
+        #expect(propagation.started.isEmpty, "its search never started")
+        #expect(recorder.propagatedHandOvers.value.isEmpty)
+        #expect(store.state.preparingPhases.isEmpty)
+    }
+
+    /// The propagation cost is read when the job starts, as reference does: a node that re-announces
+    /// a higher cost while the job waits gets a stamp at the new cost.
+    @Test func aQueuedPropagatedSendUsesTheCostTheNodeAdvertisesWhenItStarts() async {
+        let me = Identity(), pn = Identity(), recorder = RecordingNode(), delivery = StampGate(),
+            propagation = StampGate()
+        let pnDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                                 aspects: ["propagation"], identity: pn)!
+        let store = makeNode(recorder, delivery: delivery, propagation: propagation, me: me, propagationNode: pnDest)
+        let d = message(from: me, to: costlyPeer, "d")
+        await send(store, d)
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data(), content: Data("p".utf8)))
+        guard let explicit = store.state.stampQueue.first?.message.hash else {
+            Issue.record("the explicit send is not queued"); return
+        }
+
+        await hearPropagationNode(store, pnDest, identity: pn, cost: 12)
+        #expect(store.state.endpoint.learned[pnDest.hash]?.appData.flatMap(PNAnnounce.parse)?.targetStampCost == 12,
+                "the re-announce must really replace the cost")
+        delivery.end(d.hash)
+        await propagation.waitUntilStarted(explicit)
+        #expect(propagation.cost(of: explicit) == 12)
+        propagation.end(explicit)
+    }
+
+    /// ...and one that now advertises a cost above our ceiling fails the waiting send once, without
+    /// a search (reference fails the message when the cost is unusable, LXMRouter.py:3004-3008).
+    @Test func aQueuedPropagatedSendFailsWithoutSearchingWhenTheNodesCostIsNowRefused() async {
+        let me = Identity(), pn = Identity(), recorder = RecordingNode(), delivery = StampGate(),
+            propagation = StampGate()
+        let pnDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                                 aspects: ["propagation"], identity: pn)!
+        let store = makeNode(recorder, delivery: delivery, propagation: propagation, me: me, propagationNode: pnDest)
+        let d = message(from: me, to: costlyPeer, "d"), after = message(from: me, to: costlyPeer, "after")
+        await send(store, d)
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data(), content: Data("p".utf8)))
+        guard let explicit = store.state.stampQueue.first?.message.hash else {
+            Issue.record("the explicit send is not queued"); return
+        }
+        await send(store, after)
+
+        await hearPropagationNode(store, pnDest, identity: pn, cost: LXMFPropagation.maxPropagationStampCost + 1)
+        propagation.end(explicit)
+        delivery.end(d.hash)
+        delivery.end(after.hash)
+        await waitForHandOver(store, recorder, after.hash)
+        #expect(recorder.failures.value == [explicit])
+        #expect(propagation.started.isEmpty)
+        #expect(recorder.propagatedHandOvers.value.isEmpty)
+        #expect(store.state.preparingPhases.isEmpty)
     }
 }
