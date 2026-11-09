@@ -26,6 +26,7 @@ private struct PhaseRecordingNode: Reducer {
     let reports: LockIsolated<[Reported]>
     var failures: LockIsolated<[Data]> = LockIsolated([])
     var propagatedHandOvers: LockIsolated<Int> = LockIsolated(0)
+    var cancellations: LockIsolated<[Data]> = LockIsolated([])
 
     var body: some Reducer<State, Action> {
         Reduce { _, action in
@@ -33,6 +34,7 @@ private struct PhaseRecordingNode: Reducer {
                 reports.withValue { $0.append(Reported(hash: hash, phase: phase)) }
             }
             if case let .delegate(.deliveryFailed(hash)) = action { failures.withValue { $0.append(hash) } }
+            if case let .delegate(.deliveryCancelled(hash)) = action { cancellations.withValue { $0.append(hash) } }
             if case .router(.sendViaPropagation) = action { propagatedHandOvers.withValue { $0 += 1 } }
             return .none
         }
@@ -257,6 +259,36 @@ private func makePropagationClient(stampCost: Int, recorder: PhaseRecordingNode)
         #expect(recorder.failures.value == [hash].compactMap { $0 })
         #expect(recorder.propagatedHandOvers.value == 0)
         #expect(store.state.preparingPhases.isEmpty)
+    }
+
+    /// `.cancelOutbound` on an explicit propagated send mid-stamp: reported cancelled once, its
+    /// search stopped, never handed over, and another explicit send in flight is untouched.
+    @Test(.timeLimit(.minutes(1))) func cancellingOneStampingExplicitSendReportsItCancelledAndLeavesTheOther() async {
+        let reports = LockIsolated<[Reported]>([])
+        let recorder = PhaseRecordingNode(reports: reports)
+        let store = makePropagationClient(stampCost: LXMFPropagation.maxPropagationStampCost, recorder: recorder)
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data("t".utf8), content: Data("one".utf8)))
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data("t".utf8), content: Data("two".utf8)))
+        let hashes = reports.value.map(\.hash)
+        #expect(hashes.count == 2 && hashes[0] != hashes[1])
+        guard hashes.count == 2 else { return }
+
+        await store.send(.cancelOutbound(messageHash: hashes[0]))
+        await store.skipReceivedActions(strict: false)
+        await store.send(.cancelOutbound(messageHash: hashes[0]))     // already cancelled: reports nothing more
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.cancellations.value == [hashes[0]])
+        #expect(recorder.failures.value.isEmpty)
+        #expect(store.state.preparingPhases[hashes[0]] == nil)
+        #expect(store.state.preparingPhases[hashes[1]] == .stamping, "the other send is untouched")
+
+        await store.send(.cancelOutbound(messageHash: hashes[1]))
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.cancellations.value == [hashes[0], hashes[1]])
+        #expect(recorder.propagatedHandOvers.value == 0)
+        // Both searches are over only if each was cancelled by its own ID.
+        store.exhaustivity = .on
+        await store.finish(timeout: .seconds(10))
     }
 
     @Test func settingTheSamePropagationNodeLeavesAStampingExplicitSendRunning() async {

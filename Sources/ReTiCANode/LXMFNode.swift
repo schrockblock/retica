@@ -304,7 +304,8 @@ public struct LXMFNode {
         case cancelDeliveryStamps
         /// Cancel one outbound message, wherever it is: in its delivery or propagation stamp search,
         /// queued, retrying, or mid-transfer (its Resource is cancelled on the wire). Reports
-        /// `.delegate(.deliveryCancelled)` once; nothing else is reported for it afterwards.
+        /// `.delegate(.deliveryCancelled)` once; nothing else is reported for it afterwards. That
+        /// includes an explicit `.sendViaPropagation` still stamping: its stamp work is stopped.
         /// Reference `LXMRouter.cancel_outbound` (LXMRouter.py:1719-1744).
         case cancelOutbound(messageHash: Data)
         /// Internal: a path-request interval has passed for sends in `waitingForPeerCost`.
@@ -718,6 +719,7 @@ public struct LXMFNode {
                     else { return }                                  // cancelled mid-search
                     await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
                 }
+                .cancellable(id: CancelID.propagationStampFor(msg.hash))
                 .cancellable(id: CancelID.propagationStamp)
                 return .merge(preparing, work)
 
@@ -819,7 +821,10 @@ public struct LXMFNode {
                 // message) and hand the rest to the router, which owns every copy it was given. A
                 // delivery copy still in its stamp search was never handed over, so if the router holds
                 // nothing else for the message the cancel is reported here — once either way.
+                // An explicit `.sendViaPropagation` still stamping has a phase but is in neither the
+                // delivery list nor the router; its per-message ID, cancelled below, stops the work.
                 let wasSearching = state.inFlightDeliveryStamps.contains(hash)
+                    || state.preparingPhases[hash] == .stamping
                 state.inFlightDeliveryStamps.removeAll { $0 == hash }
                 state.preparingPhases[hash] = nil
                 state.pendingFallbacks[hash] = nil      // the router drops its eligibility below
