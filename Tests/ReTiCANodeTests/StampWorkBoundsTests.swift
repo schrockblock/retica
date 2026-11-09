@@ -122,6 +122,7 @@ private func makePropagationClient(advertisedStampCost: Int) -> TestStore<LXMFNo
     await store.send(.sendViaPropagation(destinationHash: recipientDest, title: Data("t".utf8),
                                          content: Data("x".utf8)))
     await store.send(.cancelPropagationStamps)
+    await store.skipReceivedActions(strict: false)      // the send is reported deliveryFailed
     store.exhaustivity = .on
     await store.finish(timeout: .seconds(10))
 }

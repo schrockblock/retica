@@ -24,12 +24,16 @@ private struct PhaseRecordingNode: Reducer {
     typealias State = LXMFNode.State
     typealias Action = LXMFNode.Action
     let reports: LockIsolated<[Reported]>
+    var failures: LockIsolated<[Data]> = LockIsolated([])
+    var propagatedHandOvers: LockIsolated<Int> = LockIsolated(0)
 
     var body: some Reducer<State, Action> {
         Reduce { _, action in
             if case let .delegate(.deliveryPreparing(hash, phase)) = action {
                 reports.withValue { $0.append(Reported(hash: hash, phase: phase)) }
             }
+            if case let .delegate(.deliveryFailed(hash)) = action { failures.withValue { $0.append(hash) } }
+            if case .router(.sendViaPropagation) = action { propagatedHandOvers.withValue { $0 += 1 } }
             return .none
         }
         LXMFNode()
@@ -94,6 +98,33 @@ private func waitOutTheCostWait(_ store: TestStoreOf<LXMFNode>, _ clock: TestClo
         await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
         await store.skipReceivedActions(strict: false)
     }
+}
+
+private let propagationNodeHash = Data(repeating: 0xC0, count: 16)
+private let propagationRecipient = Data(repeating: 0xA1, count: 16)
+
+/// A node with a propagation node set at `stampCost` and a recipient it can pack for.
+@MainActor
+private func makePropagationClient(stampCost: Int, recorder: PhaseRecordingNode) -> TestStoreOf<LXMFNode> {
+    var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+    ep.transport.learned[propagationRecipient] = LearnedDestination(
+        identity: Identity(), appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),
+        hops: 1, nextHop: nil, announceEmitted: 0)
+    ep.transport.learned[propagationNodeHash] = LearnedDestination(
+        identity: Identity(),
+        appData: PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
+                            targetStampCost: stampCost, stampCostFlexibility: 0, peeringCost: 0).packed,
+        ratchet: nil, interfaceID: InterfaceID("tcp"), hops: 1, nextHop: nil, announceEmitted: 0)
+    var node = LXMFNode.State(identity: Identity(), endpoint: ep)
+    node.router.outboundPropagationNode = propagationNodeHash
+    let store = TestStore(initialState: node) { recorder } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: sentAt))
+        $0.continuousClock = TestClock()
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+    return store
 }
 
 @Suite @MainActor struct LXMFNodePreparingPhaseTests {
@@ -184,28 +215,9 @@ private func waitOutTheCostWait(_ store: TestStoreOf<LXMFNode>, _ clock: TestClo
 
     /// Review Focus 5: an explicit propagated send stamps (and packs) in one effect.
     @Test func anExplicitPropagatedSendReportsStampingThenHandedOver() async {
-        let pnHash = Data(repeating: 0xC0, count: 16), recipient = Data(repeating: 0xA1, count: 16)
-        var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
-        ep.transport.learned[recipient] = LearnedDestination(
-            identity: Identity(), appData: nil, ratchet: nil, interfaceID: InterfaceID("tcp"),
-            hops: 1, nextHop: nil, announceEmitted: 0)
-        ep.transport.learned[pnHash] = LearnedDestination(
-            identity: Identity(),
-            appData: PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 0, perSyncLimit: 0,
-                                targetStampCost: 4, stampCostFlexibility: 0, peeringCost: 0).packed,
-            ratchet: nil, interfaceID: InterfaceID("tcp"), hops: 1, nextHop: nil, announceEmitted: 0)
-        var node = LXMFNode.State(identity: Identity(), endpoint: ep)
-        node.router.outboundPropagationNode = pnHash
         let reports = LockIsolated<[Reported]>([])
-        let store = TestStore(initialState: node) { PhaseRecordingNode(reports: reports) } withDependencies: {
-            $0.date = .constant(Date(timeIntervalSince1970: sentAt))
-            $0.continuousClock = TestClock()
-            $0.uuid = .incrementing
-            $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
-        }
-        store.exhaustivity = .off
-
-        await store.send(.sendViaPropagation(destinationHash: recipient, title: Data("t".utf8), content: Data("x".utf8)))
+        let store = makePropagationClient(stampCost: 4, recorder: PhaseRecordingNode(reports: reports))
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data("t".utf8), content: Data("x".utf8)))
         await store.receive({ if case .router(.sendViaPropagation) = $0 { return true }; return false }, timeout: .seconds(30))
         await store.skipReceivedActions(strict: false)
 
@@ -213,6 +225,50 @@ private func waitOutTheCostWait(_ store: TestStoreOf<LXMFNode>, _ clock: TestClo
         #expect(reports.value.map(\.phase) == [.stamping, .handedOver])
         #expect(reports.value.allSatisfy { $0.hash == hash })
         #expect(store.state.preparingPhases.isEmpty)
+    }
+
+    /// The router knows nothing of an explicit propagated send until its hand-over, so the node
+    /// itself must report one whose stamp work is cancelled: failed once, never handed over.
+    @Test func cancellingPropagationStampsFailsAStampingExplicitSendOnce() async {
+        let reports = LockIsolated<[Reported]>([])
+        let recorder = PhaseRecordingNode(reports: reports)
+        let store = makePropagationClient(stampCost: LXMFPropagation.maxPropagationStampCost, recorder: recorder)
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data("t".utf8), content: Data("x".utf8)))
+        let hash = reports.value.first?.hash
+        #expect(reports.value.map(\.phase) == [.stamping])
+
+        await store.send(.cancelPropagationStamps)
+        await store.send(.cancelPropagationStamps)     // a second cancel has nothing left to fail
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.failures.value == [hash].compactMap { $0 })
+        #expect(recorder.propagatedHandOvers.value == 0)
+        #expect(store.state.preparingPhases.isEmpty)
+    }
+
+    @Test func changingThePropagationNodeFailsAStampingExplicitSendOnce() async {
+        let reports = LockIsolated<[Reported]>([])
+        let recorder = PhaseRecordingNode(reports: reports)
+        let store = makePropagationClient(stampCost: LXMFPropagation.maxPropagationStampCost, recorder: recorder)
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data("t".utf8), content: Data("x".utf8)))
+        let hash = reports.value.first?.hash
+
+        await store.send(.setPropagationNode(destinationHash: Data(repeating: 0xC1, count: 16)))
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.failures.value == [hash].compactMap { $0 })
+        #expect(recorder.propagatedHandOvers.value == 0)
+        #expect(store.state.preparingPhases.isEmpty)
+    }
+
+    @Test func settingTheSamePropagationNodeLeavesAStampingExplicitSendRunning() async {
+        let reports = LockIsolated<[Reported]>([])
+        let recorder = PhaseRecordingNode(reports: reports)
+        let store = makePropagationClient(stampCost: LXMFPropagation.maxPropagationStampCost, recorder: recorder)
+        await store.send(.sendViaPropagation(destinationHash: propagationRecipient, title: Data("t".utf8), content: Data("x".utf8)))
+        await store.send(.setPropagationNode(destinationHash: propagationNodeHash))
+        #expect(recorder.failures.value.isEmpty)
+        #expect(store.state.preparingPhases.count == 1)
+        await store.send(.cancelPropagationStamps)       // reclaim the long search
+        await store.skipReceivedActions(strict: false)
     }
 
     @Test func aCancelledWaitingSendReportsNoHandedOver() async {

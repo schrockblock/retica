@@ -283,6 +283,10 @@ public struct LXMFNode {
         /// for size is reported `propagationRefused` at once instead.
         case sendMessage(message: LXMessage, fallbackToPropagation: Bool)
         case syncFromPropagationNode
+        /// Cancel in-flight propagation stamp work. An explicit `.sendViaPropagation` still stamping is
+        /// reported `.delegate(.deliveryFailed(messageHash:))` (once, never handed over), and so is
+        /// one still stamping when `.setPropagationNode` names a different node. The same holds for
+        /// the pending propagated copies of fallback sends, which fail through the router.
         case cancelPropagationStamps
         /// Cancel any in-flight delivery-stamp searches. Call when the app backgrounds, the user
         /// abandons a send, or the destination is no longer reachable. Mirrors `cancelPropagationStamps`
@@ -682,7 +686,7 @@ public struct LXMFNode {
                 // having never reached the node (the photo of 2026-10-21). Every stamp in flight
                 // was sized to THIS node's cost, so there is nothing to stop or redo.
                 guard destinationHash != state.router.outboundPropagationNode else { return .none }
-                forgetPropagationStamping(&state)
+                let strandedSends = forgetPropagationStamping(&state)
                 // Every in-flight stamp was sized to the PREVIOUS node's advertised cost, and a stamp
                 // below a node's enforced minimum is dropped by its ingest — so finishing that search
                 // could only burn a core for a message the new node would reject. Constructed on this
@@ -691,6 +695,7 @@ public struct LXMFNode {
                 // The copies whose searches this abandons have failed (through the router's `fail`,
                 // so a message whose delivery copy is still pending is not reported failed).
                 return .merge(.cancel(id: CancelID.propagationStamp), abandonPendingPropagatedCopies(state),
+                              strandedSends,
                               .send(.router(.setOutboundPropagationNode(destinationHash))))
 
             case let .sendViaPropagation(destinationHash, title, content):
@@ -763,8 +768,10 @@ public struct LXMFNode {
                 // merely discard its result. Reference exposes the same lever as
                 // `LXMRouter.cancel_outbound` → `LXStamper.cancel_work` (LXStamper.py:146-175).
                 // ...and the copies those searches were for have failed, through the router's `fail`.
-                forgetPropagationStamping(&state)
-                return .merge(.cancel(id: CancelID.propagationStamp), abandonPendingPropagatedCopies(state))
+                // An explicit `.sendViaPropagation` still stamping is reported `deliveryFailed` here.
+                let strandedSends = forgetPropagationStamping(&state)
+                return .merge(.cancel(id: CancelID.propagationStamp), abandonPendingPropagatedCopies(state),
+                              strandedSends)
 
             case .cancelDeliveryStamps:
                 // The app's explicit reclaim for in-flight delivery-stamp searches. Even an accepted
@@ -1515,10 +1522,15 @@ public struct LXMFNode {
 
     /// The propagation stamp work was cancelled or its node changed: a message that reported
     /// `.stamping` for an explicit propagated send, and so is not in `inFlightDeliveryStamps`, will
-    /// not reach the router and reports nothing further, so its phase is forgotten.
-    private func forgetPropagationStamping(_ state: inout State) {
+    /// not reach the router, so its phase is forgotten and it is reported `deliveryFailed`, once.
+    /// The router has no record of such a message before its hand-over (it is in neither
+    /// `pendingPropagatedCopies` nor `inFlightDeliveryStamps`), so nothing else can report it.
+    private func forgetPropagationStamping(_ state: inout State) -> Effect<Action> {
         let searching = Set(state.inFlightDeliveryStamps)
-        state.preparingPhases = state.preparingPhases.filter { searching.contains($0.key) }
+        let stranded = state.preparingPhases.keys.filter { !searching.contains($0) }
+            .sorted { $0.lexicographicallyPrecedes($1) }
+        for hash in stranded { state.preparingPhases[hash] = nil }
+        return .merge(stranded.map { .send(.delegate(.deliveryFailed(messageHash: $0))) })
     }
 
     /// `message` stamped at `cost`, or unchanged when `cost` is nil. Nil only if the search was cancelled.
