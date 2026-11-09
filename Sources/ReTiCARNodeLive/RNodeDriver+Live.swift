@@ -23,25 +23,26 @@ extension RNodeDriver {
 /// `RNodeInterface` may `start` again from `.unavailable` without a `stop()` in between, so
 /// `pendingConnects` is a counter and `stop()` drains them all.
 ///
-/// Sends bind to the link that is up when they are called (ledger carry 1). A power-off fails no
-/// FCB op, so a write in flight then may never return: `send` races it against that link ending
-/// and answers false when it does, rather than leaving the interface's sender waiting.
+/// Sends bind to the link that is up when they are called (ledger carry 1). `send` also races the
+/// kit's write against that link ending and answers false as soon as the adapter sees it end.
+/// Today's FCB already fails a pending write on a power-off or a disconnect, so the race is
+/// defence-in-depth against a future FCB that doesn't; no test can make it decisive, and the
+/// in-flight power-off test pins only the outcome.
 final class RNodeLiveAdapter: Sendable {
     let session: RNodeSession
     private let link = LockIsolated(Link())
     /// `connect(radio:config:)` calls launched by `start` that have not returned yet.
     private let pendingConnects = LockIsolated(0)
 
+    /// The ledger's link generation is `owner` plus `waiters`: `endLink` fails and clears every
+    /// waiter of the current link, so a send only ever waits on the link it started on.
     private struct Link {
         /// Bumped by every `start` and `stop`: a superseded pump never touches the link.
         var owner: UInt64 = 0
-        /// Bumped whenever the link ends (or a start or stop supersedes it): the ledger's link
-        /// generation. Sends started on one generation are failed when it moves.
-        var generation: UInt64 = 0
-        /// `.connected` was reported on `generation` and nothing has ended it since.
+        /// `.connected` was reported for `owner` and nothing has ended that link since.
         var up = false
         var nextWaiter: UInt64 = 0
-        /// Sends in flight on `generation`, each failed when it moves.
+        /// Sends in flight on the current link, each failed when it ends.
         var waiters: [UInt64: @Sendable () -> Void] = [:]
     }
 
@@ -109,6 +110,8 @@ final class RNodeLiveAdapter: Sendable {
         }
         guard let token else { return false }
         let session = self.session
+        // If the race answers first, this task runs on; FCB resolves every pending write when the
+        // link ends, so it always finishes.
         Task {
             do {
                 try await session.send(packet)
@@ -146,7 +149,6 @@ final class RNodeLiveAdapter: Sendable {
     private func endLink(_ owner: UInt64) {
         let waiters = link.withValue { link -> [@Sendable () -> Void] in
             guard link.owner == owner else { return [] }
-            link.generation &+= 1
             link.up = false
             defer { link.waiters = [:] }
             return Array(link.waiters.values)

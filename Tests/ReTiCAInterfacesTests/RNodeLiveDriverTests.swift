@@ -172,8 +172,10 @@ extension FCBDriverAdapterCBMTests {
             await live.end()
         }
 
-        /// Ledger carry 1 / preflight B1: a power-off fails no FCB op, so the DATA write in flight
-        /// never returns; the send answers false once its link ends.
+        /// Ledger carry 1 / preflight B1: Bluetooth powers off during the DATA write and the send
+        /// answers false within 2 s. This pins the outcome only: today's FCB fails the pending
+        /// write itself, so the adapter's race against the link ending is defence-in-depth and
+        /// not what this test decides.
         @Test func liveSendInFlightWhenBluetoothPowersOffReturnsFalse() async {
             let radio = await makeLiveRNodeRadio()
             let live = startLiveRNode(radio, radio.config())
