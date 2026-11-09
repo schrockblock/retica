@@ -336,7 +336,10 @@ Once enabled, ReTiCA behaves as reference (RNS 1.6.0 `Destination.py`):
 - Cost: with a full ring, a packet that no ratchet opens costs up to 513 key agreements. That
   covers junk and every packet a peer encrypted to the identity key. It was measured at about
   15-20 ms on a Mac, and it runs on the reducer's thread (the main actor in a TCA host). Reference
-  costs the same or more. The ring fills in no less than 10.7 days. A downloaded propagated
+  costs the same or more. The ring rotates at least 30 minutes apart within a process, and once
+  at every process start (the first announce after `.enableRatchets` rotates, as in reference),
+  so a host that relaunches often cycles the ring faster: 512 retained keys cover 10.7 days only
+  for a process that stays up. A downloaded propagated
   message costs one decrypt, and one addressed to another destination costs none.
 - The announce grows by 32 bytes, so `LXMFNode` cuts the display name to
   `LXMFAnnounceData.maxAppDataBytesWithRatchet` (283 bytes of app data, 32 fewer than without a
