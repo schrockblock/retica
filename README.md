@@ -273,14 +273,14 @@ stamps. Save these and replay them at launch:
 | Save | Read it from | Restore with |
 |---|---|---|
 | Your identity's private key | `identity.privateKey` | `Identity(privateKey:)` |
-| Path table | `state.endpoint.learned` (`[Data: LearnedDestination]`) | `.endpoint(.transport(.rehydrateLearnedDestinations(_:)))` |
-| Known identities (recall) and the link costs they announced | `state.endpoint.knownDestinations` | `.endpoint(.transport(.rehydrateKnownDestinations(_:)))`. Without it the first link to a peer enforcing link-request stamps fails until it announces again. |
+| Path table | `state.endpoint.learned` (`[Data: LearnedDestination]`) | `.endpoint(.transport(.rehydrateLearnedDestinations(_:)))`. `LearnedDestination.ratchet` is deprecated and ignored: a peer's ratchet is saved with its known destination (next row). |
+| Known identities (recall), the link costs they announced, and their ratchets | `state.endpoint.knownDestinations`, including `ratchet` and `ratchetReceived` | `.endpoint(.transport(.rehydrateKnownDestinations(_:)))`. Without it the first link to a peer enforcing link-request stamps fails until it announces again. Without the two ratchet fields, messages to a peer go to its identity key until it announces again, and a peer that enforces ratchets drops them. A ratchet older than 30 days (`Transport.ratchetExpiry`) is dropped on restore. |
 | Hashes of messages already received | `message.hash` from each `.delegate(.messageReceived)` | `.router(.rehydrateDedup(seenHashes:downloadedTransientIds:))`, **oldest first** |
 | Transient ids downloaded from a propagation node | `.router(.messagesDownloaded(transientIds:))` actions, or `state.router.downloadedTransientIds` | the same action |
 | Peers' display names and stamp costs | `state.learnedPeers` | `.rehydrateLearnedPeers(_:)` |
 | Blocked senders | `state.ignoredDestinations` | `.rehydrateIgnoredDestinations(_:)` |
 | Stamp tickets peers gave you (one per peer) | `.delegate(.ticketReceived(destinationHash:ticket:))`, or `state.outboundTickets` | `.rehydrateTickets(outbound:inbound:lastDeliveries:)`, `outbound:`. Without them every send to a stamp-enforcing peer does proof-of-work again until it sends you a new ticket. |
-| Stamp tickets you issued (only with `issueTickets` on, or if you add ticket fields yourself) | `.delegate(.ticketIssued(destinationHash:ticket:))`, or `state.inboundTickets` | the same action, `inbound:`. Without them, once you set a delivery stamp cost, a peer's ticket-stamped messages fail validation (and are dropped if you enforce stamps). |
+| Stamp tickets you issued (only with `issueTickets` on, or if you add ticket fields yourself) | `.delegate(.ticketIssued(destinationHash:ticket:))`, or `state.inboundTickets` | the same action, `inbound:`. Without them, once you set a delivery stamp cost, a peer's ticket-stamped messages fail validation (and are dropped if you enforce stamps). `.ticketIssued` can repeat a ticket you already saved (a resend before `.rehydrateTickets` lands), so upsert by the ticket bytes. |
 | When a ticket you issued was last delivered to each peer | `.delegate(.ticketDelivered(destinationHash:at:))`, or `state.lastTicketDeliveries` | the same action, `lastDeliveries:`. Without them a ticket goes out again within a day of the last delivered one. |
 | Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))`; in an `LXMFServiceNode` host (ReTiCAMsgr), `.node(.client(.endpoint(.delegate(.destinationStampGenerated(...)))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.rehydrateDestinationStamp(...))))` |
 | A propagation node's stored messages (only if you run one) | the stored entries | `.pn(.ingestContainer(LXMFPropagation.container(timestamp:entries:)))` on `LXMFServiceNode` |
@@ -288,11 +288,21 @@ stamps. Save these and replay them at launch:
 Ordering matters for `seenHashes`: it is a ring of 10,000, so supplying newest-first keeps the
 wrong half. The rehydrate actions drop expired, malformed or future-dated rows and never
 overwrite an entry the network has already refreshed, so they are safe to send after
-`.endpoint(.start)` (ReTiCAMsgr runs its database reads alongside starting the interfaces). They
-cannot tell you to delete expired rows from disk; prune those yourself with
+`.endpoint(.start)` (ReTiCAMsgr runs its database reads alongside starting the interfaces).
+A ticket restored after `.endpoint(.start)` still applies to a send that is waiting for the peer's
+stamp cost: that send is handed over with the ticket stamp as soon as the ticket lands. A send
+that already started its proof-of-work search keeps searching, and finishes with a valid stamp.
+One exception: `.rehydrateTickets` does **not** drop a ticket whose expiry is far in the future.
+A peer chooses the expiry of a ticket it gives you, and reference accepts any value. A ticket you
+issued only expires later than 21 days from now if your clock went backwards, and dropping it
+would make that peer's ticket stamps fail while the peer still holds the ticket. It does drop
+future delivery times, which would stop issuing to that peer until the clock caught up. The
+rehydrate actions cannot tell you to delete expired rows from disk; prune those yourself with
 `Transport.pathExpiry` (7 days), `Transport.knownDestinationExpiry` (8.75 days),
-`LXMFNode.stampCostExpiry` (45 days), a ticket's `expires` for tickets peers gave you, and
-`expires` plus `LXMessage.ticketGrace` (5 days) for tickets you issued. `LearnedDestination` and `KnownDestination` are not
+`LXMFNode.stampCostExpiry` (45 days), a ticket's `expires` for tickets peers gave you,
+`expires` plus `LXMessage.ticketGrace` (5 days) for tickets you issued, and
+`LXMessage.ticketInterval` (1 day) for ticket delivery times (an older one has no effect).
+`LearnedDestination` and `KnownDestination` are not
 `Codable`; store their public fields (the identity as `identity.publicKey`) and rebuild them with
 their public initialisers. A destination stamp is mined once per destination: about 45 s at the
 default value on a Mac (see [Network stamps](#network-stamps-rns-16)); on a phone it has not been
@@ -301,7 +311,8 @@ A rehydrated stamp is checked against `destinationValue` and mined again if it f
 
 ## Stamp tickets (LXMF 1.3)
 
-A ticket a peer gives you is always kept and used: sends to that peer are stamped with it instead
+A ticket a peer gives you in a message whose signature validated (so the sender's identity must
+already be known) is kept and used: sends to that peer are stamped with it instead
 of proof-of-work until it expires. Issuing tickets yourself is **off by default**, as in reference,
 where the client opts in per message (`include_ticket`). Turn it on with `.setIssueTickets(true)`.
 Then every message the node builds (`.send`, `.sendViaPropagation`) carries a ticket for its
@@ -313,8 +324,9 @@ A message you build yourself and send with `.sendMessage` is already hashed and 
 cannot add the field. Ask for it before creating the message and include it in `fields`:
 
 ```swift
-let field = state.ticketFieldToIssue(destinationHash: peer, now: Date())   // nil when off or not due
-let message = LXMessage.create(source: identity, destinationHash: peer, timestamp: now,
+let now = Date()
+let field = state.ticketFieldToIssue(destinationHash: peer, now: now)   // nil when off or not due
+let message = LXMessage.create(source: identity, destinationHash: peer, timestamp: now.timeIntervalSince1970,
                                title: title, content: content, fields: fields + (field.map { [$0] } ?? []))
 store.send(.sendMessage(message: message, fallbackToPropagation: true))
 ```
@@ -523,7 +535,7 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Network stamps on our link requests | Implemented, tested live against RNS 1.6.0. **On, as in 1.6.0** | Only to a destination that announced a link cost, and only up to cost 20 (reference has no ceiling). An enforcing reference peer accepts the stamped request and ignores an unstamped one. |
 | Enforcing network stamps (`enforceStamps`) | Implemented, tested against reference fixtures; announces also tested live against RNS 1.6.0. **Off by default**, as in 1.6.0 | Refuses announces, path requests and link requests whose stamp falls short (see Part 1). Announce and path-request costs can be set per interface, as in reference. Inbound path- and link-request enforcement is tested only with fixtures, not against a live reference peer. |
 | Announce propagation as a transport node | Implemented | Relay mode (`.enableRelay`), HEADER_2 rewrite; rebroadcast and retry constants cross-validated; per-interface announce bandwidth cap. |
-| Ratchets | **Partial** | ReTiCA encrypts to a peer's announced ratchet but never generates, rotates, persists or announces its own. So there is no forward secrecy for traffic *to* a ReTiCA destination, and a peer that calls `enforce_ratchets()` drops everything ReTiCA sends it. |
+| Ratchets | **Partial** | A peer's announced ratchet is kept with its known destination (refreshed by every fresh announce, kept when an announce carries none, expired after 30 days, persisted by the host) and used for opportunistic packets and propagated LXMF payloads to it; the propagated payload is cross-validated byte for byte against LXMF 1.3.0. Not yet tested against a live peer that enforces ratchets. ReTiCA never generates, rotates or announces its own ratchet, so there is no forward secrecy for traffic *to* a ReTiCA destination. |
 | Path table, path requests and responses | Implemented, cross-validated (request and response layout) | Path expiry by interface mode. Persisted by the host. No rate limiting of inbound path requests. |
 | Forwarding as a relay | Implemented | Multi-hop data forwarding, and a link table so links can be established through a relay. |
 | Proofs | **Partial** | Single-packet proofs (implicit and explicit) are sent and validated; link packet proofs too. A ReTiCA relay keeps no reverse table, so it does not route proofs for third parties. |

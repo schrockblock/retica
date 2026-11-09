@@ -215,22 +215,41 @@ private func waitForHandOver(_ store: TestStoreOf<LXMFNode>) async {
         #expect(store.state.preparingPhases.isEmpty)
     }
 
-    /// A ticket that arrives while a first send waits for the peer's cost stamps it when the wait runs
-    /// out, and the copy is not kept for re-stamping: it already carries the stamp the peer accepts.
-    @Test func aTicketLearnedDuringTheCostWaitStampsTheSendWhenTheWaitRunsOut() async {
+    /// A ticket that arrives while a first send waits for the peer's cost releases the send at once
+    /// with the ticket stamp, with no clock advance. Nothing is kept for re-stamping and no stamp
+    /// search is reported as preparing.
+    @Test func aTicketLearnedDuringTheCostWaitStampsTheSendAtOnce() async {
         let me = Identity(), peer = Identity(), recorded = Recorded(), clock = TestClock()
         let store = await makeNode(me, recorded, clock: clock)
         let m = outbound(from: me, to: peer)
         await store.send(.sendMessage(message: m, fallbackToPropagation: false))
         #expect(recorded.phases.value == [.waitingForPeer])
+        #expect(recorded.handedOver.value.isEmpty)
 
         await deliver(store, inbound(from: peer, to: me, fields: ticketField(expires: .double(now + 1000), ticket: ticketA)),
                       validated: true)
-        for _ in 0..<LXMFNode.peerCostPathRequests {
-            await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds))
-            await store.skipReceivedActions(strict: false)
-        }
         #expect(recorded.handedOver.value.map(\.stamp) == [LXMessage.ticketStamp(ticket: ticketA, messageHash: m.hash)])
+        #expect(recorded.phases.value == [.waitingForPeer, .handedOver], "no .stamping was reported")
+        #expect(store.state.waitingForPeerCost.isEmpty)
+        #expect(store.state.inFlightDeliveryStamps.isEmpty)
+        #expect(store.state.unstampedHandOvers.isEmpty)
+    }
+
+    /// The same release when the ticket comes from `.rehydrateTickets` (the app restoring its store).
+    @Test func aRestoredTicketReleasesASendWaitingForTheCostAtOnce() async {
+        let me = Identity(), peer = Identity(), recorded = Recorded(), clock = TestClock()
+        let store = await makeNode(me, recorded, clock: clock)
+        let m = outbound(from: me, to: peer)
+        await store.send(.sendMessage(message: m, fallbackToPropagation: false))
+        #expect(recorded.handedOver.value.isEmpty)
+
+        let ticket = LXMFNode.Ticket(ticket: ticketA, expires: Date(timeIntervalSince1970: now + 1000))
+        await store.send(.rehydrateTickets(outbound: [deliveryHash(peer): ticket], inbound: [:], lastDeliveries: [:]))
+        await store.skipReceivedActions(strict: false)
+        #expect(recorded.handedOver.value.map(\.stamp) == [LXMessage.ticketStamp(ticket: ticketA, messageHash: m.hash)])
+        #expect(recorded.phases.value == [.waitingForPeer, .handedOver], "no .stamping was reported")
+        #expect(store.state.waitingForPeerCost.isEmpty)
+        #expect(store.state.inFlightDeliveryStamps.isEmpty)
         #expect(store.state.unstampedHandOvers.isEmpty)
     }
 

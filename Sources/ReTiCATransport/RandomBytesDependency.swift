@@ -1,6 +1,6 @@
 import Foundation
-import Security
 import ComposableArchitecture
+import ReTiCA
 
 /// A dependency that produces `count` random bytes. Live is CSPRNG-backed
 /// (`SecRandomCopyBytes`); test/preview is a deterministic ramp so spawned resource
@@ -13,9 +13,9 @@ public struct RandomBytesGenerator: Sendable {
 
 extension RandomBytesGenerator: DependencyKey {
     public static let liveValue = RandomBytesGenerator { count in
-        var bytes = [UInt8](repeating: 0, count: count)
-        _ = bytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, count, $0.baseAddress!) }
-        return Data(bytes)
+        // Traps if `SecRandomCopyBytes` fails, so this never returns unrandom (zero) bytes:
+        // issued tickets, the path-request tag and the sender ID come from here.
+        SecureRandom.bytes(count)
     }
     public static let testValue = RandomBytesGenerator { count in
         Data((0..<count).map { UInt8($0 & 0xff) })

@@ -168,8 +168,15 @@ public struct LXMFNode {
         /// (`.sendMessage`) get theirs from `ticketFieldToIssue(destinationHash:now:)`.
         public var issueTickets: Bool = false
         /// Outbound messages that carry a ticket we issued, by message hash → recipient. Lets a
-        /// delivery confirmation record `lastTicketDeliveries`. Removed when the message ends.
+        /// delivery confirmation record `lastTicketDeliveries`. An entry goes at the message's
+        /// delivery confirmation, or at the first sweep after it can no longer be confirmed. A sweep
+        /// runs at every terminal outcome reported for any message and at every new ticket-carrying
+        /// send. So entries are bounded by the messages still out, plus those ended silently since the
+        /// last sweep (a delivery copy that ends after its propagated copy was accepted reports nothing).
         public internal(set) var ticketCarryingMessages: [Data: Data] = [:]
+        /// Ticket-carrying messages whose propagated copy was accepted while their delivery copy was
+        /// still out. Tells a sweep that the router's success for them has been handled here.
+        public internal(set) var ticketMessagesAccepted: Set<Data> = []
 
         /// Display name advertised in every delivery-destination announce.
         /// Nil means no name is encoded (the announce still carries the full app-data blob per
@@ -437,7 +444,9 @@ public struct LXMFNode {
             /// We minted a ticket for the peer `destinationHash` and put it in an outbound message;
             /// it is now in `State.inboundTickets[destinationHash]`. Persist it: without it, after a
             /// relaunch that peer's ticket stamps no longer validate. Not reported when a ticket
-            /// already held is reused.
+            /// already held is reused. It can repeat a ticket reported in an earlier session: a
+            /// message carrying it, resent before `.rehydrateTickets` restores `inboundTickets`, is
+            /// reported again. Hosts should upsert by the ticket bytes.
             case ticketIssued(destinationHash: Data, ticket: LXMFNode.Ticket)
             /// A message carrying a ticket we issued to `destinationHash` was confirmed delivered at
             /// `at`, now in `State.lastTicketDeliveries`. Persist it.
@@ -575,8 +584,12 @@ public struct LXMFNode {
     static let peerCostPathRequests = 3
 
     @Dependency(\.date) var date
+    /// Transport's clock: a peer ratchet's receive time is stamped with it, so its freshness is read
+    /// with it too (`recallRatchet`).
+    @Dependency(\.transportDate) var transportDate
     @Dependency(\.continuousClock) var clock
-    @Dependency(\.withRandomNumberGenerator) var withRandomNumberGenerator
+    /// A minted ticket's bytes. Live: `SecRandomCopyBytes`. Test: the ramp `00 01 02 …`.
+    @Dependency(\.randomBytes) var randomBytes
     public init() {}
 
     public var body: some ReducerOf<Self> {
@@ -689,9 +702,11 @@ public struct LXMFNode {
                 func wellFormed(_ t: Ticket) -> Bool {
                     t.ticket.count == LXMessage.ticketLength && t.expires.timeIntervalSinceReferenceDate.isFinite
                 }
+                var restoredOutbound: [Data] = []
                 for (hash, ticket) in outbound where state.outboundTickets[hash] == nil {
                     guard wellFormed(ticket), ticket.expires >= now else { continue }
                     state.outboundTickets[hash] = ticket
+                    if ticket.expires > now { restoredOutbound.append(hash) }
                 }
                 let inboundCutoff = now - LXMessage.ticketGrace
                 for (hash, tickets) in inbound {
@@ -707,7 +722,10 @@ public struct LXMFNode {
                     if let live = state.lastTicketDeliveries[hash], live >= at { continue }
                     state.lastTicketDeliveries[hash] = at
                 }
-                return .none
+                // A send parked in the first-send cost wait for a peer whose ticket was just restored
+                // gets the ticket stamp at once. A stamp search already running for that peer is not
+                // restarted: it finishes with a valid stamp.
+                return .merge(restoredOutbound.map { handOverWaitingSends(&state, destinationHash: $0) })
 
             case .registerDelivery:
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
@@ -831,10 +849,14 @@ public struct LXMFNode {
                 let msg = ticketStamped(state, created) ?? created
                 let deliveryCost = msg.stamp == nil ? deliveryStampCost(state, destinationHash: destinationHash) : nil
                 let preparing = reportPhase(&state, msg.hash, .stamping)
+                // The recipient's ratchet as of now, as reference reads it when it packs.
+                let ratchet = state.endpoint.transport.recallRatchet(destinationHash: destinationHash,
+                                                                     now: transportDate.now)
                 let work: Effect<Action> = .run { send in
                     guard let stamped = await LXMFNode.withDeliveryStamp(msg, cost: deliveryCost),
                           let (packed, _) = await LXMFPropagation.pack(
-                              message: stamped, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                              message: stamped, recipientIdentity: recipient, ratchet: ratchet,
+                              timestamp: ts, stampCost: cost)
                     else { return }                                  // cancelled mid-search
                     await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
                 }
@@ -1142,8 +1164,13 @@ public struct LXMFNode {
                     let ticket = Ticket(ticket: entry.ticket, expires: Date(timeIntervalSince1970: entry.expires))
                     if state.outboundTickets[message.sourceHash] != ticket {
                         state.outboundTickets[message.sourceHash] = ticket
-                        ticketEffect = .send(.delegate(.ticketReceived(destinationHash: message.sourceHash,
-                                                                       ticket: ticket)))
+                        // A send parked in the first-send cost wait for this peer now gets the
+                        // ticket stamp at once instead of waiting out the timer. A stamp search
+                        // already running for the peer is not restarted: it finishes with a valid stamp.
+                        ticketEffect = .merge(
+                            .send(.delegate(.ticketReceived(destinationHash: message.sourceHash,
+                                                            ticket: ticket))),
+                            handOverWaitingSends(&state, destinationHash: message.sourceHash))
                     }
                 }
 
@@ -1266,6 +1293,7 @@ public struct LXMFNode {
                 // A delivered ticket starts the interval in which no new one is sent to that peer
                 // (reference `process_outbound`, LXMRouter.py:3060-3067).
                 var ticketDelivered: Effect<Action> = .none
+                state.ticketMessagesAccepted.remove(hash)
                 if let dest = state.ticketCarryingMessages.removeValue(forKey: hash) {
                     let at = date.now
                     state.lastTicketDeliveries[dest] = at
@@ -1283,6 +1311,7 @@ public struct LXMFNode {
                 return startPropagatedCopy(&state, message: message)
 
             case let .router(.delegate(.propagationAccepted(hash))):
+                if state.ticketCarryingMessages[hash] != nil { state.ticketMessagesAccepted.insert(hash) }
                 let done = finishProgress(&state, .propagated(hash))
                 return .merge(done, .send(.delegate(.propagationAccepted(messageHash: hash))))
 
@@ -1472,15 +1501,13 @@ public struct LXMFNode {
                 }
 
             // Every terminal outcome reaches the host as one of these, from whichever branch decided
-            // it, so a message that ends without a delivery confirmation is forgotten here. A
-            // propagated copy's acceptance ends the message only when no delivery copy is still out.
-            case let .delegate(.deliveryFailed(hash)), let .delegate(.deliveryRejected(hash)),
-                 let .delegate(.deliveryCancelled(hash)):
-                state.ticketCarryingMessages[hash] = nil
-                return .none
-
-            case let .delegate(.propagationAccepted(hash)):
-                if !state.router.hasOutboundState(for: hash) { state.ticketCarryingMessages[hash] = nil }
+            // it. Each one sweeps every ticket-carrying message that can no longer be confirmed,
+            // not only its own: a delivery copy that ends after its propagated copy was accepted
+            // ends silently (the router reports no second outcome), so its message is collected
+            // by the next sweep.
+            case .delegate(.deliveryFailed), .delegate(.deliveryRejected), .delegate(.deliveryCancelled),
+                 .delegate(.deliveryConfirmed), .delegate(.propagationAccepted):
+                sweepTicketCarryingMessages(&state)
                 return .none
 
             case .endpoint, .router, .delegate:
@@ -1493,9 +1520,37 @@ public struct LXMFNode {
     /// issuing is off or the rule says not to include one. See `State.ticketFieldToIssue`.
     private func ticketFields(_ state: State, _ destinationHash: Data) -> [MsgPackValue.IntPair] {
         guard state.issueTickets else { return [] }
-        let fresh = withRandomNumberGenerator { LXMFNode.State.randomTicket(using: &$0) }
-        return state.ticketFieldToIssue(destinationHash: destinationHash, now: date.now, newTicket: fresh)
+        return state.ticketFieldToIssue(destinationHash: destinationHash, now: date.now,
+                                        newTicket: randomBytes(LXMessage.ticketLength))
             .map { [$0] } ?? []
+    }
+
+    /// Forget every ticket-carrying message that can no longer be confirmed delivered: the router
+    /// holds no copy of it, the node is not preparing, stamping or holding it, and no delivery
+    /// success for it is still on its way. A message the router counts as succeeded is kept until
+    /// the node has handled a success for it (`ticketMessagesAccepted`, or the confirmation itself,
+    /// which removes the entry), so a `deliveryConfirmed` queued behind this sweep still finds it.
+    ///
+    /// Two gaps, both unproven to occur, both costing only a missed `lastTicketDeliveries` update (a
+    /// ticket may then go to that peer again within a day):
+    ///  - A send recorded here reaches the router through a queued `.router(.send)`. Until it is
+    ///    processed nothing holds the message, so a sweep processed first would drop it. In every
+    ///    send branch the hand-over is queued before anything that reports a terminal outcome.
+    ///  - A message whose propagated copy was already accepted, whose delivery copy then succeeds,
+    ///    is dropped by a sweep processed between that success and its `deliveryConfirmed`.
+    private func sweepTicketCarryingMessages(_ state: inout State) {
+        for hash in Array(state.ticketCarryingMessages.keys) {
+            let stillOut = state.router.hasOutboundState(for: hash)
+                || state.preparingPhases[hash] != nil
+                || state.inFlightDeliveryStamps.contains(hash)
+                || state.pendingFallbacks[hash] != nil
+                || state.waitingForPeerCost.values.contains { $0.contains { $0.message.hash == hash } }
+            let successUnhandled = state.router.succeededMessages.contains(hash)
+                && !state.ticketMessagesAccepted.contains(hash)
+            guard !stillOut, !successUnhandled else { continue }
+            state.ticketCarryingMessages[hash] = nil
+            state.ticketMessagesAccepted.remove(hash)
+        }
     }
 
     /// Record the ticket `message` carries to its recipient as one we issued: remember the message
@@ -1508,6 +1563,7 @@ public struct LXMFNode {
               entry.expires > date.now.timeIntervalSince1970
         else { return .none }
         let dest = message.destinationHash
+        sweepTicketCarryingMessages(&state)
         state.ticketCarryingMessages[message.hash] = dest
         if state.inboundTickets[dest]?.contains(where: { $0.ticket == entry.ticket }) == true { return .none }
         let ticket = Ticket(ticket: entry.ticket, expires: Date(timeIntervalSince1970: entry.expires))
@@ -1581,10 +1637,14 @@ public struct LXMFNode {
         // A ticket learned since the delivery copy left stamps the copy without a search.
         let message = ticketStamped(state, message) ?? message
         let deliveryCost = message.stamp == nil ? deliveryStampCost(state, destinationHash: message.destinationHash) : nil
+        // The recipient's ratchet as of now, as reference reads it when it packs.
+        let ratchet = state.endpoint.transport.recallRatchet(destinationHash: message.destinationHash,
+                                                             now: transportDate.now)
         return .run { send in
             guard let stamped = await LXMFNode.withDeliveryStamp(message, cost: deliveryCost),
                   let (packed, _) = await LXMFPropagation.pack(
-                      message: stamped, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                      message: stamped, recipientIdentity: recipient, ratchet: ratchet,
+                      timestamp: ts, stampCost: cost)
             else { return }                          // cancelled mid-search
             await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
         }
@@ -1845,8 +1905,10 @@ extension LXMFNode.State {
     /// The ticket is part of the message's hashed, signed payload, so ask before creating it:
     ///
     /// ```swift
-    /// let field = store.state.ticketFieldToIssue(destinationHash: peer, now: Date())
-    /// let message = LXMessage.create(source: identity, destinationHash: peer, timestamp: now,
+    /// let now = Date()
+    /// let field = store.state.ticketFieldToIssue(destinationHash: peer, now: now)
+    /// let message = LXMessage.create(source: identity, destinationHash: peer,
+    ///                                timestamp: now.timeIntervalSince1970,
     ///                                title: title, content: content,
     ///                                fields: otherFields + (field.map { [$0] } ?? []))
     /// store.send(.sendMessage(message: message, fallbackToPropagation: true))
@@ -1865,23 +1927,16 @@ extension LXMFNode.State {
     ///  3. else a new random 16-byte ticket expiring `LXMessage.ticketExpiry` (21 days) from `now`.
     ///
     /// The value is `[expires, ticket]` with `expires` a float unix time, as reference sends it.
+    /// A new ticket's bytes come from `SecureRandom.bytes` (`SecRandomCopyBytes`).
     public func ticketFieldToIssue(destinationHash: Data, now: Date) -> MsgPackValue.IntPair? {
-        var rng = SystemRandomNumberGenerator()
-        return ticketFieldToIssue(destinationHash: destinationHash, now: now, using: &rng)
+        ticketFieldToIssue(destinationHash: destinationHash, now: now,
+                           newTicket: SecureRandom.bytes(LXMessage.ticketLength))
     }
 
-    /// `ticketFieldToIssue(destinationHash:now:)` drawing a new ticket's bytes from `generator`.
-    public func ticketFieldToIssue<G: RandomNumberGenerator>(destinationHash: Data, now: Date,
-                                                            using generator: inout G) -> MsgPackValue.IntPair? {
-        ticketFieldToIssue(destinationHash: destinationHash, now: now, newTicket: Self.randomTicket(using: &generator))
-    }
-
-    static func randomTicket<G: RandomNumberGenerator>(using generator: inout G) -> Data {
-        Data((0..<LXMessage.ticketLength).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
-    }
-
-    /// The rule, with `newTicket` as the bytes of a ticket minted now (unused if none is minted).
-    func ticketFieldToIssue(destinationHash: Data, now: Date, newTicket: Data) -> MsgPackValue.IntPair? {
+    /// `ticketFieldToIssue(destinationHash:now:)` with `newTicket` as the bytes of a ticket minted now
+    /// (unused when the rule reuses one or includes none). Bytes that are not `LXMessage.ticketLength`
+    /// long are never minted: the result is nil where a mint would have happened.
+    public func ticketFieldToIssue(destinationHash: Data, now: Date, newTicket: Data) -> MsgPackValue.IntPair? {
         guard issueTickets else { return nil }
         if let last = lastTicketDeliveries[destinationHash], now.timeIntervalSince(last) < LXMessage.ticketInterval {
             return nil
@@ -1892,6 +1947,7 @@ extension LXMFNode.State {
             .max(by: { $0.expires < $1.expires }) {
             ticket = reusable
         } else {
+            guard newTicket.count == LXMessage.ticketLength else { return nil }
             ticket = LXMFNode.Ticket(ticket: newTicket, expires: now + LXMessage.ticketExpiry)
         }
         return .init(LXMessage.fieldTicket, .array([.double(ticket.expires.timeIntervalSince1970), .bin(ticket.ticket)]))

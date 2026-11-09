@@ -20,17 +20,10 @@ private let ticketC = Data(repeating: 0x5C, count: 16)
 
 private func at(_ offset: TimeInterval) -> Date { Date(timeIntervalSince1970: now + offset) }
 
-/// SplitMix64: deterministic bytes for minted tickets.
-private struct SeededGenerator: RandomNumberGenerator, Sendable {
-    var state: UInt64
-    mutating func next() -> UInt64 {
-        state &+= 0x9E3779B97F4A7C15
-        var z = state
-        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
-        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
-        return z ^ (z >> 31)
-    }
-}
+/// The bytes the `randomBytes` dependency yields in these tests, so a minted ticket is known. Not the
+/// dependency's test ramp (00 01 … 0f), which equals `ticketA`.
+private let mintedBytes = Data(repeating: 0xA5, count: 16)
+private let mintedRandom = RandomBytesGenerator { Data(repeating: 0xA5, count: $0) }
 
 /// Counted in a reducer: with exhaustivity off, `store.send` skips actions a later `receive` could see.
 private final class Recorded: Sendable {
@@ -72,7 +65,7 @@ private func makeNode(_ me: Identity, peer: Identity, _ recorded: Recorded,
         $0.continuousClock = TestClock()
         $0.date = .constant(Date(timeIntervalSince1970: now))
         $0.uuid = .incrementing
-        $0.withRandomNumberGenerator = WithRandomNumberGenerator(SeededGenerator(state: 42))
+        $0.randomBytes = mintedRandom
     }
     store.exhaustivity = .off
     await store.send(.endpoint(.transport(.interfaceConnected(iface, .tcp))))
@@ -116,6 +109,7 @@ private func confirm(_ store: TestStoreOf<LXMFNode>, _ hash: Data) async {
         let m = try #require(recorded.handedOver.value.first)
         let entry = try #require(m.ticketField)
         #expect(entry.expires == now + LXMessage.ticketExpiry)
+        #expect(entry.ticket == mintedBytes, "the bytes come from the randomBytes dependency")
         let minted = LXMFNode.Ticket(ticket: entry.ticket, expires: at(LXMessage.ticketExpiry))
         #expect(store.state.inboundTickets == [deliveryHash(peer): [minted]])
         #expect(recorded.issued.value.map(\.0) == [deliveryHash(peer)])
@@ -157,7 +151,7 @@ private func confirm(_ store: TestStoreOf<LXMFNode>, _ hash: Data) async {
         }
         await send(store, to: peer)
         let entry = try #require(recorded.handedOver.value.first?.ticketField)
-        #expect(entry.ticket != ticketA)
+        #expect(entry.ticket == mintedBytes)
         #expect(entry.expires == now + LXMessage.ticketExpiry)
         #expect(store.state.inboundTickets[deliveryHash(peer)]?.map(\.ticket) == [ticketA, entry.ticket])
         #expect(recorded.issued.value.map(\.1.ticket) == [entry.ticket])
@@ -224,21 +218,166 @@ private func confirm(_ store: TestStoreOf<LXMFNode>, _ hash: Data) async {
         #expect(recorded.delivered.value.isEmpty)
     }
 
-    /// A message that ends without delivery is forgotten and counts as no delivery.
-    @Test func aFailedTicketCarryingMessageIsForgottenWithoutADelivery() async throws {
+    /// A message the app cancels ends through the router's real path and is forgotten, so a late
+    /// confirmation for it counts as no delivery.
+    @Test func aCancelledTicketCarryingMessageIsForgottenWithoutADelivery() async throws {
         let me = Identity(), peer = Identity(), recorded = Recorded()
         let store = await makeNode(me, peer: peer, recorded) { $0.issueTickets = true }
         await send(store, to: peer)
         let m = try #require(recorded.handedOver.value.first)
         #expect(store.state.ticketCarryingMessages == [m.hash: deliveryHash(peer)])
 
-        await store.send(.router(.delegate(.deliveryFailed(messageHash: m.hash))))
+        await store.send(.cancelOutbound(messageHash: m.hash))
         await store.skipReceivedActions(strict: false)
+        #expect(store.state.router.hasOutboundState(for: m.hash) == false)
         #expect(store.state.ticketCarryingMessages.isEmpty)
-        await confirm(store, m.hash)   // a late confirmation for a forgotten message
+        await confirm(store, m.hash)
         #expect(store.state.lastTicketDeliveries.isEmpty)
         #expect(recorded.delivered.value.isEmpty)
     }
+}
+
+// MARK: - Forgetting ticket-carrying messages
+
+private let staleHash = Data(repeating: 0x51, count: 32)
+private let otherHash = Data(repeating: 0x0E, count: 32)
+private let someDest = Data(repeating: 0xDE, count: 16)
+
+/// The terminal outcomes the node reports; each must sweep.
+enum TicketSweepTerminal: CaseIterable, Sendable {
+    case failed, rejected, cancelled, confirmed, propagationAccepted
+
+    func action(_ hash: Data) -> LXMFNode.Action {
+        switch self {
+        case .failed:              return .delegate(.deliveryFailed(messageHash: hash))
+        case .rejected:            return .delegate(.deliveryRejected(messageHash: hash))
+        case .cancelled:           return .delegate(.deliveryCancelled(messageHash: hash))
+        case .confirmed:           return .delegate(.deliveryConfirmed(messageHash: hash))
+        case .propagationAccepted: return .delegate(.propagationAccepted(messageHash: hash))
+        }
+    }
+}
+
+@Suite @MainActor struct LXMFNodeTicketSweepTests {
+    /// Each terminal outcome — of ANY message — collects a ticket-carrying message nothing holds any
+    /// more. This is how a delivery copy that ended silently is collected.
+    @Test(arguments: TicketSweepTerminal.allCases)
+    func everyTerminalOutcomeForgetsAMessageThatCanNoLongerBeConfirmed(_ terminal: TicketSweepTerminal) async {
+        let me = Identity(), peer = Identity(), recorded = Recorded()
+        let store = await makeNode(me, peer: peer, recorded) { $0.ticketCarryingMessages = [staleHash: someDest] }
+        await store.send(terminal.action(otherHash))
+        #expect(store.state.ticketCarryingMessages.isEmpty)
+    }
+
+    // The "kept" tests below sweep through a new ticket-carrying send, the other sweep trigger.
+    // The last one also shows that send does sweep: it drops a message nothing holds.
+
+    /// A message the router still holds is kept by a sweep.
+    @Test func aMessageTheRouterStillHoldsIsKept() async throws {
+        let me = Identity(), peer = Identity(), recorded = Recorded()
+        let store = await makeNode(me, peer: peer, recorded) { $0.issueTickets = true }
+        await send(store, to: peer)
+        let m = try #require(recorded.handedOver.value.first)
+        #expect(store.state.router.hasOutboundState(for: m.hash))
+
+        await send(store, to: peer, "sweep")   // a new ticket-carrying send sweeps
+        #expect(store.state.ticketCarryingMessages[m.hash] == deliveryHash(peer))
+    }
+
+    /// A message still waiting in the node for its recipient's announce (not yet in the router) is kept.
+    @Test func aMessageStillWaitingInTheNodeIsKept() async throws {
+        let me = Identity(), peer = Identity(), stranger = Identity(), recorded = Recorded()
+        let store = await makeNode(me, peer: peer, recorded) { $0.issueTickets = true }
+        await send(store, to: stranger)    // no path, no cost: it waits for the announce
+        let hash = try #require(store.state.ticketCarryingMessages.keys.first)
+        #expect(store.state.router.hasOutboundState(for: hash) == false)
+        #expect(store.state.waitingForPeerCost[deliveryHash(stranger)]?.count == 1)
+
+        await send(store, to: peer, "sweep")   // a new ticket-carrying send sweeps
+        #expect(store.state.ticketCarryingMessages[hash] == deliveryHash(stranger))
+        await store.send(.cancelDeliveryStamps)
+        await store.skipReceivedActions(strict: false)
+    }
+
+    /// The router has settled a delivery success whose confirmation the node has not handled yet:
+    /// a sweep in between must not lose it.
+    @Test func aSuccessTheNodeHasNotHandledYetIsKeptAndStillCounts() async {
+        let me = Identity(), peer = Identity(), recorded = Recorded()
+        let pending = Data(repeating: 0x77, count: 32)
+        let store = await makeNode(me, peer: peer, recorded) {
+            $0.issueTickets = true
+            $0.ticketCarryingMessages = [pending: someDest, staleHash: someDest]
+            $0.router.succeededMessages.insert(pending)
+        }
+        await send(store, to: peer, "sweep")   // a new ticket-carrying send sweeps
+        #expect(store.state.ticketCarryingMessages[pending] == someDest)
+        #expect(store.state.ticketCarryingMessages[staleHash] == nil, "the send swept")
+        await confirm(store, pending)
+        #expect(store.state.lastTicketDeliveries[someDest] == at(0))
+        #expect(store.state.ticketCarryingMessages[pending] == nil)
+    }
+
+    /// The fallback's propagated copy is accepted while the delivery copy is still out: the entry
+    /// is kept, and the delivery copy's later confirmation still records the ticket's delivery.
+    @Test func afterThePropagatedCopyIsAcceptedTheDeliveryCopysConfirmationStillCounts() async throws {
+        let recipient = Identity(), recorded = Recorded(), clock = TestClock()
+        let store = makePropagationNode(recipient: recipient, recorded: recorded, clock: clock, pnLinkActive: true)
+        let m = try await sendFallbackUntilThePropagatedCopyIsAccepted(store, recipient, clock)
+        #expect(store.state.ticketCarryingMessages[m.hash] == deliveryHash(recipient))
+        #expect(store.state.ticketMessagesAccepted == [m.hash])
+
+        await store.send(.router(.opportunisticDelivered(messageHash: m.hash)))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.lastTicketDeliveries == [deliveryHash(recipient): at(0)])
+        #expect(store.state.ticketCarryingMessages.isEmpty)
+        #expect(store.state.ticketMessagesAccepted.isEmpty)
+    }
+
+    /// The same, but the delivery copy then runs out. The router reports nothing for it (a copy
+    /// already succeeded), so the entry is collected by the next terminal outcome of any message,
+    /// and no delivery is recorded.
+    @Test func afterThePropagatedCopyIsAcceptedADeliveryCopyThatEndsSilentlyIsCollected() async throws {
+        let recipient = Identity(), recorded = Recorded(), clock = TestClock()
+        let store = makePropagationNode(recipient: recipient, recorded: recorded, clock: clock, pnLinkActive: true)
+        let m = try await sendFallbackUntilThePropagatedCopyIsAccepted(store, recipient, clock)
+
+        for _ in 0..<(LXMFDelivery.maxAttempts + 2) {
+            await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+            await store.skipReceivedActions(strict: false)
+        }
+        #expect(store.state.router.hasOutboundState(for: m.hash) == false, "the delivery copy has ended")
+        #expect(store.state.ticketCarryingMessages[m.hash] != nil, "silently: nothing has swept it yet")
+
+        await store.send(TicketSweepTerminal.failed.action(otherHash))
+        #expect(store.state.ticketCarryingMessages.isEmpty)
+        #expect(store.state.ticketMessagesAccepted.isEmpty)
+        #expect(store.state.lastTicketDeliveries.isEmpty)
+    }
+}
+
+/// Send a ticket-carrying fallback message, let its delivery copy stall until the propagated copy
+/// is handed to the (active) node link, and have the router accept that copy.
+@MainActor
+private func sendFallbackUntilThePropagatedCopyIsAccepted(_ store: TestStoreOf<LXMFNode>, _ recipient: Identity,
+                                                          _ clock: TestClock<Duration>) async throws -> LXMessage {
+    let dest = deliveryHash(recipient)
+    let field = try #require(store.state.ticketFieldToIssue(destinationHash: dest, now: at(0), newTicket: mintedBytes))
+    let m = LXMessage.create(source: store.state.identity, destinationHash: dest, timestamp: now,
+                             title: Data("t".utf8), content: Data("both ways".utf8), fields: [field])
+    await store.send(.sendMessage(message: m, fallbackToPropagation: true))
+    await store.skipReceivedActions(strict: false)
+    for _ in 0..<(LXMFDelivery.propagationFallbackAfterAttempts - 1) {
+        await clock.advance(by: .seconds(LXMFDelivery.retryWaitSeconds))
+    }
+    await store.receive({ action in
+        if case .router(.sendViaPropagation) = action { return true }
+        return false
+    }, timeout: .seconds(30))
+    await store.skipReceivedActions(strict: false)
+    await store.send(.router(.delivered(messageHash: m.hash, leg: .propagated)))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.router.hasOutboundState(for: m.hash), "the delivery copy is still out")
+    return m
 }
 
 // MARK: - Host-built messages
@@ -248,6 +387,22 @@ private func confirm(_ store: TestStoreOf<LXMFNode>, _ hash: Data) async {
         let me = Identity(), peer = Identity(), recorded = Recorded()
         let store = await makeNode(me, peer: peer, recorded)
         #expect(store.state.ticketFieldToIssue(destinationHash: deliveryHash(peer), now: at(0)) == nil)
+    }
+
+    /// The no-bytes helper draws a fresh 16-byte ticket each call; bytes of the wrong length mint nothing.
+    @Test func theHelperMintsSixteenFreshBytesAndRefusesWrongLengthBytes() async throws {
+        let me = Identity(), peer = Identity(), recorded = Recorded()
+        let store = await makeNode(me, peer: peer, recorded) { $0.issueTickets = true }
+        let dest = deliveryHash(peer)
+        func ticket(_ field: MsgPackValue.IntPair?) -> Data? {
+            guard case let .array(items)? = field?.value, items.count == 2, case let .bin(t) = items[1] else { return nil }
+            return t
+        }
+        let one = try #require(ticket(store.state.ticketFieldToIssue(destinationHash: dest, now: at(0))))
+        let two = try #require(ticket(store.state.ticketFieldToIssue(destinationHash: dest, now: at(0))))
+        #expect(one.count == LXMessage.ticketLength)
+        #expect(one != two)
+        #expect(store.state.ticketFieldToIssue(destinationHash: dest, now: at(0), newTicket: Data(count: 15)) == nil)
     }
 
     /// The host builds its message with the helper's field; `.sendMessage` records the mint, and the
@@ -377,7 +532,8 @@ private enum IssueFixture {
 private let pnHash = Data(repeating: 0xC0, count: 16)
 
 @MainActor
-private func makePropagationNode(recipient: Identity, recorded: Recorded) -> TestStoreOf<LXMFNode> {
+private func makePropagationNode(recipient: Identity, recorded: Recorded, clock: TestClock<Duration> = TestClock(),
+                                 pnLinkActive: Bool = false) -> TestStoreOf<LXMFNode> {
     let dest = deliveryHash(recipient)
     var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     ep.transport.learned[dest] = LearnedDestination(identity: recipient, appData: nil, ratchet: nil,
@@ -392,11 +548,12 @@ private func makePropagationNode(recipient: Identity, recorded: Recorded) -> Tes
     node.router.outboundPropagationNode = pnHash
     node.router.knownPaths.insert(dest)
     node.issueTickets = true
+    if pnLinkActive { node.router.directLinks[pnHash] = .active(linkID: Data(repeating: 0x1D, count: 16)) }
     let store = TestStore(initialState: node) { RecordingNode(recorded: recorded) } withDependencies: {
         $0.date = .constant(Date(timeIntervalSince1970: now))
-        $0.continuousClock = TestClock()
+        $0.continuousClock = clock
         $0.uuid = .incrementing
-        $0.withRandomNumberGenerator = WithRandomNumberGenerator(SeededGenerator(state: 7))
+        $0.randomBytes = mintedRandom
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
     }
     store.exhaustivity = .off
