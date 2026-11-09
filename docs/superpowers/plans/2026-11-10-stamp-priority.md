@@ -1,5 +1,12 @@
 # Stamp search priority Implementation Plan
 
+**Status 2026-11-09: done.** ReTiCA 6bff1d4, 68cf0ca, 378bada, 82155af, 0fb0b8f; ReTiCAMsgr 0271f94. Rulings:
+link-request key searches stay uncapped (one per link, reference); our own path requests preempt a running
+destination-stamp search when they would run next (DIVERGENCE — the destination search is memoryless, and
+waiting behind it broke first sends to new peers). Deferred minors: a queued delivery job is not switched to a
+ticket stamp if a ticket arrives while it waits; announces stay keyed by destination plus interface (reference:
+destination); items waiting on the running destination search count toward the 32.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Schedule stamp work as reference does: one LXMF stamp search at a time, oldest message first (its delivery stamp, then its propagation stamp), and network stamps through one worker with path requests ahead of announces — so queued messages go out in order instead of all finishing late together.
