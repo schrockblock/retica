@@ -57,6 +57,14 @@ private final class Peer {
             self.read("received.log")?.split(separator: "\n").map(String.init).first { $0.contains(text) }
         }
     }
+
+    /// The peer's log line for its `--reply` to `dest`, written once the reply has gone out. It names
+    /// the ratchet the reply was encrypted to.
+    func sent(to dest: Data, within seconds: Double = 20) async -> String? {
+        await poll(seconds: seconds) {
+            self.read("sent.log")?.split(separator: "\n").map(String.init).first { $0.contains("to=\(dest.hexString)") }
+        }
+    }
 }
 
 @MainActor
@@ -79,14 +87,23 @@ private struct Harness {
     let inbound: LockIsolated<[String]>
     let accepted: LockIsolated<Int>
     let linkFailures: LockIsolated<Int>
+    /// Our own ratchets, enabled (and optionally enforced) the way the README tells a host: before
+    /// `.registerDelivery`, which announces.
+    var ratchets = false
+    var enforceRatchets = false
 
     var body: some ReducerOf<Self> {
         Scope(state: \.node, action: \.node) { LXMFNode() }
         Reduce { state, action in
             guard case let .node(a) = action else { return .none }
             if case .endpoint(.transport(.interfaceConnected)) = a, state.node.deliveryDestinationHash == nil {
-                return .concatenate(.send(.node(.setDisplayName("ReTiCA", stampCost: nil))),
-                                    .send(.node(.registerDelivery)))
+                let delivery = LXMessage.deliveryHash(identityHash: state.node.identity.hash)
+                let own: [Effect<Action>] = ratchets
+                    ? [.send(.node(.endpoint(.enableRatchets(destinationHash: delivery, ring: [])))),
+                       .send(.node(.endpoint(.setEnforceRatchets(destinationHash: delivery, enforceRatchets))))]
+                    : []
+                return .concatenate(own + [.send(.node(.setDisplayName("ReTiCA", stampCost: nil))),
+                                           .send(.node(.registerDelivery))])
             }
             if case let .delegate(.messageReceived(m, _, _)) = a {
                 inbound.withValue { $0.append(String(decoding: m.content, as: UTF8.self)) }
@@ -112,7 +129,8 @@ private final class LiveNode {
     /// `enforceStamps` and `destinationCost` are the switches for enforcing what we receive.
     init(port: Int, stampPathRequests: Bool = false, stampDestinations: Bool = false,
          destinationValue: Double = NetworkStamp.defaultDestinationValue,
-         enforceStamps: Bool = false, destinationCost: Double = NetworkStamp.defaultDestinationCost) async throws {
+         enforceStamps: Bool = false, destinationCost: Double = NetworkStamp.defaultDestinationCost,
+         ratchets: Bool = false, enforceRatchets: Bool = false) async throws {
         let (inbound, accepted, linkFailures) = (self.inbound, self.accepted, self.linkFailures)
         var initial = Harness.State(node: LXMFNode.State(
             identity: identity, endpoint: TCPEndpoint.State(host: "127.0.0.1", port: UInt16(port), reconnectOnDrop: true)))
@@ -122,7 +140,8 @@ private final class LiveNode {
         initial.node.endpoint.transport.enforceStamps = enforceStamps
         initial.node.endpoint.transport.destinationCost = destinationCost
         store = Store(initialState: initial) {
-            Harness(inbound: inbound, accepted: accepted, linkFailures: linkFailures)
+            Harness(inbound: inbound, accepted: accepted, linkFailures: linkFailures,
+                    ratchets: ratchets, enforceRatchets: enforceRatchets)
         } withDependencies: { $0.context = .live }
         store.send(.node(.endpoint(.start)))
         let registered = await poll(seconds: 30) { self.store.state.node.deliveryDestinationHash }
@@ -417,5 +436,87 @@ private final class LiveNode {
         let log = try #require(await recipient.received(containing: "via the node", within: 60))
         #expect(log.contains("stamp_valid=True"))
         #expect(log.contains("method=3"), "3 is LXMessage.PROPAGATED")
+    }
+}
+
+/// Reference `Identity._get_ratchet_id`: the first 10 bytes of the full hash of a ratchet public key.
+private func ratchetID(_ ratchetPublic: Data) -> String { Crypto.fullHash(ratchetPublic).prefix(10).hexString }
+
+// Ratchets against a reference LXMF 1.3.0 router built with `enforce_ratchets=True` (peer.py
+// `--enforce-ratchets`, which asserts the enforcement took). Its delivery destination drops anything
+// only its identity key opens, so a message in its received.log was encrypted to one of its ratchets,
+// and the log's `ratchet_id` names which one (None would mean the identity key).
+//
+//   RETICA_LIVE_STAMP_PYTHON=/Users/ell/opt/anaconda3/envs/rns-latest/bin/python \
+//     swift test --no-parallel --filter LiveRatchetInteropTests
+@Suite(.serialized, .enabled(if: pythonPath != nil), .timeLimit(.minutes(5)))
+@MainActor struct LiveRatchetInteropTests {
+    @Test func anOpportunisticMessageReachesAPeerEnforcingRatchets() async throws {
+        let port = nextPort()
+        let peer = try Peer("ratchet-opp", ["--listen", "\(port)", "--announce-every", "3", "--enforce-ratchets"])
+        defer { peer.stop() }
+        let dest = try await peer.address()
+        let node = try await LiveNode(port: port)
+        defer { node.stop() }
+
+        #expect(await node.hears(dest))
+        let ratchet = try #require(node.store.state.node.endpoint.knownDestinations[dest]?.ratchet,
+                                   "the peer's announce must carry its ratchet")
+        node.send("opportunistic to a ratchet", to: dest)
+        let log = try #require(await peer.received(containing: "opportunistic to a ratchet"))
+        #expect(log.contains("method=1"), "1 is LXMessage.OPPORTUNISTIC")
+        #expect(log.contains("ratchet_id=\(ratchetID(ratchet))"), "decrypted with the ratchet it announced")
+    }
+
+    /// Us, to a reference propagation node that does not enforce anything, to a recipient that syncs
+    /// and enforces ratchets. The node cannot open the payload; only the recipient's ratchet can.
+    @Test func aPropagatedMessageReachesARecipientEnforcingRatchets() async throws {
+        let port = nextPort()
+        let hub = try Peer("ratchet-hub", ["--listen", "\(port)", "--cost", "0", "--propagation-node"])
+        defer { hub.stop() }
+        let pn = try await hub.address("pn_address")
+        let recipient = try Peer("ratchet-recipient", ["--connect", "\(port)", "--announce-every", "3",
+                                                       "--enforce-ratchets", "--sync-from", hub.pnAddressFile])
+        defer { recipient.stop() }
+        let dest = try await recipient.address()
+        let node = try await LiveNode(port: port)
+        defer { node.stop() }
+
+        #expect(await node.hears(dest))
+        let ratchet = try #require(node.store.state.node.endpoint.knownDestinations[dest]?.ratchet,
+                                   "the recipient's announce must carry its ratchet")
+        #expect(await node.hears(pn, within: 90), "a node's first announce is delayed")
+        node.store.send(.node(.setPropagationNode(destinationHash: pn)))
+        node.store.send(.node(.sendViaPropagation(destinationHash: dest, title: Data(),
+                                                  content: Data("propagated to a ratchet".utf8))))
+        let accepted = await poll(seconds: 150) { node.accepted.value > 0 ? true : nil }
+        #expect(accepted == true, "the node must accept the propagation stamp")
+
+        let log = try #require(await recipient.received(containing: "propagated to a ratchet", within: 60))
+        #expect(log.contains("method=3"), "3 is LXMessage.PROPAGATED")
+        #expect(log.contains("ratchet_id=\(ratchetID(ratchet))"), "decrypted with the ratchet it announced")
+    }
+
+    /// The other direction: we enable and enforce our own ratchets, announce, and the reference peer's
+    /// reply is encrypted to the ratchet we announced (its sent.log) and opened by our ring. Under our
+    /// enforcement the identity key could not have opened it.
+    @Test func aReplyEncryptedToOurAnnouncedRatchetIsDecryptedByOurRing() async throws {
+        let port = nextPort()
+        let peer = try Peer("ratchet-reply", ["--listen", "\(port)", "--announce-every", "3", "--reply",
+                                              "--enforce-ratchets"])
+        defer { peer.stop() }
+        _ = try await peer.address()
+        let node = try await LiveNode(port: port, ratchets: true, enforceRatchets: true)
+        defer { node.stop() }
+        let delivery = try #require(node.store.state.node.deliveryDestinationHash)
+        let own = try #require(node.store.state.node.endpoint.transport.ownRatchets[delivery])
+        #expect(own.enforce)
+
+        let heard = await poll(seconds: 40) { node.inbound.value.contains("hello from the reference peer") ? true : nil }
+        #expect(heard == true, "the reply must open with our ring")
+        let newest = try #require(node.store.state.node.endpoint.transport.ownRatchets[delivery]?.ring.first)
+        let publicKey = try #require(Identity.ratchetPublicKey(privateKey: newest))
+        let sent = try #require(await peer.sent(to: delivery))
+        #expect(sent.contains("ratchet_id=\(ratchetID(publicKey))"), "the peer must encrypt to the ratchet we announced")
     }
 }

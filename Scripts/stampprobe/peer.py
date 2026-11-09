@@ -35,6 +35,9 @@ ap.add_argument("--link-cost", type=float,
 ap.add_argument("--reply", action="store_true", help="message the first delivery destination heard")
 ap.add_argument("--propagation-node", action="store_true", help="also serve as a propagation node")
 ap.add_argument("--sync-from", help="file holding a propagation node's address, to sync from")
+ap.add_argument("--enforce-ratchets", action="store_true",
+                help="LXMRouter(enforce_ratchets=True): our delivery destination drops anything not encrypted "
+                     "to one of its ratchets (Destination.py:600-607, Identity.py decrypt)")
 ap.add_argument("--identity", help="load our identity from this private-key file (RNS.Identity.from_file), so a "
                                    "test knows our address before we start")
 args = ap.parse_args()
@@ -88,9 +91,14 @@ identity = RNS.Identity.from_file(args.identity) if args.identity else RNS.Ident
 assert identity is not None, "the identity file did not load"
 # The lowest cost LXMF accepts from a node, so a debug build's search stays short.
 router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(args.dir, "lxmf"), autopeer=False,
-                        propagation_cost=LXMF.LXMRouter.PROPAGATION_COST_MIN, propagation_cost_flexibility=0)
+                        propagation_cost=LXMF.LXMRouter.PROPAGATION_COST_MIN, propagation_cost_flexibility=0,
+                        enforce_ratchets=args.enforce_ratchets)
 source = router.register_delivery_identity(identity, display_name="Reference peer",
                                            stamp_cost=args.cost if args.cost > 0 else None)
+# Reference enables ratchets on every delivery destination (LXMRouter.py:423) and enforces them only on
+# request (LXMRouter.py:428-429). A test of enforcement proves nothing if it did not take.
+assert source.ratchets is not None
+assert source._Destination__enforce_ratchets == args.enforce_ratchets
 if args.cost > 0:
     router.enforce_stamps()
 if args.link_cost is not None:
@@ -103,13 +111,22 @@ def record(name, line):
         f.write(line + "\n")
 
 
+def hex_or_none(b):
+    return RNS.hexrep(b, delimit=False) if b else "None"
+
+
 def on_message(m):
+    # ratchet_id is the id of the ratchet that decrypted the message, or None when the identity key did
+    # (Identity.py decrypt sets it on the destination; LXMRouter.py:2173 and :2861 copy it here).
     record("received.log", f"content={m.content_as_string()} method={m.method} signature={m.signature_validated} "
-                           f"stamp_checked={m.stamp_checked} stamp_valid={m.stamp_valid}")
+                           f"stamp_checked={m.stamp_checked} stamp_valid={m.stamp_valid} "
+                           f"ratchet_id={hex_or_none(m.ratchet_id)}")
 
 
 router.register_delivery_callback(on_message)
 replied = set()
+# Our replies, until each is logged to sent.log once it has gone out.
+outbound = []
 
 
 class Announces:
@@ -119,8 +136,10 @@ class Announces:
         if args.reply and destination_hash not in replied and destination_hash != source.hash:
             replied.add(destination_hash)
             destination = RNS.Destination(announced_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-            router.handle_outbound(LXMF.LXMessage(destination, source, "hello from the reference peer", "t",
-                                                  desired_method=LXMF.LXMessage.OPPORTUNISTIC))
+            message = LXMF.LXMessage(destination, source, "hello from the reference peer", "t",
+                                     desired_method=LXMF.LXMessage.OPPORTUNISTIC)
+            outbound.append((destination_hash, message))
+            router.handle_outbound(message)
 
 
 RNS.Transport.register_announce_handler(Announces())
@@ -140,6 +159,13 @@ last_sync = 0
 while True:
     time.sleep(0.5)
     now = time.time()
+    for entry in list(outbound):
+        destination_hash, message = entry
+        if message.state in (LXMF.LXMessage.SENT, LXMF.LXMessage.DELIVERED):
+            # The id of the ratchet the packet was encrypted to, None for the identity key
+            # (LXMessage.py:478 from Packet.py:220, set by Destination.py:705-708).
+            record("sent.log", f"to={RNS.hexrep(destination_hash, delimit=False)} ratchet_id={hex_or_none(message.ratchet_id)}")
+            outbound.remove(entry)
     if args.announce_every and now - last_announce >= args.announce_every:
         router.announce(source.hash)
         last_announce = now
