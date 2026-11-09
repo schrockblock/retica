@@ -8,6 +8,9 @@ import Foundation
 ///   match (all accounts; a nil access group matches the service in ANY group, as `SecItem*` does)
 ///   or when any match is synchronizable; `deleteItem` removes exactly the item a prior `found`
 ///   read named, while `delete(location)` removes EVERY match regardless;
+/// - `update` replaces the data of every device-local match in place (same account, same
+///   persistent reference), as `SecItemUpdate` does; `.notFound` when there is none, and a
+///   synchronizable item is never matched;
 /// - failures can be injected per location (`failDelete` also covers `deleteItem` of items at
 ///   that location), and `dropAdds` makes an add report `.added` while storing nothing.
 /// `onBeforeAdd` and `onBeforeRead` run outside the lock, so a hook may call `set` (e.g. another
@@ -34,6 +37,7 @@ public final class InMemoryKeychain: @unchecked Sendable {
     private var readFailures: [Location: Int32] = [:]
     private var addFailures: [Location: Int32] = [:]
     private var deleteFailures: [Location: Int32] = [:]
+    private var updateFailures: [Location: Int32] = [:]
     private var droppedAdds: Set<Location> = []
     private var beforeAdd: (@Sendable (Location) -> Void)?
     private var beforeRead: (@Sendable (Location) -> Void)?
@@ -76,12 +80,14 @@ public final class InMemoryKeychain: @unchecked Sendable {
     public func failRead(at location: Location, status: Int32) { locked { readFailures[location] = status } }
     public func failAdd(at location: Location, status: Int32) { locked { addFailures[location] = status } }
     public func failDelete(at location: Location, status: Int32) { locked { deleteFailures[location] = status } }
+    public func failUpdate(at location: Location, status: Int32) { locked { updateFailures[location] = status } }
     public func dropAdds(at location: Location) { _ = locked { droppedAdds.insert(location) } }
     public func clearFailures() {
         locked {
             readFailures = [:]
             addFailures = [:]
             deleteFailures = [:]
+            updateFailures = [:]
             droppedAdds = []
         }
     }
@@ -97,7 +103,8 @@ public final class InMemoryKeychain: @unchecked Sendable {
             read: { [self] location in self.read(location) },
             add: { [self] location, data in self.add(location, data) },
             delete: { [self] location in self.delete(location) },
-            deleteItem: { [self] ref in self.deleteItem(ref) }
+            deleteItem: { [self] ref in self.deleteItem(ref) },
+            update: { [self] location, data in self.update(location, data) }
         )
     }
 
@@ -150,6 +157,16 @@ public final class InMemoryKeychain: @unchecked Sendable {
             guard !keys.isEmpty else { return .notFound }
             for key in keys { items[key] = nil }
             return .deleted
+        }
+    }
+
+    private func update(_ location: Location, _ data: Data) -> KeychainOps.UpdateResult {
+        locked {
+            if let status = updateFailures[location] { return .failed(status) }
+            let keys = matchingKeys(location).filter { items[$0]?.synchronizable == false }
+            guard !keys.isEmpty else { return .notFound }
+            for key in keys { items[key]?.data = data }
+            return .updated
         }
     }
 

@@ -39,8 +39,20 @@ struct KeychainOpsTests {
         #expect(deleteItem[kSecAttrService as String] == nil)
         #expect(deleteItem[kSecAttrAccessGroup as String] == nil)
 
+        // An update addresses the location (class, service, group) and changes only the data.
+        let update = KeychainOps.updateQuery(grouped)
+        #expect(update[kSecClass as String] as? String == kSecClassGenericPassword as String)
+        #expect(update[kSecAttrService as String] as? String == "svc")
+        #expect(update[kSecAttrAccessGroup as String] as? String == "TEAMID.group")
+        #expect(update[kSecUseDataProtectionKeychain as String] as? Bool == true)
+        #expect(update[kSecReturnData as String] == nil)
+        let changes = KeychainOps.updateAttributes(data: Data([4]))
+        #expect(changes.count == 1)
+        #expect(changes[kSecValueData as String] as? Data == Data([4]))
+
         // Writes and deletes never touch the synchronizable attribute (items stay device-local).
-        for query in [add, delete, deleteItem] {
+        // Absent from the update query, SecItemUpdate matches only device-local items.
+        for query in [add, delete, deleteItem, update] {
             #expect(query[kSecAttrSynchronizable as String] == nil)
         }
         #expect(KeychainOps.readQuery(ungrouped)[kSecAttrAccessGroup as String] == nil)
@@ -86,6 +98,45 @@ struct KeychainOpsTests {
         #expect(KeychainOps.mapDelete(status: errSecSuccess) == .deleted)
         #expect(KeychainOps.mapDelete(status: errSecItemNotFound) == .notFound)
         #expect(KeychainOps.mapDelete(status: errSecInteractionNotAllowed) == .failed(errSecInteractionNotAllowed))
+        #expect(KeychainOps.mapUpdate(status: errSecSuccess) == .updated)
+        #expect(KeychainOps.mapUpdate(status: errSecItemNotFound) == .notFound)
+        #expect(KeychainOps.mapUpdate(status: errSecInteractionNotAllowed) == .failed(errSecInteractionNotAllowed))
+    }
+
+    /// A hand-built `KeychainOps` without `update` fails loudly, never silently succeeds.
+    @Test func updateDefaultsToUnimplemented() {
+        let ops = KeychainOps(read: { _ in .notFound }, add: { _, _ in .added },
+                              delete: { _ in .notFound }, deleteItem: { _ in .notFound })
+        #expect(ops.update(grouped, Data([1])) == .failed(errSecUnimplemented))
+    }
+
+    /// `update` replaces the data in place (same item, same persistent reference), reports
+    /// `.notFound` with no item, never matches a synchronizable copy, and honours `failUpdate`.
+    @Test func inMemoryUpdateReplacesInPlace() {
+        let keychain = InMemoryKeychain()
+        #expect(keychain.ops.update(grouped, Data([1])) == .notFound)
+        #expect(keychain.item(at: grouped) == nil, "update never creates an item")
+
+        keychain.set(Data([1]), at: grouped)
+        guard case let .found(_, ref) = keychain.ops.read(grouped) else {
+            Issue.record("expected .found")
+            return
+        }
+        #expect(keychain.ops.update(grouped, Data([2])) == .updated)
+        #expect(keychain.ops.read(grouped) == .found(Data([2]), persistentRef: ref))
+        #expect(keychain.addCount == 0)
+
+        let synced = IdentityKeychain.Location(service: "synced", accessGroup: "TEAMID.group")
+        keychain.set(Data([3]), at: synced, synchronizable: true)
+        #expect(keychain.ops.update(synced, Data([4])) == .notFound)
+        #expect(keychain.item(at: synced) == Data([3]))
+
+        keychain.failUpdate(at: grouped, status: errSecInteractionNotAllowed)
+        #expect(keychain.ops.update(grouped, Data([5])) == .failed(errSecInteractionNotAllowed))
+        #expect(keychain.item(at: grouped) == Data([2]))
+        keychain.clearFailures()
+        #expect(keychain.ops.update(grouped, Data([5])) == .updated)
+        #expect(keychain.item(at: grouped) == Data([5]))
     }
 
     @Test func inMemoryAddIsAddOnly() {

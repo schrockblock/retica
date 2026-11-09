@@ -32,6 +32,7 @@ public struct KeychainOps: Sendable {
     }
     public enum AddResult: Sendable, Equatable { case added, duplicate, failed(Int32) }
     public enum DeleteResult: Sendable, Equatable { case deleted, notFound, failed(Int32) }
+    public enum UpdateResult: Sendable, Equatable { case updated, notFound, failed(Int32) }
 
     public var read: @Sendable (IdentityKeychain.Location) -> ReadResult
     public var add: @Sendable (IdentityKeychain.Location, Data) -> AddResult
@@ -41,17 +42,28 @@ public struct KeychainOps: Sendable {
     public var delete: @Sendable (IdentityKeychain.Location) -> DeleteResult
     /// Deletes exactly the one item a `read` returned, by its persistent reference.
     public var deleteItem: @Sendable (_ persistentRef: Data) -> DeleteResult
+    /// Replaces the data of the device-local items matching the location's query, in place
+    /// (`SecItemUpdate`): there is no moment when the item is missing, as there is between a
+    /// delete and an add. `.notFound` when no device-local item matches; a synchronizable item is
+    /// never matched. `IdentityKeychain` never uses it. Its own items are add-only.
+    public var update: @Sendable (IdentityKeychain.Location, Data) -> UpdateResult
 
+    /// `update` defaults to failing with `errSecUnimplemented`, so a hand-built `KeychainOps` that
+    /// predates it still compiles, and a caller that needs it sees a failure, never a silent no-op.
     public init(
         read: @escaping @Sendable (IdentityKeychain.Location) -> ReadResult,
         add: @escaping @Sendable (IdentityKeychain.Location, Data) -> AddResult,
         delete: @escaping @Sendable (IdentityKeychain.Location) -> DeleteResult,
-        deleteItem: @escaping @Sendable (_ persistentRef: Data) -> DeleteResult
+        deleteItem: @escaping @Sendable (_ persistentRef: Data) -> DeleteResult,
+        update: @escaping @Sendable (IdentityKeychain.Location, Data) -> UpdateResult = { _, _ in
+            .failed(errSecUnimplemented)
+        }
     ) {
         self.read = read
         self.add = add
         self.delete = delete
         self.deleteItem = deleteItem
+        self.update = update
     }
 }
 
@@ -82,6 +94,10 @@ extension KeychainOps {
         },
         deleteItem: { persistentRef in
             mapDelete(status: SecItemDelete(deleteItemQuery(persistentRef) as CFDictionary))
+        },
+        update: { location, data in
+            mapUpdate(status: SecItemUpdate(updateQuery(location) as CFDictionary,
+                                            updateAttributes(data: data) as CFDictionary))
         }
     )
 
@@ -122,6 +138,17 @@ extension KeychainOps {
 
     static func deleteQuery(_ location: IdentityKeychain.Location) -> [String: Any] {
         baseQuery(location)
+    }
+
+    /// Class + service (+ access group). No synchronizable attribute, so `SecItemUpdate` matches
+    /// only device-local items (its default) and never rewrites an iCloud copy.
+    static func updateQuery(_ location: IdentityKeychain.Location) -> [String: Any] {
+        baseQuery(location)
+    }
+
+    /// Only the data changes; accessibility and every other attribute stay as the add set them.
+    static func updateAttributes(data: Data) -> [String: Any] {
+        [kSecValueData as String: data]
     }
 
     /// Exactly one item, by persistent reference — no service/group/account matching.
@@ -176,6 +203,14 @@ extension KeychainOps {
     static func mapDelete(status: OSStatus) -> DeleteResult {
         switch status {
         case errSecSuccess: return .deleted
+        case errSecItemNotFound: return .notFound
+        default: return .failed(status)
+        }
+    }
+
+    static func mapUpdate(status: OSStatus) -> UpdateResult {
+        switch status {
+        case errSecSuccess: return .updated
         case errSecItemNotFound: return .notFound
         default: return .failed(status)
         }
