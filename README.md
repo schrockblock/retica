@@ -280,7 +280,7 @@ stamps. Save these and replay them at launch:
 | Peers' display names and stamp costs | `state.learnedPeers` | `.rehydrateLearnedPeers(_:)` |
 | Blocked senders | `state.ignoredDestinations` | `.rehydrateIgnoredDestinations(_:)` |
 | Stamp tickets peers gave you (one per peer) | `.delegate(.ticketReceived(destinationHash:ticket:))`, or `state.outboundTickets` | `.rehydrateTickets(outbound:inbound:lastDeliveries:)`, `outbound:`. Without them every send to a stamp-enforcing peer does proof-of-work again until it sends you a new ticket. |
-| Stamp tickets you issued (only with `issueTickets` on, or if you add ticket fields yourself) | `.delegate(.ticketIssued(destinationHash:ticket:))`, or `state.inboundTickets` | the same action, `inbound:`. Without them, once you set a delivery stamp cost, a peer's ticket-stamped messages fail validation (and are dropped if you enforce stamps). |
+| Stamp tickets you issued (only with `issueTickets` on, or if you add ticket fields yourself) | `.delegate(.ticketIssued(destinationHash:ticket:))`, or `state.inboundTickets` | the same action, `inbound:`. Without them, once you set a delivery stamp cost, a peer's ticket-stamped messages fail validation (and are dropped if you enforce stamps). `.ticketIssued` can repeat a ticket you already saved (a resend before `.rehydrateTickets` lands), so upsert by the ticket bytes. |
 | When a ticket you issued was last delivered to each peer | `.delegate(.ticketDelivered(destinationHash:at:))`, or `state.lastTicketDeliveries` | the same action, `lastDeliveries:`. Without them a ticket goes out again within a day of the last delivered one. |
 | Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))`; in an `LXMFServiceNode` host (ReTiCAMsgr), `.node(.client(.endpoint(.delegate(.destinationStampGenerated(...)))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.rehydrateDestinationStamp(...))))` |
 | A propagation node's stored messages (only if you run one) | the stored entries | `.pn(.ingestContainer(LXMFPropagation.container(timestamp:entries:)))` on `LXMFServiceNode` |
@@ -288,11 +288,18 @@ stamps. Save these and replay them at launch:
 Ordering matters for `seenHashes`: it is a ring of 10,000, so supplying newest-first keeps the
 wrong half. The rehydrate actions drop expired, malformed or future-dated rows and never
 overwrite an entry the network has already refreshed, so they are safe to send after
-`.endpoint(.start)` (ReTiCAMsgr runs its database reads alongside starting the interfaces). They
-cannot tell you to delete expired rows from disk; prune those yourself with
+`.endpoint(.start)` (ReTiCAMsgr runs its database reads alongside starting the interfaces).
+One exception: `.rehydrateTickets` does **not** drop a ticket whose expiry is far in the future.
+A peer chooses the expiry of a ticket it gives you, and reference accepts any value. A ticket you
+issued only expires later than 21 days from now if your clock went backwards, and dropping it
+would make that peer's ticket stamps fail while the peer still holds the ticket. It does drop
+future delivery times, which would stop issuing to that peer until the clock caught up. The
+rehydrate actions cannot tell you to delete expired rows from disk; prune those yourself with
 `Transport.pathExpiry` (7 days), `Transport.knownDestinationExpiry` (8.75 days),
-`LXMFNode.stampCostExpiry` (45 days), a ticket's `expires` for tickets peers gave you, and
-`expires` plus `LXMessage.ticketGrace` (5 days) for tickets you issued. `LearnedDestination` and `KnownDestination` are not
+`LXMFNode.stampCostExpiry` (45 days), a ticket's `expires` for tickets peers gave you,
+`expires` plus `LXMessage.ticketGrace` (5 days) for tickets you issued, and
+`LXMessage.ticketInterval` (1 day) for ticket delivery times (an older one has no effect).
+`LearnedDestination` and `KnownDestination` are not
 `Codable`; store their public fields (the identity as `identity.publicKey`) and rebuild them with
 their public initialisers. A destination stamp is mined once per destination: about 45 s at the
 default value on a Mac (see [Network stamps](#network-stamps-rns-16)); on a phone it has not been
@@ -313,8 +320,9 @@ A message you build yourself and send with `.sendMessage` is already hashed and 
 cannot add the field. Ask for it before creating the message and include it in `fields`:
 
 ```swift
-let field = state.ticketFieldToIssue(destinationHash: peer, now: Date())   // nil when off or not due
-let message = LXMessage.create(source: identity, destinationHash: peer, timestamp: now,
+let now = Date()
+let field = state.ticketFieldToIssue(destinationHash: peer, now: now)   // nil when off or not due
+let message = LXMessage.create(source: identity, destinationHash: peer, timestamp: now.timeIntervalSince1970,
                                title: title, content: content, fields: fields + (field.map { [$0] } ?? []))
 store.send(.sendMessage(message: message, fallbackToPropagation: true))
 ```
