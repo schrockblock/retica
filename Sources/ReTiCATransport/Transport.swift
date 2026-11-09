@@ -565,6 +565,8 @@ public struct Transport {
         /// (RNS 1.6.0 Destination.py:575-598).
         ///
         /// A ring entry that is not 32 bytes is dropped, and the ring is cut to `Transport.ratchetCount`.
+        /// That cleaning is not reported by itself: the cleaned ring goes out with `.ratchetsChanged`
+        /// at the next rotation, which the next announce always performs.
         /// The next announce or local path response rotates (reference resets `latest_ratchet_time` to
         /// 0), and from then on each carries the public key of the newest ratchet, which grows the
         /// announce by 32 bytes. If the app data this destination last announced no longer fits with
@@ -1422,6 +1424,19 @@ public struct Transport {
                     // the identity key unless enforced — reference `Destination.decrypt`
                     // (Destination.py:720-752), minus its reload-from-disk retry: the ring here is the
                     // only copy in the process. An empty ring passes no ratchets, as reference does.
+                    //
+                    // Cost: up to `ratchetCount` (512) X25519 agreements, plus one for the identity key,
+                    // for every SINGLE packet to an enabled destination that no ratchet opens: junk, and
+                    // every legitimate packet to the identity key. Measured about 15-20 ms per packet on
+                    // a Mac with a full ring (reviewer probe, 2026-11-08); unmeasured on a phone. It runs
+                    // here, on the reducer's thread (the main actor in a TCA host), and no inbound rate
+                    // bound covers DATA (ingress control limits announces only; `seenPacketHashes` stops
+                    // exact replays only). Accepted as parity: reference does the same scan and, on a
+                    // failure, reloads the ring file and scans again (Destination.py:738-745). The
+                    // ciphertext names no ratchet, so there is no cheaper lookup. The ring grows one key
+                    // per announce at most every 30 minutes, so it takes at least 10.7 days to fill.
+                    // Opt-in only (`.enableRatchets`). Follow-up recorded in the ratchets plan's status:
+                    // an inbound decrypt budget, or decrypting off the main actor.
                     let own = state.ownRatchets[packet.destinationHash]
                     guard let destination = state.localDestinations[packet.destinationHash],
                           destination.kind == packet.destinationType,

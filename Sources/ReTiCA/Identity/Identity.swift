@@ -100,7 +100,12 @@ public struct Identity: Equatable, Sendable {
     /// counts; unbound (nil) in production, where it costs one task-local read.
     @TaskLocal static var usabilityCheckProbe: LockedCounter? = nil
 
-    /// A thread-safe count, for `usabilityCheckProbe`.
+    /// Test seam: when bound, each X25519 agreement `decrypt(_:ratchets:enforceRatchets:)` performs
+    /// (one per ratchet tried, one for the identity key) increments it, so a test can count what a
+    /// decrypt path costs. Task-local and nil in production, like `usabilityCheckProbe`.
+    @TaskLocal static var decryptAgreementProbe: LockedCounter? = nil
+
+    /// A thread-safe count, for `usabilityCheckProbe` and `decryptAgreementProbe`.
     final class LockedCounter: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
@@ -163,6 +168,7 @@ public struct Identity: Equatable, Sendable {
 
         if let ratchets {
             for ratchet in ratchets {
+                Identity.decryptAgreementProbe?.withValue { $0 += 1 }
                 guard let rPriv = try? Curve25519.KeyAgreement.PrivateKey(
                         rawRepresentation: ratchet),
                       let shared = try? rPriv.sharedSecretFromKeyAgreement(with: peerPub)
@@ -180,6 +186,7 @@ public struct Identity: Equatable, Sendable {
         // it entirely and decrypts via the static key, the opposite of enforcement.
         if enforceRatchets { return nil }
 
+        Identity.decryptAgreementProbe?.withValue { $0 += 1 }
         guard let staticPriv = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: x),
               let shared = try? staticPriv.sharedSecretFromKeyAgreement(with: peerPub)
         else { return nil }

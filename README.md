@@ -282,7 +282,7 @@ stamps. Save these and replay them at launch:
 | Stamp tickets peers gave you (one per peer) | `.delegate(.ticketReceived(destinationHash:ticket:))`, or `state.outboundTickets` | `.rehydrateTickets(outbound:inbound:lastDeliveries:)`, `outbound:`. Without them every send to a stamp-enforcing peer does proof-of-work again until it sends you a new ticket. |
 | Stamp tickets you issued (only with `issueTickets` on, or if you add ticket fields yourself) | `.delegate(.ticketIssued(destinationHash:ticket:))`, or `state.inboundTickets` | the same action, `inbound:`. Without them, once you set a delivery stamp cost, a peer's ticket-stamped messages fail validation (and are dropped if you enforce stamps). `.ticketIssued` can repeat a ticket you already saved (a resend before `.rehydrateTickets` lands), so upsert by the ticket bytes. |
 | When a ticket you issued was last delivered to each peer | `.delegate(.ticketDelivered(destinationHash:at:))`, or `state.lastTicketDeliveries` | the same action, `lastDeliveries:`. Without them a ticket goes out again within a day of the last delivered one. |
-| Your destination's own ratchets (only if you enable them) | `.endpoint(.transport(.delegate(.ratchetsChanged(destinationHash:ring:))))`: the whole ring, X25519 **private keys**, newest first. Replace the saved ring each time, and keep it where you keep private keys (the Keychain on iOS) | `.endpoint(.transport(.enableRatchets(destinationHash:ring:)))` with the saved ring, or `[]` the first time, before the destination's first announce. See "Own ratchets" below. |
+| Your destination's own ratchets (only if you enable them) | `.node(.endpoint(.delegate(.ratchetsChanged(destinationHash:ring:))))`; in an `LXMFServiceNode` host (ReTiCAMsgr), `.node(.client(.endpoint(.delegate(.ratchetsChanged(...)))))`. The whole ring, X25519 **private keys**, newest first: replace the saved ring each time, and keep it where you keep private keys (the Keychain on iOS) | `.node(.endpoint(.enableRatchets(destinationHash:ring:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.enableRatchets(...))))`. Pass the saved ring, or `[]` the first time, keyed by `LXMessage.deliveryHash(identityHash:)`, **before `.registerDelivery`** (it announces). See [Own ratchets](#own-ratchets). |
 | Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))`; in an `LXMFServiceNode` host (ReTiCAMsgr), `.node(.client(.endpoint(.delegate(.destinationStampGenerated(...)))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.rehydrateDestinationStamp(...))))` |
 | A propagation node's stored messages (only if you run one) | the stored entries | `.pn(.ingestContainer(LXMFPropagation.container(timestamp:entries:)))` on `LXMFServiceNode` |
 
@@ -313,7 +313,9 @@ A rehydrated stamp is checked against `destinationValue` and mined again if it f
 ### Own ratchets
 
 Reference LXMF enables ratchets on every delivery destination. ReTiCA leaves them **off** until the
-host sends `.endpoint(.transport(.enableRatchets(destinationHash:ring:)))` with the ring it saved.
+host sends `.endpoint(.enableRatchets(destinationHash:ring:))` with the ring it saved. An LXMF host
+sends it before `.registerDelivery`, because registering announces, and the destination's first
+announce should already carry a ratchet.
 The ring is X25519 private keys that only the host can store safely. If it is lost on relaunch,
 every message a peer encrypted to an old ratchet can no longer be decrypted, and that includes
 messages a propagation node holds for days. A library that enabled ratchets by default would
@@ -329,15 +331,23 @@ Once enabled, ReTiCA behaves as reference (RNS 1.6.0 `Destination.py`):
   context flag set.
 - An inbound packet to the destination is tried with every retained ratchet first, then with the
   identity key. So is a propagated LXMF message downloaded for it.
-- `.endpoint(.transport(.setEnforceRatchets(destinationHash:_:)))` drops anything only the identity
-  key opens. It is ignored until ratchets are enabled, as in reference.
+- `.endpoint(.setEnforceRatchets(destinationHash:_:))` drops anything only the identity key opens.
+  It is ignored until ratchets are enabled, as in reference.
+- Cost: with a full ring, a packet that no ratchet opens costs up to 513 key agreements. That
+  covers junk and every packet a peer encrypted to the identity key. It was measured at about
+  15-20 ms on a Mac, and it runs on the reducer's thread (the main actor in a TCA host). Reference
+  costs the same or more. The ring fills in no less than 10.7 days. A downloaded propagated
+  message costs one decrypt, and one addressed to another destination costs none.
 - The announce grows by 32 bytes, so `LXMFNode` cuts the display name to
   `LXMFAnnounceData.maxAppDataBytesWithRatchet` (283 bytes of app data, 32 fewer than without a
   ratchet).
 - Enabling forgets captured app data that no longer fits, so later announces without app data
-  and path responses still go out.
+  and path responses still go out. They go out with **no** app data, though, which erases the
+  requester's copy of your display name until your next announce with app data. `LXMFNode` sends
+  one every time it announces.
 
-A restored entry that is not 32 bytes is dropped. Received messages do not report which ratchet
+A restored entry that is not 32 bytes is dropped. That cleaning is reported only with the next
+rotation, which the next announce always performs. Received messages do not report which ratchet
 decrypted them.
 
 ## Stamp tickets (LXMF 1.3)

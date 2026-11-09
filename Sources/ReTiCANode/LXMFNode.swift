@@ -1048,16 +1048,23 @@ public struct LXMFNode {
                         // is full_hash of the served bytes AS-IS — which equals the node's stored key. Do
                         // NOT strip again here (that double-strip hashed served[:-32] → purge never matched).
                         tids.append(LXMFPropagation.transientId(lxmfData: blob))
+                        // Only an entry addressed to our delivery destination is decrypted (reference
+                        // `if destination_hash in self.delivery_destinations`, LXMRouter.py:2855); any other
+                        // is still marked downloaded above. A decrypt can scan the whole ring, so this
+                        // keeps foreign entries from costing one.
+                        guard let delivery = state.deliveryDestinationHash,
+                              LXMFPropagation.destinationHash(lxmfData: blob) == delivery else { continue }
                         // With our delivery destination's own ratchets enabled, they are tried first and
                         // enforcement applies, as reference decrypts through `delivery_destination.decrypt`.
-                        let own = state.deliveryDestinationHash.flatMap { state.endpoint.transport.ownRatchets[$0] }
+                        let own = state.endpoint.transport.ownRatchets[delivery]
                         if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity,
                                                                       ratchets: own?.ring,
                                                                       enforceRatchets: own?.enforce ?? false) {
-                            // Our delivery hash: the router drops a download addressed to anyone else.
-                            // Its transient id is still marked downloaded below (spec settled detail 5).
+                            // Our delivery hash: the router drops a message whose own destination is
+                            // anyone else. Its transient id is still marked downloaded below (spec settled
+                            // detail 5).
                             effects.append(.send(.router(.received(method: .propagated,
-                                                                   destinationHash: state.deliveryDestinationHash ?? Data(),
+                                                                   destinationHash: delivery,
                                                                    data: packed))))
                         }
                     }

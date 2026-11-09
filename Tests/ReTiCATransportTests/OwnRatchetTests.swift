@@ -303,6 +303,25 @@ private func dataPacket(to dest: Destination, _ plaintext: Data, ratchetPublic: 
         #expect(delivered(log) == [Data("plain identity".utf8)])
     }
 
+    /// A served (stampless) propagated entry to our newest ratchet costs ONE key agreement with a full
+    /// ring: the full tail is tried first, as reference's single pass. Trying the stamp-stripped layout
+    /// first scanned the whole ring (513 agreements) before every successful decrypt.
+    @Test func aServedPropagatedEntryToTheNewestRatchetCostsOneAgreement() throws {
+        let me = Identity()
+        let ring = (0..<512).map { _ in newRatchetPrivate() }
+        let msg = LXMessage.create(source: Identity(), destinationHash: LXMessage.deliveryHash(identityHash: me.hash),
+                                   timestamp: 1700000000.5, title: Data("t".utf8), content: Data("served".utf8))
+        let tail = Data(msg.packed.dropFirst(LXMessage.destinationLength))
+        let served = LXMFPropagation.lxmfData(destinationHash: msg.destinationHash,
+                                              encryptedData: me.encrypt(tail, ratchet: Identity.ratchetPublicKey(privateKey: ring[0])))
+        let counter = Identity.LockedCounter()
+        let recovered = Identity.$decryptAgreementProbe.withValue(counter) {
+            LXMFPropagation.recoverPacked(lxmfData: served, recipientIdentity: me, ratchets: ring)
+        }
+        #expect(recovered == msg.packed)
+        #expect(counter.value == 1)
+    }
+
     // MARK: Review Focus 4 — the announce budget and captured app data
 
     @Test func enablingForgetsCapturedAppDataThatNoLongerFitsAndKeepsAnnouncing() async throws {
@@ -367,6 +386,29 @@ private func dataPacket(to dest: Destination, _ plaintext: Data, ratchetPublic: 
                 #expect(announces.isEmpty, "32 bytes over: nothing can be sent")
             }
         }
+    }
+
+    /// With stamping on, the enable-time re-check counts the 18-byte stamp extension too: 300 bytes fit
+    /// beside the extension (315) but not beside the extension and a ratchet (283).
+    @Test func enablingWhileStampingCountsTheStampExtensionInTheRecheck() async throws {
+        let dest = ownDestination()
+        let log = DelegateLog([])
+        var stamping = Transport.State()
+        stamping.stampDestinations = true
+        stamping.destinationValue = 0
+        let store = await makeStore(dest, log, clock: LockIsolated(start), initial: stamping)
+        await store.send(.rehydrateDestinationStamp(destinationHash: dest.hash, stamp: Data(repeating: 1, count: 14)))
+        let captured = Data(repeating: 0x43, count: 300)
+        await store.send(.announce(destinationHash: dest.hash, appData: captured))
+        #expect(store.state.localAppData[dest.hash] == captured, "precondition: it fit with the stamp")
+        await store.send(.enableRatchets(destinationHash: dest.hash, ring: []))
+        #expect(store.state.localAppData[dest.hash] == nil)
+        // And the destination still announces (without app data), stamped and ratcheted.
+        await store.send(.announce(destinationHash: dest.hash, appData: nil))
+        await store.skipReceivedActions(strict: false)
+        let announces = transmittedAnnounces(log)
+        #expect(announces.count == 2)
+        #expect(announces.last.map { $0.contextFlag } == true)
     }
 
     @Test func enablingKeepsCapturedAppDataThatStillFits() async throws {

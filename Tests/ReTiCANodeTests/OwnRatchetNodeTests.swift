@@ -108,6 +108,64 @@ private func download(_ store: TestStore<LXMFNode.State, LXMFNode.Action>, _ ent
         #expect(propagated.value == [ratchetMsg.packed])
     }
 
+    /// A download with a full ring: the entry to our newest ratchet costs one key agreement, and an entry
+    /// addressed to another destination costs none (reference decrypts only entries for its delivery
+    /// destinations, LXMRouter.py:2855). Both transient ids are still acknowledged.
+    @Test func aDownloadCostsOneAgreementForOurEntryAndNoneForAForeignOne() async throws {
+        let me = Identity()
+        let ring = (0..<512).map { _ in newRatchetPrivate() }
+        let (ours, ourMsg) = downloadEntry(to: me, ratchetPublic: Identity.ratchetPublicKey(privateKey: ring[0]),
+                                           content: "ours")
+        let (foreign, _) = downloadEntry(to: Identity(), ratchetPublic: nil, content: "someone else's")
+        var state = LXMFNode.State(identity: me, endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        let delivery = LXMessage.deliveryHash(identityHash: me.hash)
+        state.deliveryDestinationHash = delivery
+        state.endpoint.transport.ownRatchets[delivery] = .init(ring: ring)
+        let linkID = Data(repeating: 0xA7, count: 16)
+        state.syncPhase[linkID] = .awaitingMessages
+        let propagated = LockIsolated<[Data]>([])
+        let store = node(state, propagated: propagated)
+        let counter = Identity.LockedCounter()
+        await Identity.$decryptAgreementProbe.withValue(counter) {
+            await store.send(.endpoint(.delegate(.responseReceived(
+                linkID: linkID, requestID: Data(repeating: 1, count: 16),
+                data: MsgPack.encode(.array([.bin(foreign), .bin(ours)]))))))
+        }
+        await store.receive(.router(.messagesDownloaded(transientIds: [
+            LXMFPropagation.transientId(lxmfData: foreign), LXMFPropagation.transientId(lxmfData: ours)])))
+        await store.skipReceivedActions(strict: false)
+        #expect(propagated.value == [ourMsg.packed])
+        #expect(counter.value == 1)
+    }
+
+    /// The host-facing forms on TransportEndpoint reach Transport, and a rotation comes back as an
+    /// endpoint delegate (the paths an LXMFServiceNode host such as ReTiCAMsgr wraps in `.client`).
+    @Test func theEndpointMirrorsEnableEnforceAndTheRotationReport() async throws {
+        let me = Identity()
+        let state = LXMFNode.State(identity: me, endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
+        let delivery = LXMessage.deliveryHash(identityHash: me.hash)
+        let store = node(state)
+        let restored = [newRatchetPrivate()]
+        await store.send(.endpoint(.enableRatchets(destinationHash: delivery, ring: restored)))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.endpoint.transport.ownRatchets[delivery]?.ring == restored)
+        await store.send(.endpoint(.setEnforceRatchets(destinationHash: delivery, true)))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.endpoint.transport.ownRatchets[delivery]?.enforce == true)
+
+        // `.registerDelivery` announces, which rotates.
+        await store.send(.registerDelivery)
+        let reported = LockIsolated<[Data]?>(nil)
+        await store.receive({ action in
+            guard case let .endpoint(.delegate(.ratchetsChanged(hash, ring))) = action, hash == delivery else { return false }
+            reported.setValue(ring)
+            return true
+        }, timeout: .seconds(5))
+        let ring = try #require(reported.value)
+        #expect(ring.count == 2 && ring.last == restored[0])
+        #expect(store.state.endpoint.transport.ownRatchets[delivery]?.ring == ring)
+    }
+
     @Test func theDeliveryAnnounceUsesTheRatchetBudgetOnceRatchetsAreEnabled() async {
         let me = Identity()
         var state = LXMFNode.State(identity: me, endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))

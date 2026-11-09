@@ -88,10 +88,12 @@ private func expectDelivered(_ store: TestStore<LXMFRouter.State, LXMFRouter.Act
     let linkID = Data(repeating: 0xA7, count: 16)
     var state = LXMFNode.State(identity: me, endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     state.syncPhase[linkID] = .awaitingMessages
+    // Only entries for our delivery destination are decrypted (reference LXMRouter.py:2855).
+    state.deliveryDestinationHash = msg.destinationHash
     let store = makeNode(state)
     await store.send(.endpoint(.delegate(.responseReceived(linkID: linkID, requestID: Data(repeating: 1, count: 16),
                                                            data: MsgPack.encode(.array([.bin(entry)]))))))
-    await store.receive(.router(.received(method: .propagated, destinationHash: Data(), data: msg.packed)))
+    await store.receive(.router(.received(method: .propagated, destinationHash: msg.destinationHash, data: msg.packed)))
 }
 
 /// A propagated copy needs a packed propagation container and goes through `.sendViaPropagation`;

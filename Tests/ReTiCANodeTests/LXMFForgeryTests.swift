@@ -164,7 +164,9 @@ private func getResponse(_ entries: [Data]) -> Data {
     await store.send(.endpoint(.delegate(.responseReceived(linkID: linkID, requestID: Data(repeating: 1, count: 16),
                                                            data: getResponse([entry])))))
     await store.receive(.router(.messagesDownloaded(transientIds: [tid])))
-    await store.receive(.router(.delegate(.messageRejected(hash: msg.hash, reason: .notAddressedToUs))))
+    // An entry addressed to another destination is not even decrypted (reference decrypts only
+    // entries for its delivery destinations, LXMRouter.py:2855), so it never reaches the router and
+    // is not reported as rejected; it is still marked downloaded.
     #expect(store.state.router.downloadedTransientIds.contains(tid))
 }
 

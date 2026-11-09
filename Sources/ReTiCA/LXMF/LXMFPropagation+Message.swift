@@ -48,8 +48,14 @@ extension LXMFPropagation {
     /// Recover the packed LXMF wire bytes (destinationHash ‖ decrypted tail) from one container/download
     /// entry, decrypting the tail with `recipientIdentity`. Nil if malformed or decryption fails. The
     /// symmetric inverse of `pack`'s encryption step; `open` is `unpack(recoverPacked(...))`.
-    /// Handles both stamped entries (new format: strip trailing 32-byte stamp first) and stampless entries
-    /// (old reference fixtures: fall back to decrypting the full tail).
+    /// Handles both stampless entries (what a propagation node serves: reference strips the stamp
+    /// before serving, LXMRouter.py:1551, and so does ReTiCA's node) and stamped ones (a container
+    /// straight from `pack`).
+    ///
+    /// The full tail is tried FIRST, as reference makes a single unstripped pass (LXMRouter.py:2857-2858):
+    /// a served entry then costs one decrypt. Each decrypt can try every ratchet, so trying the
+    /// stripped layout first wasted a whole ring scan on every download. A wrong-layout attempt fails
+    /// the token HMAC, so the order does not change what decrypts.
     ///
     /// `ratchets` are the recipient delivery destination's own ratchet private keys, newest first:
     /// each is tried before the identity key, and with `enforceRatchets` the identity key is not tried
@@ -59,15 +65,14 @@ extension LXMFPropagation {
                                      enforceRatchets: Bool = false) -> Data? {
         guard let destHash = destinationHash(lxmfData: lxmfData) else { return nil }
         let raw = Data(lxmfData.dropFirst(LXMessage.destinationLength))
-        // Try stripping the trailing stamp first (stamped entries, new format).
-        if raw.count > LXStamper.stampSize {
-            let stripped = Data(strippedCore(lxmfData: lxmfData).dropFirst(LXMessage.destinationLength))
-            if let tail = recipientIdentity.decrypt(stripped, ratchets: ratchets, enforceRatchets: enforceRatchets) {
-                return destHash + tail
-            }
+        // The full tail: a served (stampless) entry.
+        if let tail = recipientIdentity.decrypt(raw, ratchets: ratchets, enforceRatchets: enforceRatchets) {
+            return destHash + tail
         }
-        // Fall back to decrypting the full tail (stampless entries, old fixtures).
-        guard let tail = recipientIdentity.decrypt(raw, ratchets: ratchets, enforceRatchets: enforceRatchets)
+        // The tail without its trailing stamp: a stamped entry.
+        guard raw.count > LXStamper.stampSize else { return nil }
+        let stripped = Data(strippedCore(lxmfData: lxmfData).dropFirst(LXMessage.destinationLength))
+        guard let tail = recipientIdentity.decrypt(stripped, ratchets: ratchets, enforceRatchets: enforceRatchets)
         else { return nil }
         return destHash + tail
     }

@@ -154,6 +154,11 @@ public struct TransportEndpoint {
         case registerLocalDestination(Destination, linkCost: Double? = nil)
         /// Hand back a persisted destination stamp — see `Transport.Action.rehydrateDestinationStamp`.
         case rehydrateDestinationStamp(destinationHash: Data, stamp: Data)
+        /// Enable our own ratchets on a destination with the ring the host saved — see
+        /// `Transport.Action.enableRatchets`.
+        case enableRatchets(destinationHash: Data, ring: [Data])
+        /// Enforce our own ratchets on a destination — see `Transport.Action.setEnforceRatchets`.
+        case setEnforceRatchets(destinationHash: Data, Bool)
         /// Stop serving a local destination (RNS `Transport.deregister_destination`): the shared
         /// router forgets it (`Transport.Action.deregisterLocalDestination`) and every inbound link
         /// on it is closed — an established one at once (LINKCLOSE to the peer, `linkClosed`), one
@@ -216,6 +221,9 @@ public struct TransportEndpoint {
             /// A stamp was mined for one of our destinations: persist it and hand it back with
             /// `.rehydrateDestinationStamp` after a relaunch. See `Transport.Action.Delegate`.
             case destinationStampGenerated(destinationHash: Data, stamp: Data, value: Double)
+            /// A destination's own ratchet ring rotated: persist the whole ring (private keys) and
+            /// hand it back with `.enableRatchets` after a relaunch. See `Transport.Action.Delegate`.
+            case ratchetsChanged(destinationHash: Data, ring: [Data])
         }
     }
 
@@ -261,6 +269,10 @@ public struct TransportEndpoint {
                 return .send(.transport(.registerLocalDestination(d, linkCost: linkCost)))
             case let .rehydrateDestinationStamp(h, stamp):
                 return .send(.transport(.rehydrateDestinationStamp(destinationHash: h, stamp: stamp)))
+            case let .enableRatchets(h, ring):
+                return .send(.transport(.enableRatchets(destinationHash: h, ring: ring)))
+            case let .setEnforceRatchets(h, enforce):
+                return .send(.transport(.setEnforceRatchets(destinationHash: h, enforce)))
             case let .deregisterLocalDestination(hash):
                 // Router first, so a LINKREQUEST racing this action is no longer handed up. Then
                 // close the ESTABLISHED responder links on the destination; `LinkSession.close` is
@@ -562,6 +574,8 @@ public struct TransportEndpoint {
                 return .send(.delegate(.singlePacketDelivered(token: token)))
             case let .transport(.delegate(.destinationStampGenerated(h, stamp, value))):
                 return .send(.delegate(.destinationStampGenerated(destinationHash: h, stamp: stamp, value: value)))
+            case let .transport(.delegate(.ratchetsChanged(h, ring))):
+                return .send(.delegate(.ratchetsChanged(destinationHash: h, ring: ring)))
             case let .transport(.delegate(.pathLearned(h, hops))):
                 return .send(.delegate(.pathLearned(destinationHash: h, hops: hops)))
             case let .transport(.delegate(.sendFailed(h, r))):
