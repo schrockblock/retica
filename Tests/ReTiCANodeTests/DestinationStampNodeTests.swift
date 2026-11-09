@@ -35,13 +35,14 @@ import ComposableArchitecture
         await store.finish()
     }
 
-    /// The network stamp worker: one search running (A's destination stamp, held open), an announce
-    /// of B and a path request queued. The stop cancels the running search and empties both queues,
-    /// and starts nothing that was queued.
+    /// The network stamp worker: one search running (X's path-request stamp, held open), the
+    /// announces of A and B and a path request for Y queued. The stop cancels the running search and
+    /// empties both queues, and starts nothing that was queued.
     @Test func stoppingTheEndpointCancelsTheRunningNetworkStampSearchAndEmptiesBothQueues() async {
         let a = Destination(kind: .single, direction: .in, appName: "retica", aspects: ["a"], identity: Identity())!
         let b = Destination(kind: .single, direction: .in, appName: "retica", aspects: ["b"], identity: Identity())!
         let x = Data(repeating: 0x22, count: 16)
+        let y = Data(repeating: 0x33, count: 16)
         let started = LockIsolated<[Data]>([])
         // Held open until cancelled, so the search is certainly running at the stop.
         let held: @Sendable (Data) async -> Void = { material in
@@ -65,22 +66,25 @@ import ComposableArchitecture
         await store.send(.registerLocalDestination(b))
         await store.send(.announce(destinationHash: a.hash, appData: nil))
         await store.send(.announce(destinationHash: b.hash, appData: nil))
+        // X preempts A's search and runs; Y queues behind it.
         await store.send(.requestPath(destinationHash: x))
+        await store.send(.requestPath(destinationHash: y))
         await store.skipReceivedActions(strict: false)
-        #expect(store.state.transport.stampingDestinations == [a.hash])
-        #expect(store.state.transport.queuedPathRequestStamps.map(\.destinationHash) == [x])
+        #expect(Set(store.state.transport.stampingPathRequests.keys) == [x])
+        #expect(store.state.transport.queuedPathRequestStamps.map(\.destinationHash) == [y])
         #expect(store.state.transport.pendingStampedAnnounces.map(\.destinationHash) == [a.hash, b.hash])
 
         await store.send(.stop)
         await store.skipReceivedActions(strict: false)
         #expect(store.state.transport.stampingDestinations.isEmpty)
-        #expect(store.state.transport.stampingPathRequests.isEmpty, "the queued path request did not start")
+        #expect(store.state.transport.stampingPathRequests.isEmpty)
         #expect(store.state.transport.queuedPathRequestStamps.isEmpty)
         #expect(store.state.transport.pendingStampedAnnounces.isEmpty)
         // The held search returns only when cancelled: one still running would outlive `finish`.
         store.exhaustivity = .on
         await store.finish()
-        #expect(started.value.count <= 1, "nothing queued was started")
+        #expect(!started.value.contains { $0.prefix(16) == y }, "the queued path request never started")
+        #expect(!started.value.dropFirst(2).contains { $0 == started.value.first }, "nor A's search again")
     }
 
     @Test func theGeneratedStampReachesTheHostAndARehydratedOneIsUsed() async throws {

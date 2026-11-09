@@ -15,9 +15,10 @@ private let stamp = Data(repeating: 7, count: 14)
 
 /// Both stamp searches, held open until the test ends one: `finish(material)` makes the search over
 /// `material` return `stamp`. A search returns nil once cancelled. `started` lists the materials in
-/// the order the searches began.
+/// the order the searches began, `cancelled` the materials of searches that ended by cancellation.
 private final class SearchGate: Sendable {
     let started = LockIsolated<[Data]>([])
+    let cancelled = LockIsolated<[Data]>([])
     let finished = LockIsolated<Set<Data>>([])
 
     func finish(_ material: Data) { finished.withValue { _ = $0.insert(material) } }
@@ -28,7 +29,13 @@ private final class SearchGate: Sendable {
             if finished.value.contains(material) { return stamp }
             try? await Task.sleep(for: .milliseconds(2))
         }
+        cancelled.withValue { $0.append(material) }
         return nil
+    }
+
+    /// Waits (real time, bounded) until `count` searches have been cancelled.
+    func waitForCancels(_ count: Int) async {
+        for _ in 0..<2500 where cancelled.value.count < count { try? await Task.sleep(for: .milliseconds(2)) }
     }
 
     var destination: DestinationStampGenerator {
@@ -115,9 +122,11 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
 }
 
 @Suite @MainActor struct NetworkStampWorkerTests {
-    /// Review Focus 5: a path request queued behind a running announce stamp starts before an
-    /// announce stamp queued before it.
-    @Test func aPathRequestQueuedBehindAnAnnounceStampStartsBeforeAQueuedAnnounceStamp() async throws {
+    /// Review Focus 5, and the preemption DIVERGENCE: our path request does not wait behind a running
+    /// destination stamp search. It cancels it and starts at once; the destination's announces stay
+    /// queued, its search starts again after the path request, and they go out when it ends, ahead
+    /// of an announce of B queued before the path request.
+    @Test func aPathRequestPreemptsARunningDestinationSearchWhichResumesAfterIt() async throws {
         let gate = SearchGate()
         let recorder = Recorder()
         let store = makeStore(gate, recorder: recorder)
@@ -130,36 +139,144 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
 
         await store.send(.announce(destinationHash: a.hash, appData: nil))
         await store.send(.announce(destinationHash: b.hash, appData: nil))
-        await store.send(.requestPath(destinationHash: x))
-        #expect(store.state.stampingDestinations == [a.hash], "one search at a time")
-        #expect(store.state.stampingPathRequests.isEmpty)
-        #expect(store.state.queuedPathRequestStamps.map(\.destinationHash) == [x])
         await gate.waitForStarts(1)
         #expect(gate.started.value == [material(a)])
 
-        // A's stamp: the path request is next, though B's announce was queued before it.
-        gate.finish(material(a))
-        await receiveDestinationEnd(store, a.hash)
-        let tag = try #require(store.state.stampingPathRequests[x])
-        #expect(store.state.stampingDestinations.isEmpty)
-        #expect(queuedAnnounceOrder(store.state) == [b.hash])
+        await store.send(.requestPath(destinationHash: x))
+        let tag = try #require(store.state.stampingPathRequests[x], "started at once")
+        #expect(store.state.stampingDestinations.isEmpty, "A's search is cancelled")
+        #expect(queuedAnnounceOrder(store.state) == [a.hash, b.hash], "A's announce stays queued")
         await gate.waitForStarts(2)
+        await gate.waitForCancels(1)
         #expect(gate.started.value == [material(a), x + tag])
+        #expect(gate.cancelled.value == [material(a)])
 
-        // The path request's stamp: it goes out, and B's search starts.
+        // The path request's stamp: it goes out, and A's search starts again (not B's).
         gate.finish(x + tag)
         await receivePathRequestEnd(store, x)
         await store.skipReceivedActions(strict: false)
-        #expect(store.state.stampingDestinations == [b.hash])
+        #expect(store.state.stampingDestinations == [a.hash])
         await gate.waitForStarts(3)
-        #expect(gate.started.value == [material(a), x + tag, material(b)])
+        #expect(gate.started.value == [material(a), x + tag, material(a)])
         let sentRequest = try #require(recorder.packets.last {
             $0.destinationHash == Transport.pathRequestDestinationHash
         })
         #expect(sentRequest.payload.count == Transport.pathRequestStampedLength)
         #expect(Data(sentRequest.payload.suffix(14)) == stamp)
 
+        // A's stamp releases A's announce; then B's search starts.
+        gate.finish(material(a))
+        await receiveDestinationEnd(store, a.hash)
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.packets.filter { $0.packetType == .announce }.map(\.destinationHash) == [a.hash])
+        #expect(store.state.stampingDestinations == [b.hash])
+
         await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// A path response (a request from the network) does not preempt a running destination search.
+    @Test func aPathResponseDoesNotPreemptARunningDestinationSearch() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let a = newDestination("a")
+        let b = newDestination("b")
+        await store.send(.interfaceConnected(i0))
+        await store.send(.registerLocalDestination(a))
+        await store.send(.registerLocalDestination(b))
+        await store.send(.announce(destinationHash: a.hash, appData: nil))
+        await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))
+        #expect(store.state.stampingDestinations == [a.hash])
+        #expect(store.state.pendingStampedAnnounces.filter(\.isPathResponse).map(\.destinationHash) == [b.hash])
+        await gate.waitForStarts(1)
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+        #expect(gate.started.value == [material(a)])
+        #expect(gate.cancelled.value == [material(a)], "cancelled only by the final cancel")
+    }
+
+    /// Our path request does not preempt a destination search that answers a path response which
+    /// arrived before it: queue-0 work keeps its arrival order.
+    @Test func aPathRequestWaitsBehindADestinationSearchForAnEarlierPathResponse() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let b = newDestination("b")
+        let x = Data(repeating: 0x22, count: 16)
+        await store.send(.interfaceConnected(i0))
+        await store.send(.registerLocalDestination(b))
+        await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))
+        #expect(store.state.stampingDestinations == [b.hash])
+        await gate.waitForStarts(1)
+        await store.send(.requestPath(destinationHash: x))
+        #expect(store.state.stampingDestinations == [b.hash], "not preempted")
+        #expect(store.state.queuedPathRequestStamps.map(\.destinationHash) == [x])
+        await gate.waitForStarts(2)        // returns after its bound if no second search starts
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+        #expect(gate.started.value == [material(b)], "B's search was not cancelled and restarted")
+    }
+
+    /// Within queue 0, arrival order decides between a waiting path response and a queued path
+    /// request, either way round. A running path-request search holds the worker meanwhile.
+    @Test func aPathResponseAndAPathRequestStartInArrivalOrder() async throws {
+        for responseFirst in [true, false] {
+            let gate = SearchGate()
+            let store = makeStore(gate)
+            let b = newDestination("b")
+            let w = Data(repeating: 0x11, count: 16)
+            let x = Data(repeating: 0x22, count: 16)
+            await store.send(.interfaceConnected(i0))
+            await store.send(.registerLocalDestination(b))
+            await store.send(.requestPath(destinationHash: w))
+            let wTag = try #require(store.state.stampingPathRequests[w])
+            if responseFirst {
+                await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))
+                await store.send(.requestPath(destinationHash: x))
+            } else {
+                await store.send(.requestPath(destinationHash: x))
+                await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))
+            }
+            #expect(Set(store.state.stampingPathRequests.keys) == [w], "responseFirst \(responseFirst)")
+
+            gate.finish(w + wTag)
+            await receivePathRequestEnd(store, w)
+            if responseFirst {
+                #expect(store.state.stampingDestinations == [b.hash], "B's path response arrived first")
+                #expect(store.state.queuedPathRequestStamps.map(\.destinationHash) == [x])
+            } else {
+                #expect(Set(store.state.stampingPathRequests.keys) == [x], "X arrived first")
+                #expect(store.state.stampingDestinations.isEmpty)
+            }
+            await store.send(.cancelNetworkStamps)
+            store.exhaustivity = .on
+            await store.finish()
+        }
+    }
+
+    /// `.cancelDestinationStamps` hands the worker to queued path-request work.
+    @Test func cancellingDestinationStampsStartsTheQueuedPathRequestSearch() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let b = newDestination("b")
+        let x = Data(repeating: 0x22, count: 16)
+        await store.send(.interfaceConnected(i0))
+        await store.send(.registerLocalDestination(b))
+        // B's search answers an earlier path response, so X waits behind it.
+        await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))
+        await store.send(.requestPath(destinationHash: x))
+        #expect(store.state.stampingDestinations == [b.hash])
+        #expect(store.state.stampingPathRequests.isEmpty)
+
+        await store.send(.cancelDestinationStamps)
+        #expect(store.state.stampingDestinations.isEmpty)
+        #expect(store.state.pendingStampedAnnounces.isEmpty)
+        #expect(Set(store.state.stampingPathRequests.keys) == [x])
+
+        await store.send(.cancelPathRequestStamps)
+        #expect(!store.state.hasNetworkStampWork)
         store.exhaustivity = .on
         await store.finish()
     }
@@ -204,12 +321,12 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         let gate = SearchGate()
         let recorder = Recorder()
         let store = makeStore(gate, recorder: recorder)
-        let a = newDestination("a")
+        let w = Data(repeating: 0x11, count: 16)
         let x = Data(repeating: 0x22, count: 16)
         let y = Data(repeating: 0x33, count: 16)
         await store.send(.interfaceConnected(i0))
-        await store.send(.registerLocalDestination(a))
-        await store.send(.announce(destinationHash: a.hash, appData: nil))
+        await store.send(.requestPath(destinationHash: w))       // holds the worker
+        let wTag = try #require(store.state.stampingPathRequests[w])
 
         await store.send(.requestPath(destinationHash: x))
         let oldTag = try #require(store.state.queuedPathRequestStamps.first?.tag)
@@ -219,8 +336,8 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         let newTag = try #require(store.state.queuedPathRequestStamps.last?.tag)
         #expect(newTag != oldTag)
 
-        gate.finish(material(a))
-        await receiveDestinationEnd(store, a.hash)
+        gate.finish(w + wTag)
+        await receivePathRequestEnd(store, w)
         let yTag = try #require(store.state.stampingPathRequests[y], "Y is now first")
         gate.finish(y + yTag)
         await receivePathRequestEnd(store, y)
@@ -235,7 +352,7 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         #expect(xRequests.count == 1)
         #expect(xRequests.map { Data($0.payload.dropFirst(32).prefix(16)) } == [newTag], "the newer request's tag")
         await gate.waitForStarts(3)
-        #expect(gate.started.value == [material(a), y + yTag, x + newTag])
+        #expect(gate.started.value == [w + wTag, y + yTag, x + newTag])
 
         store.exhaustivity = .on
         await store.finish()
@@ -251,12 +368,14 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         await store.send(.interfaceConnected(i0))
         await store.send(.registerLocalDestination(a))
         await store.send(.registerLocalDestination(b))
-        await store.send(.announce(destinationHash: a.hash, appData: nil))   // holds the worker
+        await store.send(.announce(destinationHash: a.hash, appData: nil))
 
-        let targets = (0..<40).map { Data(repeating: UInt8($0 + 1), count: 16) }
+        // The first path request preempts A's search and holds the worker; 32 of the rest queue.
+        let targets = (0..<41).map { Data(repeating: UInt8($0 + 1), count: 16) }
         for t in targets { await store.send(.requestPath(destinationHash: t)) }
         #expect(Transport.stampedPathResponseQueueLimit == 32)
-        #expect(store.state.queuedPathRequestStamps.map(\.destinationHash) == Array(targets.prefix(32)),
+        #expect(Set(store.state.stampingPathRequests.keys) == [targets[0]])
+        #expect(store.state.queuedPathRequestStamps.map(\.destinationHash) == Array(targets[1...32]),
                 "the oldest 32 stay")
 
         // A path response for B finds the shared queue full.
@@ -267,9 +386,9 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         #expect(queuedAnnounceOrder(store.state) == [a.hash, b.hash])
 
         // A replacement still fits, at the back.
-        await store.send(.requestPath(destinationHash: targets[0]))
+        await store.send(.requestPath(destinationHash: targets[1]))
         #expect(store.state.queuedPathRequestStamps.map(\.destinationHash)
-                == Array(targets[1..<32]) + [targets[0]])
+                == Array(targets[2...32]) + [targets[1]])
 
         await store.send(.cancelNetworkStamps)
         #expect(!store.state.hasNetworkStampWork)

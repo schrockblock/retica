@@ -395,7 +395,7 @@ node.endpoint.transport.enforceStamps = true       // refuse unstamped traffic w
 | Setting | Default | Reference | What it does |
 |---|---|---|---|
 | `stampDestinations` | off | `stamp_destinations` | Every announce and path response carries a stamp of `destinationValue` (default 25) and the destination's link cost. Mined once per destination; persist it (above). |
-| `stampPathRequests` | off | `stamp_path_requests` | Each path request is sent only after a stamp of `pathRequestValue` (default 15.8) is found, up to 15 s. A relay marks unstamped requests it forwards. |
+| `stampPathRequests` | off | `stamp_path_requests` | Each path request is sent only after a stamp of `pathRequestValue` (default 15.8) is found, up to 15 s from the start of its search. Its search waits behind another path request's, or behind a destination stamp search answering an earlier path response, but cancels any other running destination stamp search (see "Stamp work"). A relay marks unstamped requests it forwards. |
 | `enforceStamps` | off | `enforce_stamps` | Announces below `destinationCost` (default 23.5) are not learned or relayed; path requests below `pathRequestCost` (default 15.8) are not answered or forwarded; link requests to our destinations below their link cost (LXMF 3.25, otherwise 12.5) are not answered. Our own outbound traffic is unaffected. |
 
 Link requests are stamped whatever these say, as in 1.6.0: when a destination announced a link
@@ -462,6 +462,18 @@ costs those hashes and nothing more.
   `.sendViaPropagation` still stamping when `.cancelPropagationStamps` arrives, or when
   `.setPropagationNode` names a different node, is likewise reported `deliveryFailed` and never
   handed over.
+  Network stamps (our announces' destination stamps and our path requests' stamps) go through one
+  worker, as reference RNS 1.6.0's stamper thread: one search at a time, path requests and path
+  responses first in arrival order (one queue of 32), then announces (another 32). A newer
+  announce for the same destination and interface, or a newer path request for the same
+  destination, replaces the queued one at the back, and a full queue drops the new item.
+  DIVERGENCE: one of our own path requests cancels a running destination stamp search (unless that
+  search answers an earlier path response) instead of waiting for it. Reference waits, and the
+  first destination stamp takes about 45 s on a Mac (longer on a phone), which outlasts the LXMF
+  router's path wait (5 tries, 7 s apart), so a first send to a new peer would fail roughly half
+  the time (estimated from the mean search time, not observed). The destination search is
+  memoryless, so restarting it later loses no expected work; its announces stay queued. Path
+  responses do not preempt. Link-request key searches are not part of this worker (one per link).
   `.cancelOutbound(messageHash:)` cancels one message wherever it is. Network stamp searches
   (destination, path-request and link-request stamps) are cancelled by `.endpoint(.stop)`; a link
   waiting for its key fails with `.pathStale`, and an announce waiting for its stamp is dropped.
