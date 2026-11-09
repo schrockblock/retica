@@ -50,25 +50,36 @@ extension LXMFPropagation {
     /// symmetric inverse of `pack`'s encryption step; `open` is `unpack(recoverPacked(...))`.
     /// Handles both stamped entries (new format: strip trailing 32-byte stamp first) and stampless entries
     /// (old reference fixtures: fall back to decrypting the full tail).
-    public static func recoverPacked(lxmfData: Data, recipientIdentity: Identity) -> Data? {
+    ///
+    /// `ratchets` are the recipient delivery destination's own ratchet private keys, newest first:
+    /// each is tried before the identity key, and with `enforceRatchets` the identity key is not tried
+    /// — reference decrypts a propagated message through `delivery_destination.decrypt`
+    /// (Destination.py:720-752).
+    public static func recoverPacked(lxmfData: Data, recipientIdentity: Identity, ratchets: [Data]? = nil,
+                                     enforceRatchets: Bool = false) -> Data? {
         guard let destHash = destinationHash(lxmfData: lxmfData) else { return nil }
         let raw = Data(lxmfData.dropFirst(LXMessage.destinationLength))
         // Try stripping the trailing stamp first (stamped entries, new format).
         if raw.count > LXStamper.stampSize {
             let stripped = Data(strippedCore(lxmfData: lxmfData).dropFirst(LXMessage.destinationLength))
-            if let tail = recipientIdentity.decrypt(stripped) {
+            if let tail = recipientIdentity.decrypt(stripped, ratchets: ratchets, enforceRatchets: enforceRatchets) {
                 return destHash + tail
             }
         }
         // Fall back to decrypting the full tail (stampless entries, old fixtures).
-        guard let tail = recipientIdentity.decrypt(raw) else { return nil }
+        guard let tail = recipientIdentity.decrypt(raw, ratchets: ratchets, enforceRatchets: enforceRatchets)
+        else { return nil }
         return destHash + tail
     }
 
-    /// Recover the LXMessage from one container entry by decrypting its tail with `recipientIdentity`.
-    /// Returns nil if the entry is malformed or decryption/unpack fails.
-    public static func open(lxmfData: Data, recipientIdentity: Identity) -> LXMessage? {
-        guard let packed = recoverPacked(lxmfData: lxmfData, recipientIdentity: recipientIdentity) else { return nil }
+    /// Recover the LXMessage from one container entry by decrypting its tail with `recipientIdentity`
+    /// (and `ratchets` first, see `recoverPacked`). Returns nil if the entry is malformed or
+    /// decryption/unpack fails.
+    public static func open(lxmfData: Data, recipientIdentity: Identity, ratchets: [Data]? = nil,
+                            enforceRatchets: Bool = false) -> LXMessage? {
+        guard let packed = recoverPacked(lxmfData: lxmfData, recipientIdentity: recipientIdentity,
+                                         ratchets: ratchets, enforceRatchets: enforceRatchets)
+        else { return nil }
         return LXMessage.unpack(packed)
     }
 }

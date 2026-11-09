@@ -298,4 +298,58 @@ private func sendAndCapturePayload(_ store: TestStore<Transport.State, Transport
         #expect(store.state.knownDestinations[peer.destinationHash]?.ratchet == r.publicKey)
         #expect(store.state.knownDestinations[peer.destinationHash]?.ratchetReceived == received)
     }
+
+    /// A restored row heard more recently than the live entry wins the entry, but not the ratchet:
+    /// the ratchet received later is kept, whichever entry it came with.
+    @Test func aNewerRestoredRowKeepsTheFresherRatchet() async {
+        let now = LockIsolated(start)
+        let store = await connected(now)
+        let noRatchet = Peer(), olderRatchet = Peer(), newerRatchet = Peer()
+        let live = [noRatchet, olderRatchet, newerRatchet].map { _ in newRatchet() }
+        for (peer, r) in zip([noRatchet, olderRatchet, newerRatchet], live) {
+            await store.send(.received(i0, peer.announce(emitted: 1000, prefix: 0x01, ratchet: r.publicKey)))
+        }
+        now.setValue(start.addingTimeInterval(60))
+        let rowHeard = start.addingTimeInterval(30)
+        let restoredOlder = newRatchet(), restoredNewer = newRatchet()
+        await store.send(.rehydrateKnownDestinations([
+            noRatchet.destinationHash: KnownDestination(
+                identity: noRatchet.identity, appData: Data([0x01]), lastHeard: rowHeard),
+            olderRatchet.destinationHash: KnownDestination(
+                identity: olderRatchet.identity, appData: Data([0x02]), lastHeard: rowHeard,
+                ratchet: restoredOlder.publicKey, ratchetReceived: start.addingTimeInterval(-3600)),
+            newerRatchet.destinationHash: KnownDestination(
+                identity: newerRatchet.identity, appData: Data([0x03]), lastHeard: rowHeard,
+                ratchet: restoredNewer.publicKey, ratchetReceived: start.addingTimeInterval(20)),
+        ]))
+        let known = store.state.knownDestinations
+        for (peer, appData) in [(noRatchet, 0x01), (olderRatchet, 0x02), (newerRatchet, 0x03)] {
+            #expect(known[peer.destinationHash]?.lastHeard == rowHeard, "precondition: the row won the entry")
+            #expect(known[peer.destinationHash]?.appData == Data([UInt8(appData)]))
+        }
+        #expect(known[noRatchet.destinationHash]?.ratchet == live[0].publicKey, "a row without one keeps the live ratchet")
+        #expect(known[noRatchet.destinationHash]?.ratchetReceived == start)
+        #expect(known[olderRatchet.destinationHash]?.ratchet == live[1].publicKey, "an older restored ratchet loses")
+        #expect(known[olderRatchet.destinationHash]?.ratchetReceived == start)
+        #expect(known[newerRatchet.destinationHash]?.ratchet == restoredNewer.publicKey, "a newer one wins")
+        #expect(known[newerRatchet.destinationHash]?.ratchetReceived == start.addingTimeInterval(20))
+    }
+
+    /// The live entry wins (heard last) but its ratchet is older than the restored one: the restored
+    /// ratchet is taken.
+    @Test func aWinningLiveEntryTakesANewerRestoredRatchet() async {
+        let now = LockIsolated(start)
+        let store = await connected(now)
+        let peer = Peer()
+        let rLive = newRatchet(), rRestored = newRatchet()
+        await store.send(.received(i0, peer.announce(emitted: 1000, prefix: 0x01, ratchet: rLive.publicKey)))
+        now.setValue(start.addingTimeInterval(120))
+        await store.send(.received(i0, peer.announce(emitted: 2000, prefix: 0x02, ratchet: nil)))
+        await store.send(.rehydrateKnownDestinations([peer.destinationHash: KnownDestination(
+            identity: peer.identity, appData: Data([0x09]), lastHeard: start.addingTimeInterval(60),
+            ratchet: rRestored.publicKey, ratchetReceived: start.addingTimeInterval(60))]))
+        #expect(store.state.knownDestinations[peer.destinationHash]?.lastHeard == now.value, "the live entry wins")
+        #expect(store.state.knownDestinations[peer.destinationHash]?.ratchet == rRestored.publicKey)
+        #expect(store.state.knownDestinations[peer.destinationHash]?.ratchetReceived == start.addingTimeInterval(60))
+    }
 }

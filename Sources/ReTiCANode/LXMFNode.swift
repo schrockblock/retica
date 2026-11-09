@@ -736,8 +736,7 @@ public struct LXMFNode {
                 // returns `msgpack.packb(peer_data)` for every registered delivery destination, even
                 // when display_name and stamp_cost are both None. The nil-checks on those fields
                 // control only the *contents* of the packed list, never whether to emit one.
-                let appData = LXMFAnnounceData.pack(displayName: state.displayName,
-                                                    stampCost: state.deliveryStampCost)
+                let appData = deliveryAnnounceAppData(state)
                 // LXMF 1.3.0 announces a link cost of 3.25 on its delivery destination
                 // (LXMRouter.py:422); it is on the wire only when the host stamps announces.
                 return .merge(.send(.endpoint(.registerLocalDestination(d, linkCost: LXMFDelivery.deliveryLinkCost))),
@@ -791,14 +790,12 @@ public struct LXMFNode {
             case .announceDelivery:
                 // No-op when registerDelivery was never called (deliveryDestinationHash nil).
                 guard let hash = state.deliveryDestinationHash else { return .none }
-                let appData = LXMFAnnounceData.pack(displayName: state.displayName,
-                                                    stampCost: state.deliveryStampCost)
+                let appData = deliveryAnnounceAppData(state)
                 return .send(.endpoint(.announce(destinationHash: hash, appData: appData)))
 
             case let .announceDeliveryOnInterface(interfaceID):
                 guard let hash = state.deliveryDestinationHash else { return .none }
-                let appData = LXMFAnnounceData.pack(displayName: state.displayName,
-                                                    stampCost: state.deliveryStampCost)
+                let appData = deliveryAnnounceAppData(state)
                 return .send(.endpoint(.announceOn(interface: interfaceID, destinationHash: hash, appData: appData)))
 
             case let .send(destinationHash, title, content, method):
@@ -1051,7 +1048,12 @@ public struct LXMFNode {
                         // is full_hash of the served bytes AS-IS — which equals the node's stored key. Do
                         // NOT strip again here (that double-strip hashed served[:-32] → purge never matched).
                         tids.append(LXMFPropagation.transientId(lxmfData: blob))
-                        if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity) {
+                        // With our delivery destination's own ratchets enabled, they are tried first and
+                        // enforcement applies, as reference decrypts through `delivery_destination.decrypt`.
+                        let own = state.deliveryDestinationHash.flatMap { state.endpoint.transport.ownRatchets[$0] }
+                        if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity,
+                                                                      ratchets: own?.ring,
+                                                                      enforceRatchets: own?.enforce ?? false) {
                             // Our delivery hash: the router drops a download addressed to anyone else.
                             // Its transient id is still marked downloaded below (spec settled detail 5).
                             effects.append(.send(.router(.received(method: .propagated,
@@ -1514,6 +1516,15 @@ public struct LXMFNode {
                 return .none
             }
         }
+    }
+
+    /// The delivery destination's announce app data. Its display name is cut to the smaller budget
+    /// when the destination announces its own ratchet (`Transport.State.ownRatchets`, read when the
+    /// action is handled), so the announce still fits.
+    private func deliveryAnnounceAppData(_ state: State) -> Data {
+        let ratchet = state.deliveryDestinationHash.map { state.endpoint.transport.ownRatchets[$0] != nil } ?? false
+        return LXMFAnnounceData.pack(displayName: state.displayName, stampCost: state.deliveryStampCost,
+                                     ratchet: ratchet)
     }
 
     /// The `FIELD_TICKET` entry for a message this node builds to `destinationHash`, or none when

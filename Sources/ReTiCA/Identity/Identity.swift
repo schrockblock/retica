@@ -84,6 +84,17 @@ public struct Identity: Equatable, Sendable {
         return isUsableX25519PublicKey(key)
     }
 
+    /// The X25519 public key of a ratchet private key — reference `Identity._ratchet_public_bytes`
+    /// (RNS 1.6.0 Identity.py). Nil unless `privateKey` is 32 bytes CryptoKit accepts as an X25519
+    /// private key; CryptoKit accepts any 32 bytes (the scalar is clamped), so in practice the length
+    /// is the check.
+    public static func ratchetPublicKey(privateKey: Data) -> Data? {
+        guard privateKey.count == 32,
+              let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey)
+        else { return nil }
+        return key.publicKey.rawRepresentation
+    }
+
     /// Test seam: when a test binds a counter here, each trial agreement above increments it, so a
     /// test can show that a path does not pay for one. Task-local, so parallel tests do not mix
     /// counts; unbound (nil) in production, where it costs one task-local read.

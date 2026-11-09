@@ -282,6 +282,7 @@ stamps. Save these and replay them at launch:
 | Stamp tickets peers gave you (one per peer) | `.delegate(.ticketReceived(destinationHash:ticket:))`, or `state.outboundTickets` | `.rehydrateTickets(outbound:inbound:lastDeliveries:)`, `outbound:`. Without them every send to a stamp-enforcing peer does proof-of-work again until it sends you a new ticket. |
 | Stamp tickets you issued (only with `issueTickets` on, or if you add ticket fields yourself) | `.delegate(.ticketIssued(destinationHash:ticket:))`, or `state.inboundTickets` | the same action, `inbound:`. Without them, once you set a delivery stamp cost, a peer's ticket-stamped messages fail validation (and are dropped if you enforce stamps). `.ticketIssued` can repeat a ticket you already saved (a resend before `.rehydrateTickets` lands), so upsert by the ticket bytes. |
 | When a ticket you issued was last delivered to each peer | `.delegate(.ticketDelivered(destinationHash:at:))`, or `state.lastTicketDeliveries` | the same action, `lastDeliveries:`. Without them a ticket goes out again within a day of the last delivered one. |
+| Your destination's own ratchets (only if you enable them) | `.endpoint(.transport(.delegate(.ratchetsChanged(destinationHash:ring:))))`: the whole ring, X25519 **private keys**, newest first. Replace the saved ring each time, and keep it where you keep private keys (the Keychain on iOS) | `.endpoint(.transport(.enableRatchets(destinationHash:ring:)))` with the saved ring, or `[]` the first time, before the destination's first announce. See "Own ratchets" below. |
 | Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))`; in an `LXMFServiceNode` host (ReTiCAMsgr), `.node(.client(.endpoint(.delegate(.destinationStampGenerated(...)))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.rehydrateDestinationStamp(...))))` |
 | A propagation node's stored messages (only if you run one) | the stored entries | `.pn(.ingestContainer(LXMFPropagation.container(timestamp:entries:)))` on `LXMFServiceNode` |
 
@@ -308,6 +309,36 @@ their public initialisers. A destination stamp is mined once per destination: ab
 default value on a Mac (see [Network stamps](#network-stamps-rns-16)); on a phone it has not been
 measured. Without it every cold start mines again before the first announce goes out.
 A rehydrated stamp is checked against `destinationValue` and mined again if it falls short.
+
+### Own ratchets
+
+Reference LXMF enables ratchets on every delivery destination. ReTiCA leaves them **off** until the
+host sends `.endpoint(.transport(.enableRatchets(destinationHash:ring:)))` with the ring it saved.
+The ring is X25519 private keys that only the host can store safely. If it is lost on relaunch,
+every message a peer encrypted to an old ratchet can no longer be decrypted, and that includes
+messages a propagation node holds for days. A library that enabled ratchets by default would
+lose them that way for every host that does not persist the ring.
+
+Once enabled, ReTiCA behaves as reference (RNS 1.6.0 `Destination.py`):
+- Each announce and local path response for the destination rotates the ring if more than 30
+  minutes (`Transport.ratchetInterval`) have passed since the last rotation. The first one after
+  `.enableRatchets` always rotates.
+- Each rotation reports the whole ring, at most 512 keys (`Transport.ratchetCount`), with
+  `.ratchetsChanged`.
+- Each announce and path response carries the newest ratchet's public key (32 bytes), with the
+  context flag set.
+- An inbound packet to the destination is tried with every retained ratchet first, then with the
+  identity key. So is a propagated LXMF message downloaded for it.
+- `.endpoint(.transport(.setEnforceRatchets(destinationHash:_:)))` drops anything only the identity
+  key opens. It is ignored until ratchets are enabled, as in reference.
+- The announce grows by 32 bytes, so `LXMFNode` cuts the display name to
+  `LXMFAnnounceData.maxAppDataBytesWithRatchet` (283 bytes of app data, 32 fewer than without a
+  ratchet).
+- Enabling forgets captured app data that no longer fits, so later announces without app data
+  and path responses still go out.
+
+A restored entry that is not 32 bytes is dropped. Received messages do not report which ratchet
+decrypted them.
 
 ## Stamp tickets (LXMF 1.3)
 
@@ -535,7 +566,7 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Network stamps on our link requests | Implemented, tested live against RNS 1.6.0. **On, as in 1.6.0** | Only to a destination that announced a link cost, and only up to cost 20 (reference has no ceiling). An enforcing reference peer accepts the stamped request and ignores an unstamped one. |
 | Enforcing network stamps (`enforceStamps`) | Implemented, tested against reference fixtures; announces also tested live against RNS 1.6.0. **Off by default**, as in 1.6.0 | Refuses announces, path requests and link requests whose stamp falls short (see Part 1). Announce and path-request costs can be set per interface, as in reference. Inbound path- and link-request enforcement is tested only with fixtures, not against a live reference peer. |
 | Announce propagation as a transport node | Implemented | Relay mode (`.enableRelay`), HEADER_2 rewrite; rebroadcast and retry constants cross-validated; per-interface announce bandwidth cap. |
-| Ratchets | **Partial** | A peer's announced ratchet is kept with its known destination (refreshed by every fresh announce, kept when an announce carries none, expired after 30 days, persisted by the host) and used for opportunistic packets and propagated LXMF payloads to it; the propagated payload is cross-validated byte for byte against LXMF 1.3.0. Not yet tested against a live peer that enforces ratchets. ReTiCA never generates, rotates or announces its own ratchet, so there is no forward secrecy for traffic *to* a ReTiCA destination. |
+| Ratchets | **Partial** | A peer's announced ratchet is kept with its known destination (refreshed by every fresh announce, kept when an announce carries none, expired after 30 days, persisted by the host) and used for opportunistic packets and propagated LXMF payloads to it; the propagated payload is cross-validated byte for byte against LXMF 1.3.0. Not yet tested against a live peer that enforces ratchets. Own ratchets are a host opt-in (see [Own ratchets](#own-ratchets)): when enabled, a destination rotates, announces and decrypts with its own ring, optionally enforced. A reference RNS 1.6.0 validates our ratcheted announce and encrypts to its ratchet, and we decrypt that (a test gated on `RETICA_REFERENCE_PYTHON`); reference-encrypted packets and propagated messages to our ratchets are cross-validated from committed fixtures. Without the opt-in there is no forward secrecy for traffic *to* a ReTiCA destination. |
 | Path table, path requests and responses | Implemented, cross-validated (request and response layout) | Path expiry by interface mode. Persisted by the host. No rate limiting of inbound path requests. |
 | Forwarding as a relay | Implemented | Multi-hop data forwarding, and a link table so links can be established through a relay. |
 | Proofs | **Partial** | Single-packet proofs (implicit and explicit) are sent and validated; link packet proofs too. A ReTiCA relay keeps no reverse table, so it does not route proofs for third parties. |

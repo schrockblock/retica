@@ -35,7 +35,7 @@ public struct KnownDestination: Equatable, Sendable {
     /// The 32-byte X25519 ratchet public key this destination last announced, or nil (reference
     /// `Identity.known_ratchets`, written by `_remember_ratchet`, Identity.py:535-575). Every encryption
     /// to this destination goes to it while it is fresh: read it through
-    /// `Transport.State.recallRatchet(destinationHash:)`, which applies the expiry. Set by each fresh
+    /// `Transport.State.recallRatchet(destinationHash:now:)`, which applies the expiry. Set by each fresh
     /// announce that carries a usable ratchet, whether or not it wins the path; an announce without
     /// one leaves it as it was, as reference does (Identity.py:726).
     public var ratchet: Data?

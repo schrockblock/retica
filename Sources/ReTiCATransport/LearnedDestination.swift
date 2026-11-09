@@ -6,10 +6,10 @@ public struct LearnedDestination: Equatable, Sendable {
     public var identity: Identity     // public-only, recovered from the announce
     public var appData: Data?
     /// **Ignored.** Transport neither reads nor writes this: a peer's ratchet lives on
-    /// `KnownDestination.ratchet`, read through `Transport.State.recallRatchet(destinationHash:)`.
+    /// `KnownDestination.ratchet`, read through `Transport.State.recallRatchet(destinationHash:now:)`.
     /// Kept only so a host that still stores it with the path row keeps compiling; it is whatever
     /// the host put in (nil for every entry Transport builds).
-    @available(*, deprecated, message: "Ignored by Transport. A peer's ratchet is KnownDestination.ratchet; read it with Transport.State.recallRatchet(destinationHash:).")
+    @available(*, deprecated, message: "Ignored by Transport. A peer's ratchet is KnownDestination.ratchet; read it with Transport.State.recallRatchet(destinationHash:now:).")
     public var ratchet: Data? {
         get { legacyRatchet }
         set { legacyRatchet = newValue }

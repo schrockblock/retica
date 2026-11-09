@@ -35,6 +35,14 @@ public struct Transport {
         /// nil. Written by `.announce`, cleared by `.registerLocalDestination`; see both for the
         /// divergence from reference's explicit `set_default_app_data`.
         public var localAppData: [Data: Data] = [:]
+        /// Our own ratchets, per local destination that has them enabled — reference
+        /// `Destination.ratchets` (RNS 1.6.0 Destination.py:87-94, 233-262, 575-611). Present only
+        /// after the host sends `.enableRatchets` with the ring it restored (a deliberate divergence:
+        /// reference enables them on every LXMF delivery destination; see `.enableRatchets`). Each
+        /// announce and local path response for the destination rotates the ring when due and
+        /// carries the public key of `ring[0]`; inbound SINGLE packets to it are decrypted with the
+        /// ring first. Kept across deregistration, as a stamp is.
+        public var ownRatchets: [Data: OwnRatchets] = [:]
         public var learned: [Data: LearnedDestination] = [:]
         /// Every remote destination a valid announce was heard for (reference
         /// `Identity.known_destinations`) — what `recall(destinationHash:)` reads. Written on each
@@ -42,7 +50,7 @@ public struct Transport {
         /// `Identity.validate_announce` → `remember` runs), culled by `maintenanceTick` only once
         /// pathless past `Transport.knownDestinationExpiry`, restored by `.rehydrateKnownDestinations`.
         /// Also holds each peer's ratchet (`KnownDestination.ratchet`), which only a fresh announce
-        /// (after the replay check) sets; read it with `recallRatchet(destinationHash:)`.
+        /// (after the replay check) sets; read it with `recallRatchet(destinationHash:now:)`.
         public var knownDestinations: [Data: KnownDestination] = [:]
         public var interfaces: [InterfaceID: InterfaceProfile] = [:]
         public var transportIdentity: Identity? = nil
@@ -285,6 +293,24 @@ public struct Transport {
         /// `ProofDestination`), so an inbound proof finds its receipt with one lookup.
         public var pendingReceipts: [Data: PendingReceipt] = [:]
 
+        /// One local destination's own ratchets.
+        public struct OwnRatchets: Equatable, Sendable {
+            /// X25519 private keys, newest first, at most `Transport.ratchetCount`. Secrets: the host
+            /// persists them (`.delegate(.ratchetsChanged)`) somewhere fit for private keys.
+            public internal(set) var ring: [Data]
+            /// When the ring last rotated, or nil when it has not rotated since `.enableRatchets`
+            /// (reference `latest_ratchet_time = 0`, Destination.py:591), so the next announce rotates.
+            public internal(set) var lastRotation: Date?
+            /// Drop inbound packets no ratchet decrypts, instead of trying the identity key —
+            /// reference `enforce_ratchets` (Destination.py:600-611, Identity.py:1255-1259).
+            public internal(set) var enforce: Bool
+            public init(ring: [Data], lastRotation: Date? = nil, enforce: Bool = false) {
+                self.ring = ring
+                self.lastRotation = lastRotation
+                self.enforce = enforce
+            }
+        }
+
         public init() {}
 
         /// The stamp value an announce received on `interfaceID` is checked against: that interface's
@@ -358,7 +384,8 @@ public struct Transport {
         /// Nil when none is known or the known one was first heard more than `Transport.ratchetExpiry`
         /// (30 days) before `now`, as reference discards one read from its store (Identity.py:626).
         /// A ratchet with no receive time, or a non-finite one, counts as expired.
-        public func recallRatchet(destinationHash: Data, now: Date = Date()) -> Data? {
+        /// `now` has no default: pass the clock the receive time was stamped with (`\.transportDate`).
+        public func recallRatchet(destinationHash: Data, now: Date) -> Data? {
             guard let known = knownDestinations[destinationHash], let ratchet = known.ratchet,
                   let received = known.ratchetReceived,
                   Transport.ratchetIsFresh(received: received, now: now)
@@ -528,9 +555,32 @@ public struct Transport {
         /// Rows are stored public-only, and a row keyed by one of this node's registered local
         /// destinations is ignored. A row's ratchet is restored only if it passes
         /// `Identity.isUsableRatchet` and its `ratchetReceived` is finite, not in the future and within
-        /// `ratchetExpiry`; otherwise the row is restored without it. A live entry that wins but has
-        /// no ratchet takes the row's.
+        /// `ratchetExpiry`; otherwise the row is restored without it. The ratchet is merged apart from
+        /// the rest of the entry: whichever entry wins, the ratchet received later is kept (the live
+        /// one on a tie), so a newer row cannot wipe a fresher live ratchet.
         case rehydrateKnownDestinations([Data: KnownDestination])
+        /// Enable our own ratchets on local destination `destinationHash`, starting from `ring`: the
+        /// X25519 private keys the host saved from `.delegate(.ratchetsChanged)`, newest first, or
+        /// `[]` for a destination that never had any. Reference `Destination.enable_ratchets`
+        /// (RNS 1.6.0 Destination.py:575-598).
+        ///
+        /// A ring entry that is not 32 bytes is dropped, and the ring is cut to `Transport.ratchetCount`.
+        /// The next announce or local path response rotates (reference resets `latest_ratchet_time` to
+        /// 0), and from then on each carries the public key of the newest ratchet, which grows the
+        /// announce by 32 bytes. If the app data this destination last announced no longer fits with
+        /// those 32 bytes, it is forgotten (see `State.localAppData`), so a later announce without app
+        /// data and path responses still go out. Sending it again restarts from the given ring.
+        ///
+        /// DIVERGENCE: reference LXMF enables ratchets on every delivery destination. ReTiCA enables
+        /// them only here, because the ring is private keys only the host can keep: a ring lost on
+        /// relaunch leaves every message encrypted to an old ratchet undecryptable, including ones a
+        /// propagation node holds for days.
+        case enableRatchets(destinationHash: Data, ring: [Data])
+        /// Enforce ratchets on `destinationHash`: an inbound packet (and a propagated LXMF message
+        /// LXMFNode downloads) that no ratchet decrypts is dropped instead of being tried with the
+        /// identity key. Reference `Destination.enforce_ratchets` (Destination.py:600-611). Ignored
+        /// unless ratchets are enabled on it, as reference returns False then.
+        case setEnforceRatchets(destinationHash: Data, Bool)
         case delegate(Delegate)
 
         @CasePathable
@@ -551,6 +601,10 @@ public struct Transport {
             /// a Mac, and has not been measured on a phone (reference `store_destination_stamp`,
             /// Stamps.py:888-905).
             case destinationStampGenerated(destinationHash: Data, stamp: Data, value: Double)
+            /// The own ratchet ring of `destinationHash` rotated: `ring` is the whole ring, private
+            /// keys, newest first. Persist it (replacing the previous one) somewhere fit for private
+            /// keys, and pass it to `.enableRatchets` after a relaunch, before the first announce.
+            case ratchetsChanged(destinationHash: Data, ring: [Data])
         }
     }
 
@@ -622,9 +676,11 @@ public struct Transport {
             }
 
             // An announce of `dest` as wire bytes. With a stamp, the 18-byte extension follows the app
-            // data and the signature covers it (Destination.py:353-362). Nil if it cannot be packed.
+            // data and the signature covers it (Destination.py:353-362). With a ratchet (32 bytes), it
+            // sits between the random hash and the signature, is signed over, and the context flag is
+            // set (Destination.py:335-376). Nil if it cannot be packed.
             func announceBytes(_ dest: Destination, _ identity: Identity, appData: Data?, stamp: Data?,
-                               pathResponse: Bool, _ state: State) -> Data? {
+                               ratchet: Data?, pathResponse: Bool, _ state: State) -> Data? {
                 var wireAppData = appData
                 if let stamp {
                     let linkCost = state.localLinkCosts[dest.hash] ?? NetworkStamp.defaultLinkRequestCost
@@ -634,21 +690,55 @@ public struct Transport {
                 let randomHash = Announce.randomHash(now: now, randomPrefix: SecureRandom.bytes(5))
                 let payload = Announce.buildPayload(identity: identity, destinationHash: dest.hash,
                                                     nameHash: dest.nameHash, randomHash: randomHash,
-                                                    ratchet: nil, appData: wireAppData)
-                return try? Packet.announce(from: dest, payload: payload, pathResponse: pathResponse).packed()
+                                                    ratchet: ratchet, appData: wireAppData)
+                return try? Packet.announce(from: dest, payload: payload, pathResponse: pathResponse,
+                                            ratchetPresent: ratchet != nil).packed()
+            }
+
+            // Rotate `hash`'s own ratchets if due — reference `rotate_ratchets` (Destination.py:250-262),
+            // called only from `_announce` (:335-338), so only when an announce or a local path response
+            // is built: a new private key goes to the front once more than `ratchetInterval` has passed
+            // since the last rotation, or at once after `.enableRatchets`, and the ring is cut to
+            // `ratchetCount`. Reports the new ring so the host persists it (reference persists in
+            // the same call, :259).
+            func rotateRatchetsIfDue(_ hash: Data, _ state: inout State) -> Effect<Action> {
+                guard var own = state.ownRatchets[hash] else { return .none }
+                let now = date.now
+                if let last = own.lastRotation, !(now > last.addingTimeInterval(Transport.ratchetInterval)) {
+                    return .none
+                }
+                own.ring.insert(SecureRandom.bytes(Transport.ratchetKeyLength), at: 0)
+                if own.ring.count > Transport.ratchetCount { own.ring.removeLast(own.ring.count - Transport.ratchetCount) }
+                own.lastRotation = now
+                state.ownRatchets[hash] = own
+                return .send(.delegate(.ratchetsChanged(destinationHash: hash, ring: own.ring)))
+            }
+
+            // The ratchet `hash`'s announces carry: the public key of the newest ratchet, or nil when
+            // ratchets are not enabled (reference `_ratchet_public_bytes(self.ratchets[0])`, :337).
+            func announcedRatchet(_ hash: Data, _ state: State) -> Data? {
+                state.ownRatchets[hash]?.ring.first.flatMap { Identity.ratchetPublicKey(privateKey: $0) }
+            }
+
+            // Bytes standing in for the ratchet when only the announce's length matters.
+            func ratchetPlaceholder(_ hash: Data, _ state: State) -> Data? {
+                state.ownRatchets[hash] != nil ? Data(count: Transport.ratchetKeyLength) : nil
             }
 
             // Emit an announce of `dest` (see `.announce` for the sticky app data rule, including why
-            // the capture follows a successful pack).
+            // the capture follows a successful pack). It rotates the ratchets first when due, and the
+            // rotation is reported even if the announce then cannot be packed: the ring changed.
             func emitAnnounce(_ dest: Destination, _ identity: Identity, appData: Data?, interface: InterfaceID?,
                               stamp: Data?, _ state: inout State) -> Effect<Action> {
+                let rotated = rotateRatchetsIfDue(dest.hash, &state)
                 let announcedAppData = appData ?? state.localAppData[dest.hash]
                 guard let raw = announceBytes(dest, identity, appData: announcedAppData, stamp: stamp,
-                                              pathResponse: false, state) else { return .none }
+                                              ratchet: announcedRatchet(dest.hash, state),
+                                              pathResponse: false, state) else { return rotated }
                 if let appData { state.localAppData[dest.hash] = appData }
                 let targets: [InterfaceID] = interface.map { state.interfaces[$0] != nil ? [$0] : [] }
                     ?? Array(state.interfaces.keys)
-                return .merge(targets.map { .send(.delegate(.transmit($0, raw))) })
+                return .merge([rotated] + targets.map { .send(.delegate(.transmit($0, raw))) })
             }
 
             // Answer a path request for our own `dest` on `interfaceID`. It replays the app data this
@@ -656,13 +746,17 @@ public struct Transport {
             // `shouldReplace` on the requester, and sending nil would erase whatever richer entry the
             // requester had learned from a normal announce (display name, PN metadata, ...).
             //
-            // `ratchet` stays nil: ReTiCA has no own-ratchet lifecycle at all (it only honours a
-            // PEER's announced ratchet when encrypting), so there is nothing truthful to put here.
+            // With ratchets enabled it carries the CURRENT newest ratchet and may rotate first: in
+            // reference a local path response is a freshly built announce (`announce(path_response=True)`
+            // → `_announce`, which rotates and signs over `ratchets[0]`, Destination.py:331-376; its
+            // cached-tag branch at :319-329 is unreachable, as its comment says).
             func emitPathResponse(_ dest: Destination, _ identity: Identity, on interfaceID: InterfaceID,
-                                  stamp: Data?, _ state: State) -> Effect<Action> {
+                                  stamp: Data?, _ state: inout State) -> Effect<Action> {
+                let rotated = rotateRatchetsIfDue(dest.hash, &state)
                 guard let raw = announceBytes(dest, identity, appData: state.localAppData[dest.hash], stamp: stamp,
-                                              pathResponse: true, state) else { return .none }
-                return .send(.delegate(.transmit(interfaceID, raw)))
+                                              ratchet: announcedRatchet(dest.hash, state),
+                                              pathResponse: true, state) else { return rotated }
+                return .merge(rotated, .send(.delegate(.transmit(interfaceID, raw))))
             }
 
             // One search per destination, no timeout (reference sets none for destination stamps; at
@@ -738,7 +832,7 @@ public struct Transport {
                     switch item.kind {
                     case let .pathResponse(interfaceID):
                         guard state.interfaces[interfaceID] != nil else { continue }
-                        effects.append(emitPathResponse(dest, identity, on: interfaceID, stamp: stamp, state))
+                        effects.append(emitPathResponse(dest, identity, on: interfaceID, stamp: stamp, &state))
                     case let .announce(appData, interface):
                         effects.append(emitAnnounce(dest, identity, appData: appData, interface: interface,
                                                     stamp: stamp, &state))
@@ -887,12 +981,26 @@ public struct Transport {
                         ratchet = restored
                         ratchetReceived = received
                     }
-                    if var live = state.knownDestinations[hash], live.lastHeard >= candidate.lastHeard {
-                        // The live entry wins, but an announce without a ratchet does not clear one
-                        // (Identity.py:726), so a live entry with none takes the restored ratchet.
-                        if live.ratchet == nil, let ratchet {
-                            live.ratchet = ratchet
-                            live.ratchetReceived = ratchetReceived
+                    // The ratchet is merged on its own terms, whichever entry wins: an announce without a
+                    // ratchet does not clear one (Identity.py:726), so the entry that was heard last need
+                    // not hold the newest ratchet. The ratchet received later wins, the live one on a
+                    // tie. A live ratchet without a receive time counts as expired and loses.
+                    let live = state.knownDestinations[hash]
+                    var keptRatchet = live?.ratchet
+                    var keptReceived = live?.ratchetReceived
+                    let restoredIsNewer: Bool = {
+                        guard let ratchetReceived else { return false }
+                        guard keptRatchet != nil, let keptReceived else { return true }
+                        return ratchetReceived > keptReceived
+                    }()
+                    if let ratchet, restoredIsNewer {
+                        keptRatchet = ratchet
+                        keptReceived = ratchetReceived
+                    }
+                    if var live, live.lastHeard >= candidate.lastHeard {
+                        if live.ratchet != keptRatchet || live.ratchetReceived != keptReceived {
+                            live.ratchet = keptRatchet
+                            live.ratchetReceived = keptReceived
                             state.knownDestinations[hash] = live
                         }
                         continue
@@ -902,7 +1010,7 @@ public struct Transport {
                     state.knownDestinations[hash] = KnownDestination(
                         identity: publicOnly, appData: candidate.appData, lastHeard: candidate.lastHeard,
                         linkCost: candidate.linkCost, stampValue: candidate.stampValue,
-                        ratchet: ratchet, ratchetReceived: ratchetReceived)
+                        ratchet: keptRatchet, ratchetReceived: keptReceived)
                 }
                 return .none
 
@@ -1239,15 +1347,15 @@ public struct Transport {
                         // (1) We OWN the requested destination → answer with a fresh path-response.
                         if let dest = state.localDestinations[requested],
                            let identity = dest.identity, identity.privateKey != nil {
-                            // App data and ratchet: see `emitPathResponse`.
+                            // App data, ratchet and rotation: see `emitPathResponse`.
                             guard state.stampDestinations else {
-                                return emitPathResponse(dest, identity, on: interfaceID, stamp: nil, state)
+                                return emitPathResponse(dest, identity, on: interfaceID, stamp: nil, &state)
                             }
                             // Stamping: the response carries the same extension as our announces. With
                             // no stamp yet it waits for one, ahead of waiting announces (reference
                             // queues it at a higher priority, Transport.py:1455).
                             if let stamp = usableStamp(dest, identity, &state) {
-                                return emitPathResponse(dest, identity, on: interfaceID, stamp: stamp, state)
+                                return emitPathResponse(dest, identity, on: interfaceID, stamp: stamp, &state)
                             }
                             return waitForStamp(State.PendingStampedAnnounce(destinationHash: dest.hash,
                                                                              kind: .pathResponse(interface: interfaceID)),
@@ -1310,9 +1418,15 @@ public struct Transport {
                         guard let raw = forwardTowardDest(packet, entry) else { return .none }
                         return .send(.delegate(.transmit(entry.interfaceID, raw)))
                     }
+                    // With our own ratchets enabled, every retained ratchet is tried (newest first), then
+                    // the identity key unless enforced — reference `Destination.decrypt`
+                    // (Destination.py:720-752), minus its reload-from-disk retry: the ring here is the
+                    // only copy in the process. An empty ring passes no ratchets, as reference does.
+                    let own = state.ownRatchets[packet.destinationHash]
                     guard let destination = state.localDestinations[packet.destinationHash],
                           destination.kind == packet.destinationType,
-                          let plaintext = destination.decrypt(packet.payload)
+                          let plaintext = destination.decrypt(packet.payload, ratchets: own?.ring,
+                                                              enforceRatchets: own?.enforce ?? false)
                     else { return .none }
                     return .send(.delegate(.received(destinationHash: packet.destinationHash,
                                                      plaintext: plaintext,
@@ -1667,10 +1781,12 @@ public struct Transport {
                 // No stamp yet: the announce waits for one (reference `enqueue_stamped_announce`,
                 // Destination.py:297-301). Its sticky app data is captured NOW, so a path response
                 // released ahead of it replays it — but only if the stamped announce will pack, for
-                // the reason above. Any 14 bytes give the same length as the real stamp.
+                // the reason above. Any 14 bytes give the same length as the real stamp, and any 32 the
+                // same length as the ratchet the announce will carry when it is released.
                 let announcedAppData = appData ?? state.localAppData[destinationHash]
                 guard announceBytes(dest, identity, appData: announcedAppData,
-                                    stamp: Data(count: NetworkStamp.stampLength), pathResponse: false, state) != nil
+                                    stamp: Data(count: NetworkStamp.stampLength),
+                                    ratchet: ratchetPlaceholder(destinationHash, state), pathResponse: false, state) != nil
                 else { return .none }
                 if let appData { state.localAppData[destinationHash] = appData }
                 return waitForStamp(State.PendingStampedAnnounce(destinationHash: destinationHash,
@@ -1795,6 +1911,32 @@ public struct Transport {
                 guard let raw = try? proof.packed() else { return .none }
                 return .send(.delegate(.transmit(interfaceID, raw)))
 
+            case let .enableRatchets(destinationHash, ring):
+                // A restored entry that is not a 32-byte private key is dropped, so it is never
+                // announced nor tried. Ring order is the host's (newest first).
+                let usable = ring.filter { Identity.ratchetPublicKey(privateKey: $0) != nil }
+                state.ownRatchets[destinationHash] = State.OwnRatchets(
+                    ring: Array(usable.prefix(Transport.ratchetCount)), lastRotation: nil,
+                    enforce: state.ownRatchets[destinationHash]?.enforce ?? false)
+                // The app data captured for this destination was checked against an announce without
+                // a ratchet. One that no longer fits would silence every later announce without app
+                // data and every path response (see `.announce`), so it is forgotten here.
+                if let captured = state.localAppData[destinationHash],
+                   let dest = state.localDestinations[destinationHash],
+                   let identity = dest.identity, identity.privateKey != nil,
+                   announceBytes(dest, identity, appData: captured,
+                                 stamp: state.stampDestinations ? Data(count: NetworkStamp.stampLength) : nil,
+                                 ratchet: ratchetPlaceholder(destinationHash, state),
+                                 pathResponse: false, state) == nil {
+                    state.localAppData[destinationHash] = nil
+                }
+                return .none
+
+            case let .setEnforceRatchets(destinationHash, enforce):
+                guard state.ownRatchets[destinationHash] != nil else { return .none }
+                state.ownRatchets[destinationHash]?.enforce = enforce
+                return .none
+
             case .delegate:
                 return .none
             }
@@ -1832,6 +1974,14 @@ public struct Transport {
     /// A known destination culled earlier (`knownDestinationExpiry`) takes its ratchet with it, as
     /// reference's `clean_known_destinations` does (Identity.py:455).
     public static let ratchetExpiry: TimeInterval = 60 * 60 * 24 * 30
+    /// How many of our own ratchets a destination keeps: reference `RATCHET_COUNT`
+    /// (RNS 1.6.0 Destination.py:87-94), 512. Older ones fall off the ring at rotation.
+    public static let ratchetCount = 512
+    /// The minimum time between rotations of our own ratchets: reference `RATCHET_INTERVAL`
+    /// (Destination.py:87-94), 30 minutes. Rotation happens only when announcing.
+    public static let ratchetInterval: TimeInterval = 30 * 60
+    /// A ratchet key's length, private or public (X25519): reference `RATCHETSIZE / 8`.
+    public static let ratchetKeyLength = 32
     /// Whether a ratchet first heard at `received` is still usable at `now`. A non-finite time is not.
     static func ratchetIsFresh(received: Date, now: Date) -> Bool {
         let age = now.timeIntervalSince(received)

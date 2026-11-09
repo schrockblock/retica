@@ -78,27 +78,27 @@ public struct LXMFAnnounceData: Equatable {
     /// (nor truncates a name further). With a null stamp cost the name budget fell from 326 to 308
     /// UTF-8 bytes, so a name of 309-326 bytes, which fitted before, is now cut to fit.
     ///
-    /// **Assumes no ratchet.** `Transport`'s `.announce` case passes `ratchet: nil` today. A
-    /// ratchet is a fifth fixed payload field of `Announce.ratchetSize` (32) bytes, so if ReTiCA
-    /// ever announces one this must drop by 32 — otherwise a name that fits here stops fitting
-    /// on the wire, which is exactly the failure this constant exists to prevent.
+    /// **Without a ratchet.** A destination with its own ratchets enabled (`Transport`'s
+    /// `.enableRatchets`) announces a fifth fixed payload field of `Announce.ratchetSize` (32) bytes;
+    /// its budget is `maxAppDataBytesWithRatchet` (283), and `pack(displayName:stampCost:ratchet:)`
+    /// takes which one applies. Unlike the stamp extension the ratchet is not reserved
+    /// unconditionally: ratchets are a host opt-in, and reserving them would cut every name by 32
+    /// bytes for hosts that never enable them.
     ///
-    /// **Dropping the constant is necessary but not sufficient, and an earlier note here said
-    /// otherwise.** It claimed a ratchet would "merely fail to announce rather than poison state,
-    /// because the capture-after-pack fix is independent". That is wider than the evidence: the fix
-    /// stops a *new* unsendable value being captured, but nothing clears one already captured.
-    /// `Transport.state.localAppData` is written in exactly two places — cleared on
-    /// `.registerLocalDestination`, and set after a successful pack — so a name captured while it
-    /// fit (≤ 315 B) becomes unsendable the moment a ratchet adds 32 bytes, and from then on
-    /// `announce(nil)` and local path responses go silent again with no self-heal. A re-review
-    /// probe characterised exactly that state: seeded oversize sticky entry → zero transmits.
-    /// So when ratchets land: drop this by 32 **and** re-validate or clear existing captures.
+    /// **Shrinking the budget is necessary but not sufficient.** A name captured in
+    /// `Transport.state.localAppData` while it fit without a ratchet would be unsendable with one,
+    /// and `announce(nil)` and local path responses would go silent with no self-heal (a re-review
+    /// probe showed it: seeded oversize sticky entry → zero transmits). So `.enableRatchets`
+    /// re-validates the capture with the ratchet's 32 bytes and forgets it when it no longer fits.
     public static let maxAppDataBytes =
         Packet.mtu
         - (Packet.addressLength + 3)
         - (Announce.keySize + Announce.nameHashLength + Announce.randomHashLength
            + Announce.signatureLength)
         - NetworkStamp.extensionLength
+
+    /// `maxAppDataBytes` less the 32-byte ratchet, for a destination announcing its own ratchet.
+    public static let maxAppDataBytesWithRatchet = maxAppDataBytes - Announce.ratchetSize
 
     /// Pack delivery-destination announce app-data in the 0.5.0+ msgpack format.
     ///
@@ -112,14 +112,17 @@ public struct LXMFAnnounceData: Equatable {
     /// The functionality array always contains `SF_COMPRESSION` (0x00),
     /// mirroring `supported_functionality = [SF_COMPRESSION]` at LXMRouter.py:1047.
     ///
-    /// **`displayName` is truncated to fit `maxAppDataBytes`** — see `displayNameBudget`. This is
+    /// **`displayName` is truncated to fit `maxAppDataBytes`** (or `maxAppDataBytesWithRatchet`) — see `displayNameBudget`. This is
     /// a DELIBERATE DIVERGENCE: reference `get_announce_app_data` (LXMRouter.py:1034-1050) applies
     /// no length bound, and an over-long name there makes `RNS.Packet.pack` raise IOError
     /// (RNS 1.4.2 Packet.py:234-236) so the announce simply fails. ReTiCA's `Transport` `.announce`
     /// swallows that failure (`try?`), so an unbounded name here silently took the destination off
     /// the network — a shortened name is strictly better than no announce. Names that fit the budget
     /// are emitted unchanged, so the cross-validation vectors (all far shorter) are untouched.
-    public static func pack(displayName: String?, stampCost: Int?) -> Data {
+    ///
+    /// `ratchet` says whether the announce carrying this blob also carries our own ratchet: the
+    /// budget is then `maxAppDataBytesWithRatchet`.
+    public static func pack(displayName: String?, stampCost: Int?, ratchet: Bool = false) -> Data {
         let costValue: MsgPackValue
         if let cost = stampCost, cost > 0, cost < NetworkStamp.stampCostCap {
             costValue = .uint(UInt64(cost))
@@ -134,15 +137,17 @@ public struct LXMFAnnounceData: Equatable {
         }
 
         var nameBytes = Data(displayName.utf8)
-        let budget = displayNameBudget(costValue: costValue, functionalityValue: functionalityValue)
+        let budget = displayNameBudget(costValue: costValue, functionalityValue: functionalityValue,
+                                       maxBytes: ratchet ? maxAppDataBytesWithRatchet : maxAppDataBytes)
         if nameBytes.count > budget {
             nameBytes = Data(truncated(displayName, toUTF8Bytes: budget).utf8)
         }
         return MsgPack.encode(.array([.bin(nameBytes), costValue, functionalityValue]))
     }
 
-    /// How many UTF-8 bytes of display name fit in `maxAppDataBytes`, given the rest of this
-    /// particular blob (a 1-byte stamp cost encodes shorter than a 2-byte one).
+    /// How many UTF-8 bytes of display name fit in `maxBytes` (`maxAppDataBytes`, or
+    /// `maxAppDataBytesWithRatchet`), given the rest of this particular blob (a 1-byte stamp cost
+    /// encodes shorter than a 2-byte one).
     ///
     /// The non-name overhead is MEASURED by encoding the blob with an empty name, not tallied by
     /// hand, so a change to the msgpack encoder or to the shape of the array cannot silently
@@ -150,11 +155,12 @@ public struct LXMFAnnounceData: Equatable {
     ///
     /// The extra `- 1` covers the bin header growing from bin8 (2 bytes) to bin16 (3 bytes) above
     /// 255 name bytes. It is unconditional because this budget only ever binds well above 255
-    /// (its smallest possible value here is 307), so reserving the byte costs nothing real.
-    private static func displayNameBudget(costValue: MsgPackValue,
-                                          functionalityValue: MsgPackValue) -> Int {
+    /// (its smallest possible value here is 307, or 275 with a ratchet), so reserving the byte costs
+    /// nothing real.
+    private static func displayNameBudget(costValue: MsgPackValue, functionalityValue: MsgPackValue,
+                                          maxBytes: Int) -> Int {
         let overhead = MsgPack.encode(.array([.bin(Data()), costValue, functionalityValue])).count
-        return maxAppDataBytes - overhead - 1
+        return maxBytes - overhead - 1
     }
 
     /// The longest prefix of `name` that is at most `budget` UTF-8 bytes, cut on an extended
