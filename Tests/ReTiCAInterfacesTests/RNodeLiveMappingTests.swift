@@ -143,9 +143,24 @@ private func end(_ reason: String) -> RNodeEvent {
                 + "Change them in Settings, then Connect.")
     }
 
+    /// T1 review carry: a fraction under 0.1 keeps its leading zeros.
+    @Test func rejectionMessageKeepsLeadingZerosInTheFraction() {
+        let text = RNodeLiveMessage.configurationRejected([
+            RNodeParameterMismatch(field: .frequency, requested: 868_100_000, reported: 868_005_000),
+        ])
+        #expect(text == "The radio didn't accept these settings: frequency 868.005 MHz (asked for 868.1 MHz). "
+                + "Change them in Settings, then Connect.")
+    }
+
     @Test func anUnknownTerminalEndPassesItsReason() {
         var mapper = live()
         #expect(mapper.map(end("radio not found")) == .finish(.unavailable(.other("radio not found"))))
+    }
+
+    /// T1 review carry: an empty reason reports no text, so the app shows its generic message.
+    @Test func anEmptyTerminalEndReportsNoText() {
+        var mapper = live()
+        #expect(mapper.map(end("")) == .finish(.unavailable(.other(nil))))
     }
 
     @Test(arguments: [

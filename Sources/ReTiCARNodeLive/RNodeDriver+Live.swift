@@ -1,6 +1,190 @@
 import Foundation
+import ComposableArchitecture
 import RNodeKit
 import ReTiCAInterfaces
+
+extension RNodeDriver {
+    /// Contract 2's live value over ONE `RNodeSession`. `start` subscribes to the session's events,
+    /// then connects to `config.radio` with `config.params` (retrieve-only: the session never
+    /// scans), and the session writes those params at every handshake. A terminal end yields
+    /// `.unavailable` and finishes the stream. `send` writes one whole packet on the link that is up
+    /// when it is called, and answers false at once if none is, or as soon as that link ends.
+    /// `stop` disconnects and always returns. Reconnecting is RNodeKit's. The session outlives
+    /// every start/stop; its owner must `disconnect()` it before dropping it.
+    public static func live(session: RNodeSession) -> RNodeDriver {
+        let adapter = RNodeLiveAdapter(session: session)
+        return RNodeDriver(start: { adapter.start($0) },
+                           send: { await adapter.send($0) },
+                           stop: { await adapter.stop() })
+    }
+}
+
+/// The state behind `RNodeDriver.live(session:)`, shaped like `MeshtasticLiveAdapter`.
+/// `RNodeInterface` may `start` again from `.unavailable` without a `stop()` in between, so
+/// `pendingConnects` is a counter and `stop()` drains them all.
+///
+/// Sends bind to the link that is up when they are called (ledger carry 1). A power-off fails no
+/// FCB op, so a write in flight then may never return: `send` races it against that link ending
+/// and answers false when it does, rather than leaving the interface's sender waiting.
+final class RNodeLiveAdapter: Sendable {
+    let session: RNodeSession
+    private let link = LockIsolated(Link())
+    /// `connect(radio:config:)` calls launched by `start` that have not returned yet.
+    private let pendingConnects = LockIsolated(0)
+
+    private struct Link {
+        /// Bumped by every `start` and `stop`: a superseded pump never touches the link.
+        var owner: UInt64 = 0
+        /// Bumped whenever the link ends (or a start or stop supersedes it): the ledger's link
+        /// generation. Sends started on one generation are failed when it moves.
+        var generation: UInt64 = 0
+        /// `.connected` was reported on `generation` and nothing has ended it since.
+        var up = false
+        var nextWaiter: UInt64 = 0
+        /// Sends in flight on `generation`, each failed when it moves.
+        var waiters: [UInt64: @Sendable () -> Void] = [:]
+    }
+
+    init(session: RNodeSession) {
+        self.session = session
+    }
+
+    func start(_ config: RNodeDriverConfig) -> AsyncStream<RNodeDriverEvent> {
+        let owner = link.withValue { link -> UInt64 in
+            link.owner &+= 1
+            return link.owner
+        }
+        endLink(owner)
+        // Subscribe BEFORE connecting: the hub registers a subscriber synchronously, so this
+        // stream sees every event of the connect below (the current state is replayed first,
+        // and the mapper drops it).
+        let events = session.events()
+        let session = self.session
+        let pendingConnects = self.pendingConnects
+        let radioConfig = RNodeRadioConfig(config.params)
+        pendingConnects.withValue { $0 += 1 }
+        // CoreBluetooth connects never time out: connect from a task (Contract 1).
+        Task {
+            await session.connect(radio: config.radio, config: radioConfig)
+            pendingConnects.withValue { $0 -= 1 }
+        }
+        return AsyncStream { continuation in
+            let pump = Task { await self.pump(events, owner: owner, continuation) }
+            continuation.onTermination = { _ in pump.cancel() }
+        }
+    }
+
+    private func pump(_ events: AsyncStream<RNodeEvent>, owner: UInt64,
+                      _ continuation: AsyncStream<RNodeDriverEvent>.Continuation) async {
+        var mapper = RNodeEventMapper()
+        for await event in events {
+            switch mapper.map(event) {
+            case .ignore:
+                continue
+            case let .emit(mapped):
+                switch mapped {
+                case .connected: linkUp(owner)
+                case .disconnected, .unavailable: endLink(owner)
+                case .packet, .channelLoad, .hardwareError: break
+                }
+                continuation.yield(mapped)
+            case let .finish(mapped):
+                endLink(owner)
+                continuation.yield(mapped)
+                continuation.finish()
+                return
+            }
+        }
+        endLink(owner)
+        continuation.finish()
+    }
+
+    func send(_ packet: Data) async -> Bool {
+        let outcome = SendOutcome()
+        let token = link.withValue { link -> UInt64? in
+            guard link.up else { return nil }
+            link.nextWaiter &+= 1
+            link.waiters[link.nextWaiter] = { outcome.resolve(false) }
+            return link.nextWaiter
+        }
+        guard let token else { return false }
+        let session = self.session
+        Task {
+            do {
+                try await session.send(packet)
+                outcome.resolve(true)
+            } catch {
+                outcome.resolve(false)
+            }
+        }
+        let sent = await outcome.value()
+        link.withValue { _ = $0.waiters.removeValue(forKey: token) }
+        return sent
+    }
+
+    /// Always returns (Contract 3). A connect launched by `start` is an unstructured hop onto the
+    /// session actor and may reach it AFTER this disconnect; it returns promptly once a later
+    /// disconnect supersedes it, so disconnect again until none is outstanding.
+    func stop() async {
+        let owner = link.withValue { link -> UInt64 in
+            link.owner &+= 1
+            return link.owner
+        }
+        endLink(owner)
+        await session.disconnect()
+        while pendingConnects.value > 0 {
+            try? await Task.sleep(for: .milliseconds(10))
+            await session.disconnect()
+        }
+    }
+
+    private func linkUp(_ owner: UInt64) {
+        link.withValue { if $0.owner == owner { $0.up = true } }
+    }
+
+    /// Ends the current link for `owner` (unless superseded) and fails every send in flight on it.
+    private func endLink(_ owner: UInt64) {
+        let waiters = link.withValue { link -> [@Sendable () -> Void] in
+            guard link.owner == owner else { return [] }
+            link.generation &+= 1
+            link.up = false
+            defer { link.waiters = [:] }
+            return Array(link.waiters.values)
+        }
+        for fail in waiters { fail() }
+    }
+}
+
+/// A one-shot answer for one send: the first `resolve` wins, whichever side calls it.
+private final class SendOutcome: Sendable {
+    private struct State {
+        var value: Bool?
+        var continuation: CheckedContinuation<Bool, Never>?
+    }
+
+    private let state = LockIsolated(State())
+
+    func value() async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let ready = state.withValue { s -> Bool? in
+                if let value = s.value { return value }
+                s.continuation = continuation
+                return nil
+            }
+            if let ready { continuation.resume(returning: ready) }
+        }
+    }
+
+    func resolve(_ value: Bool) {
+        let continuation = state.withValue { s -> CheckedContinuation<Bool, Never>? in
+            guard s.value == nil else { return nil }
+            s.value = value
+            defer { s.continuation = nil }
+            return s.continuation
+        }
+        continuation?.resume(returning: value)
+    }
+}
 
 /// What the adapter should do with one kit event.
 enum RNodeLiveStep: Equatable {
@@ -57,12 +241,14 @@ struct RNodeEventMapper: Equatable {
         }
     }
 
-    private func message(forTerminalReason reason: String) -> String {
+    /// nil for an empty reason, so the app shows its generic adapter message rather than a blank one.
+    private func message(forTerminalReason reason: String) -> String? {
         switch reason {
         case RNodeSession.firmwareTooOldReason:        return RNodeLiveMessage.firmwareTooOld
         case RNodeSession.pairingRequiredReason:       return RNodeLiveMessage.pairingRequired
         case RNodeSession.pairingRemovedReason:        return RNodeLiveMessage.pairingRemoved
         case RNodeSession.configurationRejectedReason: return RNodeLiveMessage.configurationRejected(rejected)
+        case "":                                       return nil
         default:                                       return reason
         }
     }
