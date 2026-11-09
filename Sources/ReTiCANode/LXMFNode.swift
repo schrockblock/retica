@@ -145,13 +145,31 @@ public struct LXMFNode {
         /// `FIELD_TICKET` (`LXMRouter.py:2176-2184`); reported as `.ticketReceived`. While unexpired,
         /// a send to that peer is stamped with the ticket — no cost wait, no search — even when the
         /// peer advertises no cost, as reference does (`LXMessage.py:303-310`). An expired entry is
-        /// never used, but stays here until the host replaces the table.
+        /// never used; it stays here for the rest of the session and is dropped by the next
+        /// `.rehydrateTickets` (reference also culls every ~8 minutes; this library does not).
         public var outboundTickets: [Data: LXMFNode.Ticket] = [:]
         /// Tickets we issued, by the `lxmf.delivery` hash of the peer we issued them to. When we
         /// have a `deliveryStampCost`, an inbound message whose stamp is the ticket stamp of one of
         /// the unexpired tickets issued to ITS sender is valid without proof-of-work
         /// (`LXMRouter.py:2190-2193`, `Storage.py:290-301`). Tickets issued to anyone else do not count.
+        /// Written when a ticket is minted for an outbound message (see `issueTickets` and
+        /// `ticketFieldToIssue(destinationHash:now:)`), reported as `.ticketIssued`, and restored by
+        /// `.rehydrateTickets`.
         public var inboundTickets: [Data: [LXMFNode.Ticket]] = [:]
+        /// When a message carrying a ticket we issued was last confirmed delivered, by recipient
+        /// `lxmf.delivery` hash (reference `ticket_deliveries`, `LXMRouter.py:3060-3067`). While
+        /// less than `LXMessage.ticketInterval` (1 day) old, no ticket is put in messages to that
+        /// peer. Reported as `.ticketDelivered`; restored by `.rehydrateTickets`.
+        public var lastTicketDeliveries: [Data: Date] = [:]
+        /// Whether messages this node builds (`.send`, `.sendViaPropagation`) carry a ticket for
+        /// their recipient, by reference `generate_ticket` (`LXMRouter.py:1205-1228`). Reference
+        /// leaves this to the client per message (`include_ticket`, default off); here it is one
+        /// switch, **off by default**, set with `.setIssueTickets`. Host-built messages
+        /// (`.sendMessage`) get theirs from `ticketFieldToIssue(destinationHash:now:)`.
+        public var issueTickets: Bool = false
+        /// Outbound messages that carry a ticket we issued, by message hash → recipient. Lets a
+        /// delivery confirmation record `lastTicketDeliveries`. Removed when the message ends.
+        public internal(set) var ticketCarryingMessages: [Data: Data] = [:]
 
         /// Display name advertised in every delivery-destination announce.
         /// Nil means no name is encoded (the announce still carries the full app-data blob per
@@ -276,6 +294,23 @@ public struct LXMFNode {
         /// Replace the whole ignore set. The host sends it on launch next to
         /// `rehydrateLearnedPeers`; an empty set clears everything.
         case rehydrateIgnoredDestinations(Set<Data>)
+        /// Turn ticket issuing on or off (`State.issueTickets`, default off). State only.
+        case setIssueTickets(Bool)
+        /// Restore ticket state from a previous session: `outbound` → `State.outboundTickets`,
+        /// `inbound` → `State.inboundTickets`, `lastDeliveries` → `State.lastTicketDeliveries`.
+        /// The host sends it on launch next to `rehydrateLearnedPeers`.
+        ///
+        /// Sweeps in the same pass, as reference `clean_available_tickets` does at startup
+        /// (`LXMRouter.py:1498-1512`, cull `expires < cutoff`): an outbound ticket whose expiry is
+        /// before now is dropped, and an inbound one whose expiry is more than
+        /// `LXMessage.ticketGrace` (5 days) before now. Also dropped: a ticket that is not
+        /// `LXMessage.ticketLength` bytes or whose expiry is not finite, and a delivery time that is
+        /// not finite or is in the future (it would stop issuing to that peer until the clock caught up).
+        ///
+        /// A restored row never replaces live state: a live outbound ticket arrived this session, so
+        /// it is the newest (reference keeps the newest received); an inbound ticket already held is
+        /// not duplicated; a live delivery time at least as recent is kept.
+        case rehydrateTickets(outbound: [Data: Ticket], inbound: [Data: [Ticket]], lastDeliveries: [Data: Date])
         case registerDelivery
         /// Update the display name and delivery stamp cost carried in the delivery-destination
         /// app data. **State only — this sends nothing.** Follow it with `.announceDelivery`
@@ -299,12 +334,19 @@ public struct LXMFNode {
         /// re-broadcast on every other interface too. Same app data and same no-op rule as
         /// `.announceDelivery`; transmits nothing when that interface is not connected.
         case announceDeliveryOnInterface(InterfaceID)
+        /// Build and send a message. With `State.issueTickets` on it carries a stamp ticket for its
+        /// recipient when reference `generate_ticket` would include one (so does `.sendViaPropagation`).
         case send(destinationHash: Data, title: Data, content: Data, method: LXMFRouter.DeliveryMethod)
         case setPropagationNode(destinationHash: Data)
         case sendViaPropagation(destinationHash: Data, title: Data, content: Data)
         /// Send `message` directly. With `fallbackToPropagation`, a copy goes to the propagation node
         /// only if the direct copy stalls (its third attempt) or fails; a copy the node would refuse
         /// for size is reported `propagationRefused` at once instead.
+        ///
+        /// `message` is already hashed and signed, so the node cannot add a stamp ticket to it. To
+        /// issue one, build the message with `State.ticketFieldToIssue(destinationHash:now:)` in its
+        /// fields; a ticket from our own delivery destination found here is recorded in
+        /// `State.inboundTickets` (reported `.ticketIssued` if new) and its delivery is counted.
         case sendMessage(message: LXMessage, fallbackToPropagation: Bool)
         case syncFromPropagationNode
         /// Cancel in-flight propagation stamp work. An explicit `.sendViaPropagation` still stamping is
@@ -392,6 +434,14 @@ public struct LXMFNode {
             /// A peer gave us a ticket, now in `State.outboundTickets[destinationHash]` (the peer's
             /// `lxmf.delivery` hash). Reported when the stored entry changes, so the host can persist it.
             case ticketReceived(destinationHash: Data, ticket: LXMFNode.Ticket)
+            /// We minted a ticket for the peer `destinationHash` and put it in an outbound message;
+            /// it is now in `State.inboundTickets[destinationHash]`. Persist it: without it, after a
+            /// relaunch that peer's ticket stamps no longer validate. Not reported when a ticket
+            /// already held is reused.
+            case ticketIssued(destinationHash: Data, ticket: LXMFNode.Ticket)
+            /// A message carrying a ticket we issued to `destinationHash` was confirmed delivered at
+            /// `at`, now in `State.lastTicketDeliveries`. Persist it.
+            case ticketDelivered(destinationHash: Data, at: Date)
         }
     }
 
@@ -526,6 +576,7 @@ public struct LXMFNode {
 
     @Dependency(\.date) var date
     @Dependency(\.continuousClock) var clock
+    @Dependency(\.withRandomNumberGenerator) var withRandomNumberGenerator
     public init() {}
 
     public var body: some ReducerOf<Self> {
@@ -626,6 +677,38 @@ public struct LXMFNode {
                 state.ignoredDestinations = hashes
                 return .none
 
+            case let .setIssueTickets(on):
+                state.issueTickets = on
+                return .none
+
+            case let .rehydrateTickets(outbound, inbound, lastDeliveries):
+                // Reference culls `expires < cutoff` (Storage.py:132-137, LXMRouter.py:1504-1505), so a
+                // row exactly at its cutoff survives. Non-finite expiries are dropped: NaN compares
+                // false both ways, so a plain `<` cutoff test would keep it forever.
+                let now = date.now
+                func wellFormed(_ t: Ticket) -> Bool {
+                    t.ticket.count == LXMessage.ticketLength && t.expires.timeIntervalSinceReferenceDate.isFinite
+                }
+                for (hash, ticket) in outbound where state.outboundTickets[hash] == nil {
+                    guard wellFormed(ticket), ticket.expires >= now else { continue }
+                    state.outboundTickets[hash] = ticket
+                }
+                let inboundCutoff = now - LXMessage.ticketGrace
+                for (hash, tickets) in inbound {
+                    for ticket in tickets {
+                        guard wellFormed(ticket), ticket.expires >= inboundCutoff,
+                              state.inboundTickets[hash]?.contains(where: { $0.ticket == ticket.ticket }) != true
+                        else { continue }
+                        state.inboundTickets[hash, default: []].append(ticket)
+                    }
+                }
+                for (hash, at) in lastDeliveries {
+                    guard at.timeIntervalSinceReferenceDate.isFinite, at <= now else { continue }
+                    if let live = state.lastTicketDeliveries[hash], live >= at { continue }
+                    state.lastTicketDeliveries[hash] = at
+                }
+                return .none
+
             case .registerDelivery:
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
                                           aspects: LXMessage.deliveryAspects, identity: state.identity)
@@ -701,10 +784,14 @@ public struct LXMFNode {
                 return .send(.endpoint(.announceOn(interface: interfaceID, destinationHash: hash, appData: appData)))
 
             case let .send(destinationHash, title, content, method):
+                // The ticket field is part of the hashed, signed payload, so it is chosen before the
+                // message exists (reference `handle_outbound` sets it before `pack`, LXMRouter.py:2098-2102).
                 let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
-                                           timestamp: date.now.timeIntervalSince1970, title: title, content: content)
+                                           timestamp: date.now.timeIntervalSince1970, title: title, content: content,
+                                           fields: ticketFields(state, destinationHash))
                 state.router.uncancel(msg.hash)   // an app send is a fresh send (see `.sendMessage`)
-                return deliverySend(&state, message: msg, method: method)
+                let issued = recordIssuedTicket(&state, msg)
+                return .merge(issued, deliverySend(&state, message: msg, method: method))
 
             case let .setPropagationNode(destinationHash):
                 // The node already set is NOT a change: the app re-applies it on every
@@ -733,8 +820,10 @@ public struct LXMFNode {
                       let cost = propagationStampCost(state)
                 else { return .none }
                 let created = LXMessage.create(source: state.identity, destinationHash: destinationHash,
-                                               timestamp: date.now.timeIntervalSince1970, title: title, content: content)
+                                               timestamp: date.now.timeIntervalSince1970, title: title, content: content,
+                                               fields: ticketFields(state, destinationHash))
                 state.router.uncancel(created.hash)   // an app send is a fresh send (see `.sendMessage`)
+                let issued = recordIssuedTicket(&state, created)
                 refreshOutboundPropagationNodeRetryWait(&state)
                 let ts = date.now.timeIntervalSince1970
                 // The recipient's ticket, if we hold one, is the delivery stamp: no delivery search.
@@ -751,7 +840,7 @@ public struct LXMFNode {
                 }
                 .cancellable(id: CancelID.propagationStampFor(msg.hash))
                 .cancellable(id: CancelID.propagationStamp)
-                return .merge(preparing, work)
+                return .merge(issued, preparing, work)
 
             case let .sendMessage(message, fallbackToPropagation):
                 // The delivery copy is stamped on exactly the same terms as `.send` — this is the
@@ -767,6 +856,9 @@ public struct LXMFNode {
                 // (whose per-message stamp effects were cancelled with it), and would otherwise
                 // swallow this deliberate re-send and leave its row on "sending" for good.
                 state.router.uncancel(message.hash)
+                // A ticket the host put in from `ticketFieldToIssue` is recorded here, where the
+                // message (and so its hash) first reaches the node.
+                let issued = recordIssuedTicket(&state, message)
                 // Direct first (spec Amendment A2): the propagated copy is only remembered here, and
                 // packed when the router reports `propagationFallbackDue`. The router must know the
                 // message is eligible BEFORE the delivery copy reaches it — a destination whose link
@@ -785,7 +877,7 @@ public struct LXMFNode {
                         fallback = .send(.router(.markFallbackEligible(messageHash: message.hash)))
                     }
                 }
-                return .concatenate(fallback, deliverySend(&state, message: message, method: .opportunistic))
+                return .merge(issued, .concatenate(fallback, deliverySend(&state, message: message, method: .opportunistic)))
 
             case .syncFromPropagationNode:
                 return .send(.router(.syncFromPropagationNode))
@@ -1171,7 +1263,15 @@ public struct LXMFNode {
                 state.preparingPhases[hash] = nil
                 forgetUnstampedHandOver(&state, hash)
                 let done = finishProgress(&state, .delivery(hash))
-                return .merge(.cancel(id: CancelID.propagationStampFor(hash)), done,
+                // A delivered ticket starts the interval in which no new one is sent to that peer
+                // (reference `process_outbound`, LXMRouter.py:3060-3067).
+                var ticketDelivered: Effect<Action> = .none
+                if let dest = state.ticketCarryingMessages.removeValue(forKey: hash) {
+                    let at = date.now
+                    state.lastTicketDeliveries[dest] = at
+                    ticketDelivered = .send(.delegate(.ticketDelivered(destinationHash: dest, at: at)))
+                }
+                return .merge(.cancel(id: CancelID.propagationStampFor(hash)), done, ticketDelivered,
                               .send(.delegate(.deliveryConfirmed(messageHash: hash))))
 
             case let .router(.delegate(.propagationFallbackDue(hash))):
@@ -1371,10 +1471,48 @@ public struct LXMFNode {
                                   activity)
                 }
 
+            // Every terminal outcome reaches the host as one of these, from whichever branch decided
+            // it, so a message that ends without a delivery confirmation is forgotten here. A
+            // propagated copy's acceptance ends the message only when no delivery copy is still out.
+            case let .delegate(.deliveryFailed(hash)), let .delegate(.deliveryRejected(hash)),
+                 let .delegate(.deliveryCancelled(hash)):
+                state.ticketCarryingMessages[hash] = nil
+                return .none
+
+            case let .delegate(.propagationAccepted(hash)):
+                if !state.router.hasOutboundState(for: hash) { state.ticketCarryingMessages[hash] = nil }
+                return .none
+
             case .endpoint, .router, .delegate:
                 return .none
             }
         }
+    }
+
+    /// The `FIELD_TICKET` entry for a message this node builds to `destinationHash`, or none when
+    /// issuing is off or the rule says not to include one. See `State.ticketFieldToIssue`.
+    private func ticketFields(_ state: State, _ destinationHash: Data) -> [MsgPackValue.IntPair] {
+        guard state.issueTickets else { return [] }
+        let fresh = withRandomNumberGenerator { LXMFNode.State.randomTicket(using: &$0) }
+        return state.ticketFieldToIssue(destinationHash: destinationHash, now: date.now, newTicket: fresh)
+            .map { [$0] } ?? []
+    }
+
+    /// Record the ticket `message` carries to its recipient as one we issued: remember the message
+    /// so its delivery confirmation can be counted, and add a ticket not yet held to
+    /// `inboundTickets`, reported as `.ticketIssued`. Only for a message from our own delivery
+    /// destination with a well-formed, unexpired `FIELD_TICKET`; anything else is left alone.
+    private func recordIssuedTicket(_ state: inout State, _ message: LXMessage) -> Effect<Action> {
+        guard message.sourceHash == LXMessage.deliveryHash(identityHash: state.identity.hash),
+              let entry = message.ticketField,
+              entry.expires > date.now.timeIntervalSince1970
+        else { return .none }
+        let dest = message.destinationHash
+        state.ticketCarryingMessages[message.hash] = dest
+        if state.inboundTickets[dest]?.contains(where: { $0.ticket == entry.ticket }) == true { return .none }
+        let ticket = Ticket(ticket: entry.ticket, expires: Date(timeIntervalSince1970: entry.expires))
+        state.inboundTickets[dest, default: []].append(ticket)
+        return .send(.delegate(.ticketIssued(destinationHash: dest, ticket: ticket)))
     }
 
     /// The propagation stamp cost to work at, or **nil meaning "do not send via this node"**.
@@ -1694,5 +1832,68 @@ public struct LXMFNode {
             let rest = sends.filter { $0.message.hash != hash }
             state.unstampedHandOvers[dest] = rest.isEmpty ? nil : rest
         }
+    }
+}
+
+// MARK: - Issuing tickets
+
+extension LXMFNode.State {
+    /// The `FIELD_TICKET` entry to put in a message YOU build to `destinationHash` before sending it
+    /// with `.sendMessage`, or nil when `issueTickets` is off or no ticket should be included.
+    /// Messages the node builds itself (`.send`, `.sendViaPropagation`) get theirs automatically.
+    ///
+    /// The ticket is part of the message's hashed, signed payload, so ask before creating it:
+    ///
+    /// ```swift
+    /// let field = store.state.ticketFieldToIssue(destinationHash: peer, now: Date())
+    /// let message = LXMessage.create(source: identity, destinationHash: peer, timestamp: now,
+    ///                                title: title, content: content,
+    ///                                fields: otherFields + (field.map { [$0] } ?? []))
+    /// store.send(.sendMessage(message: message, fallbackToPropagation: true))
+    /// ```
+    ///
+    /// This only reads state. The node records a minted ticket in `inboundTickets` (and reports
+    /// `.ticketIssued`) when the message carrying it reaches `.sendMessage`, which is also where it
+    /// starts watching for that message's delivery confirmation. A field asked for but never sent is
+    /// never recorded, and no separate "I minted one" action exists to forget. Two messages built
+    /// before either is sent can each mint a ticket; both are recorded and both stay valid.
+    ///
+    /// The rule is reference `generate_ticket` (`LXMRouter.py:1205-1228`, LXMF 1.3.0):
+    ///  1. none if a ticket was delivered to this peer less than `LXMessage.ticketInterval` (1 day) ago;
+    ///  2. else the ticket already issued to this peer with the latest expiry, if that is more than
+    ///     `LXMessage.ticketRenew` (14 days) away;
+    ///  3. else a new random 16-byte ticket expiring `LXMessage.ticketExpiry` (21 days) from `now`.
+    ///
+    /// The value is `[expires, ticket]` with `expires` a float unix time, as reference sends it.
+    public func ticketFieldToIssue(destinationHash: Data, now: Date) -> MsgPackValue.IntPair? {
+        var rng = SystemRandomNumberGenerator()
+        return ticketFieldToIssue(destinationHash: destinationHash, now: now, using: &rng)
+    }
+
+    /// `ticketFieldToIssue(destinationHash:now:)` drawing a new ticket's bytes from `generator`.
+    public func ticketFieldToIssue<G: RandomNumberGenerator>(destinationHash: Data, now: Date,
+                                                            using generator: inout G) -> MsgPackValue.IntPair? {
+        ticketFieldToIssue(destinationHash: destinationHash, now: now, newTicket: Self.randomTicket(using: &generator))
+    }
+
+    static func randomTicket<G: RandomNumberGenerator>(using generator: inout G) -> Data {
+        Data((0..<LXMessage.ticketLength).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
+    }
+
+    /// The rule, with `newTicket` as the bytes of a ticket minted now (unused if none is minted).
+    func ticketFieldToIssue(destinationHash: Data, now: Date, newTicket: Data) -> MsgPackValue.IntPair? {
+        guard issueTickets else { return nil }
+        if let last = lastTicketDeliveries[destinationHash], now.timeIntervalSince(last) < LXMessage.ticketInterval {
+            return nil
+        }
+        let ticket: LXMFNode.Ticket
+        if let reusable = (inboundTickets[destinationHash] ?? [])
+            .filter({ $0.expires > now + LXMessage.ticketRenew })
+            .max(by: { $0.expires < $1.expires }) {
+            ticket = reusable
+        } else {
+            ticket = LXMFNode.Ticket(ticket: newTicket, expires: now + LXMessage.ticketExpiry)
+        }
+        return .init(LXMessage.fieldTicket, .array([.double(ticket.expires.timeIntervalSince1970), .bin(ticket.ticket)]))
     }
 }

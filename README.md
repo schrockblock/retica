@@ -279,6 +279,9 @@ stamps. Save these and replay them at launch:
 | Transient ids downloaded from a propagation node | `.router(.messagesDownloaded(transientIds:))` actions, or `state.router.downloadedTransientIds` | the same action |
 | Peers' display names and stamp costs | `state.learnedPeers` | `.rehydrateLearnedPeers(_:)` |
 | Blocked senders | `state.ignoredDestinations` | `.rehydrateIgnoredDestinations(_:)` |
+| Stamp tickets peers gave you (one per peer) | `.delegate(.ticketReceived(destinationHash:ticket:))`, or `state.outboundTickets` | `.rehydrateTickets(outbound:inbound:lastDeliveries:)`, `outbound:`. Without them every send to a stamp-enforcing peer does proof-of-work again until it sends you a new ticket. |
+| Stamp tickets you issued (only with `issueTickets` on, or if you add ticket fields yourself) | `.delegate(.ticketIssued(destinationHash:ticket:))`, or `state.inboundTickets` | the same action, `inbound:`. Without them, once you set a delivery stamp cost, a peer's ticket-stamped messages fail validation (and are dropped if you enforce stamps). |
+| When a ticket you issued was last delivered to each peer | `.delegate(.ticketDelivered(destinationHash:at:))`, or `state.lastTicketDeliveries` | the same action, `lastDeliveries:`. Without them a ticket goes out again within a day of the last delivered one. |
 | Your destinations' network stamps (only with `stampDestinations` on) | `.node(.endpoint(.delegate(.destinationStampGenerated(destinationHash:stamp:value:))))`; in an `LXMFServiceNode` host (ReTiCAMsgr), `.node(.client(.endpoint(.delegate(.destinationStampGenerated(...)))))` | `.node(.endpoint(.rehydrateDestinationStamp(destinationHash:stamp:)))`; in an `LXMFServiceNode` host, `.node(.client(.endpoint(.rehydrateDestinationStamp(...))))` |
 | A propagation node's stored messages (only if you run one) | the stored entries | `.pn(.ingestContainer(LXMFPropagation.container(timestamp:entries:)))` on `LXMFServiceNode` |
 
@@ -287,13 +290,38 @@ wrong half. The rehydrate actions drop expired, malformed or future-dated rows a
 overwrite an entry the network has already refreshed, so they are safe to send after
 `.endpoint(.start)` (ReTiCAMsgr runs its database reads alongside starting the interfaces). They
 cannot tell you to delete expired rows from disk; prune those yourself with
-`Transport.pathExpiry` (7 days), `Transport.knownDestinationExpiry` (8.75 days) and
-`LXMFNode.stampCostExpiry` (45 days). `LearnedDestination` and `KnownDestination` are not
+`Transport.pathExpiry` (7 days), `Transport.knownDestinationExpiry` (8.75 days),
+`LXMFNode.stampCostExpiry` (45 days), a ticket's `expires` for tickets peers gave you, and
+`expires` plus `LXMessage.ticketGrace` (5 days) for tickets you issued. `LearnedDestination` and `KnownDestination` are not
 `Codable`; store their public fields (the identity as `identity.publicKey`) and rebuild them with
 their public initialisers. A destination stamp is mined once per destination: about 45 s at the
 default value on a Mac (see [Network stamps](#network-stamps-rns-16)); on a phone it has not been
 measured. Without it every cold start mines again before the first announce goes out.
 A rehydrated stamp is checked against `destinationValue` and mined again if it falls short.
+
+## Stamp tickets (LXMF 1.3)
+
+A ticket a peer gives you is always kept and used: sends to that peer are stamped with it instead
+of proof-of-work until it expires. Issuing tickets yourself is **off by default**, as in reference,
+where the client opts in per message (`include_ticket`). Turn it on with `.setIssueTickets(true)`.
+Then every message the node builds (`.send`, `.sendViaPropagation`) carries a ticket for its
+recipient, following reference `generate_ticket`: none if a ticket was delivered to that peer less
+than a day ago; otherwise the ticket already issued to that peer if it has more than 14 days left;
+otherwise a new one valid for 21 days.
+
+A message you build yourself and send with `.sendMessage` is already hashed and signed, so the node
+cannot add the field. Ask for it before creating the message and include it in `fields`:
+
+```swift
+let field = state.ticketFieldToIssue(destinationHash: peer, now: Date())   // nil when off or not due
+let message = LXMessage.create(source: identity, destinationHash: peer, timestamp: now,
+                               title: title, content: content, fields: fields + (field.map { [$0] } ?? []))
+store.send(.sendMessage(message: message, fallbackToPropagation: true))
+```
+
+The node records the ticket (and reports `.ticketIssued`) when that message reaches `.sendMessage`.
+A delivery confirmation of a message carrying one of your tickets is reported as
+`.ticketDelivered`. Persist all three kinds of ticket state (see the table above).
 
 ## Network stamps (RNS 1.6)
 
@@ -529,7 +557,7 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Propagation node announces | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | Fractional costs are read as their ceiling, and float limits are accepted. |
 | Delivery stamps | Implemented, cross-validated, tested live against RNS 1.6.0 / LXMF 1.3.0 | Generated when a peer asks for a cost of 20 or less, on the delivery copy and on propagated copies; above 20 ReTiCA sends unstamped (reference has no ceiling). Inbound validation once you set a cost; enforcement off by default, as in reference. MeshChatX turns enforcement on with a default cost of 8. |
 | Propagation stamps | Implemented, cross-validated | Cost ceiling 20 (reference has none). |
-| Tickets | **Missing** | An inbound `FIELD_TICKET` is carried but never used; with stamp enforcement on, a ticket-holding peer that reference would accept is rejected. |
+| Tickets | Implemented, cross-validated against LXMF 1.3.0 (ticket stamps, `FIELD_TICKET` read and written) | Received tickets are kept and used; inbound ticket stamps are validated. Issuing is **off by default** (`.setIssueTickets`). The host persists ticket state. Expired tickets are dropped when `.rehydrateTickets` runs at launch, not every ~8 minutes as in reference. Not tested against a live reference peer. |
 | Paper messages (`lxm://`, QR) | **Missing** | |
 | Ignore list | Implemented | `.ignoreDestination` / `.unignoreDestination`. |
 
@@ -582,6 +610,7 @@ byte-for-byte reproduces what the reference produced. Running the tests does not
 | RNS 1.6.0 stamped announce packets | `generate_stamped_announce_packet_fixtures.py` | `stamped_announce_packet_fixtures.json` (copied to the transport and node tests) | `Tests/ReTiCATests/Destination/StampedAnnounceTests.swift`, `StampedAnnounceTransportTests.swift`, `StampEnforcementTests.swift` |
 | RNS 1.6.0 destination stamps, path requests, link requests | `Tests/ReTiCATransportTests/Vectors/generate_destination_stamp_fixtures.py`, `generate_path_request_fixtures.py`, `generate_link_request_stamp_fixtures.py` | `destination_stamp_fixtures.json`, `path_request_fixtures.json`, `link_request_stamp_fixtures.json` | `DestinationStampTests.swift`, `PathRequestStampTests.swift`, `StampEnforcementTests.swift` |
 | LXMF stamps and peering keys | `generate_lxmf_stamp_fixtures.py`, `generate_lxmf_peering_fixtures.py` | `lxmf_stamp_fixtures.json`, `lxmf_peering_fixtures.json` | `LXStamperCrossValidationTests.swift`, `LXStamperPeeringCrossValidationTests.swift`, `LXMFStampMessageCrossValidationTests.swift` |
+| LXMF 1.3.0 stamp tickets: ticket stamps both ways, and the `FIELD_TICKET` an issuer writes | `generate_lxmf_ticket_fixtures.py`; `Tests/ReTiCANodeTests/Vectors/generate_lxmf_ticket_issue_fixtures.py` | `lxmf_ticket_fixtures.json`; values pasted into the test | `LXMFTicketCrossValidationTests.swift`; `Tests/ReTiCANodeTests/LXMFNodeTicketIssueTests.swift` |
 | Propagation container | `generate_lxmf_propagation_fixtures.py` | `lxmf_propagation_fixtures.json` | `LXMFPropagationCrossValidationTests.swift` |
 | Delivery announce app data, propagation node announces | `generate_lxmf_announce_fixtures.py`, `generate_lxmf_pn_announce_fixtures.py` | `lxmf_announce_fixtures.json`, `lxmf_pn_announce_fixtures.json` | `Tests/ReTiCATests/LXMFAnnounceDataCrossValidationTests.swift`, `PNAnnounceCrossValidationTests.swift` |
 | Transport: announce ingest, rebroadcast, path requests, relaying, compression, multi-segment resources | `Tests/ReTiCATransportTests/Vectors/generate_transport_fixtures.py` | `transport_fixtures.json` | `TransportCrossValidationTests.swift`, `RelayCrossValidationTests.swift`, `CompressionCrossValidationTests.swift`, `MultiSegmentCrossValidationTests.swift` |
