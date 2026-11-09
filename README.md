@@ -395,7 +395,7 @@ node.endpoint.transport.enforceStamps = true       // refuse unstamped traffic w
 | Setting | Default | Reference | What it does |
 |---|---|---|---|
 | `stampDestinations` | off | `stamp_destinations` | Every announce and path response carries a stamp of `destinationValue` (default 25) and the destination's link cost. Mined once per destination; persist it (above). |
-| `stampPathRequests` | off | `stamp_path_requests` | Each path request is sent only after a stamp of `pathRequestValue` (default 15.8) is found, up to 15 s from the start of its search. Its search waits behind another path request's, or behind a destination stamp search answering an earlier path response, but cancels any other running destination stamp search (see "Stamp work"). A relay marks unstamped requests it forwards. |
+| `stampPathRequests` | off | `stamp_path_requests` | Each path request is sent only after a stamp of `pathRequestValue` (default 15.8) is found, up to 15 s from the start of its search. Its search waits behind another path request's, or behind any waiting earlier path response, but otherwise cancels a running destination stamp search (see "Stamp work"). A relay marks unstamped requests it forwards. |
 | `enforceStamps` | off | `enforce_stamps` | Announces below `destinationCost` (default 23.5) are not learned or relayed; path requests below `pathRequestCost` (default 15.8) are not answered or forwarded; link requests to our destinations below their link cost (LXMF 3.25, otherwise 12.5) are not answered. Our own outbound traffic is unaffected. |
 
 Link requests are stamped whatever these say, as in 1.6.0: when a destination announced a link
@@ -452,7 +452,8 @@ costs those hashes and nothing more.
 - **Stamp work.** Delivery and propagation stamps are proof-of-work searches that can take
   minutes. One runs at a time, oldest message first (its delivery stamp, then its propagation stamp
   if it is sent propagated), as reference LXMF does; the others wait in `State.stampQueue`. A send
-  stamped with a ticket, or to a peer that asks for no stamp, does not wait. Sending a message that
+  stamped with a ticket, or to a peer that asks for no stamp, does not wait (a ticketed explicit
+  `.sendViaPropagation` still queues for its propagation stamp). Sending a message that
   is already queued or stamping does not queue it again. A propagated send reads the node's stamp
   cost when its search starts. A queued message is cancelled and reported exactly like one whose
   search is running.
@@ -467,11 +468,14 @@ costs those hashes and nothing more.
   responses first in arrival order (one queue of 32), then announces (another 32). A newer
   announce for the same destination and interface, or a newer path request for the same
   destination, replaces the queued one at the back, and a full queue drops the new item.
-  DIVERGENCE: one of our own path requests cancels a running destination stamp search (unless that
-  search answers an earlier path response) instead of waiting for it. Reference waits, and the
-  first destination stamp takes about 45 s on a Mac (longer on a phone), which outlasts the LXMF
-  router's path wait (5 tries, 7 s apart), so a first send to a new peer would fail roughly half
-  the time (estimated from the mean search time, not observed). The destination search is
+  DIVERGENCE: one of our own path requests cancels a running destination stamp search instead of
+  waiting for it, but only when that path request would run next, that is when it is older than
+  every waiting path response (otherwise cancelling would only start another destination's
+  path-response search and the request would still wait). Reference waits, and the
+  first destination stamp takes about 45 s on a Mac (longer on a phone). A first send to a new
+  peer waits 21 s in LXMFNode (3 path requests, 7 s apart) and then goes to the router unstamped,
+  so a path request stuck behind a 45 s search risks that send going out unstamped or failing
+  (not measured). The destination search is
   memoryless, so restarting it later loses no expected work; its announces stay queued. Path
   responses do not preempt. Link-request key searches are not part of this worker (one per link).
   `.cancelOutbound(messageHash:)` cancels one message wherever it is. Network stamp searches

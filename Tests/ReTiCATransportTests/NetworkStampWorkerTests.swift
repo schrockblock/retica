@@ -219,6 +219,35 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         #expect(gate.started.value == [material(b)], "B's search was not cancelled and restarted")
     }
 
+    /// A running destination search A is not cancelled for our path request when another
+    /// destination's path response (B) waiting is older than the request: the worker would pick B's
+    /// search next, so cancelling A would gain the request nothing. (The positive case, nothing older
+    /// waiting, is the first test in this suite.)
+    @Test func aPathRequestDoesNotCancelADestinationSearchWhenAnotherDestinationsEarlierPathResponseWaits() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let a = newDestination("a")
+        let b = newDestination("b")
+        let x = Data(repeating: 0x22, count: 16)
+        await store.send(.interfaceConnected(i0))
+        await store.send(.registerLocalDestination(a))
+        await store.send(.registerLocalDestination(b))
+        await store.send(.announce(destinationHash: a.hash, appData: nil))
+        await gate.waitForStarts(1)
+        await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))
+        #expect(store.state.stampingDestinations == [a.hash])
+        await store.send(.requestPath(destinationHash: x))
+        #expect(store.state.stampingDestinations == [a.hash], "A is not cancelled")
+        #expect(store.state.queuedPathRequestStamps.map(\.destinationHash) == [x])
+        #expect(store.state.stampingPathRequests.isEmpty)
+        await gate.waitForStarts(2)        // returns after its bound if no second search starts
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+        #expect(gate.started.value == [material(a)], "no other search started")
+        #expect(gate.cancelled.value == [material(a)], "A was cancelled only by the final cancel")
+    }
+
     /// Within queue 0, arrival order decides between a waiting path response and a queued path
     /// request, either way round. A running path-request search holds the worker meanwhile.
     @Test func aPathResponseAndAPathRequestStartInArrivalOrder() async throws {

@@ -144,8 +144,8 @@ public struct Transport {
         /// `enqueue_stamped_pr` into `stamp_queues` priority 0, Transport.py:1466-1473). One network
         /// stamp search runs at a time, path requests and path responses ahead of announces, as
         /// reference's single `stamper_job` thread draining `WorkerQueues` (Transport.py:99-130,
-        /// 1476-1493), except that a queued path request cancels a running destination search not
-        /// serving an earlier path response (a DIVERGENCE, see `startNextNetworkStampSearch`); that
+        /// 1476-1493), except that a queued path request older than every waiting path response cancels a
+        /// running destination search (a DIVERGENCE, see `startNextNetworkStampSearch`); that
         /// destination's announces stay queued and its search starts again after the path work.
         /// Keyed by destination: a newer request replaces the queued one and goes to
         /// the back. Shares `Transport.stampedPathResponseQueueLimit` with the waiting path responses;
@@ -904,12 +904,14 @@ public struct Transport {
             // anything that queues work or ends, cancels or drops a search.
             //
             // DIVERGENCE: one of OUR path requests waiting cancels a running destination stamp search,
-            // unless that search is serving a path response that arrived before the path request.
+            // but only when it would run next: when it is older than every waiting path response
+            // (the loop below picks the oldest path work). Otherwise cancelling would only start
+            // another destination's path-response search, with the request still waiting.
             // Reference never preempts: a path request waits for the whole destination search
             // (Transport.py:1476-1488), about 45 s at the default value on a Mac and longer on a
-            // phone, which outlasts the LXMF router's path wait (5 tries, 7 s apart), so a first send
-            // to a new peer would fail roughly half the time while the destination stamp is first
-            // mined (estimated from the mean search time, not observed).
+            // phone. A first send to a new peer waits 21 s in LXMFNode (3 path requests, 7 s apart)
+            // before going to the router unstamped, so a path request stuck behind that search
+            // risks the send going out unstamped or failing (not measured).
             // A destination search is memoryless (a fresh random stamp each round,
             // `NetworkStamp.generate`), so restarting it loses no expected work: it costs only the
             // path-request search (at most `pathStampTimeout`). What waits for the destination's stamp
@@ -919,9 +921,7 @@ public struct Transport {
             func startNextNetworkStampSearch(_ state: inout State) -> Effect<Action> {
                 var preempted: [Effect<Action>] = []
                 if let head = state.queuedPathRequestStamps.first, let running = state.stampingDestinations.first,
-                   !state.pendingStampedAnnounces.contains(where: {
-                       $0.destinationHash == running && $0.isPathResponse && $0.sequence < head.sequence
-                   }) {
+                   !state.pendingStampedAnnounces.contains(where: { $0.isPathResponse && $0.sequence < head.sequence }) {
                     state.stampingDestinations.remove(running)
                     preempted.append(.cancel(id: CancelID.destinationStamp(running)))
                 }
