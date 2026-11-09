@@ -23,7 +23,8 @@ extension RNodeDriver {
 /// `RNodeInterface` may `start` again from `.unavailable` without a `stop()` in between, so
 /// `pendingConnects` is a counter and `stop()` drains them all.
 ///
-/// Sends bind to the link that is up when they are called (ledger carry 1). `send` also races the
+/// Sends bind to the link that is up when they are called, so a packet dropped with one link
+/// never goes out on the reconnected one. `send` also races the
 /// kit's write against that link ending and answers false as soon as the adapter sees it end.
 /// Today's FCB already fails a pending write on a power-off or a disconnect, so the race is
 /// defence-in-depth against a future FCB that doesn't; no test can make it decisive, and the
@@ -34,7 +35,7 @@ final class RNodeLiveAdapter: Sendable {
     /// `connect(radio:config:)` calls launched by `start` that have not returned yet.
     private let pendingConnects = LockIsolated(0)
 
-    /// The ledger's link generation is `owner` plus `waiters`: `endLink` fails and clears every
+    /// A link's identity is `owner` plus `waiters`: `endLink` fails and clears every
     /// waiter of the current link, so a send only ever waits on the link it started on.
     private struct Link {
         /// Bumped by every `start` and `stop`: a superseded pump never touches the link.

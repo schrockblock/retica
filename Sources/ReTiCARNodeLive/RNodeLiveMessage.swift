@@ -18,7 +18,8 @@ public enum RNodeLiveMessage {
         configurationRejectedPrefix + mismatches.map(clause).joined(separator: ", ") + configurationRejectedSuffix
     }
 
-    /// Exactly the four Contract 2 user-action failures (the last by prefix). Task 8 reads it.
+    /// Exactly the four failures only the user can fix (a rejection matched by prefix). The app
+    /// uses it to stop automatic re-dials until the user acts.
     public static func needsUserAction(_ text: String) -> Bool {
         text == firmwareTooOld || text == pairingRequired || text == pairingRemoved
             || text.hasPrefix(configurationRejectedPrefix)
@@ -26,7 +27,7 @@ public enum RNodeLiveMessage {
 
     private static func clause(_ mismatch: RNodeParameterMismatch) -> String {
         let field = mismatch.field
-        // Ledger ruling (preflight L4): the same whatever the radio echoed, or didn't.
+        // Always this clause, whatever the radio echoed, or didn't.
         if field == .radioState { return "the radio didn't turn on" }
         let asked = "(asked for \(value(mismatch.requested, field)))"
         guard let reported = mismatch.reported else { return "\(name(field)) no reply \(asked)" }

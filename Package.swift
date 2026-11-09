@@ -20,8 +20,8 @@ let package = Package(
         // The live MeshCore driver (spec 2026-11-07 Contract 2). The ONLY ReTiCA code that
         // imports MeshCoreKit.
         .library(name: "ReTiCAMeshCoreLive", targets: ["ReTiCAMeshCoreLive"]),
-        // The live RNode driver (spec 2026-11-08 Contract 2). The ONLY ReTiCA code that
-        // imports RNodeKit.
+        // The live RNode driver (spec 2026-11-08 Contract 2). The ONLY ReTiCA library code
+        // that imports RNodeKit (tests import it too).
         .library(name: "ReTiCARNodeLive", targets: ["ReTiCARNodeLive"]),
     ],
     dependencies: [
