@@ -52,12 +52,9 @@ import ComposableArchitecture
 /// with enforcement off (the default, and the only configuration any caller produces) the reducer
 /// emitted byte-identical output whether validation ran or not.
 ///
-/// **Ticket divergence (documented, not implemented):** Reference `validate_stamp`
-/// (LXMessage.py:273-283) accepts a stamp equal to `truncated_hash(ticket + message_id)` regardless
-/// of cost. ReTiCA has no tickets (Tier 3, unticketed). When `enforceDeliveryStamps = true`, a
-/// ticket-holding peer that reference would accept, we reject. This divergence is harmless with
-/// enforcement off (the default) — such messages are delivered. Whoever enables enforcement should
-/// be aware that `LXMessage.py:273-283` covers a wider acceptance set than `LXMessage.validateStamp`.
+/// **Tickets:** a stamp equal to `truncated_hash(ticket + message_id)` for an unexpired ticket we
+/// issued to the sender is also valid (reference `validate_stamp`, LXMessage.py:280-301, LXMF 1.3.0).
+/// Those cases are in `LXMFNodeTicketTests`; every message here has no ticket issued to its sender.
 ///
 /// **Anti-vacuity standard.** Every test asserts on whether `.delegate(.messageReceived)` arrives or
 /// not. A test that passes when the validate path never runs, or when a dropped message is silently

@@ -76,6 +76,18 @@ public struct LXMFNode {
         }
     }
 
+    /// An LXMF stamp ticket (LXMF 1.3.0): 16 bytes that let the holder stamp messages to the issuer
+    /// with `LXMessage.ticketStamp` instead of proof-of-work, until `expires`.
+    public struct Ticket: Equatable, Sendable {
+        public var ticket: Data
+        public var expires: Date
+
+        public init(ticket: Data, expires: Date) {
+            self.ticket = ticket
+            self.expires = expires
+        }
+    }
+
     @ObservableState
     public struct State: Equatable {
         public var endpoint: TransportEndpoint.State
@@ -127,6 +139,20 @@ public struct LXMFNode {
         /// `learnedPeers`: the library hides no peers, the host does.
         public var ignoredDestinations: Set<Data> = []
 
+        /// Tickets peers gave us, by the peer's `lxmf.delivery` hash: one per peer, the newest
+        /// received wins (reference `remember_ticket`'s upsert, `Storage.py:228-238`). Written only
+        /// from a message whose signature validated that carries a well-formed, unexpired
+        /// `FIELD_TICKET` (`LXMRouter.py:2176-2184`); reported as `.ticketReceived`. While unexpired,
+        /// a send to that peer is stamped with the ticket — no cost wait, no search — even when the
+        /// peer advertises no cost, as reference does (`LXMessage.py:303-310`). An expired entry is
+        /// never used, but stays here until the host replaces the table.
+        public var outboundTickets: [Data: LXMFNode.Ticket] = [:]
+        /// Tickets we issued, by the `lxmf.delivery` hash of the peer we issued them to. When we
+        /// have a `deliveryStampCost`, an inbound message whose stamp is the ticket stamp of one of
+        /// the unexpired tickets issued to ITS sender is valid without proof-of-work
+        /// (`LXMRouter.py:2190-2193`, `Storage.py:290-301`). Tickets issued to anyone else do not count.
+        public var inboundTickets: [Data: [LXMFNode.Ticket]] = [:]
+
         /// Display name advertised in every delivery-destination announce.
         /// Nil means no name is encoded (the announce still carries the full app-data blob per
         /// reference parity — see `LXMFAnnounceData.pack` and `get_announce_app_data` in
@@ -146,11 +172,9 @@ public struct LXMFNode {
         /// message is delivered — exactly `LXMRouter.lxmf_delivery`'s else-branch at line 1878.
         ///
         /// Set to `true` to drop messages with invalid stamps, mirroring reference's `enforce_stamps()`
-        /// call (LXMRouter.py:696-697). **Ticket divergence:** reference `validate_stamp`
-        /// (LXMessage.py:273-283) also accepts a stamp equal to `truncated_hash(ticket + message_id)`
-        /// regardless of cost ("inbound tickets", Tier 3, unticketed in ReTiCA). With enforcement on,
-        /// a ticket-holding peer that reference accepts, we reject. This divergence is harmless with
-        /// enforcement off (the default). Whoever enables enforcement should account for this gap.
+        /// call (LXMRouter.py:696-697). A stamp equal to the ticket stamp of an unexpired ticket in
+        /// `inboundTickets` for the sender is valid too, as in reference `validate_stamp`
+        /// (LXMessage.py:280-301, LXMF 1.3.0); a ticket only counts if this node holds it.
         public var enforceDeliveryStamps: Bool = false
 
         /// Hashes of messages whose delivery-stamp search is currently in flight, oldest first.
@@ -365,6 +389,9 @@ public struct LXMFNode {
             /// `.stamping` again, then `.handedOver` again. A message that ends or is cancelled while
             /// preparing reports its terminal outcome and no `.handedOver`.
             case deliveryPreparing(messageHash: Data, phase: PreparingPhase)
+            /// A peer gave us a ticket, now in `State.outboundTickets[destinationHash]` (the peer's
+            /// `lxmf.delivery` hash). Reported when the stored entry changes, so the host can persist it.
+            case ticketReceived(destinationHash: Data, ticket: LXMFNode.Ticket)
         }
     }
 
@@ -705,12 +732,15 @@ public struct LXMFNode {
                 guard let recipient = state.endpoint.recall(destinationHash: destinationHash),
                       let cost = propagationStampCost(state)
                 else { return .none }
-                let msg = LXMessage.create(source: state.identity, destinationHash: destinationHash,
-                                           timestamp: date.now.timeIntervalSince1970, title: title, content: content)
-                state.router.uncancel(msg.hash)   // an app send is a fresh send (see `.sendMessage`)
+                let created = LXMessage.create(source: state.identity, destinationHash: destinationHash,
+                                               timestamp: date.now.timeIntervalSince1970, title: title, content: content)
+                state.router.uncancel(created.hash)   // an app send is a fresh send (see `.sendMessage`)
                 refreshOutboundPropagationNodeRetryWait(&state)
                 let ts = date.now.timeIntervalSince1970
-                let deliveryCost = deliveryStampCost(state, destinationHash: destinationHash)
+                // The recipient's ticket, if we hold one, is the delivery stamp: no delivery search.
+                // The propagation stamp is still searched, so the send still reports `.stamping`.
+                let msg = ticketStamped(state, created) ?? created
+                let deliveryCost = msg.stamp == nil ? deliveryStampCost(state, destinationHash: destinationHash) : nil
                 let preparing = reportPhase(&state, msg.hash, .stamping)
                 let work: Effect<Action> = .run { send in
                     guard let stamped = await LXMFNode.withDeliveryStamp(msg, cost: deliveryCost),
@@ -1010,6 +1040,21 @@ public struct LXMFNode {
                                     .merge(restamp, handOverWaitingSends(&state, destinationHash: h)))
 
             case let .router(.delegate(.messageDelivered(message, validated, method))):
+                // Remember a ticket the sender gave us, first, as reference `lxmf_delivery` does
+                // (LXMRouter.py:2176-2188, LXMF 1.3.0): before stamp validation and the ignore
+                // check, so a ticket is kept even from a message that is then dropped. Only when the
+                // signature validated: otherwise `sourceHash` is unauthenticated and anyone could
+                // plant a ticket for any peer. `ticketField` has refused malformed entries.
+                var ticketEffect: Effect<Action> = .none
+                if validated, let entry = message.ticketField, date.now.timeIntervalSince1970 < entry.expires {
+                    let ticket = Ticket(ticket: entry.ticket, expires: Date(timeIntervalSince1970: entry.expires))
+                    if state.outboundTickets[message.sourceHash] != ticket {
+                        state.outboundTickets[message.sourceHash] = ticket
+                        ticketEffect = .send(.delegate(.ticketReceived(destinationHash: message.sourceHash,
+                                                                       ticket: ticket)))
+                    }
+                }
+
                 // Ignore list, reference `LXMRouter.lxmf_delivery`'s `ignored_list` check: the
                 // sender's lxmf.delivery hash is on the host's list, so the message goes nowhere.
                 // Sits BEFORE stamp validation so a blocked sender never costs the ~60 ms
@@ -1019,7 +1064,7 @@ public struct LXMFNode {
                 // `sourceHash` is unauthenticated when `validated == false`; a forged hash only
                 // loses the forger's own message. Spec 2026-10-15 §1.
                 if state.ignoredDestinations.contains(message.sourceHash) {
-                    return .none
+                    return ticketEffect
                 }
 
                 // Stamp validation mirrors `LXMRouter.lxmf_delivery` (LXMRouter.py:1861-1880, LXMF 1.1.0).
@@ -1038,10 +1083,10 @@ public struct LXMFNode {
                 // replayed message does not repeat the work, but a flood of distinct messages pays it
                 // per message.
                 //
-                // Ticket divergence: reference also accepts `truncated_hash(ticket + message_id)` stamps
-                // (LXMessage.py:273-283, "inbound tickets"). ReTiCA has no tickets (Tier 3, unticketed).
-                // With enforcement off (default) the gap is invisible — both deliver. With enforcement on
-                // a ticket-holding peer reference accepts, we reject. Documented in `enforceDeliveryStamps`.
+                // Tickets first: a stamp equal to `truncated_hash(ticket + message_id)` for an unexpired
+                // ticket we issued TO THIS SENDER is valid, with no workblock (reference
+                // `get_inbound_tickets` + `validate_stamp`, LXMRouter.py:2192-2193, Storage.py:290-301,
+                // LXMessage.py:280-301). Tickets issued to other peers are not consulted.
                 //
                 // The RESULT is carried on the message (`stampValid`/`stampChecked`), mirroring
                 // reference's assignment pair at LXMRouter.py:1865-1869 — not added as a delegate
@@ -1051,20 +1096,24 @@ public struct LXMFNode {
                 // statement from "validated and failed"; the app can tell those apart.
                 var delivered = message
                 if let cost = state.deliveryStampCost {
-                    let stampValid = message.validateStamp(targetCost: cost)
+                    let now = date.now
+                    let tickets = (state.inboundTickets[message.sourceHash] ?? [])
+                        .filter { $0.expires > now }.map(\.ticket)
+                    let stampValid = message.validateStamp(targetCost: cost, tickets: tickets)
                     delivered = message.withStampValidation(valid: stampValid)
                     if !stampValid {
                         // Enforcement off (default): deliver anyway, matching reference's
                         // "allow anyway, since stamp enforcement is disabled" branch (LXMRouter.py:1878-1879).
                         // Enforcement on: drop, matching `return False` (LXMRouter.py:1877).
                         if state.enforceDeliveryStamps {
-                            return .none    // drop — app receives nothing
+                            return ticketEffect    // drop — app receives nothing
                         }
                         // fall through to deliver, flagged checked-and-invalid
                     }
                 }
-                return .send(.delegate(.messageReceived(message: delivered, signatureValidated: validated,
-                                                        method: method)))
+                return .concatenate(ticketEffect,
+                                    .send(.delegate(.messageReceived(message: delivered, signatureValidated: validated,
+                                                                     method: method))))
 
             case let .router(.delegate(.messageRejected(hash, reason))):
                 // A forgery-check drop is the router's business: the app is told nothing, as for a
@@ -1391,6 +1440,8 @@ public struct LXMFNode {
         else { return .send(.router(.propagatedCopyFailed(messageHash: message.hash))) }
         refreshOutboundPropagationNodeRetryWait(&state)
         let ts = date.now.timeIntervalSince1970
+        // A ticket learned since the delivery copy left stamps the copy without a search.
+        let message = ticketStamped(state, message) ?? message
         let deliveryCost = message.stamp == nil ? deliveryStampCost(state, destinationHash: message.destinationHash) : nil
         return .run { send in
             guard let stamped = await LXMFNode.withDeliveryStamp(message, cost: deliveryCost),
@@ -1491,6 +1542,12 @@ public struct LXMFNode {
                               waitForUnknownCost: Bool = true) -> Effect<Action> {
         refreshNextHopRetryWait(&state, message.destinationHash)
         let dest = message.destinationHash
+        // A ticket from the peer replaces the stamp: no cost wait and no search, so nothing to report
+        // as preparing. Before the wait, because the wait exists only to learn a cost (reference
+        // `handle_outbound` applies the ticket and un-defers the stamp, LXMRouter.py:2089-2094).
+        if let ticketed = ticketStamped(state, message) {
+            return .send(.router(.send(message: ticketed, desiredMethod: method)))
+        }
         if waitForUnknownCost, message.stamp == nil, state.learnedPeers[dest] == nil, state.endpoint.learned[dest] == nil {
             return waitForPeerCost(&state, message: message, method: method)
         }
@@ -1510,6 +1567,19 @@ public struct LXMFNode {
         .cancellable(id: CancelID.deliveryStampFor(message.hash))
         .cancellable(id: CancelID.deliveryStamp)
         return .merge(preparing, search)
+    }
+
+    /// `message` stamped with the ticket its recipient gave us, or nil when it already has a stamp or
+    /// we hold no unexpired ticket for that recipient. Reference uses a ticket while `expires > now`
+    /// (`Storage.py:240-251`) and only when it is `TICKET_LENGTH` bytes (`LXMessage.py:306`). An
+    /// existing stamp is kept, as everywhere on the send path (see `deliverySend`).
+    private func ticketStamped(_ state: State, _ message: LXMessage) -> LXMessage? {
+        guard message.stamp == nil,
+              let ticket = state.outboundTickets[message.destinationHash],
+              ticket.expires > date.now,
+              ticket.ticket.count == LXMessage.ticketLength
+        else { return nil }
+        return message.withStamp(LXMessage.ticketStamp(ticket: ticket.ticket, messageHash: message.hash))
     }
 
     /// `deliveryPreparing` for `phase`, unless the message already reported it (once per transition).
@@ -1579,7 +1649,8 @@ public struct LXMFNode {
         // `.cancel(id:)` cancels when constructed (86ee622); the guard above keeps this to a real hand-over.
         var effects: [Effect<Action>] = [.cancel(id: CancelID.peerCostWait(dest))]
         for send in waiting {
-            if costMayArriveLater, send.message.stamp == nil, state.learnedPeers[dest] == nil {
+            if costMayArriveLater, send.message.stamp == nil, state.learnedPeers[dest] == nil,
+               ticketStamped(state, send.message) == nil {     // a ticketed copy is stamped already
                 state.unstampedHandOvers[dest, default: []].append(send)
             }
             effects.append(deliverySend(&state, message: send.message, method: send.method, waitForUnknownCost: false))

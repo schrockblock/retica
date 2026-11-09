@@ -169,6 +169,65 @@ public struct LXMessage: Equatable, Sendable {
                                     workblock: LXStamper.stampWorkblock(material: hash))
     }
 
+    // MARK: - Stamp tickets (LXMF 1.3.0)
+
+    /// `FIELD_TICKET` (reference `LXMF.py:19`). Its value is `[expires, ticket]`: `expires` a unix
+    /// time (reference sends a float), `ticket` 16 bytes. A peer that puts one in a message to us lets
+    /// us stamp our messages to it with `ticketStamp` instead of proof-of-work.
+    public static let fieldTicket: Int = 0x0C
+    /// Reference `TICKET_LENGTH = TRUNCATED_HASHLENGTH//8` (`LXMessage.py:42`).
+    public static let ticketLength = 16
+    /// Reference `TICKET_EXPIRY`, `TICKET_GRACE`, `TICKET_RENEW`, `TICKET_INTERVAL` (`LXMessage.py:49-52`).
+    public static let ticketExpiry: TimeInterval = 21 * 24 * 60 * 60
+    public static let ticketGrace: TimeInterval = 5 * 24 * 60 * 60
+    public static let ticketRenew: TimeInterval = 14 * 24 * 60 * 60
+    public static let ticketInterval: TimeInterval = 1 * 24 * 60 * 60
+    /// Reference `COST_TICKET = 0x100` (`LXMessage.py:53`): the stamp value reference records for a
+    /// ticket stamp.
+    public static let costTicket = 0x100
+
+    /// The stamp a ticket holder attaches: `truncated_hash(ticket + message_id)`, 16 bytes
+    /// (reference `get_stamp`, `LXMessage.py:306-310`). No search.
+    public static func ticketStamp(ticket: Data, messageHash: Data) -> Data {
+        Crypto.truncatedHash(ticket + messageHash)
+    }
+
+    /// Validate the stamp against `tickets` first, then as proof-of-work at `targetCost`
+    /// (reference `validate_stamp(target_cost, tickets)`, `LXMessage.py:280-301`). A ticket match
+    /// skips the workblock derivation entirely.
+    public func validateStamp(targetCost: Int, tickets: [Data]) -> Bool {
+        if let stamp, tickets.contains(where: { LXMessage.ticketStamp(ticket: $0, messageHash: hash) == stamp }) {
+            return true
+        }
+        return validateStamp(targetCost: targetCost)
+    }
+
+    /// The `FIELD_TICKET` entry, if this message carries a well-formed one: an array of at least two
+    /// elements whose first is a finite number and whose second is exactly `ticketLength` bytes
+    /// (reference `lxmf_delivery`'s checks, `LXMRouter.py:2176-2183`). Anything else is nil.
+    /// Expiry is the caller's check. With duplicate keys the last wins, as in a Python dict.
+    ///
+    /// Stricter than reference in two ways, both on hostile input: a non-numeric `expires` makes
+    /// reference raise inside `lxmf_delivery` and drop the whole message, where this ignores the
+    /// ticket and the message is still delivered; and an infinite `expires` (which reference would
+    /// remember forever) is refused.
+    public var ticketField: (expires: Double, ticket: Data)? {
+        guard let value = fields.last(where: { $0.key == LXMessage.fieldTicket })?.value,
+              case let .array(items) = value, items.count > 1,
+              case let .bin(ticket) = items[1], ticket.count == LXMessage.ticketLength
+        else { return nil }
+        let expires: Double
+        switch items[0] {
+        case let .double(d): expires = d
+        case let .float(f):  expires = Double(f)
+        case let .uint(u):   expires = Double(u)
+        case let .int(i):    expires = Double(i)
+        default:             return nil
+        }
+        guard expires.isFinite else { return nil }
+        return (expires, ticket)
+    }
+
     /// A copy carrying the outcome of a stamp validation: `stampChecked` becomes true and
     /// `stampValid` records the result.
     ///
