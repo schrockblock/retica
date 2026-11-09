@@ -100,7 +100,7 @@ let package = Package(
             ],
             resources: [.process("Vectors/transport_fixtures.json"), .process("Vectors/proof_fixtures.json"), .process("Vectors/stamped_announce_packet_fixtures.json"),
                         .process("Vectors/path_request_fixtures.json"), .process("Vectors/destination_stamp_fixtures.json"),
-                        .process("Vectors/link_request_stamp_fixtures.json")]
+                        .process("Vectors/link_request_stamp_fixtures.json"), .process("Vectors/peer_ratchet_fixtures.json")]
         ),
         .target(
             name: "ReTiCANode",

@@ -41,6 +41,8 @@ public struct Transport {
         /// announce that passes the ingress gate (before the replay check, as reference's
         /// `Identity.validate_announce` → `remember` runs), culled by `maintenanceTick` only once
         /// pathless past `Transport.knownDestinationExpiry`, restored by `.rehydrateKnownDestinations`.
+        /// Also holds each peer's ratchet (`KnownDestination.ratchet`), which only a fresh announce
+        /// (after the replay check) sets; read it with `recallRatchet(destinationHash:)`.
         public var knownDestinations: [Data: KnownDestination] = [:]
         public var interfaces: [InterfaceID: InterfaceProfile] = [:]
         public var transportIdentity: Identity? = nil
@@ -66,7 +68,7 @@ public struct Transport {
         /// about these exact bytes ("a 32-byte ratchet sits between random_hash and signature"),
         /// not a fact about our parsed view of them. The two can disagree: `Announce.parse` drops
         /// a ratchet that cannot perform key agreement while the bytes stay in the payload, so
-        /// `learned[dest].ratchet == nil` does NOT imply the payload is ratchet-free. Deriving the
+        /// a known destination without a ratchet does NOT imply the payload is ratchet-free. Deriving the
         /// flag from parsed state emitted `contextFlag: false` over a ratchet-carrying payload and
         /// the receiver then parsed with `ratchetLen = 0`, misaligning signature and app data.
         public struct CachedAnnounce: Equatable, Sendable {
@@ -350,6 +352,20 @@ public struct Transport {
             knownDestinations[destinationHash]?.linkCost
         }
 
+        /// The ratchet public key to encrypt to `destinationHash` with, or nil to use its identity
+        /// key — reference `Identity.get_ratchet` (RNS 1.6.0 Identity.py:618-675), which
+        /// `Destination.encrypt` consults for every SINGLE destination (Destination.py:694-708).
+        /// Nil when none is known or the known one was first heard more than `Transport.ratchetExpiry`
+        /// (30 days) before `now`, as reference discards one read from its store (Identity.py:626).
+        /// A ratchet with no receive time, or a non-finite one, counts as expired.
+        public func recallRatchet(destinationHash: Data, now: Date = Date()) -> Data? {
+            guard let known = knownDestinations[destinationHash], let ratchet = known.ratchet,
+                  let received = known.ratchetReceived,
+                  Transport.ratchetIsFresh(received: received, now: now)
+            else { return nil }
+            return ratchet
+        }
+
         /// The learned path to `destinationHash`, but only when its interface is currently connected.
         ///
         /// `LearnedDestination.interfaceID` is captured at announce time and replaced only by a
@@ -510,7 +526,10 @@ public struct Transport {
         /// `knownDestinationExpiry` is dropped, and a restored row never replaces a live entry heard
         /// at least as recently. (Reference does not sweep on load; its cull runs every 5 minutes.)
         /// Rows are stored public-only, and a row keyed by one of this node's registered local
-        /// destinations is ignored.
+        /// destinations is ignored. A row's ratchet is restored only if it passes
+        /// `Identity.isUsableRatchet` and its `ratchetReceived` is finite, not in the future and within
+        /// `ratchetExpiry`; otherwise the row is restored without it. A live entry that wins but has
+        /// no ratchet takes the row's.
         case rehydrateKnownDestinations([Data: KnownDestination])
         case delegate(Delegate)
 
@@ -855,12 +874,35 @@ public struct Transport {
                     // Our own destinations are never remembered from announces (see `.received`),
                     // so a stored row for one is foreign data: it must not shadow the local identity.
                     guard state.localDestinations[hash] == nil else { continue }
-                    if let live = state.knownDestinations[hash], live.lastHeard >= candidate.lastHeard { continue }
+                    // The ratchet goes to `Identity.encrypt`, whose agreement is force-unwrapped, so
+                    // restored bytes face the check `Announce.parse` applies to announced ones; and a
+                    // ratchet is kept only with a finite, not future, unexpired receive time. A ratchet
+                    // failing either is dropped and the row kept (its destination is then encrypted to
+                    // by identity key until it announces a ratchet).
+                    var ratchet: Data? = nil
+                    var ratchetReceived: Date? = nil
+                    if let restored = candidate.ratchet, let received = candidate.ratchetReceived,
+                       received <= now, Transport.ratchetIsFresh(received: received, now: now),
+                       Identity.isUsableRatchet(restored) {
+                        ratchet = restored
+                        ratchetReceived = received
+                    }
+                    if var live = state.knownDestinations[hash], live.lastHeard >= candidate.lastHeard {
+                        // The live entry wins, but an announce without a ratchet does not clear one
+                        // (Identity.py:726), so a live entry with none takes the restored ratchet.
+                        if live.ratchet == nil, let ratchet {
+                            live.ratchet = ratchet
+                            live.ratchetReceived = ratchetReceived
+                            state.knownDestinations[hash] = live
+                        }
+                        continue
+                    }
                     // Public-only, whatever the host handed back: this table never holds a private key.
                     guard let publicOnly = Identity(publicKey: candidate.identity.publicKey) else { continue }
                     state.knownDestinations[hash] = KnownDestination(
                         identity: publicOnly, appData: candidate.appData, lastHeard: candidate.lastHeard,
-                        linkCost: candidate.linkCost, stampValue: candidate.stampValue)
+                        linkCost: candidate.linkCost, stampValue: candidate.stampValue,
+                        ratchet: ratchet, ratchetReceived: ratchetReceived)
                 }
                 return .none
 
@@ -1026,9 +1068,13 @@ public struct Transport {
                     // The link cost and stamp value ride here too, as reference's `remember` stores
                     // `lr_cost` and `stamp_value` (Identity.py:109-124): an announce that does not win
                     // the path below still updates the cost a link to this destination must pay.
+                    // The ratchet already known is carried over here and replaced below only by a
+                    // fresh announce that brings one.
+                    let previous = state.knownDestinations[packet.destinationHash]
                     state.knownDestinations[packet.destinationHash] = KnownDestination(
                         identity: parsed.identity, appData: parsed.appData, lastHeard: icNow,
-                        linkCost: parsed.linkCost, stampValue: parsed.stampValue)
+                        linkCost: parsed.linkCost, stampValue: parsed.stampValue,
+                        ratchet: previous?.ratchet, ratchetReceived: previous?.ratchetReceived)
                     // Anti-replay: a previously-seen random-blob for this destination is a replay.
                     // RingSet.insert both tests and records; false → already present → drop.
                     // NOTE: we record the blob for EVERY fresh announce here. RNS only appends the
@@ -1040,7 +1086,7 @@ public struct Transport {
                     // Path-table next hop: relayed (HEADER_2) → its transport_id; directly heard → the dest.
                     let nextHop = packet.transportId ?? packet.destinationHash
                     let candidate = LearnedDestination(
-                        identity: parsed.identity, appData: parsed.appData, ratchet: parsed.ratchet,
+                        identity: parsed.identity, appData: parsed.appData,
                         interfaceID: interfaceID, hops: packet.hops, nextHop: nextHop,
                         announceEmitted: emitted, learnedAt: date.now)
                     // A route whose interface is gone (a radio switched off, a BLE session ended)
@@ -1087,6 +1133,28 @@ public struct Transport {
                         return .none
                     }
                     state.announceBlobs[packet.destinationHash] = ring
+
+                    // Remember the announced ratchet (reference `_remember_ratchet`, reached from
+                    // `__finalize_av` for every valid announce, Identity.py:726), before and apart from
+                    // the path decision below, so an announce that loses the path still refreshes it.
+                    // An announce without one (or whose ratchet failed the usability check in
+                    // `Announce.parse`) leaves the known one. The same ratchet heard again keeps its
+                    // first receive time, as reference's store does (Storage.py:429-451).
+                    //
+                    // After the replay check, where reference has it on every validation: a replayed
+                    // announce brings a ratchet this table already took when the announce was fresh,
+                    // or an older one, and taking it would put an old ratchet back over a newer one.
+                    // Reference reaches the same result by another route for a replay its verdict
+                    // cache still holds: a cache hit for a known destination skips
+                    // `_remember_ratchet` (Identity.py:722). A replay it has evicted from that cache
+                    // (128 entries) it validates again and remembers; this does not.
+                    if let ratchet = parsed.ratchet,
+                       var known = state.knownDestinations[packet.destinationHash],
+                       known.ratchet != ratchet {
+                        known.ratchet = ratchet
+                        known.ratchetReceived = icNow
+                        state.knownDestinations[packet.destinationHash] = known
+                    }
 
                     var effects: [Effect<Action>] = []
                     // Update the path only if this fresh announce improves it, or the current one is
@@ -1198,10 +1266,10 @@ public struct Transport {
                             // our path — do not answer (RNS Transport.py:3833). A leaf's random
                             // `pathRequestSenderID` matches no real next hop.
                             guard requestorTransportId != entry.nextHop else { return .none }
-                            // The flag comes from the CACHE, not from `entry.ratchet`. The payload is
+                            // The flag comes from the CACHE, not from any parsed ratchet. The payload is
                             // the original announce's bytes, so the flag must describe those bytes:
                             // `Announce.parse` drops a ratchet it cannot key-agree with, leaving the
-                            // 32 bytes in the payload but `entry.ratchet == nil`. See CachedAnnounce.
+                            // 32 bytes in the payload but no ratchet remembered. See CachedAnnounce.
                             let response = Packet(
                                 headerType: .header2, packetType: .announce, transportType: .transport,
                                 destinationType: .single, context: .pathResponse,
@@ -1329,6 +1397,14 @@ public struct Transport {
                 where state.learned[dest] == nil
                     && now.timeIntervalSince(known.lastHeard) > Transport.knownDestinationExpiry {
                     state.knownDestinations[dest] = nil
+                }
+                // A ratchet first heard more than `ratchetExpiry` ago is cleared (reference
+                // `expire_ratchets` / `_clean_ratchets`, Identity.py:465-470, 578-615). `recallRatchet`
+                // already ignores it; this keeps it from sitting in state for the host to persist.
+                for (dest, known) in state.knownDestinations where known.ratchet != nil
+                    && !(known.ratchetReceived.map { Transport.ratchetIsFresh(received: $0, now: now) } ?? false) {
+                    state.knownDestinations[dest]?.ratchet = nil
+                    state.knownDestinations[dest]?.ratchetReceived = nil
                 }
                 for (link, entry) in Array(state.linkTable) {
                     let expired = entry.validated
@@ -1513,7 +1589,10 @@ public struct Transport {
                     return .send(.delegate(.sendFailed(destinationHash: destinationHash,
                                                        reason: .interfaceUnavailable)))
                 }
-                let ciphertext = entry.identity.encrypt(plaintext, ratchet: entry.ratchet)
+                // To the destination's ratchet while one is fresh, as reference `Destination.encrypt`
+                // does for every SINGLE destination (Destination.py:694-708).
+                let ciphertext = entry.identity.encrypt(
+                    plaintext, ratchet: state.recallRatchet(destinationHash: destinationHash, now: date.now))
                 let packet: Packet
                 if let nh = entry.relayNextHop(toward: destinationHash) {
                     // Destination is reached via a relay → send HEADER_2 to the next hop.
@@ -1747,6 +1826,17 @@ public struct Transport {
     /// cannot stamp a use, so it measures from the last announce for every entry — more retentive
     /// for a hash heard once and recalled days later (the case recall exists for), never less.
     public static let knownDestinationExpiry: TimeInterval = pathExpiry * 1.25
+    /// How long a peer's ratchet is used after it was first heard: reference `RATCHET_EXPIRY`
+    /// (RNS 1.6.0 Identity.py:72), 30 days. Past it `recallRatchet` answers nil and
+    /// `maintenanceTick` clears it. `public` so a host persisting ratchets prunes on the same terms.
+    /// A known destination culled earlier (`knownDestinationExpiry`) takes its ratchet with it, as
+    /// reference's `clean_known_destinations` does (Identity.py:455).
+    public static let ratchetExpiry: TimeInterval = 60 * 60 * 24 * 30
+    /// Whether a ratchet first heard at `received` is still usable at `now`. A non-finite time is not.
+    static func ratchetIsFresh(received: Date, now: Date) -> Bool {
+        let age = now.timeIntervalSince(received)
+        return age.isFinite && age <= ratchetExpiry
+    }
     /// Mode-dependent path lifetimes (RNS Transport.py:787-792).
     static let apPathExpiry: TimeInterval = 60 * 60 * 24       // AP_PATH_TIME, 1 day
     static let roamingPathExpiry: TimeInterval = 60 * 60 * 6   // ROAMING_PATH_TIME, 6 hours

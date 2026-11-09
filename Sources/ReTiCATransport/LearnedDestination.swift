@@ -5,7 +5,16 @@ import ReTiCA
 public struct LearnedDestination: Equatable, Sendable {
     public var identity: Identity     // public-only, recovered from the announce
     public var appData: Data?
-    public var ratchet: Data?         // received 32-byte ratchet public key, or nil
+    /// **Ignored.** Transport neither reads nor writes this: a peer's ratchet lives on
+    /// `KnownDestination.ratchet`, read through `Transport.State.recallRatchet(destinationHash:)`.
+    /// Kept only so a host that still stores it with the path row keeps compiling; it is whatever
+    /// the host put in (nil for every entry Transport builds).
+    @available(*, deprecated, message: "Ignored by Transport. A peer's ratchet is KnownDestination.ratchet; read it with Transport.State.recallRatchet(destinationHash:).")
+    public var ratchet: Data? {
+        get { legacyRatchet }
+        set { legacyRatchet = newValue }
+    }
+    private var legacyRatchet: Data?
     public var interfaceID: InterfaceID
     public var hops: UInt8
     /// The announce's transport_id, or the destination's own hash when heard directly: Transport
@@ -18,12 +27,14 @@ public struct LearnedDestination: Equatable, Sendable {
     // on it would go stale when the destination changed it in an announce that lost the path. They
     // live on `KnownDestination`, which every valid announce refreshes, as reference keeps them.
 
-    public init(identity: Identity, appData: Data?, ratchet: Data?, interfaceID: InterfaceID,
+    /// `ratchet` is ignored by Transport (see the property); it defaults to nil and is kept for
+    /// hosts that still pass it.
+    public init(identity: Identity, appData: Data?, ratchet: Data? = nil, interfaceID: InterfaceID,
                 hops: UInt8, nextHop: Data?, announceEmitted: UInt64,
                 learnedAt: Date = Date(timeIntervalSince1970: 0)) {
         self.identity = identity
         self.appData = appData
-        self.ratchet = ratchet
+        self.legacyRatchet = ratchet
         self.interfaceID = interfaceID
         self.hops = hops
         self.nextHop = nextHop

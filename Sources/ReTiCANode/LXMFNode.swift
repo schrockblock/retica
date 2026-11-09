@@ -584,6 +584,9 @@ public struct LXMFNode {
     static let peerCostPathRequests = 3
 
     @Dependency(\.date) var date
+    /// Transport's clock: a peer ratchet's receive time is stamped with it, so its freshness is read
+    /// with it too (`recallRatchet`).
+    @Dependency(\.transportDate) var transportDate
     @Dependency(\.continuousClock) var clock
     /// A minted ticket's bytes. Live: `SecRandomCopyBytes`. Test: the ramp `00 01 02 …`.
     @Dependency(\.randomBytes) var randomBytes
@@ -846,10 +849,14 @@ public struct LXMFNode {
                 let msg = ticketStamped(state, created) ?? created
                 let deliveryCost = msg.stamp == nil ? deliveryStampCost(state, destinationHash: destinationHash) : nil
                 let preparing = reportPhase(&state, msg.hash, .stamping)
+                // The recipient's ratchet as of now, as reference reads it when it packs.
+                let ratchet = state.endpoint.transport.recallRatchet(destinationHash: destinationHash,
+                                                                     now: transportDate.now)
                 let work: Effect<Action> = .run { send in
                     guard let stamped = await LXMFNode.withDeliveryStamp(msg, cost: deliveryCost),
                           let (packed, _) = await LXMFPropagation.pack(
-                              message: stamped, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                              message: stamped, recipientIdentity: recipient, ratchet: ratchet,
+                              timestamp: ts, stampCost: cost)
                     else { return }                                  // cancelled mid-search
                     await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
                 }
@@ -1630,10 +1637,14 @@ public struct LXMFNode {
         // A ticket learned since the delivery copy left stamps the copy without a search.
         let message = ticketStamped(state, message) ?? message
         let deliveryCost = message.stamp == nil ? deliveryStampCost(state, destinationHash: message.destinationHash) : nil
+        // The recipient's ratchet as of now, as reference reads it when it packs.
+        let ratchet = state.endpoint.transport.recallRatchet(destinationHash: message.destinationHash,
+                                                             now: transportDate.now)
         return .run { send in
             guard let stamped = await LXMFNode.withDeliveryStamp(message, cost: deliveryCost),
                   let (packed, _) = await LXMFPropagation.pack(
-                      message: stamped, recipientIdentity: recipient, timestamp: ts, stampCost: cost)
+                      message: stamped, recipientIdentity: recipient, ratchet: ratchet,
+                      timestamp: ts, stampCost: cost)
             else { return }                          // cancelled mid-search
             await send(.router(.sendViaPropagation(message: stamped, propagationPacked: packed)))
         }

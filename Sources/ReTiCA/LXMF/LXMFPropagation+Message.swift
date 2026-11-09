@@ -15,17 +15,34 @@ extension LXMFPropagation {
     /// validate `stampCost`: the ceiling belongs at the boundary where the *wire* value is read
     /// (`LXMFNode.propagationStampCost`), mirroring reference, which decides in
     /// `LXMRouter.get_outbound_propagation_cost` rather than inside `LXStamper`.
-    public static func pack(message: LXMessage, recipientIdentity: Identity, timestamp: Double,
+    ///
+    /// `ratchet` is the recipient's ratchet public key, from `Transport.State.recallRatchet`; the tail
+    /// is encrypted to it when given, to the identity key otherwise. Reference encrypts through
+    /// `destination.encrypt` (LXMessage.py:437), which takes the recipient's ratchet whenever one is
+    /// known (Destination.py:694-708). Pass only a ratchet `recallRatchet` returned: the encryption's key
+    /// agreement is force-unwrapped (see `Identity.encrypt`).
+    public static func pack(message: LXMessage, recipientIdentity: Identity, ratchet: Data? = nil,
+                            timestamp: Double,
                             stampCost: Int = LXMFPropagation.defaultPropagationStampCost) async
         -> (propagationPacked: Data, transientId: Data)? {
-        let tail = Data(message.packed.dropFirst(LXMessage.destinationLength))
-        let encrypted = recipientIdentity.encrypt(tail)
-        let entry = lxmfData(destinationHash: message.destinationHash, encryptedData: encrypted)  // stampless
+        let entry = stamplessEntry(message: message, recipientIdentity: recipientIdentity, ratchet: ratchet,
+                                   ephemeralPrivateKey: SecureRandom.bytes(32), iv: SecureRandom.bytes(16))
         let tid = transientId(lxmfData: entry)                                                    // over stampless
         guard let stamp = await LXStamper.generatePnStamp(transientId: tid, targetCost: stampCost)
         else { return nil }
         let stampedEntry = entry + stamp
         return (container(timestamp: timestamp, entries: [stampedEntry]), tid)
+    }
+
+    /// The stampless lxmf_data `pack` builds: destination hash ‖ the delivery tail (packed[16:])
+    /// encrypted to `ratchet`, or to the identity key when nil. Takes the ephemeral key and IV so a
+    /// test can reproduce reference bytes; `pack` passes fresh random ones.
+    static func stamplessEntry(message: LXMessage, recipientIdentity: Identity, ratchet: Data?,
+                               ephemeralPrivateKey: Data, iv: Data) -> Data {
+        let tail = Data(message.packed.dropFirst(LXMessage.destinationLength))
+        let encrypted = recipientIdentity.encrypt(tail, ratchet: ratchet,
+                                                  ephemeralPrivateKey: ephemeralPrivateKey, iv: iv)
+        return lxmfData(destinationHash: message.destinationHash, encryptedData: encrypted)
     }
 
     /// Recover the packed LXMF wire bytes (destinationHash ‖ decrypted tail) from one container/download

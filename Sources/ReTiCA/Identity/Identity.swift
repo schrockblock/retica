@@ -73,6 +73,17 @@ public struct Identity: Equatable, Sendable {
         return (try? Curve25519.KeyAgreement.PrivateKey().sharedSecretFromKeyAgreement(with: key)) != nil
     }
 
+    /// True iff `ratchet` is a 32-byte X25519 public key that `encrypt(_:ratchet:)` can agree with —
+    /// the same test `Announce.parse` applies to an announced ratchet. For ratchet bytes that did not
+    /// come through `Announce.parse` (a host's restored row), which must pass it before they reach
+    /// `encrypt`, whose agreement is force-unwrapped.
+    public static func isUsableRatchet(_ ratchet: Data) -> Bool {
+        guard ratchet.count == 32,
+              let key = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: ratchet)
+        else { return false }
+        return isUsableX25519PublicKey(key)
+    }
+
     /// Test seam: when a test binds a counter here, each trial agreement above increments it, so a
     /// test can show that a path does not pay for one. Task-local, so parallel tests do not mix
     /// counts; unbound (nil) in production, where it costs one task-local read.
@@ -117,8 +128,10 @@ public struct Identity: Equatable, Sendable {
         //   • x25519Public — Identity.init?(publicKey:) performs a trial key agreement and returns
         //     nil for low-order points, so every Identity that exists carries a usable static key.
         //   • ratchet — Announce.parse validates each announced ratchet with the same trial
-        //     agreement and drops it (keeping the announce) if unusable. No unvalidated ratchet
-        //     bytes can reach this call site.
+        //     agreement and drops it (keeping the announce) if unusable, and
+        //     `.rehydrateKnownDestinations` drops a restored ratchet failing `isUsableRatchet`.
+        //     Transport and LXMFNode pass only ratchets from `recallRatchet`, which holds nothing
+        //     else. (A caller of this public API handing in its own bytes is not covered.)
         // This try! is genuinely unreachable. Do NOT change it to return plaintext on failure —
         // that would convert a crash into a silent confidentiality failure, which is far worse.
         let shared = try! ephemeral.sharedSecretFromKeyAgreement(with: targetPub)

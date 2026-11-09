@@ -3122,7 +3122,7 @@ private func makeRatchetAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000,
 /// The relay replays the cached announce's BYTES verbatim, so the path response must carry the
 /// ORIGINAL announce's context flag — the flag is a field-layout declaration about those bytes,
 /// not a statement about what we parsed out of them. A low-order ratchet is dropped at parse
-/// (`learned[dest].ratchet == nil`) while its 32 bytes stay in the payload; deriving the flag from
+/// (`knownDestinations[dest].ratchet == nil`) while its 32 bytes stay in the payload; deriving the flag from
 /// parsed state emits contextFlag=false over a ratchet-carrying payload, and the receiver then
 /// parses with ratchetLen=0 and misaligns the signature and app-data fields.
 @Test @MainActor func relayPathResponseCarriesCachedAnnouncesContextFlag() async {
@@ -3141,7 +3141,8 @@ private func makeRatchetAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000,
     await store.send(.received(InterfaceID("i0"), announceRaw))
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
     // Precondition: the ratchet was dropped, so parsed state disagrees with the cached bytes.
-    #expect(store.state.learned[destHash]?.ratchet == nil)
+    #expect(store.state.knownDestinations[destHash] != nil)
+    #expect(store.state.knownDestinations[destHash]?.ratchet == nil)
 
     let captured = LockIsolated<Data?>(nil)
     await store.send(.received(InterfaceID("i0"), makePathRequest(for: destHash)))
