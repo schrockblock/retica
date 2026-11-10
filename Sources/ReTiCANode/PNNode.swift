@@ -26,6 +26,26 @@ public struct PNNode {
         public var pendingOffer: [Data: PendingOffer] = [:]   // peerHash → (linkID, requestID, offeredIds)
         public var pendingSyncPeers: [Data: Double] = [:]  // peer dest → the peer's peering cost, awaiting linkEstablished
         public var offerLinks: [Data: [Data]] = [:]        // outbound offer linkID → offeredIds we sent
+        /// Outbound offer linkID → the peer it syncs to, so the offer response and the transfer's
+        /// conclusion can mark that peer's handled ids. Cleared with the link.
+        public var offerLinkPeers: [Data: Data] = [:]
+        /// Outbound offer linkID → the ids in the sync transfer on it, marked handled for the peer once
+        /// the transfer concludes (reference `resource_concluded`, LXMPeer.py:505-507). Cleared with the
+        /// link, or when the transfer fails, as reference marks nothing then.
+        public var syncTransfers: [Data: [Data]] = [:]
+        /// Peer propagation-node hash → the transient ids never to offer that peer again: reference's
+        /// per-peer handled list (`propagation_entries[tid][4]`, LXMPeer.py:580-585) together with the
+        /// ids reference drops from the peer's unhandled list without marking handled (low value,
+        /// LXMPeer.py:359-361), since neither is offered again. An id becomes handled when it is
+        /// oversized for the peer (LXMPeer.py:375-378), below its stamp cost, declined in its offer
+        /// response (:432-437, :448-453), sent to it in a concluded transfer (:505-507), or offered to
+        /// us by it (see `peerValidated`).
+        ///
+        /// In memory only: a relaunch forgets it, costing one redundant offer per peer (the peer
+        /// declines what it has, and that marks them again). Bounded: each time a peer's set is
+        /// touched it is pruned to ids still in the store (reference's lists live inside the store
+        /// entries and go with them), plus, on an inbound offer, the ids just offered.
+        public var handledByPeer: [Data: Set<Data>] = [:]
         public init(identity: Identity, endpoint: TransportEndpoint.State, storageLimitBytes: Int? = nil,
                     targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
                     stampCostFlexibility: Double = 0, peeringCost: Double = 0) {
@@ -102,8 +122,17 @@ public struct PNNode {
         Scope(state: \.endpoint, action: \.endpoint) { TransportEndpoint() }
         Scope(state: \.node, action: \.node) { PropagationNode() }
         Reduce { [date] state, action in
+            /// Adds `ids` to `peer`'s handled set, first pruning it to ids the store still holds.
+            func markHandled(_ state: inout State, _ peer: Data, _ ids: some Sequence<Data>) {
+                let store = state.node.store
+                var handled = state.handledByPeer[peer, default: []].filter { store.contains(transientId: $0) }
+                handled.formUnion(ids)
+                state.handledByPeer[peer] = handled
+            }
             func clearLink(_ state: inout State, _ linkID: Data) {
                 state.offerLinks[linkID] = nil
+                state.offerLinkPeers[linkID] = nil
+                state.syncTransfers[linkID] = nil
                 state.clientIdentities[linkID] = nil
                 state.pendingGet = state.pendingGet.filter { $0.value.linkID != linkID }
                 state.pendingOffer = state.pendingOffer.filter { $0.value.linkID != linkID }
@@ -205,7 +234,17 @@ public struct PNNode {
 
             case let .node(.delegate(.peerValidated(peerHash, valid))):
                 guard let pending = state.pendingOffer[peerHash] else { return .none }
-                if valid { return .send(.node(.peerOffered(peerHash: peerHash, transientIds: pending.offeredIds))) }
+                if valid {
+                    // A peer that offers an id holds it, so it is handled for that peer. Earlier than
+                    // reference, which marks only the ids it then RECEIVES from the peer
+                    // (`queue_handled_message`, LXMRouter.py:2784) and so offers a held-but-declined id
+                    // back once, to be declined. Every id a peer sends us in a sync was in its offer, so
+                    // this is a superset; the cost of the extra marks is none (the peer holds them). An
+                    // offered id not yet stored is kept only until the set is next pruned (an id still
+                    // in transit then is offered back once).
+                    markHandled(&state, peerHash, pending.offeredIds)
+                    return .send(.node(.peerOffered(peerHash: peerHash, transientIds: pending.offeredIds)))
+                }
                 state.pendingOffer[peerHash] = nil                     // invalid key → drop
                 return .none
 
@@ -225,16 +264,27 @@ public struct PNNode {
                 let selfIdentity = state.identity
                 let identify = Effect<Action>.send(.endpoint(.identifyOverLink(linkID: linkID, identity: selfIdentity)))
                 // Offer only what the peer accepts: entries whose stamp value meets its
-                // `max(0, cost - flex)`, read from its announce again here because it may have changed
-                // since `syncToPeer` (LXMPeer.py:336-361). An unknown announce offers nothing.
-                let offerable = Self.peerAnnounce(state, dest).map {
-                    state.node.store.transientIds(acceptedAt: LXMFPropagation.peerMinimumAcceptedCost($0))
-                } ?? []
+                // `max(0, cost - flex)` and that fit its announced per-transfer and per-sync limits, in
+                // reference weight order, leaving out its handled ids (LXMPeer.py:336-384). Read from
+                // its announce again here because it may have changed since `syncToPeer`. An unknown
+                // announce offers nothing and marks nothing.
+                guard let announce = Self.peerAnnounce(state, dest) else { return identify }
+                let selection = state.node.store.offerCandidates(
+                    acceptedAt: LXMFPropagation.peerMinimumAcceptedCost(announce),
+                    transferLimitKB: announce.perTransferLimit, syncLimitKB: announce.perSyncLimit,
+                    excluding: state.handledByPeer[dest] ?? [], now: date.now)
+                // Never offered to this peer again: oversized ones reference marks handled
+                // (LXMPeer.py:375-378), low-value ones it drops from the peer's unhandled list
+                // (:359-361). Marked even when nothing is left to offer, as reference marks before
+                // its empty check.
+                markHandled(&state, dest, selection.oversized + selection.lowValue)
+                let offerable = selection.offer
                 // Nothing qualifies: no offer, so no peering key either, as reference returns before
                 // offering (LXMPeer.py:386-388). The identify still goes out, as reference identifies on
                 // every established sync link (LXMPeer.py:540).
                 guard !offerable.isEmpty else { return identify }
                 state.offerLinks[linkID] = offerable
+                state.offerLinkPeers[linkID] = dest
                 let peeringId = peerIdentity.hash + state.identity.hash              // responder-first (matches P4a)
                 return .merge(
                     identify,
@@ -253,6 +303,7 @@ public struct PNNode {
             case let .endpoint(.delegate(.responseReceived(linkID, _, data))):
                 guard let offeredIds = state.offerLinks[linkID] else { return .none }   // not an outbound offer link
                 state.offerLinks[linkID] = nil
+                let peer = state.offerLinkPeers[linkID]
                 let wanted: [Data]
                 switch MsgPack.decodeValue(data) {
                 case .bool(false):      wanted = []                          // peer has all → nothing
@@ -265,10 +316,30 @@ public struct PNNode {
                     wanted = items.compactMap { if case let .bin(d) = $0, offered.contains(d) { return d } else { return nil } }
                 default:                return .none                         // malformed
                 }
+                // The offered ids the peer did not want it already has (from another peer): handled,
+                // never offered to it again (`False`, LXMPeer.py:432-437; a list, :448-453).
+                if let peer {
+                    let wantedSet = Set(wanted)
+                    markHandled(&state, peer, offeredIds.filter { !wantedSet.contains($0) })
+                }
                 guard !wanted.isEmpty else { return .none }
-                let entries = state.node.store.entries(forTransientIds: wanted).map(\.lxmfData)
-                let container = LXMFPropagation.container(timestamp: date.now.timeIntervalSince1970, entries: entries)
+                let entries = state.node.store.entries(forTransientIds: wanted)
+                // The wanted ids become handled once the transfer concludes (`resource_concluded`,
+                // LXMPeer.py:505-507), not now: a transfer that fails leaves them to offer again.
+                if peer != nil { state.syncTransfers[linkID] = entries.map(\.transientId) }
+                let container = LXMFPropagation.container(timestamp: date.now.timeIntervalSince1970,
+                                                          entries: entries.map(\.lxmfData))
                 return .send(.endpoint(.sendResourceOverLink(linkID: linkID, data: container)))
+
+            case let .endpoint(.delegate(.resourceConcluded(linkID, _))):
+                guard let sent = state.syncTransfers.removeValue(forKey: linkID),
+                      let peer = state.offerLinkPeers[linkID] else { return .none }
+                markHandled(&state, peer, sent)
+                return .none
+
+            case let .endpoint(.delegate(.resourceFailed(linkID, _, _))):
+                state.syncTransfers[linkID] = nil                    // reference marks nothing on a failed transfer
+                return .none
 
             // Both of these are where the peering-key search is actually reclaimed: the key exists only
             // to go into an `/offer` on this link, so once the link is gone the search is dead work.

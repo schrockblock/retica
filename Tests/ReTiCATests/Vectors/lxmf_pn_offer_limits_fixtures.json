@@ -1,0 +1,224 @@
+{
+  "cases": [
+    {
+      "transfer_limit_kb": 256,
+      "sync_limit_kb": 10240,
+      "cost": 16.0,
+      "flexibility": 3.0,
+      "entries": [
+        {
+          "size": 255984,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 255985,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 100,
+          "age": 0,
+          "value": 12.99609375,
+          "handled": false
+        },
+        {
+          "size": 100,
+          "age": 864000,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 100,
+          "age": 432000,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 200,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 150,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        }
+      ],
+      "offered": [
+        4,
+        6,
+        5,
+        3,
+        0
+      ],
+      "handled_after": [
+        1
+      ],
+      "unhandled_after": [
+        0,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "transfer_limit_kb": 256,
+      "sync_limit_kb": 2,
+      "cost": 16.0,
+      "flexibility": 3.0,
+      "entries": [
+        {
+          "size": 3000,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 1000,
+          "age": 3456000,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 900,
+          "age": 2592000,
+          "value": 16.0,
+          "handled": false
+        }
+      ],
+      "offered": [
+        2,
+        1
+      ],
+      "handled_after": [],
+      "unhandled_after": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "transfer_limit_kb": 1,
+      "sync_limit_kb": 2,
+      "cost": 0.0,
+      "flexibility": 0.0,
+      "entries": [
+        {
+          "size": 985,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 984,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 960,
+          "age": 432000,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 959,
+          "age": 518400,
+          "value": 16.0,
+          "handled": false
+        }
+      ],
+      "offered": [
+        1,
+        3
+      ],
+      "handled_after": [
+        0
+      ],
+      "unhandled_after": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "transfer_limit_kb": 1,
+      "sync_limit_kb": 10240,
+      "cost": 0.0,
+      "flexibility": 0.0,
+      "entries": [
+        {
+          "size": 500,
+          "age": 0,
+          "value": 16.0,
+          "handled": true
+        },
+        {
+          "size": 5000,
+          "age": 0,
+          "value": 16.0,
+          "handled": true
+        },
+        {
+          "size": 600,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 5000,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        }
+      ],
+      "offered": [
+        2
+      ],
+      "handled_after": [
+        0,
+        1,
+        3
+      ],
+      "unhandled_after": [
+        2
+      ]
+    },
+    {
+      "transfer_limit_kb": 0,
+      "sync_limit_kb": 0,
+      "cost": 0.0,
+      "flexibility": 0.0,
+      "entries": [
+        {
+          "size": 100,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        },
+        {
+          "size": 200,
+          "age": 0,
+          "value": 16.0,
+          "handled": false
+        }
+      ],
+      "offered": [],
+      "handled_after": [
+        0,
+        1
+      ],
+      "unhandled_after": []
+    }
+  ],
+  "versions": {
+    "rns": "1.6.0",
+    "lxmf": "1.3.0"
+  }
+}

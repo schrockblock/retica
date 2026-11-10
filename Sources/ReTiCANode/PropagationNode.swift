@@ -32,10 +32,16 @@ public struct PropagationNode {
         case messageListRequested(destinationHash: Data)
         case messagesDelivered(transientIds: [Data])
         case peerOffered(peerHash: Data, transientIds: [Data])
-        /// Emit the ids to offer a peer: those whose stamp value meets `peerMinimumAcceptedCost`, the
-        /// peer's `max(0, cost - flex)` from its announce (`LXMFPropagation.peerMinimumAcceptedCost`).
-        /// An empty list means there is nothing to offer (reference sends no offer then).
-        case offerToPeer(peerHash: Data, peerMinimumAcceptedCost: Double)
+        /// Emit the ids to offer a peer: `PropagationStore.offerCandidates` at the peer's announced
+        /// `peerMinimumAcceptedCost` (its `max(0, cost - flex)`, `LXMFPropagation.peerMinimumAcceptedCost`)
+        /// and per-transfer / per-sync limits in KB (`PNAnnounce.perTransferLimit` / `perSyncLimit`;
+        /// nil = no limit), in reference weight order. An empty list means there is nothing to offer
+        /// (reference sends no offer then).
+        ///
+        /// Stateless: this reducer keeps no per-peer handled set, so it excludes nothing and does not
+        /// report the oversized / low-value ids a stateful host must stop offering. `PNNode` is that
+        /// host and calls the store directly.
+        case offerToPeer(peerHash: Data, peerMinimumAcceptedCost: Double, transferLimitKB: Int?, syncLimitKB: Int?)
         case validatePeeringKey(peerHash: Data, peeringId: Data, peeringKey: Data, targetCost: Double)
         case delegate(Delegate)
 
@@ -54,13 +60,15 @@ public struct PropagationNode {
         }
     }
 
+    /// Read for an entry's `receivedAt` (ingest) and its age (offer weight).
+    @Dependency(\.date) var date
     public init() {}
 
     public var body: some ReducerOf<Self> {
-        Reduce { state, action in
+        Reduce { [date] state, action in
             switch action {
             case let .ingestContainer(data):
-                let (added, evicted) = state.store.ingest(container: data)
+                let (added, evicted) = state.store.ingest(container: data, now: date.now)
                 let entries = state.store.entries(forTransientIds: added)
                 var effects: [Effect<Action>] = [
                     .send(.delegate(.stored(transientIds: added))),
@@ -115,9 +123,10 @@ public struct PropagationNode {
                 return .send(.delegate(.requestFromPeer(peerHash: peerHash,
                                                         transientIds: state.store.wanted(fromOffered: offered))))
 
-            case let .offerToPeer(peerHash, minimum):
-                return .send(.delegate(.offerTransientIds(peerHash: peerHash,
-                                                          transientIds: state.store.transientIds(acceptedAt: minimum))))
+            case let .offerToPeer(peerHash, minimum, transferLimitKB, syncLimitKB):
+                let selection = state.store.offerCandidates(acceptedAt: minimum, transferLimitKB: transferLimitKB,
+                                                            syncLimitKB: syncLimitKB, excluding: [], now: date.now)
+                return .send(.delegate(.offerTransientIds(peerHash: peerHash, transientIds: selection.offer)))
 
             case let .validatePeeringKey(peerHash, peeringId, peeringKey, targetCost):
                 let valid = LXStamper.validatePeeringKey(peeringId: peeringId, peeringKey: peeringKey, targetCost: targetCost)

@@ -250,7 +250,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Double = 0, targetSt
     // Something to offer (an offer with nothing in it is not made), to a peer accepting at 0, whose
     // announce we hold (a sync waits for it).
     let held = Data(repeating: 0xAB, count: 16) + Data("held".utf8)
-    _ = initial.node.store.ingest(container: LXMFPropagation.container(timestamp: 1700000000, entries: [held]))
+    _ = initial.node.store.ingest(container: LXMFPropagation.container(timestamp: 1700000000, entries: [held]), now: Date(timeIntervalSince1970: 1700000000))
     let heldId = LXMFPropagation.transientId(lxmfData: held)
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
         identity: peerIdentity,
@@ -299,7 +299,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Double = 0, targetSt
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
     var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), targetStampCost: 4)
-    _ = initial.node.store.ingest(container: container)
+    _ = initial.node.store.ingest(container: container, now: Date(timeIntervalSince1970: 1700000000))
     initial.offerLinks[linkID] = [tid]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing
@@ -327,7 +327,7 @@ private func makeStore(_ pnIdentity: Identity, peeringCost: Double = 0, targetSt
     let entry = LXMFPropagation.parseContainer(container)!.entries[0]  // stamped — what PN stores and serves
     let linkID = Data(repeating: 0xD1, count: 16)
     var initial = PNNode.State(identity: Identity(), endpoint: TCPEndpoint.State(host: "pn", port: 4242, reconnectOnDrop: false), targetStampCost: 4)
-    _ = initial.node.store.ingest(container: container)
+    _ = initial.node.store.ingest(container: container, now: Date(timeIntervalSince1970: 1700000000))
     initial.offerLinks[linkID] = [tid]
     let store = TestStore(initialState: initial) { PNNode() } withDependencies: {
         $0.continuousClock = TestClock(); $0.date = .constant(Date(timeIntervalSince1970: 1700000000)); $0.uuid = .incrementing

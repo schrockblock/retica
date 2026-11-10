@@ -15,13 +15,13 @@ private func container(_ entries: [Data]) -> Data {
     var store = PropagationStore(targetStampCost: 0)
     let e = entry(dest: 0xAA, tail: "one")
     let tid = LXMFPropagation.transientId(lxmfData: e)
-    let (firstAdded, firstEvicted) = store.ingest(container: container([e]))
+    let (firstAdded, firstEvicted) = store.ingest(container: container([e]), now: Date(timeIntervalSince1970: 1700000000))
     #expect(firstAdded == [tid])
     #expect(firstEvicted.isEmpty)
     #expect(store.count == 1)
     #expect(store.contains(transientId: tid))
     // Re-ingesting the identical container is a no-op (dedup by transient_id).
-    let (secondAdded, secondEvicted) = store.ingest(container: container([e]))
+    let (secondAdded, secondEvicted) = store.ingest(container: container([e]), now: Date(timeIntervalSince1970: 1700000000))
     #expect(secondAdded.isEmpty)
     #expect(secondEvicted.isEmpty)
     #expect(store.count == 1)
@@ -31,7 +31,7 @@ private func container(_ entries: [Data]) -> Data {
     var store = PropagationStore(targetStampCost: 0)
     let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
     let b1 = entry(dest: 0xBB, tail: "b1")
-    store.ingest(container: container([a1, b1, a2]))
+    store.ingest(container: container([a1, b1, a2]), now: Date(timeIntervalSince1970: 1700000000))
     let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
     let forA = store.entries(forDestination: destA)
     #expect(forA.count == 2)
@@ -45,7 +45,7 @@ private func container(_ entries: [Data]) -> Data {
     var store = PropagationStore(targetStampCost: 0)
     let e = entry(dest: 0xAA, tail: "x")
     let tid = LXMFPropagation.transientId(lxmfData: e)
-    store.ingest(container: container([e]))
+    store.ingest(container: container([e]), now: Date(timeIntervalSince1970: 1700000000))
     store.remove(transientId: tid)
     #expect(store.count == 0)
     #expect(!store.contains(transientId: tid))
@@ -57,9 +57,9 @@ private func container(_ entries: [Data]) -> Data {
     let e1 = entry(dest: 0xAA, tail: "aaaa")
     let e2 = entry(dest: 0xAA, tail: "bbbb")
     let e3 = entry(dest: 0xAA, tail: "cccc")
-    store.ingest(container: container([e1]))
-    store.ingest(container: container([e2]))
-    store.ingest(container: container([e3]))   // pushes over the limit → evict oldest (e1)
+    store.ingest(container: container([e1]), now: Date(timeIntervalSince1970: 1700000000))
+    store.ingest(container: container([e2]), now: Date(timeIntervalSince1970: 1700000000))
+    store.ingest(container: container([e3]), now: Date(timeIntervalSince1970: 1700000000))   // pushes over the limit → evict oldest (e1)
     #expect(store.sizeBytes <= 45)
     #expect(store.count == 2)
     #expect(!store.contains(transientId: LXMFPropagation.transientId(lxmfData: e1)))   // oldest evicted
@@ -78,12 +78,12 @@ private func container(_ entries: [Data]) -> Data {
     let tid1 = LXMFPropagation.transientId(lxmfData: e1)
     let tid2 = LXMFPropagation.transientId(lxmfData: e2)
 
-    let (added1, evicted1) = store.ingest(container: container([e1]))
+    let (added1, evicted1) = store.ingest(container: container([e1]), now: Date(timeIntervalSince1970: 1700000000))
     #expect(added1 == [tid1])
     #expect(evicted1.isEmpty)   // nothing to evict yet — e1 fits alone
 
     // e2 pushes over the cap → e1 is evicted; added contains only the survivors.
-    let (added2, evicted2) = store.ingest(container: container([e2]))
+    let (added2, evicted2) = store.ingest(container: container([e2]), now: Date(timeIntervalSince1970: 1700000000))
     #expect(evicted2 == [tid1])   // oldest evicted
     #expect(added2 == [tid2])     // e2 survived (net-new after eviction)
     #expect(!store.contains(transientId: tid1))
@@ -95,19 +95,19 @@ private func container(_ entries: [Data]) -> Data {
     // Short entry (< 16 bytes) is skipped; the well-formed one is stored.
     let shortEntry = Data([0x01, 0x02, 0x03])
     let good = entry(dest: 0xAA, tail: "ok")
-    let (added, evicted) = store.ingest(container: container([shortEntry, good]))
+    let (added, evicted) = store.ingest(container: container([shortEntry, good]), now: Date(timeIntervalSince1970: 1700000000))
     #expect(added == [LXMFPropagation.transientId(lxmfData: good)])
     #expect(evicted.isEmpty)
     #expect(store.count == 1)
     // A non-container blob ingests to nothing.
-    #expect(store.ingest(container: Data([0xFF, 0xFF])).added.isEmpty)
+    #expect(store.ingest(container: Data([0xFF, 0xFF]), now: Date(timeIntervalSince1970: 1700000000)).added.isEmpty)
     #expect(store.count == 1)
 }
 
 @Test func propagationStoreOffersAllTransientIdsOldestFirst() throws {
     var store = PropagationStore(targetStampCost: 0)
     let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2"), e3 = entry(dest: 0xBB, tail: "e3")
-    store.ingest(container: container([e1, e2, e3]))
+    store.ingest(container: container([e1, e2, e3]), now: Date(timeIntervalSince1970: 1700000000))
     #expect(store.transientIds == [e1, e2, e3].map { LXMFPropagation.transientId(lxmfData: $0) })
 }
 
@@ -117,7 +117,7 @@ private func container(_ entries: [Data]) -> Data {
     var store = PropagationStore(targetStampCost: 4)
     // An unstamped entry: 16-byte dest + payload, no PN stamp → stamp cost effectively 0 < 4.
     let bad = entry(dest: 0xAA, tail: "no-stamp")
-    let (added, _) = store.ingest(container: container([bad]))
+    let (added, _) = store.ingest(container: container([bad]), now: Date(timeIntervalSince1970: 1700000000))
     #expect(added.isEmpty, "unstamped entry must not be added")
     #expect(store.count == 0, "store must remain empty after rejecting under-cost entry")
 }
@@ -126,7 +126,7 @@ private func container(_ entries: [Data]) -> Data {
     var store = PropagationStore(targetStampCost: 0)
     let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2")
     let x = entry(dest: 0xAA, tail: "xx"), y = entry(dest: 0xAA, tail: "yy")
-    store.ingest(container: container([e1, e2]))
+    store.ingest(container: container([e1, e2]), now: Date(timeIntervalSince1970: 1700000000))
     let offered = [e1, e2, x, y].map { LXMFPropagation.transientId(lxmfData: $0) }
     #expect(store.wanted(fromOffered: offered) == [x, y].map { LXMFPropagation.transientId(lxmfData: $0) })
 }
@@ -141,7 +141,7 @@ private func container(_ entries: [Data]) -> Data {
 @Test func propagationStoreWantedEmptyWhenAllPresent() throws {
     var store = PropagationStore(targetStampCost: 0)
     let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xAA, tail: "e2")
-    store.ingest(container: container([e1, e2]))
+    store.ingest(container: container([e1, e2]), now: Date(timeIntervalSince1970: 1700000000))
     let offered = [e1, e2].map { LXMFPropagation.transientId(lxmfData: $0) }
     #expect(store.wanted(fromOffered: offered).isEmpty)
 }
@@ -160,7 +160,7 @@ private func container(_ entries: [Data]) -> Data {
     let absent = Data(repeating: 0xFF, count: 32)
 
     var store = PropagationStore(targetStampCost: 0)
-    _ = store.ingest(container: LXMFPropagation.container(timestamp: 1700000000.5, entries: [d1, d2, d3]))
+    _ = store.ingest(container: LXMFPropagation.container(timestamp: 1700000000.5, entries: [d1, d2, d3]), now: Date(timeIntervalSince1970: 1700000000))
 
     // Requested order [tid3, absent, tid1] → [d3, d1]: order preserved, absent skipped, tid2 excluded.
     let got = store.entries(forTransientIds: [tid3, absent, tid1]).map(\.lxmfData)
@@ -200,7 +200,7 @@ private func container(_ entries: [Data]) -> Data {
     // Novel entry: the stamp is unknown, so it MUST be validated — proving the seam is live.
     let onFirstIngest = LXStamper.WorkblockCounter()
     LXStamper.$workblockCounter.withValue(onFirstIngest) {
-        store.ingest(container: container([stamped]))
+        store.ingest(container: container([stamped]), now: Date(timeIntervalSince1970: 1700000000))
     }
     #expect(store.contains(transientId: tid), "setup: the entry must be accepted and stored")
     #expect(onFirstIngest.count >= 1,
@@ -209,7 +209,7 @@ private func container(_ entries: [Data]) -> Data {
     // Byte-identical replay: recognised by transient_id before any PoW is spent on it.
     let onReplay = LXStamper.WorkblockCounter()
     let (added, _) = LXStamper.$workblockCounter.withValue(onReplay) {
-        store.ingest(container: container([stamped]))
+        store.ingest(container: container([stamped]), now: Date(timeIntervalSince1970: 1700000000))
     }
     #expect(onReplay.count == 0,
             "a stored duplicate must be skipped before any stamp workblock is derived")
@@ -230,7 +230,7 @@ private func container(_ entries: [Data]) -> Data {
         entries.append(core + stamp)
     }
     var store = PropagationStore(targetStampCost: 4)
-    let (added, evicted) = store.ingest(container: container(entries))
+    let (added, evicted) = store.ingest(container: container(entries), now: Date(timeIntervalSince1970: 1700000000))
     // All three valid entries must be accepted; no eviction (no storage cap set).
     #expect(added.count == 3, "all valid stamped entries must be accepted")
     #expect(evicted.isEmpty, "no eviction expected without a storage cap")
@@ -238,7 +238,7 @@ private func container(_ entries: [Data]) -> Data {
     let expectedTids = cores.map { LXMFPropagation.transientId(lxmfData: $0) }
     #expect(Set(added) == Set(expectedTids), "transient_ids must match canonical full_hash(stampless core)")
     // Re-ingesting the same container is still a no-op.
-    let (addedAgain, _) = store.ingest(container: container(entries))
+    let (addedAgain, _) = store.ingest(container: container(entries), now: Date(timeIntervalSince1970: 1700000000))
     #expect(addedAgain.isEmpty, "re-ingest of accepted container must be a no-op")
 }
 
@@ -257,8 +257,8 @@ private func container(_ entries: [Data]) -> Data {
     // (full_hash(workblock ‖ zeros) overwhelmingly lacks 4 leading zero bits), so it must be rejected.
     let badCore = dest + Data("bad-ciphertext".utf8) + pastLengthRule
     let badEntry = badCore + Data(repeating: 0x00, count: LXStamper.stampSize)
-    store.ingest(container: container([validEntry]))
-    store.ingest(container: container([badEntry]))
+    store.ingest(container: container([validEntry]), now: Date(timeIntervalSince1970: 1700000000))
+    store.ingest(container: container([badEntry]), now: Date(timeIntervalSince1970: 1700000000))
     #expect(store.transientIds.count == 1)   // only the validEntry was accepted
 }
 
@@ -292,7 +292,7 @@ private let pastLengthRule = Data(repeating: 0x5E, count: LXMessage.lxmfOverhead
                 "\(stamped.count) bytes")
         var store = PropagationStore(targetStampCost: 8)
         #expect((store.preflightTransientId(ofStampedEntry: stamped) != nil) == accepted, "\(stamped.count) bytes")
-        #expect(store.ingest(container: container([stamped])).added.count == (accepted ? 1 : 0),
+        #expect(store.ingest(container: container([stamped]), now: Date(timeIntervalSince1970: 1700000000)).added.count == (accepted ? 1 : 0),
                 "\(stamped.count) bytes")
     }
 }
@@ -331,11 +331,11 @@ private func stampedEntry(valueIn range: Range<Double>, label: String = "flex") 
 
     var flexible = PropagationStore(targetStampCost: 12.5, stampCostFlexibility: 3.25)
     #expect(flexible.minAcceptedStampCost == 9.25)
-    #expect(flexible.ingest(container: container([stamped])).added.count == 1)
+    #expect(flexible.ingest(container: container([stamped]), now: Date(timeIntervalSince1970: 1700000000)).added.count == 1)
 
     var strict = PropagationStore(targetStampCost: 12.5)
     #expect(strict.minAcceptedStampCost == 12.5)
-    #expect(strict.ingest(container: container([stamped])).added.isEmpty)
+    #expect(strict.ingest(container: container([stamped]), now: Date(timeIntervalSince1970: 1700000000)).added.isEmpty)
 }
 
 /// I1: `ingest` records each validated entry's real stamp value, and the offer set for a peer keeps an
@@ -351,7 +351,7 @@ private func stampedEntry(valueIn range: Range<Double>, label: String = "flex") 
     let high = try await stampedEntry(valueIn: 10..<64, label: "offer-high")
     #expect(low.value < high.value)
     var store = PropagationStore(targetStampCost: 8)
-    let added = store.ingest(container: container([low.entry, high.entry])).added
+    let added = store.ingest(container: container([low.entry, high.entry]), now: Date(timeIntervalSince1970: 1700000000)).added
     #expect(added.count == 2)
     let lowId = try #require(store.preflightTransientId(ofStampedEntry: low.entry))
     let highId = try #require(store.preflightTransientId(ofStampedEntry: high.entry))
@@ -371,7 +371,7 @@ private func stampedEntry(valueIn range: Range<Double>, label: String = "flex") 
     #expect(store.minAcceptedStampCost == 0)
     let short = Data(repeating: 0xAB, count: LXMessage.destinationLength) + Data(repeating: 0x01, count: 96)
         + Data(repeating: 0xFF, count: LXStamper.stampSize)          // 144 bytes
-    #expect(store.ingest(container: container([short])).added.isEmpty)
+    #expect(store.ingest(container: container([short]), now: Date(timeIntervalSince1970: 1700000000)).added.isEmpty)
 }
 
 // MARK: - Configured costs are sanitized

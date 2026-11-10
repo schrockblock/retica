@@ -16,25 +16,36 @@ public struct PropagationStore: Equatable {
         /// store accepted the entry without validation (`targetStampCost == 0`); an offer counts nil as
         /// 0. Not persisted by hosts: rehydration re-runs `ingest`, which recomputes it.
         public internal(set) var stampValue: Double?
+        /// When `ingest` accepted the entry: its `now` argument. A peer offer weights entries by age
+        /// from this (reference `lxm_rcvd`, `propagation_entries[tid][2]`, LXMRouter.py:1190, set at
+        /// :2881). Not persisted by hosts: rehydration re-runs `ingest`, so a relaunch resets every
+        /// entry's age to 0 where reference keeps `lxm_rcvd` in the stored file name (:2877). The cost
+        /// is only offer order (an old entry is offered earlier after a relaunch than it would be).
+        public internal(set) var receivedAt: Date
         var sequence: Int
 
         /// Public construction for hosts mirroring the store (persistence, tests). `sequence` is the
         /// store's internal ordering and is not part of a host's contract, so it defaults to 0 —
         /// entries built this way are values to persist/compare, not to insert into a store.
-        public init(transientId: Data, destinationHash: Data, lxmfData: Data) {
+        /// `receivedAt` defaults to the 1970 epoch for the same reason.
+        public init(transientId: Data, destinationHash: Data, lxmfData: Data,
+                    receivedAt: Date = Date(timeIntervalSince1970: 0)) {
             self.transientId = transientId
             self.destinationHash = destinationHash
             self.lxmfData = lxmfData
             self.stampValue = nil
+            self.receivedAt = receivedAt
             self.sequence = 0
         }
 
         /// Internal construction used by the store itself, preserving the insertion-order sequence.
-        init(transientId: Data, destinationHash: Data, lxmfData: Data, stampValue: Double?, sequence: Int) {
+        init(transientId: Data, destinationHash: Data, lxmfData: Data, stampValue: Double?,
+             receivedAt: Date, sequence: Int) {
             self.transientId = transientId
             self.destinationHash = destinationHash
             self.lxmfData = lxmfData
             self.stampValue = stampValue
+            self.receivedAt = receivedAt
             self.sequence = sequence
         }
     }
@@ -135,8 +146,10 @@ public struct PropagationStore: Equatable {
     /// nothing to `added`.
     ///
     /// The host must persist `added` AND delete `evicted` so its mirror stays in sync with the in-memory store.
+    ///
+    /// `now` becomes each added entry's `receivedAt` (reference stamps `time.time()`, LXMRouter.py:2881).
     @discardableResult
-    public mutating func ingest(container: Data) -> (added: [Data], evicted: [Data]) {
+    public mutating func ingest(container: Data, now: Date) -> (added: [Data], evicted: [Data]) {
         guard let (_, lxmfDatas) = LXMFPropagation.parseContainer(container) else { return ([], []) }
         var added: [Data] = []
         for lxmfData in lxmfDatas {
@@ -202,7 +215,7 @@ public struct PropagationStore: Equatable {
             // Store the full stamped bytes (lxmfData) so PN→PN sync re-delivers the stamped entry,
             // letting the receiving PN validate and arrive at the same transient_id.
             stored[tid] = Entry(transientId: tid, destinationHash: destData, lxmfData: lxmfData,
-                                stampValue: stampValue, sequence: nextSequence)
+                                stampValue: stampValue, receivedAt: now, sequence: nextSequence)
             nextSequence += 1
             added.append(tid)
         }
@@ -234,7 +247,7 @@ public struct PropagationStore: Equatable {
     }
 
     /// All stored transient_ids, oldest-first. NOT an offer set: a peer refuses entries below its own
-    /// acceptance cost, so an offer goes through `transientIds(acceptedAt:)`.
+    /// acceptance cost and above its limits, so an offer goes through `offerCandidates`.
     public var transientIds: [Data] {
         stored.values.sorted { $0.sequence < $1.sequence }.map { $0.transientId }
     }
@@ -248,6 +261,77 @@ public struct PropagationStore: Equatable {
     public func transientIds(acceptedAt minimum: Double) -> [Data] {
         stored.values.filter { ($0.stampValue ?? 0) >= minimum }
             .sorted { $0.sequence < $1.sequence }.map { $0.transientId }
+    }
+
+    /// The offer a sync sends a peer: reference's `LXMPeer.sync` selection (LXMPeer.py:339-384), over
+    /// the stored entries not in `handled` (the peer's handled set; everything else stands in for
+    /// reference's per-peer unhandled list).
+    ///
+    /// - `lowValue`: entries whose `stampValue` (nil as 0) is below `minimum`, the peer's
+    ///   `max(0, cost - flex)`. Reference removes these from the peer's unhandled list
+    ///   (LXMPeer.py:345, :359-361), so it never offers them to that peer again; a caller matches that
+    ///   by adding them to the peer's handled set.
+    /// - The rest are sorted by weight ascending (LXMPeer.py:363), ties in ingest order as Python's
+    ///   stable sort over `propagation_entries` order leaves them. Weight is reference's `get_weight`
+    ///   (LXMRouter.py:1188-1199): `priority_weight * max(1, age_seconds/60/60/24/4) * size`.
+    ///   `priority_weight` is always 1.0 here: reference uses 0.1 for destinations on its
+    ///   `prioritised_list`, and ReTiCA has no such list. `size` is the stored stamped bytes, as
+    ///   reference's `propagation_entries[tid][3]` is `len(stamped_data)` (LXMRouter.py:2875, :2881).
+    /// - Then, in that order, with `per_message_overhead = 16` and `cumulative_size` starting at 24
+    ///   (LXMPeer.py:364-365): an entry whose `size + 16` exceeds `transferLimitKB * 1000` is
+    ///   `oversized` (reference removes it from unhandled AND marks it handled, :375-378); one that
+    ///   would bring the running total to `syncLimitKB * 1000` or more is skipped for this sync only,
+    ///   and the loop goes on to the next, smaller ones (`continue`, :380-381); every other entry is
+    ///   offered and counted. nil limit = no limit (reference's `!= None` tests).
+    ///
+    /// A limit whose `* 1000` overflows Int saturates (a huge limit is no limit) instead of trapping.
+    public func offerCandidates(acceptedAt minimum: Double, transferLimitKB: Int?, syncLimitKB: Int?,
+                                excluding handled: Set<Data>,
+                                now: Date) -> (offer: [Data], oversized: [Data], lowValue: [Data]) {
+        var lowValue: [Data] = []
+        var weighted: [(entry: Entry, weight: Double)] = []
+        for entry in stored.values.sorted(by: { $0.sequence < $1.sequence })
+        where !handled.contains(entry.transientId) {
+            if (entry.stampValue ?? 0) < minimum { lowValue.append(entry.transientId); continue }
+            weighted.append((entry, Self.offerWeight(entry, now: now)))
+        }
+        // Ascending; equal weights keep ingest order, as Python's stable sort does.
+        weighted.sort { $0.weight != $1.weight ? $0.weight < $1.weight : $0.entry.sequence < $1.entry.sequence }
+
+        let perMessageOverhead = 16                 // LXMPeer.py:364
+        var cumulativeSize = 24                     // LXMPeer.py:365
+        let transferLimit = transferLimitKB.map(Self.kilobytesAsBytes)
+        let syncLimit = syncLimitKB.map(Self.kilobytesAsBytes)
+        var offer: [Data] = []
+        var oversized: [Data] = []
+        for (entry, _) in weighted {
+            let transferSize = entry.lxmfData.count + perMessageOverhead
+            let nextSize = cumulativeSize + transferSize
+            if let transferLimit, transferSize > transferLimit {         // LXMPeer.py:375-378
+                oversized.append(entry.transientId)
+                continue
+            }
+            if let syncLimit, nextSize >= syncLimit { continue }         // LXMPeer.py:380-381: skip, not stop
+            cumulativeSize = nextSize
+            offer.append(entry.transientId)
+        }
+        return (offer, oversized, lowValue)
+    }
+
+    /// Reference `get_weight` (LXMRouter.py:1188-1199) with `priority_weight` 1.0 (no prioritised
+    /// list here): `max(1, age_seconds/60/60/24/4) * size`, divided in reference's order. An entry
+    /// "received" in the future (clock moved back) has a negative age, so its factor is 1.
+    static func offerWeight(_ entry: Entry, now: Date) -> Double {
+        let priorityWeight = 1.0
+        let ageWeight = max(1, now.timeIntervalSince(entry.receivedAt) / 60 / 60 / 24 / 4)
+        return priorityWeight * ageWeight * Double(entry.lxmfData.count)
+    }
+
+    /// `kb * 1000`, saturating instead of trapping: a peer's announced limit is any non-negative Int
+    /// (`PNAnnounce.parse`), and past Int.max / 1000 it limits nothing anyway.
+    static func kilobytesAsBytes(_ kb: Int) -> Int {
+        let (bytes, overflow) = kb.multipliedReportingOverflow(by: 1000)
+        return overflow ? (kb < 0 ? Int.min : Int.max) : bytes
     }
 
     /// Of a peer's offered transient_ids, the ones this store is missing (and would pull). Preserves the

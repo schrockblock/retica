@@ -50,7 +50,7 @@ private func makeNode(announce: Data?, pendingPeeringCost: Double? = nil,
                                endpoint: TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false),
                                targetStampCost: 0)
     let entries = heldValues.indices.map(heldEntry)
-    let added = initial.node.store.ingest(container: LXMFPropagation.container(timestamp: 1700000000, entries: entries)).added
+    let added = initial.node.store.ingest(container: LXMFPropagation.container(timestamp: 1700000000, entries: entries), now: Date(timeIntervalSince1970: 1700000000)).added
     precondition(added == heldValues.indices.map(heldId), "setup: every entry is held, in order")
     for (index, value) in heldValues.enumerated() {
         initial.node.store.setStampValue(value, forTransientId: heldId(index))

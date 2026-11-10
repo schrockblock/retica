@@ -14,7 +14,7 @@ private func container(_ entries: [Data]) -> Data {
 @Test @MainActor func propagationNodeIngestsAndReportsIds() async {
     let e = entry(dest: 0xAA, tail: "one")
     let tid = LXMFPropagation.transientId(lxmfData: e)
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([e])))
     await store.receive { action in
@@ -27,7 +27,7 @@ private func container(_ entries: [Data]) -> Data {
 
 @Test @MainActor func propagationNodeDedupsOnReingest() async {
     let e = entry(dest: 0xAA, tail: "one")
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([e])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -42,7 +42,7 @@ private func container(_ entries: [Data]) -> Data {
 @Test @MainActor func propagationNodeServesByDestination() async {
     let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
     let b1 = entry(dest: 0xBB, tail: "b1")
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1, b1, a2])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -67,7 +67,7 @@ private func container(_ entries: [Data]) -> Data {
     let stamped = core + Data(repeating: 0x77, count: LXStamper.stampSize)     // 88-byte stored entry
     let tid = LXMFPropagation.transientId(lxmfData: core)                      // stored key = full_hash(stampless)
 
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([stamped])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -86,7 +86,7 @@ private func container(_ entries: [Data]) -> Data {
 }
 
 @Test @MainActor func propagationNodeServesEmptyWhenNoneAddressed() async {
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     let dest = Data(repeating: 0xCC, count: LXMessage.destinationLength)
     await store.send(.messagesRequested(destinationHash: dest, wants: [], haves: []))
@@ -102,7 +102,7 @@ private func container(_ entries: [Data]) -> Data {
     let e = entry(dest: 0xAA, tail: "one")
     let tid = LXMFPropagation.transientId(lxmfData: e)
     let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([e])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -121,7 +121,7 @@ private func container(_ entries: [Data]) -> Data {
     let x = entry(dest: 0xAA, tail: "x"), y = entry(dest: 0xAA, tail: "y")
     let z = entry(dest: 0xAA, tail: "z"), w = entry(dest: 0xAA, tail: "w")
     let tid: (Data) -> Data = { LXMFPropagation.transientId(lxmfData: $0) }
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([x, y])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -138,21 +138,21 @@ private func container(_ entries: [Data]) -> Data {
 @Test @MainActor func propagationNodeOffersOurTransientIds() async {
     let e1 = entry(dest: 0xAA, tail: "e1"), e2 = entry(dest: 0xBB, tail: "e2")
     let tid: (Data) -> Data = { LXMFPropagation.transientId(lxmfData: $0) }
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([e1, e2])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
     let peer = Data(repeating: 0x11, count: 16)
-    await store.send(.offerToPeer(peerHash: peer, peerMinimumAcceptedCost: 0))
+    await store.send(.offerToPeer(peerHash: peer, peerMinimumAcceptedCost: 0, transferLimitKB: nil, syncLimitKB: nil))
     await store.receive { action in
         if case let .delegate(.offerTransientIds(p, ids)) = action {
-            #expect(p == peer); #expect(ids == [tid(e1), tid(e2)]); return true   // oldest-first
+            #expect(p == peer); #expect(ids == [tid(e1), tid(e2)]); return true   // equal weight: ingest order
         }
         return false
     }
     // These entries were accepted unvalidated (cost 0), so their value counts as 0: a peer that
     // accepts at anything above 0 is offered none of them.
-    await store.send(.offerToPeer(peerHash: peer, peerMinimumAcceptedCost: 1.0 / 256))
+    await store.send(.offerToPeer(peerHash: peer, peerMinimumAcceptedCost: 1.0 / 256, transferLimitKB: nil, syncLimitKB: nil))
     await store.receive { action in
         if case let .delegate(.offerTransientIds(p, ids)) = action {
             #expect(p == peer); #expect(ids.isEmpty); return true
@@ -161,11 +161,38 @@ private func container(_ entries: [Data]) -> Data {
     }
 }
 
+/// `offerToPeer` applies the peer's limits: an entry over the transfer limit is not offered, and one
+/// that does not fit the sync limit is skipped while a later one that fits is offered.
+@Test @MainActor func propagationNodeOfferToPeerHonoursThePeerLimits() async {
+    let big = Data(repeating: 0xAA, count: 16) + Data(repeating: 0x01, count: 985 - 16)    // 985 + 16 > 1000
+    let mid = Data(repeating: 0xAA, count: 16) + Data(repeating: 0x02, count: 1500 - 16)
+    let small = Data(repeating: 0xAA, count: 16) + Data(repeating: 0x03, count: 500 - 16)
+    let tid: (Data) -> Data = { LXMFPropagation.transientId(lxmfData: LXMFPropagation.strippedCore(lxmfData: $0)) }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: {
+        $0.date = .constant(Date(timeIntervalSince1970: 1700000000))
+    }
+    store.exhaustivity = .off
+    await store.send(.ingestContainer(container([big, mid, small])))
+    let peer = Data(repeating: 0x11, count: 16)
+    // Weight order is small (500), big (985), mid (1500). At a 1 KB transfer limit only small fits.
+    await store.send(.offerToPeer(peerHash: peer, peerMinimumAcceptedCost: 0, transferLimitKB: 1, syncLimitKB: nil))
+    await store.receive { action in
+        if case let .delegate(.offerTransientIds(_, ids)) = action { #expect(ids == [tid(small)]); return true }
+        return false
+    }
+    // At a 2 KB sync limit: small (24 + 516 = 540), big (540 + 1001 = 1541), not mid (+ 1516).
+    await store.send(.offerToPeer(peerHash: peer, peerMinimumAcceptedCost: 0, transferLimitKB: nil, syncLimitKB: 2))
+    await store.receive { action in
+        if case let .delegate(.offerTransientIds(_, ids)) = action { #expect(ids == [tid(small), tid(big)]); return true }
+        return false
+    }
+}
+
 @Test @MainActor func propagationNodeValidatesPeeringKey() async {
     let peer = Data(repeating: 0x11, count: 16)
     let peeringId = Data(repeating: 0x22, count: 32)
     let key = Data(repeating: 0x33, count: LXStamper.stampSize)
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     // cost 0 → any key validates (leading-zero-bits >= 0 always true)
     await store.send(.validatePeeringKey(peerHash: peer, peeringId: peeringId, peeringKey: key, targetCost: 0))
@@ -187,7 +214,7 @@ private func container(_ entries: [Data]) -> Data {
 @Test @MainActor func propagationNodeListsTransientIdsByDestination() async {
     let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
     let b1 = entry(dest: 0xBB, tail: "b1")
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1, b1, a2])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -207,7 +234,7 @@ private func container(_ entries: [Data]) -> Data {
 /// Phase-2: only the WANTED subset is served; an unwanted entry for the same destination is withheld.
 @Test @MainActor func propagationNodeServesOnlyWantedSubset() async {
     let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1, a2])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -225,7 +252,7 @@ private func container(_ entries: [Data]) -> Data {
     let a1 = entry(dest: 0xAA, tail: "a1"), a2 = entry(dest: 0xAA, tail: "a2")
     let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
     let tidA2 = LXMFPropagation.transientId(lxmfData: a2)
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1, a2])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -243,7 +270,7 @@ private func container(_ entries: [Data]) -> Data {
 @Test @MainActor func propagationNodeSkipsForeignOrAbsentWants() async {
     let a1 = entry(dest: 0xAA, tail: "a1")
     let b1 = entry(dest: 0xBB, tail: "b1")
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1, b1])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -267,7 +294,7 @@ private func container(_ entries: [Data]) -> Data {
     let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
     let tidB1 = LXMFPropagation.transientId(lxmfData: b1)
     let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1, b1])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -302,7 +329,7 @@ private func container(_ entries: [Data]) -> Data {
     let tidA2 = LXMFPropagation.transientId(lxmfData: a2)
     let tidA3 = LXMFPropagation.transientId(lxmfData: a3)
 
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1, a2, a3])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -325,7 +352,7 @@ private func container(_ entries: [Data]) -> Data {
     let a1 = entry(dest: 0xAA, tail: "msg")
     let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
     let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }
@@ -343,7 +370,7 @@ private func container(_ entries: [Data]) -> Data {
 @Test @MainActor func propagationNodeEmitsStoredEntriesForPersistence() async {
     let e = entry(dest: 0xAA, tail: "persist-me")
     let tid = LXMFPropagation.transientId(lxmfData: e)
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([e])))
     await store.receive { action in
@@ -367,7 +394,7 @@ private func container(_ entries: [Data]) -> Data {
     let e2 = entry(dest: 0xAA, tail: "bbbb")   // 20 bytes → triggers eviction of e1
     let tid1 = LXMFPropagation.transientId(lxmfData: e1)
     var initial = PropagationNode.State(storageLimitBytes: 25, targetStampCost: 0)
-    let store = TestStore(initialState: initial) { PropagationNode() }
+    let store = TestStore(initialState: initial) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
 
     await store.send(.ingestContainer(container([e1])))
@@ -392,7 +419,7 @@ private func container(_ entries: [Data]) -> Data {
     let tidA1 = LXMFPropagation.transientId(lxmfData: a1)
     let tidA2 = LXMFPropagation.transientId(lxmfData: a2)
     let destA = Data(repeating: 0xAA, count: LXMessage.destinationLength)
-    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() }
+    let store = TestStore(initialState: PropagationNode.State(targetStampCost: 0)) { PropagationNode() } withDependencies: { $0.date = .constant(Date(timeIntervalSince1970: 1700000000)) }
     store.exhaustivity = .off
     await store.send(.ingestContainer(container([a1, a2])))
     await store.receive { if case .delegate(.stored) = $0 { return true }; return false }

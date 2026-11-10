@@ -153,7 +153,7 @@ private func makePeeringNode(pendingCostForPeer: Double? = nil) -> TestStore<PNN
     // One entry the peer accepts and its announce, so a sync proceeds to the key search: with nothing
     // to offer, or no announce, it stops before the search (PNNodeOfferFilterTests).
     let held = Data(repeating: 0xAB, count: 16) + Data("held".utf8)
-    _ = initial.node.store.ingest(container: LXMFPropagation.container(timestamp: 1700000000, entries: [held]))
+    _ = initial.node.store.ingest(container: LXMFPropagation.container(timestamp: 1700000000, entries: [held]), now: Date(timeIntervalSince1970: 1700000000))
     initial.endpoint.transport.learned[peerDest] = LearnedDestination(
         identity: Identity(),
         appData: PNAnnounce(timebase: 0, nodeState: true, perTransferLimit: 256, perSyncLimit: 10240,
