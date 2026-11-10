@@ -30,6 +30,36 @@ import Foundation
     #expect(!NetworkStamp.hashMeets(Data(high), target: target))
 }
 
+/// A 32-byte hash with `leadingZeros` zero bits and then the 34-bit `mantissa` (its top bit is the
+/// leading one), the rest zero.
+private func hash(leadingZeros: Int, mantissa: UInt64) -> Data {
+    var bytes = [UInt8](repeating: 0, count: 32)
+    for k in 0..<34 where mantissa >> UInt64(33 - k) & 1 == 1 {
+        let bit = leadingZeros + k   // counted from the most significant bit
+        bytes[bit / 8] |= UInt8(0x80) >> UInt8(bit % 8)
+    }
+    return Data(bytes)
+}
+
+/// `value` end to end at the bisect_right boundary (RNS/Stamps.py stamp_value: the value is
+/// `((lz + 1) << 8) - bisect_right(TAB, mantissa)`, over 256). A mantissa EQUAL to `tab[i]` takes entry i,
+/// so it is `i + 1` below the ceiling, one more than the mantissa just under it. Computed here from
+/// the table index, not through `tabClimb`.
+@Test func valueAtABisectRightBoundaryTakesTheEqualEntry() {
+    let lz = 10
+    let ceiling = (lz + 1) << 8
+    for index in [0, 1, 2, 100, 255] {
+        let entry = NetworkStamp.tab[index]
+        #expect(NetworkStamp.value(hash: hash(leadingZeros: lz, mantissa: entry))
+                    == Double(ceiling - (index + 1)) / 256, "entry \(index)")
+        // One below: for index 0 no entry is at or below it, otherwise the previous one is.
+        #expect(NetworkStamp.value(hash: hash(leadingZeros: lz, mantissa: entry - 1))
+                    == Double(ceiling - index) / 256, "entry \(index) - 1")
+    }
+    // The all-zero hash is the one special case.
+    #expect(NetworkStamp.value(hash: Data(repeating: 0, count: 32)) == 256)
+}
+
 @Test func tabLookupIsBisectRight() {
     for index in [0, 1, 100, 255] {
         let entry = NetworkStamp.tab[index]

@@ -152,7 +152,8 @@ private func expectedTarget(hex: String, saturated isSaturated: Bool) -> Data {
 
 @Test func networkStampValidityMatchesReference() throws {
     let f = try Fixtures.load()
-    // The reference's own generated stamps at the default announce cost and value, 23.5 and 25.
+    // The reference's own generated stamps at 23.5 (the default destination COST, DESTINATION_COST)
+    // and 25 (the default announce VALUE, DESTINATION_VALUE, used here as a cost too).
     for cost in [23.5, 25.0] {
         let generated = f.generated_cases.filter { $0.cost == cost }
         #expect(!generated.isEmpty, "no generated case at cost \(cost)")
@@ -179,13 +180,14 @@ private func expectedTarget(hex: String, saturated isSaturated: Bool) -> Data {
 @Test func networkStampValidityIsExactlyHashAtOrBelowTarget() throws {
     // Recomputes validity from the raw hash and the target (big-endian hash <= target) and compares it
     // with isValid and with the reference's verdict, on stamps the reference found just under and just
-    // over the target. None of these hashes EQUALS the target, so this does not exercise the equality
-    // case; NetworkStampBoundaryTests pins that.
+    // over the target. None of these hashes EQUALS the target (asserted below), so this does not
+    // exercise the equality case; NetworkStampBoundaryTests pins that.
     for c in try Fixtures.load().edge_validity_cases {
         let material = Data(hexString: c.material)!
         let stamp = Data(hexString: c.stamp)!
         let hash = Crypto.fullHash(material + stamp)
         let target = NetworkStamp.target(fixedPoint: NetworkStamp.fixedPoint(cost: c.cost))
+        #expect(hash != target, "a hash equals its target, so this test now touches the equality case")
         let atOrBelow = !target.lexicographicallyPrecedes(hash)   // big-endian: hash <= target
         #expect(NetworkStamp.isValid(stamp: stamp, cost: c.cost, material: material) == atOrBelow)
         #expect(atOrBelow == c.valid)

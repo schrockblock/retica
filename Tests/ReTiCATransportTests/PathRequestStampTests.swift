@@ -25,7 +25,8 @@ private final class Recorder: Sendable {
 @MainActor
 private func makeStore(_ initial: Transport.State = Transport.State(), clock: TestClock<Duration> = TestClock(),
                        recorder: Recorder = Recorder(),
-                       randomBytes: RandomBytesGenerator = RandomBytesGenerator { _ in tag })
+                       randomBytes: RandomBytesGenerator = RandomBytesGenerator { _ in tag },
+                       pathRequestStampGenerator: PathRequestStampGenerator? = nil)
     -> TestStore<Transport.State, Transport.Action> {
     let store = TestStore(initialState: initial) {
         CombineReducers {
@@ -40,6 +41,7 @@ private func makeStore(_ initial: Transport.State = Transport.State(), clock: Te
         $0.randomBytes = randomBytes
         $0.continuousClock = clock
         $0.transportDate = .constant(Date(timeIntervalSince1970: 1000))
+        if let pathRequestStampGenerator { $0.pathRequestStampGenerator = pathRequestStampGenerator }
     }
     store.exhaustivity = .off
     return store
@@ -193,6 +195,40 @@ private func isPathResponse(_ raw: Data, for dest: Data) -> Bool {
         store.exhaustivity = .off
         await store.finish()
         #expect(recorder.payloads == [newRequest])
+    }
+
+    /// The race the hand-injected test above cannot reach: a search that FINISHES (returns a good stamp)
+    /// after `.cancelPathRequestStamps` cancelled it, because its generator ignores cancellation, must
+    /// still deliver no end action and transmit nothing (the `Task.isCancelled` guard in
+    /// `startPathRequestStampSearch`). The guard is belt and braces: TCA's `Send` also drops an action
+    /// sent from a cancelled task (Effect.swift:192), so this pins the behaviour, and the mutation that
+    /// breaks it is the cancellation itself.
+    @Test func aSearchThatFinishesAfterItsCancelDeliversNoEndAndSendsNothing() async throws {
+        let started = LockIsolated(false)
+        let release = LockIsolated(false)
+        let returned = LockIsolated(false)
+        let recorder = Recorder()
+        var initial = Transport.State()
+        initial.stampPathRequests = true
+        let store = makeStore(initial, recorder: recorder, pathRequestStampGenerator: PathRequestStampGenerator { _, _ in
+            started.setValue(true)
+            // Deliberately ignores cancellation: it waits for the test, then returns a full-length stamp.
+            while !release.value { try? await Task.sleep(for: .milliseconds(2)) }
+            returned.setValue(true)
+            return Data(repeating: 9, count: NetworkStamp.stampLength)
+        })
+        await store.send(.interfaceConnected(InterfaceID("i0")))
+        await store.send(.requestPath(destinationHash: destHash))
+        for _ in 0..<5000 where !started.value { try await Task.sleep(for: .milliseconds(2)) }
+        try #require(started.value, "the search never started")
+        await store.send(.cancelPathRequestStamps)
+        release.setValue(true)
+        for _ in 0..<5000 where !returned.value { try await Task.sleep(for: .milliseconds(2)) }
+        try #require(returned.value, "the generator never returned")
+        store.exhaustivity = .on
+        await store.finish(timeout: .seconds(30))
+        #expect(recorder.searchesEnded.value == 0, "a cancelled search delivered its end")
+        #expect(recorder.payloads.isEmpty, "a cancelled search's request was transmitted")
     }
 
     @Test func aStampedPathRequestIs64BytesAndValidates() async throws {

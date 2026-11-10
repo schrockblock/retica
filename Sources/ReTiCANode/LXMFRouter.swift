@@ -1301,7 +1301,9 @@ extension LXMFRouter.State {
     }
 
     /// Whether `dest` has work that needs a link to it: a pending direct or propagated copy, a queued
-    /// message (or one withdrawn from that queue to be re-stamped), or an outstanding sync. A closed link with work re-establishes; without, its budget ends.
+    /// message (or one withdrawn from that queue to be re-stamped), or an outstanding sync.
+    ///
+    /// A closed link with work re-establishes; one without it ends its retry budget.
     func hasLinkWork(for dest: Data) -> Bool {
         let hasPending = pendingDeliveries.values.contains {
             switch $0.resend {

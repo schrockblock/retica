@@ -2661,9 +2661,16 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
 /// destHash ‖ senderID ‖ tag payload (RNS 1.6.0).
 @Test @MainActor func requestPathBuildsBroadcastPathRequest() async {
     let destHash = Data(repeating: 0x22, count: 16)
+    // Each draw returns different bytes (the request draws its tag first, then a sender ID), so a
+    // payload that swapped the two, or reused one draw for both, would not match.
     let tag = Data(repeating: 0xAB, count: 16)
+    let senderID = Data(repeating: 0xCD, count: 16)
+    let draws = LockIsolated(0)
     let store = TestStore(initialState: Transport.State()) { Transport() } withDependencies: {
-        $0.randomBytes = RandomBytesGenerator { _ in tag }
+        $0.randomBytes = RandomBytesGenerator { count in
+            let n = draws.withValue { $0 += 1; return $0 }
+            return Data(repeating: n == 1 ? 0xAB : n == 2 ? 0xCD : 0xEE, count: count)
+        }
     }
     store.exhaustivity = .off
     await store.send(.interfaceConnected(InterfaceID("i0")))
@@ -2682,7 +2689,8 @@ private func makePathRequest(for destHash: Data, tag: Data = Data(repeating: 0x5
     #expect(p.destinationHash == Transport.pathRequestDestinationHash)
     #expect(Data(p.payload.prefix(16)) == destHash)
     // RNS 1.6.0: even a leaf carries a sender ID (Transport.py:3699).
-    #expect(Data(p.payload.dropFirst(16).prefix(16)) == store.state.pathRequestSenderID)
+    #expect(Data(p.payload.dropFirst(16).prefix(16)) == senderID)
+    #expect(store.state.pathRequestSenderID == senderID)
     #expect(Data(p.payload.dropFirst(32)) == tag)
 }
 

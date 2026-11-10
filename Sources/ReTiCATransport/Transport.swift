@@ -1545,8 +1545,11 @@ public struct Transport {
                         // Entry gate: ignore duplicate (destHash ‖ tag) requests.
                         guard state.discoveryPrTags.insert(requested + tag) else { return .none }
                         // Enforcing, a request without a stamp meeting the receiving interface's
-                        // path-request cost (`resolvedPathRequestCost(on:)`) is neither answered nor forwarded. After the tag gate, as in reference (Transport.py:2088-2129),
-                        // so a refused request still uses up its tag.
+                        // path-request cost (`resolvedPathRequestCost(on:)`) is neither answered
+                        // nor forwarded.
+                        //
+                        // After the tag gate, as in reference (Transport.py:2088-2129), so a
+                        // refused request still uses up its tag.
                         if state.enforceStamps {
                             guard Transport.pathRequestStampMeets(cost: state.resolvedPathRequestCost(on: interfaceID),
                                                                   destinationHash: requested,
@@ -2052,6 +2055,11 @@ public struct Transport {
                 // discoveryPathRequests is relay-only. It is set BEFORE any stamp search, as reference
                 // sets it before enqueueing one (Transport.py:3714).
                 state.pathRequests[destinationHash] = date.now
+                // DIVERGENCE, stamped requests only: with no interface connected the request is
+                // dropped (the entry above stays) and no search starts, so nothing is sent when an
+                // interface connects. Reference enqueues the stamp job whatever is connected
+                // (Transport.py:3713-3716). An unstamped request goes nowhere in either, as a send
+                // with no interface reaches none. LXMFRouter re-requests on its `pathRequestTimer`.
                 let tag = randomBytes(16)                              // request tag (RNS get_random_hash)
                 let senderID: Data
                 if let identityHash = state.transportIdentity?.hash {

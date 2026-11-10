@@ -127,7 +127,8 @@ private let pnProbe = LXMFNode.Action.endpoint(.delegate(.resourceConcluded(link
 
 @MainActor
 private func pnNode(limitKB: Int, stampCost: Double, clock: TestClock<Duration> = TestClock(),
-                    deliveryStampCost: Double? = nil) -> (TestStore<LXMFNode.State, LXMFNode.Action>, Identity) {
+                    deliveryStampCost: Double? = nil,
+                    parkDeliveryStamps: Bool = false) -> (TestStore<LXMFNode.State, LXMFNode.Action>, Identity) {
     let recipient = Identity()
     var state = LXMFNode.State(identity: Identity(),
                                endpoint: TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
@@ -151,6 +152,16 @@ private func pnNode(limitKB: Int, stampCost: Double, clock: TestClock<Duration> 
         $0.date = .constant(Date(timeIntervalSince1970: 1700000000.5))
         $0.uuid = .incrementing
         $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+        if parkDeliveryStamps {
+            // A delivery-stamp search that cannot finish: it suspends until its task is cancelled (the
+            // generator contract), then returns nil. A real cost-20 search is only unlikely to finish.
+            $0.lxmfStampGenerator = LXMFStampGenerator(
+                deliveryStamp: { _, _ in
+                    try? await Task.sleep(for: .seconds(3600))
+                    return nil
+                },
+                propagationPack: LXMFStampGenerator.liveValue.propagationPack)
+        }
     }
     store.exhaustivity = .off
     return (store, recipient)
@@ -390,12 +401,13 @@ private func openedPropagatedCopy(_ store: TestStore<LXMFNode.State, LXMFNode.Ac
 /// its delivery-stamp search (so the router holds nothing for it) must not fail the message — that
 /// copy can still succeed, and did: failing here gave `deliveryFailed` and then a confirmation.
 @Test(.timeLimit(.minutes(1))) @MainActor func pnCopyAbandonWhileTheDeliveryStampIsSearchedDoesNotFailTheMessage() async {
-    // The delivery stamp at cost 20 cannot finish during the test, so its search is deterministically
-    // in flight when the abandon lands. Its eventual hand-over is then played by sending the
-    // `.router(.send)` it would deliver. A fallback cannot start while that search runs, so the
-    // pending propagated copy (from an earlier attempt's hand-off, say) is marked directly.
+    // The delivery stamp search is parked (the generator suspends until cancelled), so it is
+    // deterministically in flight when the abandon lands: a real cost-20 search merely usually runs
+    // for minutes, and occasionally finished and flaked this test. Its eventual hand-over is played
+    // by sending the `.router(.send)` it would deliver. A fallback cannot start while that search
+    // runs, so the pending propagated copy (from an earlier attempt's hand-off, say) is marked directly.
     let (store, _) = pnNode(limitKB: 0, stampCost: LXMFPropagation.maxPropagationStampCost,
-                            deliveryStampCost: LXMFNode.maxDeliveryStampCost)
+                            deliveryStampCost: LXMFNode.maxDeliveryStampCost, parkDeliveryStamps: true)
     let m = note()
     await store.send(.sendMessage(message: m, fallbackToPropagation: false))
     await store.send(.router(.propagatedCopyPending(messageHash: m.hash)))

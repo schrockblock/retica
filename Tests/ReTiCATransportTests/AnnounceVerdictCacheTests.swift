@@ -190,6 +190,26 @@ private func parses(_ store: TestStore<Transport.State, Transport.Action>, _ id:
         #expect(lenient.state.knownDestinations[low.destinationHash]?.linkCost != nil, "and meets the 9 of lo")
     }
 
+    /// The enforcement check on a cached-VALID hit (Identity.py:776-785). It matters only if enforcement
+    /// changes while the cache is live (reference fixes it for the process, `Transport.State.enforceStamps`
+    /// is a plain var): an announce cached valid UNenforced, with no stamp, is refused once enforcing,
+    /// without a parse, while a stamped one cached the same way is still served.
+    @Test func aCachedValidUnstampedAnnounceIsRefusedOnceEnforcingWithoutAParse() async throws {
+        let (raw, _) = makeAnnounce()
+        let plain = try #require(Packet(raw: raw))
+        var cache = AnnounceVerdictCache()
+        #expect(cache.resolve(plain, cost: 23.5, enforce: false) != nil)
+        try #require(cache.valid[AnnounceVerdictCache.Key(plain)] != nil, "cached valid")
+        let counter = Identity.LockedCounter()
+        let enforced = Announce.$parseProbe.withValue(counter) { cache.resolve(plain, cost: 23.5, enforce: true) }
+        #expect(enforced == nil, "no stamp, so refused once enforcing")
+        #expect(counter.value == 0, "decided from the cache, not by parsing")
+
+        let stamped = try #require(Packet(raw: try StampedAnnounce.load("stripped").raw()))
+        #expect(cache.resolve(stamped, cost: 23.5, enforce: false) != nil)
+        #expect(cache.resolve(stamped, cost: 23.5, enforce: true) != nil, "a stamp that met the cost is served enforcing")
+    }
+
     @Test func the129thEntryEvictsTheOldest() async throws {
         let store = makeStore()
         let bad = (0...128).map { _ in forged(makeAnnounce().0) }
