@@ -97,7 +97,7 @@ let package = Package(
                 .product(name: "FCBComposable", package: "FCB"),
                 .product(name: "CoreBluetoothMock", package: "IOS-CoreBluetooth-Mock"),
             ],
-            resources: [.process("Vectors/ble_fixtures.json"), .process("Vectors/meshtastic_fixtures.json"), .process("Vectors/meshtastic_our_split.json"), .process("Vectors/meshcore_fixtures.json"), .process("Vectors/meshcore_our_split.json"), .process("Vectors/autointerface_fixtures.json")]
+            resources: [.process("Vectors/ble_fixtures.json"), .process("Vectors/meshtastic_fixtures.json"), .process("Vectors/meshtastic_our_split.json"), .process("Vectors/meshcore_fixtures.json"), .process("Vectors/meshcore_our_split.json"), .process("Vectors/autointerface_fixtures.json"), .process("Vectors/autointerface_traces.json")]
         ),
         .target(
             name: "ReTiCATransport",

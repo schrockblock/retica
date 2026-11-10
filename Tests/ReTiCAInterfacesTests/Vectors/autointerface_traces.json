@@ -1,0 +1,2319 @@
+{
+ "traces": [
+  {
+   "name": "discovery",
+   "group_id_hex": "7265746963756c756d",
+   "nics": [
+    {
+     "name": "en0",
+     "index": 4,
+     "addrs": [
+      "fe80::1"
+     ]
+    },
+    {
+     "name": "en1",
+     "index": 5,
+     "addrs": [
+      "fe80::2"
+     ]
+    }
+   ],
+   "steps": [
+    {
+     "t": 0.5,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::aa",
+     "payload": "b36f5417465f5d55743ac9da95dbbf1f0af357110f38282c5c6f0fccbcc8a07b"
+    },
+    {
+     "t": 1.0,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::1",
+     "payload": "97b25576749ea936b0d8a8536ffaf442d157cf47d460dcf13c48b7bd18b6c163"
+    },
+    {
+     "t": 1.92,
+     "kind": "final_init"
+    },
+    {
+     "t": 2.0,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::aa",
+     "payload": "b36f5417465f5d55743ac9da95dbbf1f0af357110f38282c5c6f0fccbcc8a07b"
+    },
+    {
+     "t": 2.5,
+     "kind": "discovery",
+     "nic": "en1",
+     "plane": "unicastDiscovery",
+     "src": "fe80::aa",
+     "payload": "b36f5417465f5d55743ac9da95dbbf1f0af357110f38282c5c6f0fccbcc8a07b"
+    },
+    {
+     "t": 3.0,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::bb",
+     "payload": "df9b422426659e5ec7eab648fe7d39b1550d1960c6889dcb9124d9299833e0a9"
+    },
+    {
+     "t": 3.125,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::bb",
+     "payload": "a2409d7ada465f5356059a111e60bdc9993c986b7d2ade2430d042d23fdc47"
+    },
+    {
+     "t": 3.25,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::bb",
+     "payload": "2ee8848c7b660717ba9562be0a167b905900135e9c17b27d81cc5421ca75e6b1"
+    },
+    {
+     "t": 3.375,
+     "kind": "discovery",
+     "nic": "en1",
+     "plane": "multicastDiscovery",
+     "src": "fe80::bb",
+     "payload": "a2409d7ada465f5356059a111e60bdc9993c986b7d2ade2430d042d23fdc47a5010203"
+    },
+    {
+     "t": 3.5,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::1",
+     "payload": "97b25576749ea936b0d8a8536ffaf442d157cf47d460dcf13c48b7bd18b6c163"
+    },
+    {
+     "t": 3.625,
+     "kind": "discovery",
+     "nic": "en1",
+     "plane": "multicastDiscovery",
+     "src": "fe80::1",
+     "payload": "97b25576749ea936b0d8a8536ffaf442d157cf47d460dcf13c48b7bd18b6c163"
+    },
+    {
+     "t": 3.75,
+     "kind": "discovery",
+     "nic": "en1",
+     "plane": "unicastDiscovery",
+     "src": "fe80::2",
+     "payload": "2c0b6da352f65df10800f562d37e0d78c0e89124a902b9ef35857752a98d90a8"
+    },
+    {
+     "t": 3.875,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::1",
+     "payload": "b36f5417465f5d55743ac9da95dbbf1f0af357110f38282c5c6f0fccbcc8a07b"
+    },
+    {
+     "t": 3.9375,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::aa",
+     "payload": ""
+    }
+   ],
+   "results": [
+    {
+     "peers": {},
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": false,
+     "delivered": null
+    },
+    {
+     "peers": {},
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": false,
+     "delivered": null
+    },
+    {
+     "peers": {},
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.0
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      },
+      "fe80::bb": {
+       "nic": "en1",
+       "last_heard": 3.375
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      },
+      "fe80::bb": {
+       "nic": "en1",
+       "last_heard": 3.375
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 3.5,
+       "initial": 3.5
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      },
+      "fe80::bb": {
+       "nic": "en1",
+       "last_heard": 3.375
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 3.625,
+       "initial": 3.5
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      },
+      "fe80::bb": {
+       "nic": "en1",
+       "last_heard": 3.375
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 3.625,
+       "initial": 3.5
+      },
+      "en1": {
+       "last": 3.75,
+       "initial": 3.75
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      },
+      "fe80::bb": {
+       "nic": "en1",
+       "last_heard": 3.375
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 3.625,
+       "initial": 3.5
+      },
+      "en1": {
+       "last": 3.75,
+       "initial": 3.75
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.5
+      },
+      "fe80::bb": {
+       "nic": "en1",
+       "last_heard": 3.375
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 3.625,
+       "initial": 3.5
+      },
+      "en1": {
+       "last": 3.75,
+       "initial": 3.75
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    }
+   ]
+  },
+  {
+   "name": "dedupe",
+   "group_id_hex": "7265746963756c756d",
+   "nics": [
+    {
+     "name": "en0",
+     "index": 4,
+     "addrs": [
+      "fe80::1"
+     ]
+    },
+    {
+     "name": "en1",
+     "index": 5,
+     "addrs": [
+      "fe80::2"
+     ]
+    }
+   ],
+   "steps": [
+    {
+     "t": 1.0,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "4f787ece7bc96281794beed6cef45f89a60288805e061dd637e0c8512e772c88acb625c6787c1ebb"
+    },
+    {
+     "t": 1.92,
+     "kind": "final_init"
+    },
+    {
+     "t": 2.0,
+     "kind": "discovery",
+     "nic": "en0",
+     "plane": "multicastDiscovery",
+     "src": "fe80::aa",
+     "payload": "b36f5417465f5d55743ac9da95dbbf1f0af357110f38282c5c6f0fccbcc8a07b"
+    },
+    {
+     "t": 2.0625,
+     "kind": "discovery",
+     "nic": "en1",
+     "plane": "multicastDiscovery",
+     "src": "fe80::ab",
+     "payload": "5ceefd92f409a88945fe693374c391dad20af32a6dee8d395d1072b436d413f0"
+    },
+    {
+     "t": 3.0,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "4f787ece7bc96281794beed6cef45f89a60288805e061dd637e0c8512e772c88acb625c6787c1ebb"
+    },
+    {
+     "t": 3.125,
+     "kind": "data",
+     "src": "fe80::ab",
+     "payload": "4f787ece7bc96281794beed6cef45f89a60288805e061dd637e0c8512e772c88acb625c6787c1ebb"
+    },
+    {
+     "t": 3.5,
+     "kind": "data",
+     "src": "fe80::ab",
+     "payload": "26d52cec216b9e08b85afecfaba661fee00b20611490156833c05ac2c34587dacc677ff24a65d0d4"
+    },
+    {
+     "t": 3.75,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "4f787ece7bc96281794beed6cef45f89a60288805e061dd637e0c8512e772c88acb625c6787c1ebb"
+    },
+    {
+     "t": 3.8125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "4f787ece7bc96281794beed6cef45f89a60288805e061dd637e0c8512e772c88acb625c6787c1ebb"
+    },
+    {
+     "t": 3.875,
+     "kind": "data",
+     "src": "fe80::cc",
+     "payload": "ce3fffdc0671f765cf72338dd66109932a869b90945249baac775d6c5c97c807a03f9b0feb324d86"
+    },
+    {
+     "t": 5.0,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "1a4ee5bf0f66035e5777acfcf884660f859cc4ef9f25ff351c3d10a67a07d28b5dc7eec0ca50a9f3"
+    },
+    {
+     "t": 5.0009765625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "a21fc46300fbbb0c5957cceafa56d9e5cd6bc09585c41a36a40a59264d9e2881d0cbe6daeb206ce4"
+    },
+    {
+     "t": 5.001953125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "889681a1b1ecf2f4fca902987a7340304e942a422f33f738b58178a81fdab50720567f04e8723d2b"
+    },
+    {
+     "t": 5.0029296875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "d15a134c0e5b40287d2c4a5e67ed5ac71838e12cdb65ad6650da9f01f23c468ca15c0ec1849bbef3"
+    },
+    {
+     "t": 5.00390625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "d218782f2c43eefa8c997b3a7282eb3d7e93da08cb27d65083a517cc975a7b56007517b352c6f0a2"
+    },
+    {
+     "t": 5.0048828125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "77baa075e6689a1f426f893466214ab6964808b47e0fd6fe14282366bd5277d761e053e349fe51e5"
+    },
+    {
+     "t": 5.005859375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "d22b702987c8263792313434625437b8bd8a38e9403f26d6820fc22e200a2132b407ee9fddc7376a"
+    },
+    {
+     "t": 5.0068359375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "51f592592f83dda07463ae362109809359dbf4e6d0de5638a68f034928730edb97b8013bbbd1db07"
+    },
+    {
+     "t": 5.0078125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "eba53e434042446440d8af957b371565d4a48947ab789572f5cf2c9f885ae9c9ebcf323abb44e9d6"
+    },
+    {
+     "t": 5.0087890625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "09f2189246e58782ecc1c7d21197442688cf3a343f81ecb3859166c8951316bea3f00da2098a3ffe"
+    },
+    {
+     "t": 5.009765625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "356ea6bf958a8a642e172b95aa7330974b7f240f4faf32b35cd9bf9d14225a16628baf2cb3e9824f"
+    },
+    {
+     "t": 5.0107421875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "a03cd64412a36eff0f842af556221045827d247ba88db83f17782afe160227d66f17bd6388866ab8"
+    },
+    {
+     "t": 5.01171875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "4c6ec60b773d3bb12fcaeaaaad02f723ad8bb253161b286fec722681f10810a155b96602acd6ef75"
+    },
+    {
+     "t": 5.0126953125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "0234f84316295d8799ea1036b2a41ac68d0a468691380d53fa29d8d660e4be56b862dc9df1c7bd42"
+    },
+    {
+     "t": 5.013671875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "5391a8438f1e88ed9632d66a6b5d7971e5ee270e9bc5d560352b4c053ca8cb3e30e44d3510127d88"
+    },
+    {
+     "t": 5.0146484375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "8d44840150b3665f63bae7dea6951ed86b06ff0a18d1c8a84d44607e8edda4e3c8256e6b3c7cffa4"
+    },
+    {
+     "t": 5.015625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "e8e8b1de89109c3fd84a36d8d0198ce226b5fd5432ecdb27dea421644f18fca28681f165405dc351"
+    },
+    {
+     "t": 5.0166015625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "65881743737af54d096fe1faf2b9305ebb9193a73a72d0dff16511e7230421f8a73bdc9d2f842b47"
+    },
+    {
+     "t": 5.017578125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "08c4f2af2b07969fe9ea6c548c9eae6ace97d71c4123d5a44b245ce0cbe753a00be1a05a374e3bbe"
+    },
+    {
+     "t": 5.0185546875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "fac92edd35d546cf2af57cb09d0f2c185963f244d1475f6e9f664e1b12098da24deb9ecc577069d3"
+    },
+    {
+     "t": 5.01953125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "aca644b0ebb1231bb943db8614d0b367f4361b0b28a8a4bdd1b6a3bb7dc460779dc06b08445e8c60"
+    },
+    {
+     "t": 5.0205078125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "32d74f3a1f3401e76df776377be0ff49adbc0ada9c0a95b04df7314be1e15e9da5c71f302eb5d822"
+    },
+    {
+     "t": 5.021484375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "6cba472a01655606cc0c69b3c3834a680471a2c7285b3df0e251fc831441dea4750d3fae4c1156a7"
+    },
+    {
+     "t": 5.0224609375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "7ba37324107da39b54f3e7175fa5e6d6e2edaf7f5597e83df8cea50c3a4c9e809c44e489eb525c59"
+    },
+    {
+     "t": 5.0234375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "fac52c27891e5cbbd0c0fd042ac92ff2ca7e4c2e0d0d388c6a1e784b8a0df3330a13638cece6e651"
+    },
+    {
+     "t": 5.0244140625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "575837a96cbd2877bbc9ec37c6bbc0fddff4edb9b966436ead1079350848dfae69427b04d0672fd1"
+    },
+    {
+     "t": 5.025390625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "c6aa71b99391cad99f75c2ff2fb98661fd77f9de1b028ac377e65b9cb079aeac827ab49052be3114"
+    },
+    {
+     "t": 5.0263671875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "21dba419ede904a7754e76f7e9a2609e817e7cd257dd39643f3f2d50e312f46386d191098f9a6541"
+    },
+    {
+     "t": 5.02734375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "bf446a7e2a1f6da78d28f77498184f157cc3a03aa2e8ceea4d7bdb21c50ac894c28e32b7eb5e23f5"
+    },
+    {
+     "t": 5.0283203125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "a947845a69be148844284e811b8cc72fc2464ddfc068bc4ddef4aa347874ff44a62697b239bc8adf"
+    },
+    {
+     "t": 5.029296875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "d6488194e1d997be19b6a82a4caac4210ae73fcbdceb60ca4d2aba09ff2c8b260363a693e8a3c03f"
+    },
+    {
+     "t": 5.0302734375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "1e6e0cd7fc4d0b84b0a28ec7759cf0aeee06ef47b13cd8218f99a24b36bd84867b4b1c98809c3517"
+    },
+    {
+     "t": 5.03125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "41baa1e7ec56223bd97a9977b8be42101e8c155b5f368fd70ce4069c36b2015af92da942b095c16f"
+    },
+    {
+     "t": 5.0322265625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "e05702a485db734b233798361fb682cecae34ed5d77817650ce22cebda0f178de18ef41cd07fb290"
+    },
+    {
+     "t": 5.033203125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "0d694dc4fe51d5abe52d478eef86fc15a7bca6f1f9ae3a9d454e0c33446175ea1ca9846e6cd2011b"
+    },
+    {
+     "t": 5.0341796875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "77a01f7d8be922e1e4f5293f07fbdf533cd8b4d2d6ebec0e3464be7cb3f42d466306aa04a534b7a4"
+    },
+    {
+     "t": 5.03515625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "45f40bdcab700e7959af4286dd7e59b0c7a00d329c4631b3258c88a7bbe87f45f23bf1554e27f20e"
+    },
+    {
+     "t": 5.0361328125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "8822646267bf9cca4b73f3bb352efeb460ac47b73dc6a3db0732243aad3b10b368dfa4a6595c565a"
+    },
+    {
+     "t": 5.037109375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "ed270b097855b2e1cea1bdb2cd1fb5547cbb7b52b6f7c8ed3fc482eb94f8223bc96db1a199291e81"
+    },
+    {
+     "t": 5.0380859375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "7e10e201f179a895a4ef2ff89910eea07145d4a5459ba0f1fb0baab9a76bbb86d138717b68a09942"
+    },
+    {
+     "t": 5.0390625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "f0a2a007397f99ca6614d378f6e802d095830f175a1a7adc22a12e4a15d6450e2a770cf365510efb"
+    },
+    {
+     "t": 5.0400390625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "a5bb1d6f8abb286e5102645b168ba3fbde18d94805a8464149e4d6b2202ef68673e96adc97ac222d"
+    },
+    {
+     "t": 5.041015625,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "1e061fd4b9c4426d38c95e23a38e6c21489f5f43d4505aec95dd8415ed296abe55572724d14c6550"
+    },
+    {
+     "t": 5.0419921875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "4dd99e9873a3b571a4d0dd52d8ed8f42a676c539ac73b3f9abd5f53682a0696369288a6e36f475d3"
+    },
+    {
+     "t": 5.04296875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "5801d9281791c040d1498a891801914573c0ea8d63e62850a1f4f5647c1e84ad15f4bdddf9b37951"
+    },
+    {
+     "t": 5.0439453125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "48b56f457cda2a7af8e4cf0e3710d5dc1fe72fffdbca9f2a47ce5b5e8205d97dd68afa674ae4db5e"
+    },
+    {
+     "t": 5.044921875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "d34deb66d3bd380efeee897fcba79d7397407ce4c867fc602289daee93a20a9268d5c543d48125bb"
+    },
+    {
+     "t": 5.0458984375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "c3b4bab6e62e32ce50bf1ce6f3d27791ad394f695b1888a00e39eb63d0e509235212c1f5c479ea65"
+    },
+    {
+     "t": 5.125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "1a4ee5bf0f66035e5777acfcf884660f859cc4ef9f25ff351c3d10a67a07d28b5dc7eec0ca50a9f3"
+    },
+    {
+     "t": 5.1875,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "592c0e9286dd0a67e8ac59752df4585ead23202915071c020b701006f41c3ca93282b8d113922824"
+    },
+    {
+     "t": 5.25,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "1a4ee5bf0f66035e5777acfcf884660f859cc4ef9f25ff351c3d10a67a07d28b5dc7eec0ca50a9f3"
+    },
+    {
+     "t": 5.3125,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "a21fc46300fbbb0c5957cceafa56d9e5cd6bc09585c41a36a40a59264d9e2881d0cbe6daeb206ce4"
+    },
+    {
+     "t": 5.375,
+     "kind": "data",
+     "src": "fe80::aa",
+     "payload": "c3b4bab6e62e32ce50bf1ce6f3d27791ad394f695b1888a00e39eb63d0e509235212c1f5c479ea65"
+    }
+   ],
+   "results": [
+    {
+     "peers": {},
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": false,
+     "delivered": false
+    },
+    {
+     "peers": {},
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.0
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 2.0
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 2.0625
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": null
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 3.0
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 2.0625
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 3.0
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 2.0625
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": false
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 3.0
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 3.75
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 3.75
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": false
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 3.75
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": false
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0009765625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.001953125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0029296875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.00390625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0048828125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.005859375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0068359375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0078125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0087890625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.009765625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0107421875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.01171875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0126953125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.013671875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0146484375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.015625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0166015625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.017578125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0185546875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.01953125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0205078125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.021484375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0224609375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0234375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0244140625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.025390625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0263671875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.02734375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0283203125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.029296875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0302734375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.03125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0322265625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.033203125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0341796875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.03515625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0361328125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.037109375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0380859375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0390625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0400390625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.041015625
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0419921875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.04296875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0439453125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.044921875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0458984375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.0458984375
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": false
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.1875
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.25
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.3125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": true
+    },
+    {
+     "peers": {
+      "fe80::aa": {
+       "nic": "en0",
+       "last_heard": 5.3125
+      },
+      "fe80::ab": {
+       "nic": "en1",
+       "last_heard": 3.5
+      }
+     },
+     "echoes": {
+      "en0": {
+       "last": 0.0,
+       "initial": null
+      },
+      "en1": {
+       "last": 0.0,
+       "initial": null
+      }
+     },
+     "accepting": true,
+     "delivered": false
+    }
+   ]
+  }
+ ]
+}
