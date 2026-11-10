@@ -885,6 +885,29 @@ private func sentPacket(_ store: TestStore<Transport.State, Transport.Action>, _
     #expect(p.transportId == relayHash)
 }
 
+/// `Packet.encryptedMDU` is the largest plaintext a relay's HEADER_2 packet carries: 383 bytes
+/// encrypt to a 499-byte packet; 384 pad to another AES block, 515 bytes, refused as too large.
+/// LXMF's opportunistic limit rests on this (the field report: wire size 402 B never sent).
+@Test @MainActor func encryptedMDUIsTheLargestPlaintextUnderARelayHeader() async {
+    let relayHash = Data(repeating: 0x43, count: 16)
+    let (store, destHash) = await storeWithPathAnnouncedVia(relayHash, hops: 1)
+    let captured = LockIsolated<Data?>(nil)
+    await store.send(.send(destinationHash: destHash, plaintext: Data(repeating: 0x41, count: Packet.encryptedMDU)))
+    await store.receive { action in
+        if case let .delegate(.transmit(_, raw)) = action { captured.setValue(raw); return true }
+        return false
+    }
+    guard let raw = captured.value, let p = Packet(raw: raw) else {
+        Issue.record("no packet transmitted for \(Packet.encryptedMDU) bytes of plaintext")
+        return
+    }
+    #expect(p.headerType == .header2)
+    #expect(raw.count == 499)
+
+    await store.send(.send(destinationHash: destHash, plaintext: Data(repeating: 0x41, count: Packet.encryptedMDU + 1)))
+    await store.receive(.delegate(.sendFailed(destinationHash: destHash, reason: .tooLarge)))
+}
+
 /// The relay's half of the same rule (reference `Transport.inbound`, remaining_hops == 1 strips
 /// the transport header): a destination this relay learned at on-wire hops 0 behind another
 /// transport instance is the final hop, so the packet goes out HEADER_1.

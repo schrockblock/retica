@@ -11,6 +11,12 @@ public enum PacketError: Error, Equatable {
 public struct Packet: Equatable {
     public static let mtu = 500
     public static let addressLength = 16   // TRUNCATED_HASHLENGTH / 8
+    /// The largest plaintext a SINGLE destination's packet carries under ANY header: RNS
+    /// `Packet.ENCRYPTED_MDU` = floor((MTU − HEADER_MAXSIZE − IFAC_MIN − TOKEN_OVERHEAD −
+    /// KEYSIZE/16) / AES block) × AES block − 1 = floor((500 − 35 − 1 − 48 − 32) / 16) × 16 − 1.
+    /// One byte more pads to another AES block, and the packet only fits HEADER_1: with a relay's
+    /// HEADER_2 it is 515 bytes.
+    public static let encryptedMDU = 383
     public static let maxHops: UInt8 = 128 // PATHFINDER_M
 
     public var headerType: HeaderType

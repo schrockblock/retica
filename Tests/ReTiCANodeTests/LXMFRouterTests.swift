@@ -152,6 +152,25 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.directLinks[big.destinationHash] == .establishing)
 }
 
+/// The field report's message: wire size 402 B. It fits reference LXMF's opportunistic limit but no
+/// relay header, so the router opens a link instead of sending a packet every retry would fail.
+@Test @MainActor func routerSendsAWireSize402MessageDirect() async {
+    let probe = makeMessage(source: Identity(), content: String(repeating: "x", count: 300))
+    let source = Identity()
+    let msg = makeMessage(source: source, content: String(repeating: "x", count: 300 + 402 - probe.packed.count))
+    #expect(msg.packed.count == 402)
+    var initial = LXMFRouter.State()
+    initial.knownPaths.insert(msg.destinationHash)
+    let store = TestStore(initialState: initial) { LXMFRouter() }
+    store.exhaustivity = .off
+    await store.send(.send(message: msg, desiredMethod: .opportunistic))
+    await store.receive { action in
+        if case let .delegate(.requestLink(dest)) = action { #expect(dest == msg.destinationHash); return true }
+        return false
+    }
+    #expect(store.state.directLinks[msg.destinationHash] == .establishing)
+}
+
 @Test @MainActor func routerDirectWithNoLinkRequestsAndQueues() async {
     let msg = makeMessage(source: Identity(), content: "direct")
     var initial = LXMFRouter.State()

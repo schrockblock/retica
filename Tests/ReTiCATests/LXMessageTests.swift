@@ -183,7 +183,7 @@ import Foundation
     #expect(large.opportunisticFits == false)
 }
 
-/// Boundary at exactly encryptedPacketMDU (opportunisticPayload.count == MDU → fits; +1 → not).
+/// Boundary at exactly RNS ENCRYPTED_MDU (opportunisticPayload.count == 383 → fits; +1 → not).
 @Test func opportunisticFitsBoundary() {
     let source = Identity()
     let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
@@ -192,11 +192,33 @@ import Foundation
                          title: Data(), content: Data(repeating: 0x41, count: n))
     }
     let probeLen = 300   // bin16 range → +1 content == +1 opportunisticPayload byte
-    let atMduLen = probeLen + (LXMessage.encryptedPacketMDU - msg(probeLen).opportunisticPayload.count)
+    let atMduLen = probeLen + (383 - msg(probeLen).opportunisticPayload.count)
     let atMdu = msg(atMduLen)
-    #expect(atMdu.opportunisticPayload.count == LXMessage.encryptedPacketMDU)
+    #expect(atMdu.opportunisticPayload.count == 383)
     #expect(atMdu.opportunisticFits == true)
     let overMdu = msg(atMduLen + 1)
-    #expect(overMdu.opportunisticPayload.count == LXMessage.encryptedPacketMDU + 1)
+    #expect(overMdu.opportunisticPayload.count == 384)
     #expect(overMdu.opportunisticFits == false)
+}
+
+/// The field report: wire size (packed) 402 B failed to send to a recipient behind a relay and
+/// 372 B delivered. Packed 400...407 (payload 384...391) fit reference LXMF's 391-byte limit but
+/// only a HEADER_1 packet; they go direct now. Packed 399 is the largest single packet.
+@Test func opportunisticFitsByWireSize() {
+    let source = Identity()
+    let destHash = LXMessage.deliveryHash(identityHash: Identity().hash)
+    func msg(packed target: Int) -> LXMessage {
+        let probe = LXMessage.create(source: source, destinationHash: destHash, timestamp: 1700000000.5,
+                                     title: Data(), content: Data(repeating: 0x41, count: 300))
+        let m = LXMessage.create(source: source, destinationHash: destHash, timestamp: 1700000000.5,
+                                 title: Data(),
+                                 content: Data(repeating: 0x41, count: 300 + target - probe.packed.count))
+        #expect(m.packed.count == target)
+        return m
+    }
+    #expect(msg(packed: 372).opportunisticFits == true)
+    #expect(msg(packed: 399).opportunisticFits == true)
+    #expect(msg(packed: 400).opportunisticFits == false)
+    #expect(msg(packed: 402).opportunisticFits == false)
+    #expect(msg(packed: 407).opportunisticFits == false)
 }
