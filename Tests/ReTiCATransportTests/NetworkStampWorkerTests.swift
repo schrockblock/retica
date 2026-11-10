@@ -346,6 +346,100 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         await store.finish()
     }
 
+    /// Review Focus: re-announcing a destination whose stamped announce is queued keeps one queued
+    /// item for it, at the back (Transport.py:111-119).
+    @Test func reAnnouncingAQueuedDestinationKeepsOneQueuedItemAtTheBack() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let a = newDestination("a")
+        let b = newDestination("b")
+        let c = newDestination("c")
+        await store.send(.interfaceConnected(i0))
+        for d in [a, b, c] { await store.send(.registerLocalDestination(d)) }
+        await store.send(.announce(destinationHash: a.hash, appData: nil))      // A's search runs
+        await store.send(.announce(destinationHash: b.hash, appData: Data([0x01])))
+        await store.send(.announce(destinationHash: c.hash, appData: nil))
+        await store.send(.announce(destinationHash: b.hash, appData: Data([0x02])))
+        await store.send(.announce(destinationHash: b.hash, appData: Data([0x03])))
+        #expect(store.state.queuedStampedAnnounces.map(\.destinationHash) == [c.hash, b.hash])
+        #expect(store.state.queuedStampedAnnounces.last?.kind == .announce(appData: Data([0x03]), interface: nil))
+
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// The announce queue holds 32 and the item being searched is not one of them (reference pops it,
+    /// Transport.py:122-132). The 33rd queued announce is dropped and starts no search. Re-announcing a
+    /// queued destination into the full queue still succeeds, as reference removes the same-key item
+    /// before the size check (Transport.py:111-117). The running item's own re-announce is not
+    /// queued, so the full queue does not drop it.
+    @Test func aFullAnnounceQueueDropsTheNewItemAndTheRunningItemDoesNotCountTowardIt() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let a = newDestination("a")
+        let others = (0..<33).map { newDestination("d\($0)") }
+        await store.send(.interfaceConnected(i0))
+        for d in [a] + others { await store.send(.registerLocalDestination(d)) }
+        #expect(Transport.stampedAnnounceQueueLimit == 32)
+        await store.send(.announce(destinationHash: a.hash, appData: nil))
+        let runningSequence = try #require(store.state.pendingStampedAnnounces.first?.sequence)
+        for d in others[0..<32] { await store.send(.announce(destinationHash: d.hash, appData: nil)) }
+        #expect(store.state.queuedStampedAnnounces.map(\.destinationHash) == others[0..<32].map(\.hash),
+                "32 wait behind the running item")
+        #expect(store.state.pendingStampedAnnounces.count == 33)
+
+        // The 33rd is dropped, and no search starts for it.
+        await store.send(.announce(destinationHash: others[32].hash, appData: nil))
+        #expect(!store.state.pendingStampedAnnounces.contains { $0.destinationHash == others[32].hash })
+        #expect(store.state.stampingDestinations == [a.hash])
+        #expect(gate.started.value == [material(a)])
+
+        // A replacement into the full queue succeeds, at the back.
+        await store.send(.announce(destinationHash: others[5].hash, appData: Data([0x09])))
+        #expect(store.state.queuedStampedAnnounces.count == 32)
+        #expect(store.state.queuedStampedAnnounces.last?.destinationHash == others[5].hash)
+        #expect(store.state.queuedStampedAnnounces.last?.kind == .announce(appData: Data([0x09]), interface: nil))
+
+        // The running destination's own announce is not queued, so the full queue does not drop it:
+        // it takes over the running item's place.
+        await store.send(.announce(destinationHash: a.hash, appData: Data([0x0A])))
+        #expect(store.state.pendingStampedAnnounces.count == 33)
+        #expect(store.state.queuedStampedAnnounces.count == 32)
+        let running = try #require(store.state.pendingStampedAnnounces.first { $0.destinationHash == a.hash })
+        #expect(running.kind == .announce(appData: Data([0x0A]), interface: nil))
+        #expect(running.sequence > runningSequence)
+        #expect(store.state.stampingItemSequence == running.sequence)
+
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// A re-announce of the running item's key takes over its place (DIVERGENCE: reference would send
+    /// both): one announce, with the newest app data, goes out when the stamp exists.
+    @Test func aReAnnounceOfTheRunningItemTakesItsPlace() async throws {
+        let gate = SearchGate()
+        let recorder = Recorder()
+        let store = makeStore(gate, recorder: recorder)
+        let a = newDestination("a")
+        await store.send(.interfaceConnected(i0))
+        await store.send(.registerLocalDestination(a))
+        await store.send(.announce(destinationHash: a.hash, appData: Data([0x01])))
+        await store.send(.announce(destinationHash: a.hash, appData: Data([0x02])))
+        #expect(store.state.pendingStampedAnnounces.count == 1)
+        #expect(store.state.queuedStampedAnnounces.isEmpty, "the running item is not queued")
+        #expect(store.state.stampingDestinations == [a.hash])
+
+        gate.finish(material(a))
+        await receiveDestinationEnd(store, a.hash)
+        await store.skipReceivedActions(strict: false)
+        let sent = recorder.packets.filter { $0.packetType == .announce && $0.destinationHash == a.hash }
+        #expect(sent.map { Data($0.payload.dropFirst(148).dropLast(18)) } == [Data([0x02])])
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
     @Test func aNewerPathRequestReplacesTheQueuedOneWithItsTagAndGoesToTheBack() async throws {
         let gate = SearchGate()
         let recorder = Recorder()

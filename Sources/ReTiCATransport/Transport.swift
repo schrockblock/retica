@@ -166,6 +166,20 @@ public struct Transport {
         /// picked in arrival order between them.
         var networkStampSequence: UInt64 = 0
 
+        /// Arrival number of the `pendingStampedAnnounces` item the running destination search was
+        /// started for. Reference pops the item it works on out of its queue (`WorkerQueues.get`,
+        /// Transport.py:122-132), so that item no longer counts toward the 32. A same-key re-announce
+        /// replaces it and takes over its place (see `waitForStamp`). Only meaningful while `stampingDestinations` is
+        /// non-empty: a later search overwrites it.
+        var stampingItemSequence: UInt64?
+
+        /// What waits in the destination-stamp queue: `pendingStampedAnnounces` less the item whose
+        /// search runs now.
+        var queuedStampedAnnounces: [PendingStampedAnnounce] {
+            guard !stampingDestinations.isEmpty, let running = stampingItemSequence else { return pendingStampedAnnounces }
+            return pendingStampedAnnounces.filter { $0.sequence != running }
+        }
+
         /// True while a network stamp search runs or anything waits for one.
         public var hasNetworkStampWork: Bool {
             !stampingPathRequests.isEmpty || !stampingDestinations.isEmpty
@@ -228,7 +242,8 @@ public struct Transport {
         /// Announces and path responses waiting for their destination's stamp (reference
         /// `stamp_queues`, Transport.py:1453-1463), in arrival order: those whose search runs now
         /// and those whose search has not started. At most one announce per destination and target
-        /// interface (the newest, moved to the back), and bounded overall by
+        /// interface (the newest, moved to the back), and bounded overall, not counting the item whose
+        /// search runs (`queuedStampedAnnounces`), by
         /// `Transport.stampedAnnounceQueueLimit` and `Transport.stampedPathResponseQueueLimit` (the
         /// latter shared with `queuedPathRequestStamps`); dropped if the search ends without a stamp.
         /// The worker starts a destination's search when that destination's oldest path response is
@@ -945,6 +960,7 @@ public struct Transport {
                         state.pendingStampedAnnounces.removeAll { $0.destinationHash == hash }
                         continue
                     }
+                    state.stampingItemSequence = item.sequence
                     return .merge(preempted + [startDestinationStampSearch(dest, identity, &state)])
                 }
                 return .merge(preempted)
@@ -966,16 +982,31 @@ public struct Transport {
             // answers its own request.
             func waitForStamp(_ item: State.PendingStampedAnnounce, _ state: inout State) -> Effect<Action> {
                 var item = item
+                var replacedRunning = false
                 if case let .announce(_, interface) = item.kind {
                     if let interface, state.interfaces[interface] == nil { return .none }
+                    let running = state.stampingDestinations.isEmpty ? nil : state.stampingItemSequence
                     state.pendingStampedAnnounces.removeAll {
                         guard $0.destinationHash == item.destinationHash,
-                              case let .announce(_, queuedInterface) = $0.kind else { return false }
-                        return queuedInterface == interface
+                              case let .announce(_, queuedInterface) = $0.kind,
+                              queuedInterface == interface else { return false }
+                        if $0.sequence == running { replacedRunning = true }
+                        return true
                     }
                 }
+                // DIVERGENCE: reference keeps the item it is working on apart from the queue, so a
+                // same-key re-announce queues a second item and BOTH are sent (Transport.py:107-119,
+                // 122-132). Here the newer announce takes over the running item's place: one announce
+                // with the newest app data goes out when the stamp lands, not an extra stale one. It
+                // is not queued, so the size checks do not apply to it.
+                if replacedRunning {
+                    item.sequence = nextNetworkStampSequence(&state)
+                    state.pendingStampedAnnounces.append(item)
+                    state.stampingItemSequence = item.sequence
+                    return .none
+                }
                 // Path responses share reference's priority-0 queue with our queued path requests.
-                let sameClass = state.pendingStampedAnnounces.filter { $0.isPathResponse == item.isPathResponse }
+                let sameClass = state.queuedStampedAnnounces.filter { $0.isPathResponse == item.isPathResponse }
                 let occupied = sameClass.count + (item.isPathResponse ? state.queuedPathRequestStamps.count : 0)
                 let limit = item.isPathResponse ? Transport.stampedPathResponseQueueLimit
                                                 : Transport.stampedAnnounceQueueLimit
@@ -988,8 +1019,10 @@ public struct Transport {
                        < Transport.stampedQueuePerDestinationLimit {
                     item.sequence = nextNetworkStampSequence(&state)
                     state.pendingStampedAnnounces.append(item)
+                    return startNextNetworkStampSearch(&state)
                 }
-                return startNextNetworkStampSearch(&state)
+                // Dropped: nothing was queued, so no search starts for it (Transport.py:1458-1461).
+                return .none
             }
 
             switch action {
@@ -2028,7 +2061,7 @@ public struct Transport {
                 // request is dropped (Transport.py:117, 1469-1471).
                 state.queuedPathRequestStamps.removeAll { $0.destinationHash == destinationHash }
                 let occupied = state.queuedPathRequestStamps.count
-                    + state.pendingStampedAnnounces.filter(\.isPathResponse).count
+                    + state.queuedStampedAnnounces.filter(\.isPathResponse).count
                 guard occupied < Transport.stampedPathResponseQueueLimit else { return .none }
                 state.queuedPathRequestStamps.append(State.QueuedPathRequestStamp(
                     destinationHash: destinationHash, tag: tag, request: request,

@@ -5,7 +5,9 @@ link-request key searches stay uncapped (one per link, reference); our own path 
 destination-stamp search when they would run next (DIVERGENCE — the destination search is memoryless, and
 waiting behind it broke first sends to new peers). Deferred minors: a queued delivery job is not switched to a
 ticket stamp if a ticket arrives while it waits; announces stay keyed by destination plus interface (reference:
-destination); items waiting on the running destination search count toward the 32.
+destination). Parity follow-up Task 4 (2026-11-10): the item whose destination search runs no longer counts
+toward the 32 and is not replaced by a same-key re-announce (reference pops it); a dropped announce starts no
+search. Items waiting behind the running one on the same destination still count.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

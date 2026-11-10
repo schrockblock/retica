@@ -456,25 +456,28 @@ private struct Fixtures: Decodable {
         await store.send(.registerLocalDestination(busy))
         await store.send(.registerLocalDestination(quiet))
         for id in ids { await store.send(.announce(destinationHash: busy.hash, appData: nil, interface: id)) }
-        let queued = store.state.pendingStampedAnnounces.filter { $0.destinationHash == busy.hash }
+        // The first announce's search runs, so it is not queued: the quota is for what waits.
+        let queued = store.state.queuedStampedAnnounces.filter { $0.destinationHash == busy.hash }
         #expect(queued.count == Transport.stampedQueuePerDestinationLimit)
         #expect(Transport.stampedQueuePerDestinationLimit == 8)
         let kept = queued.compactMap { item -> InterfaceID? in
             if case let .announce(_, interface) = item.kind { return interface }
             return nil
         }
-        #expect(kept == Array(ids.prefix(8)), "the oldest eight stay, the newer ones are dropped")
+        #expect(kept == Array(ids[1...8]), "the oldest eight waiting stay, the newer ones are dropped")
 
         await store.send(.announce(destinationHash: quiet.hash, appData: nil))
         #expect(store.state.pendingStampedAnnounces.filter { $0.destinationHash == quiet.hash }.count == 1)
 
         // A replacement of a queued announce needs no new slot, so it still lands at the quota.
-        await store.send(.announce(destinationHash: busy.hash, appData: Data([0xEE]), interface: ids[0]))
+        await store.send(.announce(destinationHash: busy.hash, appData: Data([0xEE]), interface: ids[3]))
         let replaced = store.state.pendingStampedAnnounces.first {
-            if case let .announce(_, interface) = $0.kind { return $0.destinationHash == busy.hash && interface == ids[0] }
+            if case let .announce(_, interface) = $0.kind { return $0.destinationHash == busy.hash && interface == ids[3] }
             return false
         }
-        #expect(replaced?.kind == .announce(appData: Data([0xEE]), interface: ids[0]))
+        #expect(replaced?.kind == .announce(appData: Data([0xEE]), interface: ids[3]))
+        #expect(store.state.queuedStampedAnnounces.filter { $0.destinationHash == busy.hash }.count
+                == Transport.stampedQueuePerDestinationLimit)
 
         // Path responses are held to the same quota, apart from the announces.
         for tag in 1...12 { await store.send(.received(ids[0], pathRequest(for: busy.hash, tag: UInt8(tag)))) }
@@ -605,7 +608,9 @@ private struct Fixtures: Decodable {
             await store.send(.announce(destinationHash: other.hash, appData: nil))
             await store.send(.received(i0, pathRequest(for: other.hash, tag: UInt8(n + 1))))
         }
-        let pending = store.state.pendingStampedAnnounces
+        // The first announce's search runs and is not one of the 32 that wait.
+        #expect(store.state.pendingStampedAnnounces.count == 1 + 2 * 32)
+        let pending = store.state.queuedStampedAnnounces
         #expect(pending.filter { !$0.isPathResponse }.count == Transport.stampedAnnounceQueueLimit)
         #expect(pending.filter { $0.isPathResponse }.count == Transport.stampedPathResponseQueueLimit)
         #expect(Transport.stampedAnnounceQueueLimit == 32 && Transport.stampedPathResponseQueueLimit == 32)
