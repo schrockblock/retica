@@ -1281,13 +1281,17 @@ public struct Transport {
                     // outstanding path request for. Holding must happen BEFORE the blob ring records this
                     // announce, or the later release would look like a replay and be dropped.
                     //
-                    // KNOWN DEFERRAL (I2): RNS Interface.received_announce() (Interface.py:257-260)
-                    // propagates each arrival to parent_interface, so a listening interface sees the
-                    // AGGREGATE rate across all spawned children. ReTiCA's BLEEndpoint mints a distinct
-                    // InterfaceID per BLE peer (BLEEndpoint.swift:125-127), giving N independent
-                    // ingress-control domains with no parent. N peers can each sustain just under 3 Hz
-                    // without any burst activating, where reference would see 3N Hz and burst. Parent
-                    // aggregation requires InterfaceProfile C1 rework and is its own slice.
+                    // One ingress-control domain per InterfaceID, with no parent: this matches RNS 1.6.0
+                    // for spawned interfaces, such as AutoInterface peers (AutoInterface.py:564) and
+                    // TCP-server connections (TCPInterface.py:613). Stock RNS has no BLE interface, so
+                    // for BLE peers this is by analogy only. `Interface.received_announce` does count each arrival on the parent too
+                    // (Interfaces/Interface.py:307-311), and the interface job runs the parent's own
+                    // `should_ingress_limit()` (Transport.py:1334-1337), but the decision for an announce
+                    // is asked of `packet.receiving_interface` (Transport.py:2066-2067), which is the
+                    // spawned peer, never the parent (AutoInterface.py:668 passes the peer to
+                    // `inbound`); path requests likewise (Transport.py:2133, :3777). Nothing consults
+                    // the parent's result for traffic that arrives on a peer. (The earlier "KNOWN
+                    // DEFERRAL (I2)" here read the parent's counters as the gate; they are not.)
                     let destinationKnown = state.learned[packet.destinationHash] != nil
                     let awaitingPath = state.discoveryPathRequests[packet.destinationHash] != nil
                                    || state.pathRequests[packet.destinationHash] != nil

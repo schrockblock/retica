@@ -75,8 +75,8 @@ libbzip2 is vendored as the `Cbzip2` target.
 |---|---|---|
 | `ReTiCA` | nothing | The wire-format core: `Identity`, `Token`, `Destination`, `Packet`, `Announce`, `Link` handshake primitives, `Resource` primitives, HDLC framing, `MsgPack`, and the LXMF types (`LXMessage`, `LXStamper`, `LXMFPropagation`, `LXMFAnnounceData`, `PNAnnounce`). Pure functions, no TCA. Use it alone if you only need to build or parse packets and messages. |
 | `ReTiCATransport` | `ReTiCA`, TCA, SwiftEdDSA | The interface-agnostic stateful layer: `Transport` (path table, announces, path requests, relaying, IFAC), `LinkSession` (one link), `ResourceTransfer` (one resource), `InterfaceProfile`, `InterfaceID`, `LearnedDestination`, `KnownDestination`. |
-| `ReTiCAInterfaces` | `ReTiCA`, TCA, FCB | Interface reducers: `TCPClientInterface`, `TCPServerInterface` (Network.framework), `BLEInterface` (ble-reticulum protocol), `MeshtasticInterface`. |
-| `ReTiCANode` | the three above | The compositions you run: `TransportEndpoint` (one shared router and link plane over any mix of TCP client, TCP server, BLE and Meshtastic slots), `LXMFNode` (LXMF client), `LXMFServiceNode` (client plus optional propagation node), `PNNode` (standalone propagation node). **Most apps depend on this.** |
+| `ReTiCAInterfaces` | `ReTiCA`, TCA, FCB | Interface reducers: `TCPClientInterface`, `TCPServerInterface` (Network.framework), `BLEInterface` (ble-reticulum protocol), `MeshtasticInterface`, `AutoInterface` (POSIX sockets). |
+| `ReTiCANode` | the three above | The compositions you run: `TransportEndpoint` (one shared router and link plane over any mix of TCP client, TCP server, BLE, Meshtastic and AutoInterface slots), `LXMFNode` (LXMF client), `LXMFServiceNode` (client plus optional propagation node), `PNNode` (standalone propagation node). **Most apps depend on this.** |
 | `ReTiCAKeychain` | `ReTiCA` | `IdentityKeychain`: one Reticulum identity per device in a Keychain access group, with rules that refuse to silently replace an existing identity. `IdentityBackup`: a base32 codec for backing a key up. Optional. |
 | `ReTiCAMeshtasticLive` | `ReTiCAInterfaces`, MeshtasticKit, FCB | The live `MeshtasticDriver` (`MeshtasticDriver.live(session:)`, `MeshtasticLive.makeSession()`, `MeshtasticLive.scanRadios()`). Only needed if you use a Meshtastic radio as an interface. |
 
@@ -238,6 +238,7 @@ a packet can arrive on one and leave on another:
 | TCP server | `tcpServer: TCPServerEndpoint.State?` | Listens on a port so peers can dial you. No connection cap. Not discoverable: peers must be told your address and port. |
 | BLE | `ble: BLEEndpoint.State?` | ble-reticulum protocol v2.2 over GATT, with an L2CAP path (v3) when the peer publishes a PSM. `BLEEndpoint.State(localIdentity: identity.hash)`. |
 | Meshtastic | `meshtastic: MeshtasticEndpoint.State?` | Reticulum over a Meshtastic radio, compatible with landandair's RNS_Over_Meshtastic interface. Needs `ReTiCAMeshtasticLive` and `$0.meshtasticDriver = .live(session:)`; without it the slot reports the adapter as unavailable. |
+| AutoInterface | `auto: AutoEndpoint.State?` | Reference `AutoInterface` peering over IPv6 link-local multicast on the LAN, no address needed. Each discovered peer is its own interface, `auto:<nic>/<addr>`. `AutoEndpoint.State(config:ifacNetworkName:ifacPassphrase:)`; IFAC is always size 16, as in the reference. Remove it with `.removeAuto`, not by setting `auto = nil`. Status (`dataPortInUse`, `multicastUnavailable`, `localNetworkDenied`, ...) arrives at `.auto(.interface(.delegate(...)))`. It cannot peer with an `rnsd` or NomadNet on the same Mac: whichever starts second gets `dataPortInUse`. |
 
 ```swift
 var protected = InterfaceProfile.tcp
@@ -258,11 +259,11 @@ let node = LXMFNode.State(identity: identity, endpoint: endpoint)
 ```
 
 `InterfaceProfile` carries the interface's bitrate, mode (`.full`, `.accessPoint`, `.roaming`,
-...), hardware MTU, announce bandwidth cap and optional IFAC. The presets `.tcp` and `.ble` use
-the reference interfaces' declared values.
+...), hardware MTU, announce bandwidth cap and optional IFAC. The presets `.tcp`, `.ble` and
+`.auto` use the reference interfaces' declared values.
 
-There is no AutoInterface, UDP, RNode/KISS, serial or I2P interface, and no shared-instance
-client: to use a local `rnsd`, dial its `TCPServerInterface`.
+There is no UDP, serial or I2P interface, and no shared-instance client: to use a local `rnsd`,
+dial its `TCPServerInterface`.
 
 ## What the host must persist
 
@@ -529,6 +530,7 @@ The library declares nothing itself. The host app needs:
 |---|---|
 | BLE or Meshtastic interface | `NSBluetoothAlwaysUsageDescription`. To keep BLE running in the background, `UIBackgroundModes` `bluetooth-central` and `bluetooth-peripheral` (the BLE interface is both central and peripheral). |
 | TCP to a private LAN address, or the TCP server | iOS shows the Local Network permission prompt; add `NSLocalNetworkUsageDescription` to explain it. |
+| AutoInterface | `NSLocalNetworkUsageDescription`, and on iOS the `com.apple.developer.networking.multicast` entitlement, which Apple grants on request. Without either, no echo arrives and the slot reports `multicastUnavailable` or `localNetworkDenied`. Not used on macOS. |
 | macOS, sandboxed | `com.apple.security.network.client`; `com.apple.security.network.server` for the TCP server; `com.apple.security.device.bluetooth` for BLE. |
 | `ReTiCAKeychain` | `keychain-access-groups` containing the group you pass to `IdentityKeychain.Location`. |
 | Push wake-ups (ReTiCAPush) | `aps-environment`, the `remote-notification` background mode, and an App Group shared with the Notification Service Extension. |
@@ -619,7 +621,8 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Interfaces: TCP client and server | Implemented | HDLC framing cross-validated. |
 | Interface: BLE | Implemented | ble-reticulum protocol v2.2 (GATT) plus v3 (L2CAP). Fragmentation cross-validated against ble-reticulum. |
 | Interface: Meshtastic | Implemented | Fragment codec cross-validated against landandair's RNS_Over_Meshtastic. |
-| Interfaces: AutoInterface, UDP, RNode/KISS, serial, I2P, pipe, shared instance (LocalInterface) | **Missing** | |
+| Interface: AutoInterface | Implemented | Group address and discovery token cross-validated against RNS 1.6.0. Not yet tested live against a reference peer: that needs a second host on the LAN. |
+| Interfaces: UDP, RNode/KISS, serial, I2P, pipe, shared instance (LocalInterface) | **Missing** | |
 | Persistence | The host's job | See Part 1. The packet-hash dedup ring and the announce cache are deliberately not persisted. |
 | Admission control | **Partial** | The number of inbound links is capped; Resources per link are not, and there is no `accepts_links`-style per-destination policy. |
 

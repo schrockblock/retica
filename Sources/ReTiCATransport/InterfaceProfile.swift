@@ -73,6 +73,10 @@ public struct InterfaceProfile: Equatable, Sendable {
     /// ble-reticulum protocol v2.2 peers: HW_MTU 500 (BLEInterface.HW_MTU in the reference);
     /// 80 kbps is a conservative guess until measured live (spec §2.8).
     public static let ble = InterfaceProfile(name: "ble", bitrate: 80_000, hwMTU: 500)
+    /// Reference AutoInterface declared values, RNS 1.6.0 (AutoInterface.py:70 BITRATE_GUESS,
+    /// :44 HW_MTU), copied to every spawned peer (AutoInterface.py:565, :596). The IFAC size (16,
+    /// AutoInterface.py:50) is not a profile field: `AutoEndpoint` builds the IFAC with it.
+    public static let auto = InterfaceProfile(name: "auto", bitrate: 10_000_000, hwMTU: 1196)
     /// Reference base-class defaults (Interface.py:104-105).
     public static let `default` = InterfaceProfile(name: "default", bitrate: 62_500)
 }

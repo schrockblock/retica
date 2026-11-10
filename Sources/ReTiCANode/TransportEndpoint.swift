@@ -50,6 +50,11 @@ public struct TransportEndpoint {
         /// the same TCP-client lifecycle as the other radio slots. Counters and telemetry live in
         /// the slot and die with it.
         public var rnode: RNodeEndpoint.State?
+        /// The AutoInterface slot (at most one; owns N discovered peers, each its own
+        /// `InterfaceID` `auto:<nic>/<addr>`, the BLE / TCP-server 1:N shape). Remove it with
+        /// `.removeAuto`, never by assigning nil: that cancels the interface's effects without
+        /// running `driver.stop()`, so its sockets stay bound and its peers stay registered.
+        public var auto: AutoEndpoint.State?
 
         /// Learned-destination table of the shared router (identity / appData / path).
         public var learned: [Data: LearnedDestination] { transport.learned }
@@ -90,7 +95,8 @@ public struct TransportEndpoint {
                     ble: BLEEndpoint.State? = nil,
                     meshtastic: MeshtasticEndpoint.State? = nil,
                     meshCore: MeshCoreEndpoint.State? = nil,
-                    rnode: RNodeEndpoint.State? = nil) {
+                    rnode: RNodeEndpoint.State? = nil,
+                    auto: AutoEndpoint.State? = nil) {
             self.transport = transport
             self.linkPlane = linkPlane
             self.tcpClients = tcpClients
@@ -99,6 +105,7 @@ public struct TransportEndpoint {
             self.meshtastic = meshtastic
             self.meshCore = meshCore
             self.rnode = rnode
+            self.auto = auto
         }
 
         /// Convenience factory: an endpoint running over a single TCP-client driver.
@@ -130,6 +137,11 @@ public struct TransportEndpoint {
         public static func rnode(_ driver: RNodeEndpoint.State) -> State {
             State(rnode: driver)
         }
+
+        /// Convenience factory: an endpoint running over an AutoInterface.
+        public static func auto(_ driver: AutoEndpoint.State) -> State {
+            State(auto: driver)
+        }
     }
 
     public enum Action: Equatable {
@@ -144,6 +156,11 @@ public struct TransportEndpoint {
         case meshtastic(MeshtasticEndpoint.Action)
         case meshCore(MeshCoreEndpoint.Action)
         case rnode(RNodeEndpoint.Action)
+        case auto(AutoEndpoint.Action)
+        /// Drop the AutoInterface slot: deregister every peer at once, stop the interface, and
+        /// clear the slot only once its `driver.stop()` has returned (`removalPending` meanwhile).
+        /// An idle slot is cleared at once. A `.start` while the removal is pending is refused.
+        case removeAuto
         case transport(Transport.Action)
         case linkPlane(LinkPlane.Action)
         case link(IdentifiedActionOf<LinkSession>)
@@ -236,6 +253,19 @@ public struct TransportEndpoint {
     public var body: some ReducerOf<Self> {
         Scope(state: \.transport, action: \.transport) { Transport() }
         Scope(state: \.linkPlane, action: \.linkPlaneRoute) { LinkPlane() }
+        wiring
+            .forEach(\.tcpClients, action: \.tcpClients) { TCPEndpoint() }
+            .ifLet(\.tcpServer, action: \.tcpServer) { TCPServerEndpoint() }
+            .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
+            .ifLet(\.meshtastic, action: \.meshtastic) { MeshtasticEndpoint() }
+            .ifLet(\.meshCore, action: \.meshCore) { MeshCoreEndpoint() }
+            .ifLet(\.rnode, action: \.rnode) { RNodeEndpoint() }
+            .ifLet(\.auto, action: \.auto) { AutoEndpoint() }
+    }
+
+    /// The container's own wiring, a separate property (with a concrete type) so the compiler
+    /// type-checks its closure apart from the driver-slot chain above.
+    private var wiring: Reduce<State, Action> {
         Reduce { state, action in
             switch action {
             // --- unified verbs → shared router / link plane ---
@@ -245,7 +275,8 @@ public struct TransportEndpoint {
                                  state.ble != nil ? .send(.ble(.start)) : .none,
                                  state.meshtastic != nil ? .send(.meshtastic(.start)) : .none,
                                  state.meshCore != nil ? .send(.meshCore(.start)) : .none,
-                                 state.rnode != nil ? .send(.rnode(.start)) : .none])
+                                 state.rnode != nil ? .send(.rnode(.start)) : .none,
+                                 autoStartEffect(state)])
             case .stop:
                 // Link-request key searches are CPU work, not I/O, so no driver stopping ends them:
                 // cancel them here, not when each interface reports its disconnect, because a
@@ -262,6 +293,7 @@ public struct TransportEndpoint {
                                  state.meshtastic != nil ? .send(.meshtastic(.stop)) : .none,
                                  state.meshCore != nil ? .send(.meshCore(.stop)) : .none,
                                  state.rnode != nil ? .send(.rnode(.stop)) : .none,
+                                 state.auto != nil ? .send(.auto(.stop)) : .none,
                                  state.linkPlane.stampingLinks.isEmpty ? .none : .send(.linkPlane(.cancelStampSearches)),
                                  state.transport.hasNetworkStampWork
                                      ? .send(.transport(.cancelNetworkStamps)) : .none])
@@ -643,21 +675,84 @@ public struct TransportEndpoint {
             case let .linkPlane(.delegate(.localLinkClosed(linkID))):
                 return .send(.transport(.unregisterLocalLink(linkID)))
 
+            // --- AutoInterface peer lifecycle → shared router interface set (+ maintenance) ---
+            // The BLE / TCP-server 1:N shape (spec §5.7): one InterfaceID per discovered peer,
+            // `auto:<nic>/<addr>`, all registered with the slot's profile; the parent is never
+            // registered (the reference's parent is a no-op sink, AutoInterface.py:617). Each peer is
+            // its own ingress-control domain, as each spawned AutoInterfacePeer is in RNS 1.6.0
+            // (Transport.py:2066 consults `packet.receiving_interface`).
+            case let .auto(.interface(.delegate(.peerAdded(addr, nic)))):
+                // The interface reduced this action's cause first and still holds the peer, unless a
+                // `.stop` intervened: registering a peer it no longer backs would leave an interface
+                // (and the shared maintenance loop) that nothing deregisters.
+                guard let auto = state.auto, !auto.removalPending, auto.interface.peers[addr] != nil
+                else { return .none }
+                let id = AutoEndpoint.autoInterfaceID(nic: nic, addr: addr)
+                guard auto.peerInterfaces[id] == nil else { return .none }
+                let startEffects = maintenanceStartEffect(state)
+                state.auto?.peerInterfaces[id] = AutoEndpoint.AutoPeer(addr: addr, nic: nic)
+                return .merge([.send(.transport(.interfaceConnected(id, auto.profile)))] + startEffects)
+
+            case let .auto(.interface(.delegate(.peerRemoved(addr)))):
+                // The interface reports the address only: the slot's map gives back the NIC.
+                guard let (id, _) = state.auto?.peer(addr: addr) else { return .none }
+                state.auto?.peerInterfaces[id] = nil
+                return .merge([.send(.transport(.interfaceDisconnected(id))),
+                               .send(.linkPlane(.interfaceDisconnected(id)))]
+                              + maintenanceStopEffect(state, departing: id))
+
+            case let .auto(.interface(.delegate(.packetReceived(addr, data)))):
+                guard let (id, _) = state.auto?.peer(addr: addr) else { return .none }
+                return .send(.transport(.received(id, data)))
+
+            // A stop clears the interface's peers without a `peerRemoved` each (its stream and
+            // timers are cancelled): deregister them here from the slot's own map. The interface's
+            // only other way to lose peers, eviction and a vanished NIC, reports each one. Its
+            // stream has no terminal failure event: per-NIC failures are retried every tick (D3).
+            case .auto(.interface(.stop)):
+                return disconnectAllAutoPeers(&state)
+
+            // A `.start` sent while `.removeAuto` waits for the stop to return is refused: the
+            // interface defers it behind the stop, and stopping again cancels that deferred start.
+            case .auto(.interface(.start)):
+                guard state.auto?.removalPending == true else { return .none }
+                return .send(.auto(.interface(.stop)))
+
+            // The stop `.removeAuto` launched has returned: the slot is idle and may go now.
+            case .auto(.interface(.driverStopped)):
+                if state.auto?.removalPending == true, state.auto?.interface.isIdle == true {
+                    state.auto = nil
+                }
+                return .none
+
+            case .removeAuto:
+                // Deregister every peer, then stop the driver, and only then drop the slot (spec
+                // §5.7): `auto = nil` alone would cancel the interface's effects without running
+                // `driver.stop()`, leaving its sockets bound (ReTiCAMsgr's BLE slot learned this).
+                guard let auto = state.auto else { return .none }
+                let effects = disconnectAllAutoPeers(&state)
+                if auto.interface.isIdle {
+                    state.auto = nil
+                    return effects
+                }
+                state.auto?.removalPending = true
+                return .merge(effects, .send(.auto(.interface(.stop))))
+
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).
-            case .tcpClients, .tcpServer, .ble, .meshtastic, .meshCore, .rnode, .transport, .linkPlane, .link, .delegate,
+            case .tcpClients, .tcpServer, .ble, .meshtastic, .meshCore, .rnode, .auto, .transport, .linkPlane, .link, .delegate,
                  .sendOverLink, .sendResourceOverLink, .cancelResource, .identifyOverLink, .sendRequestOverLink,
                  .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
                  .closeLink, .registerRequestHandler, .deregisterRequestHandler:
                 return .none
             }
         }
-        .forEach(\.tcpClients, action: \.tcpClients) { TCPEndpoint() }
-        .ifLet(\.tcpServer, action: \.tcpServer) { TCPServerEndpoint() }
-        .ifLet(\.ble, action: \.ble) { BLEEndpoint() }
-        .ifLet(\.meshtastic, action: \.meshtastic) { MeshtasticEndpoint() }
-        .ifLet(\.meshCore, action: \.meshCore) { MeshCoreEndpoint() }
-        .ifLet(\.rnode, action: \.rnode) { RNodeEndpoint() }
+    }
+
+    /// `.start` reaches the auto slot unless `.removeAuto` is waiting for its stop to return.
+    private func autoStartEffect(_ state: State) -> Effect<Action> {
+        guard let auto = state.auto, !auto.removalPending else { return .none }
+        return .send(.auto(.start))
     }
 
     /// The ONE maintenance loop (path-expiry / link-table / discovery-request GC) is shared by the
@@ -710,6 +805,21 @@ public struct TransportEndpoint {
         return .merge(effects)
     }
 
+    /// Report every registered auto peer disconnected, from the slot's own map, and forget them so a
+    /// late `peerRemoved` is a no-op. Stops the shared loop iff nothing else is live.
+    private func disconnectAllAutoPeers(_ state: inout State) -> Effect<Action> {
+        guard let peers = state.auto?.peerInterfaces, !peers.isEmpty else { return .none }
+        state.auto?.peerInterfaces = [:]
+        let departing = Set(peers.keys)
+        var effects: [Effect<Action>] = []
+        for id in departing.sorted(by: { $0.rawValue < $1.rawValue }) {
+            effects.append(.send(.transport(.interfaceDisconnected(id))))
+            effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
+        }
+        effects.append(contentsOf: maintenanceStopEffect(state, departing: departing))
+        return .merge(effects)
+    }
+
     /// Routes an outbound (already IFAC-masked) buffer to whichever driver owns `txID`. Each TCP
     /// client owns its own `interfaceID` (the set key); the TCP-server owns each accepted
     /// connection in its `connInterfaces` map (1:N, like BLE); BLE owns each token in its
@@ -729,6 +839,10 @@ public struct TransportEndpoint {
         }
         if let peerToken = state.ble?.peerInterfaces[txID] {
             return .send(.ble(.ble(.send(peer: peerToken, packet: masked))))
+        }
+        // An auto peer: one datagram of masked bytes to its address (AutoInterface.py:670-677).
+        if let peer = state.auto?.peerInterfaces[txID] {
+            return .send(.auto(.interface(.send(addr: peer.addr, data: masked))))
         }
         // The radio's ONE id, while the radio is online. Between a drop and the reconnect learned
         // paths still name it, so a send then falls through to `.interfaceUnavailable` below.
@@ -755,7 +869,7 @@ public struct TransportEndpoint {
         // Not deliverable. `Packet(raw:)` recovers the destination hash; for established link
         // traffic that value IS the link ID, so the failure correlates. An unparseable packet
         // drops silently (no destination to report).
-        guard state.ble != nil || meshOwnsID || coreOwnsID || rnodeOwnsID, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
+        guard state.ble != nil || state.auto != nil || meshOwnsID || coreOwnsID || rnodeOwnsID, let destHash = Packet(raw: unmasked)?.destinationHash else { return .none }
         return .send(.delegate(.sendFailed(destinationHash: destHash, reason: .interfaceUnavailable)))
     }
 }
