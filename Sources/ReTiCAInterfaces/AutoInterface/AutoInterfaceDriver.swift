@@ -79,7 +79,8 @@ public struct AutoInterfaceDriver: Sendable {
     /// A `getifaddrs` snapshot of NICs with `fe80:` addresses.
     public var interfaces: @Sendable () -> [AutoNIC]
     /// Start a session: bind every binding, and stream events until `stop`. A second `run` ends
-    /// the previous session (its stream finishes, its sockets close).
+    /// the previous session (its stream finishes, its sockets close). Dropping the stream (consumer
+    /// cancelled) ends the session too.
     public var run: @Sendable ([AutoBinding]) -> AsyncStream<AutoSocketEvent>
     /// Close the NIC's sockets (if any) and bind the binding afresh. Events read by the replaced
     /// sockets never surface after this returns. Address change or NIC added (§5.6 D1, D2). A no-op
@@ -91,7 +92,8 @@ public struct AutoInterfaceDriver: Sendable {
     /// destination scope 0 (`AI:504-513`). Fails with `ENXIO` for a NIC that is not bound.
     public var sendMulticast: @Sendable (_ nic: String, _ token: Data, _ port: UInt16) async -> AutoSendResult
     /// Send a datagram to `(addr, port, 0, index)` from the one shared unbound socket
-    /// (`AI:490-499`, `AI:670-677`).
+    /// (`AI:490-499`, `AI:670-677`). Fails with `ENXIO` outside a session, so a send after `stop`
+    /// cannot reopen the shared socket and leak it.
     public var sendUnicast: @Sendable (_ addr: String, _ index: UInt32, _ port: UInt16, _ datagram: Data) async -> AutoSendResult
     /// Close every socket and finish the stream.
     public var stop: @Sendable () async -> Void
@@ -120,10 +122,19 @@ extension AutoInterfaceDriver: DependencyKey {
 
     /// The live driver. `deliveryGate` is a test seam: it is awaited after a socket has read a batch
     /// and before the batch reaches the actor, so a test can hold a delivery stamped with an old
-    /// generation across a `rebind`. Production passes nil.
-    static func live(deliveryGate: (@Sendable () async -> Void)?) -> AutoInterfaceDriver {
+    /// generation across a `rebind`. `startGate` is awaited before a `run`'s start hops onto the
+    /// actor, so a test can make one start arrive after a later `run` or `stop`. `socketQueue` is the
+    /// serial queue the read sources (and their fd-closing cancel handlers) run on, so a test can
+    /// occupy it. Production passes nil for all three.
+    static func live(
+        deliveryGate: (@Sendable () async -> Void)?,
+        startGate: (@Sendable () async -> Void)? = nil,
+        socketQueue: DispatchQueue? = nil
+    ) -> AutoInterfaceDriver {
         #if canImport(Darwin)
-        let actor = AutoSocketActor(deliveryGate: deliveryGate)
+        let actor = AutoSocketActor(
+            deliveryGate: deliveryGate,
+            queue: socketQueue ?? DispatchQueue(label: "retica.autointerface.sockets"))
         let ticket = SessionTicket()
         return AutoInterfaceDriver(
             interfaces: { AutoSocketActor.enumerateInterfaces() },
@@ -132,7 +143,17 @@ extension AutoInterfaceDriver: DependencyKey {
                 // start reaches the actor wins: the start then finds its ticket stale.
                 let t = ticket.bump()
                 return AsyncStream { continuation in
-                    Task { await actor.start(bindings, continuation: continuation, ticket: t, current: ticket) }
+                    // Installed here, before the start can run, so a consumer that drops the stream
+                    // early still retires the ticket and its start binds nothing. The strong capture
+                    // of the actor is released when the stream terminates (onTermination runs once).
+                    continuation.onTermination = { _ in
+                        ticket.retire(t)
+                        Task { await actor.terminated(ticket: t) }
+                    }
+                    Task {
+                        if let startGate { await startGate() }
+                        await actor.start(bindings, continuation: continuation, ticket: t, current: ticket)
+                    }
                 }
             },
             rebind: { await actor.rebind($0) },
@@ -189,6 +210,13 @@ private final class SessionTicket: @unchecked Sendable {
         defer { lock.unlock() }
         return value == t
     }
+
+    /// Makes `t` stale if it is still current (its stream terminated). A later ticket is untouched.
+    func retire(_ t: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        if value == t { value &+= 1 }
+    }
 }
 
 /// Owns every AutoInterface socket of one driver (spec §5.3, live-actor rules 1-5).
@@ -203,31 +231,40 @@ private actor AutoSocketActor {
     private struct NICSockets {
         var binding: AutoBinding
         var generation: UInt64
-        var sources: [AutoPlane: DispatchSourceRead]
+        var sources: [AutoPlane: ReadSocket]
         /// Unbound announce socket with `IPV6_MULTICAST_IF`, opened on first use. Never read, so it
         /// has no dispatch source and is closed directly.
         var multicastSender: Int32
+    }
+
+    /// A read socket's dispatch source, and a semaphore its cancel handler signals once it has
+    /// closed the fd.
+    private struct ReadSocket {
+        let source: DispatchSourceRead
+        let closed: DispatchSemaphore
     }
 
     private static let readBufferSize = AutoInterfaceWire.dataRecvSize
     private static let maxDatagramsPerRead = 64
 
     private let deliveryGate: (@Sendable () async -> Void)?
-    private let queue = DispatchQueue(label: "retica.autointerface.sockets")
+    private let queue: DispatchQueue
     private var continuation: AsyncStream<AutoSocketEvent>.Continuation?
-    private var session: UInt64 = 0
+    /// The ticket of the session `continuation` belongs to.
+    private var activeTicket: UInt64 = 0
     private var generation: UInt64 = 0
     private var nics: [String: NICSockets] = [:]
     /// The one shared unbound socket for every unicast send (§5.3.3), opened on first use.
     private var unicastSender: Int32 = -1
 
-    init(deliveryGate: (@Sendable () async -> Void)?) {
+    init(deliveryGate: (@Sendable () async -> Void)?, queue: DispatchQueue) {
         self.deliveryGate = deliveryGate
+        self.queue = queue
     }
 
     deinit {
         for nic in nics.values {
-            for source in nic.sources.values { source.cancel() }
+            for socket in nic.sources.values { socket.source.cancel() }
             if nic.multicastSender >= 0 { close(nic.multicastSender) }
         }
         if unicastSender >= 0 { close(unicastSender) }
@@ -239,17 +276,16 @@ private actor AutoSocketActor {
         _ bindings: [AutoBinding], continuation: AsyncStream<AutoSocketEvent>.Continuation,
         ticket: UInt64, current: SessionTicket
     ) {
-        teardownAll()
+        // The ticket check comes first. Starts hop through unstructured Tasks in no guaranteed order,
+        // so a stale start (a later `run` or a `stop` was issued after it) can arrive after the
+        // session that superseded it: it must finish only its own stream, not tear that session down.
         guard current.isCurrent(ticket) else {
             continuation.finish()
             return
         }
-        session &+= 1
-        let s = session
+        teardownAll()
+        activeTicket = ticket
         self.continuation = continuation
-        continuation.onTermination = { [weak self] _ in
-            Task { await self?.terminated(session: s) }
-        }
         for binding in bindings { bind(binding) }
     }
 
@@ -257,9 +293,10 @@ private actor AutoSocketActor {
         teardownAll()
     }
 
-    /// The consumer dropped the stream without `stop`: release the sockets of that session only.
-    private func terminated(session s: UInt64) {
-        guard s == session, continuation != nil else { return }
+    /// A stream terminated (consumer dropped it, or the driver finished it). Releases the sockets only
+    /// if that stream is still the live session's.
+    func terminated(ticket t: UInt64) {
+        guard t == activeTicket, continuation != nil else { return }
         teardownAll()
     }
 
@@ -290,12 +327,19 @@ private actor AutoSocketActor {
 
     private func teardown(_ nic: String) {
         guard let entry = nics.removeValue(forKey: nic) else { return }
-        // The fd of each read socket is closed in its source's cancel handler, never here.
-        for source in entry.sources.values { source.cancel() }
+        // The fd of each read socket is closed in its source's cancel handler, never here. Wait for
+        // those closes: the cancel handler runs later on `queue`, and a `rebind` that binds the data
+        // port before the old fd is closed fails EADDRINUSE (no reuse options on that plane). A probe
+        // of 200 back-to-back rebinds failed 166 without this wait. The wait cannot deadlock: nothing
+        // on `queue` waits for the actor (the event handler only drains and spawns a Task).
+        for socket in entry.sources.values { socket.source.cancel() }
+        for socket in entry.sources.values { socket.closed.wait() }
         if entry.multicastSender >= 0 { close(entry.multicastSender) }
     }
 
     private func bind(_ binding: AutoBinding) {
+        // A duplicate NIC name in one `run` would otherwise overwrite the entry and leak its fds.
+        teardown(binding.nic)
         generation &+= 1
         let gen = generation
         var entry = NICSockets(binding: binding, generation: gen, sources: [:], multicastSender: -1)
@@ -313,8 +357,9 @@ private actor AutoSocketActor {
         if allBound { continuation?.yield(.bound(nic: binding.nic)) }
     }
 
-    private func makeSource(fd: Int32, nic: String, plane: AutoPlane, generation gen: UInt64) -> DispatchSourceRead {
+    private func makeSource(fd: Int32, nic: String, plane: AutoPlane, generation gen: UInt64) -> ReadSocket {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        let closed = DispatchSemaphore(value: 0)
         let gate = deliveryGate
         source.setEventHandler { [weak self, weak source] in
             let (datagrams, error) = Self.drain(fd)
@@ -326,9 +371,12 @@ private actor AutoSocketActor {
                 await self?.deliver(nic: nic, plane: plane, generation: gen, datagrams: datagrams, error: error)
             }
         }
-        source.setCancelHandler { close(fd) }
+        source.setCancelHandler {
+            close(fd)
+            closed.signal()
+        }
         source.resume()
-        return source
+        return ReadSocket(source: source, closed: closed)
     }
 
     private func deliver(
@@ -365,6 +413,9 @@ private actor AutoSocketActor {
     }
 
     func sendUnicast(addr: String, index: UInt32, port: UInt16, datagram: Data) -> AutoSendResult {
+        // Outside a session: `teardownAll` closed the shared sender, and reopening it here would leak
+        // it until the next session's teardown. Same answer as a multicast send on an unbound NIC.
+        guard continuation != nil else { return .failed(errno: ENXIO) }
         guard let bytes = Self.parseIPv6(addr) else { return .failed(errno: EINVAL) }
         if unicastSender < 0 {
             switch Self.openSocket() {
@@ -421,7 +472,15 @@ private actor AutoSocketActor {
         case .unicastDiscovery, .data:
             guard let ll = parseIPv6(b.linkLocal) else { return .failure(SocketError(code: EINVAL)) }
             address = ll
-            port = plane == .data ? b.dataPort : b.discoveryPort &+ 1
+            if plane == .data {
+                port = b.dataPort
+            } else {
+                // `discoveryPort + 1` (`AI:174`). At 65535 it has no valid value: refuse rather than
+                // wrap to 0, which would bind an ephemeral port no peer sends to.
+                let (next, overflow) = b.discoveryPort.addingReportingOverflow(1)
+                guard !overflow else { return .failure(SocketError(code: EINVAL)) }
+                port = next
+            }
             scope = b.index
         }
         let fd: Int32

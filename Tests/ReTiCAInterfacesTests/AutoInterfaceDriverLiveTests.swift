@@ -81,7 +81,7 @@ struct AutoInterfaceDriverLiveTests {
     //    delivery reaches the actor after the rebind. The gate holds the first delivery (already
     //    read and stamped with the old generation) until the rebind has completed.
     @Test func rebindDropsEventsReadBeforeTheRebind() async throws {
-        let gate = HoldFirstDelivery()
+        let gate = HoldFirst()
         let driver = AutoInterfaceDriver.live(deliveryGate: { await gate.pass() })
         let b = binding(discoveryPort: 39_736, dataPort: 52_691)
         let log = EventLog(driver.run([b]))
@@ -142,7 +142,9 @@ struct AutoInterfaceDriverLiveTests {
         await driver.stop()
         #expect(await poll { log.isFinished }, "stream not finished by stop")
         let count = log.snapshot().count
-        _ = await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, Data("after-stop".utf8))
+        // Outside a session a unicast send must not reopen (and so leak) the shared sender.
+        #expect(await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, Data("after-stop".utf8))
+                == .failed(errno: ENXIO))
         #expect(await driver.sendMulticast("lo0", Data(repeating: 1, count: 32), b.discoveryPort) != .sent)
         try await Task.sleep(for: .milliseconds(200))
         #expect(log.snapshot().count == count, "events after stop: \(log.snapshot())")
@@ -152,6 +154,174 @@ struct AutoInterfaceDriverLiveTests {
         let nextLog = EventLog(next.run([b]))
         defer { Task { await next.stop() } }
         #expect(await nextLog.waitFor { $0.contains(.bound(nic: "lo0")) }, "port not released: \(nextLog.snapshot())")
+    }
+
+    // 6. Two back-to-back `run`s whose starts reach the actor out of order: the first (stale) start
+    //    is held until the second session has bound. The stale start must finish only its own stream;
+    //    the second session stays bound, unfinished and receiving.
+    @Test func staleStartDoesNotTearDownTheSessionThatSupersededIt() async throws {
+        let gate = HoldFirst()
+        let driver = AutoInterfaceDriver.live(deliveryGate: nil, startGate: { await gate.pass() })
+        let b = binding(discoveryPort: 39_766, dataPort: 52_721)
+        let first = EventLog(driver.run([b]))
+        #expect(await poll { await gate.didHold() }, "first start never reached the gate")
+        let second = EventLog(driver.run([b]))
+        defer { Task { await driver.stop() } }
+        #expect(await second.waitFor { $0.contains(.bound(nic: "lo0")) }, "second never bound: \(second.snapshot())")
+
+        await gate.release()
+        #expect(await poll { first.isFinished }, "stale first stream not finished")
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(first.snapshot().isEmpty, "stale session surfaced events: \(first.snapshot())")
+        #expect(!second.isFinished, "the stale start finished the live session")
+
+        let payload = Data("after-stale-start".utf8)
+        #expect(await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, payload) == .sent)
+        #expect(await second.waitFor { $0.contains(datagram(.data, payload)) },
+                "live session lost its sockets: \(second.snapshot())")
+    }
+
+    // 7. `run` then `stop` before the run's start reaches the actor: the stream finishes and nothing
+    //    binds (no `.bound`, no NIC entry, the data port free).
+    @Test func stopBeforeTheStartReachesTheActorBindsNothing() async throws {
+        let gate = HoldFirst()
+        let driver = AutoInterfaceDriver.live(deliveryGate: nil, startGate: { await gate.pass() })
+        let b = binding(discoveryPort: 39_776, dataPort: 52_731)
+        let log = EventLog(driver.run([b]))
+        #expect(await poll { await gate.didHold() }, "start never reached the gate")
+        await driver.stop()
+        await gate.release()
+
+        #expect(await poll { log.isFinished }, "stream not finished: \(log.snapshot())")
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(!log.snapshot().contains(.bound(nic: "lo0")), "bound after stop: \(log.snapshot())")
+        #expect(await driver.sendMulticast("lo0", Data(repeating: 2, count: 32), b.discoveryPort) == .failed(errno: ENXIO))
+        #expect(await bindsCleanly(b), "the late start left the data port bound")
+        await driver.stop()
+    }
+
+    // 8. The consumer drops the stream (cancels its iteration) without `stop`: the session's sockets
+    //    are released.
+    @Test func droppingTheStreamReleasesTheSockets() async throws {
+        let driver = AutoInterfaceDriver.liveValue
+        let b = binding(discoveryPort: 39_786, dataPort: 52_741)
+        let log = EventLog(driver.run([b]))
+        #expect(await log.waitFor { $0.contains(.bound(nic: "lo0")) }, "trio never bound: \(log.snapshot())")
+
+        log.cancel()
+        #expect(await poll { log.isFinished }, "consumer did not end")
+        #expect(await poll {
+            await driver.sendMulticast("lo0", Data(repeating: 3, count: 32), b.discoveryPort) == .failed(errno: ENXIO)
+        }, "NIC still bound after the stream was dropped")
+        #expect(await bindsCleanly(b), "dropped stream left the data port bound")
+        await driver.stop()
+    }
+
+    // 9. The consumer drops the stream before the run's start reaches the actor: that start binds
+    //    nothing.
+    @Test func droppingTheStreamBeforeTheStartBindsNothing() async throws {
+        let gate = HoldFirst()
+        let driver = AutoInterfaceDriver.live(deliveryGate: nil, startGate: { await gate.pass() })
+        let b = binding(discoveryPort: 39_796, dataPort: 52_751)
+        let log = EventLog(driver.run([b]))
+        #expect(await poll { await gate.didHold() }, "start never reached the gate")
+        log.cancel()
+        #expect(await poll { log.isFinished }, "consumer did not end")
+        await gate.release()
+
+        // Give the released start time to reach the actor (it cannot be awaited from here).
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(await driver.sendMulticast("lo0", Data(repeating: 4, count: 32), b.discoveryPort) == .failed(errno: ENXIO),
+                "the start of a dropped stream bound the NIC")
+        #expect(await bindsCleanly(b), "the start of a dropped stream left the data port bound")
+        await driver.stop()
+    }
+
+    // 10. `unbind` closes that NIC's sockets: no NIC entry, its data never surfaces, the port is free,
+    //     and the session's stream stays open.
+    @Test func unbindClosesTheNICsSocketsAndKeepsTheSession() async throws {
+        let driver = AutoInterfaceDriver.liveValue
+        let b = binding(discoveryPort: 39_806, dataPort: 52_761)
+        let log = EventLog(driver.run([b]))
+        defer { Task { await driver.stop() } }
+        #expect(await log.waitFor { $0.contains(.bound(nic: "lo0")) }, "trio never bound: \(log.snapshot())")
+
+        await driver.unbind("lo0")
+        #expect(await driver.sendMulticast("lo0", Data(repeating: 5, count: 32), b.discoveryPort) == .failed(errno: ENXIO))
+        let after = Data("after-unbind".utf8)
+        _ = await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, after)
+        try await Task.sleep(for: .milliseconds(200))
+        let surfaced = log.snapshot().contains {
+            if case let .datagram(_, _, _, _, payload) = $0 { return payload == after } else { return false }
+        }
+        #expect(!surfaced, "datagram surfaced after unbind: \(log.snapshot())")
+        #expect(!log.isFinished, "unbind finished the session")
+        #expect(await bindsCleanly(b), "unbind left the data port bound")
+    }
+
+    // 11. A duplicate NIC name in one `run` replaces the first entry instead of leaking its sockets:
+    //     both binds succeed (the first trio was closed before the second bound the data port), and
+    //     after `stop` the port is free.
+    @Test func duplicateNICInOneRunReplacesTheEarlierBinding() async throws {
+        let driver = AutoInterfaceDriver.liveValue
+        let b = binding(discoveryPort: 39_816, dataPort: 52_771)
+        let log = EventLog(driver.run([b, b]))
+        #expect(await log.waitFor { $0.filter { $0 == .bound(nic: "lo0") }.count == 2 },
+                "duplicate binding did not rebind cleanly: \(log.snapshot())")
+        #expect(!log.snapshot().contains { if case .bindFailed = $0 { return true } else { return false } })
+        await driver.stop()
+        #expect(await bindsCleanly(b), "the replaced binding leaked its data socket")
+    }
+
+    // 12. `discoveryPort` 65535 has no `+ 1`: the unicast discovery plane reports `EINVAL` instead of
+    //     wrapping to port 0, and the other planes bind.
+    @Test func discoveryPortAtMaximumFailsUnicastDiscoveryWithEINVAL() async throws {
+        let driver = AutoInterfaceDriver.liveValue
+        let b = binding(discoveryPort: UInt16.max, dataPort: 52_781)
+        let log = EventLog(driver.run([b]))
+        defer { Task { await driver.stop() } }
+        #expect(await log.waitFor { $0.contains(.bindFailed(nic: "lo0", plane: .unicastDiscovery, errno: EINVAL)) },
+                "no EINVAL for port 65535 + 1: \(log.snapshot())")
+        try await Task.sleep(for: .milliseconds(100))
+        let failures = log.snapshot().filter { if case .bindFailed = $0 { return true } else { return false } }
+        #expect(failures == [.bindFailed(nic: "lo0", plane: .unicastDiscovery, errno: EINVAL)])
+    }
+
+    // 13. `rebind` closes the old data socket before binding the new one. The data plane has no reuse
+    //     options, so binding while the old fd is still open fails EADDRINUSE. The old fd is closed
+    //     by its source's cancel handler on the socket queue; the test parks a short block on that
+    //     queue before each rebind, so the close cannot have happened by the time the new socket
+    //     binds unless `rebind` waits for it. (Without the block the race still lost 60-166 of every
+    //     100-200 rebinds, but not on every run.)
+    @Test func rebindClosesTheOldDataSocketBeforeBindingTheNewOne() async throws {
+        let queue = DispatchQueue(label: "retica.autointerface.sockets.test")
+        let driver = AutoInterfaceDriver.live(deliveryGate: nil, socketQueue: queue)
+        let b = binding(discoveryPort: 39_826, dataPort: 52_791)
+        let log = EventLog(driver.run([b]))
+        defer { Task { await driver.stop() } }
+        #expect(await log.waitFor { $0.contains(.bound(nic: "lo0")) }, "trio never bound: \(log.snapshot())")
+        for _ in 0..<10 {
+            queue.async { usleep(20_000) }
+            await driver.rebind(b)
+        }
+        #expect(await log.waitFor { $0.filter { $0 == .bound(nic: "lo0") }.count == 11 },
+                "not every rebind bound: \(log.snapshot())")
+        let failures = log.snapshot().filter { if case .bindFailed = $0 { return true } else { return false } }
+        #expect(failures.isEmpty, "\(failures.count) of 10 rebinds failed: \(failures.prefix(3))")
+    }
+
+    /// Whether a fresh live driver can bind `b` fully (so no earlier socket still holds the data port).
+    /// Retries for a while: a cancelled source closes its fd on the socket queue, asynchronously.
+    private func bindsCleanly(_ b: AutoBinding) async -> Bool {
+        await poll {
+            let probe = AutoInterfaceDriver.liveValue
+            let log = EventLog(probe.run([b]))
+            _ = await log.waitFor(timeout: .seconds(1)) { events in
+                events.contains { if case .bindFailed = $0 { return true } else { return $0 == .bound(nic: b.nic) } }
+            }
+            await probe.stop()
+            return log.snapshot().contains(.bound(nic: b.nic))
+        }
     }
 }
 
@@ -171,13 +341,18 @@ private final class EventLog: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [AutoSocketEvent] = []
     private var finished = false
+    private var consumer: Task<Void, Never>?
 
     init(_ stream: AsyncStream<AutoSocketEvent>) {
-        Task { [self] in
+        let task = Task { [self] in
             for await event in stream { self.append(event) }
             self.markFinished()
         }
+        lock.lock(); consumer = task; lock.unlock()
     }
+
+    /// Cancels the consuming task, which terminates the stream (the consumer "drops" it).
+    func cancel() { lock.lock(); let t = consumer; lock.unlock(); t?.cancel() }
 
     private func append(_ e: AutoSocketEvent) { lock.lock(); events.append(e); lock.unlock() }
     private func markFinished() { lock.lock(); finished = true; lock.unlock() }
@@ -190,8 +365,8 @@ private final class EventLog: @unchecked Sendable {
     }
 }
 
-/// Holds the first delivery that passes it until `release()`. Later deliveries pass straight through.
-private actor HoldFirstDelivery {
+/// Holds the first caller that passes it until `release()`. Later callers pass straight through.
+private actor HoldFirst {
     private var armed = true
     private var held = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
