@@ -331,18 +331,28 @@ Once enabled, ReTiCA behaves as reference (RNS 1.6.0 `Destination.py`):
   `.ratchetsChanged`.
 - Each announce and path response carries the newest ratchet's public key (32 bytes), with the
   context flag set.
-- An inbound packet to the destination is tried with every retained ratchet first, then with the
-  identity key. So is a propagated LXMF message downloaded for it.
+- An inbound packet to the destination is tried with the 16 newest ratchets
+  (`Transport.ratchetShallowDepth`), then with the identity key. Only if neither opens it is the
+  rest of the ring tried, and only while the interface it arrived on has deep-scan budget left: a
+  token bucket of 8 scans (`Transport.ratchetDeepScanBurst`) refilled at 1 per second
+  (`Transport.ratchetDeepScanPerSecond`). Out of budget, the packet is dropped. **This differs from
+  reference**, which tries the whole ring every time (RNS 1.6.0 Destination.py:720-752). A
+  propagated LXMF message downloaded for the destination is tried with the whole ring, then the
+  identity key, as in reference.
 - `.endpoint(.setEnforceRatchets(destinationHash:_:))` drops anything only the identity key opens.
   It is ignored until ratchets are enabled, as in reference.
-- Cost: with a full ring, a packet that no ratchet opens costs up to 513 key agreements. That
-  covers junk and every packet a peer encrypted to the identity key. It was measured at about
-  15-20 ms on a Mac, and it runs on the reducer's thread (the main actor in a TCA host). Reference
-  costs the same or more. The ring rotates at least 30 minutes apart within a process, and once
-  at every process start (the first announce after `.enableRatchets` rotates, as in reference),
-  so a host that relaunches often cycles the ring faster: 512 retained keys cover 10.7 days only
-  for a process that stays up. A downloaded propagated
-  message costs one decrypt, and one addressed to another destination costs none.
+- Cost: a packet that no ratchet opens (junk, or one a peer encrypted to the identity key) costs
+  17 key agreements, or 513 with a full ring when it takes a deep scan. A full scan was measured
+  at about 15-20 ms on a Mac, and it runs on the reducer's thread (the main actor in a TCA host),
+  so the budget holds a flood on one interface to 8 full scans, then one a second. The price: a
+  peer still encrypting to a ratchet older than our 16th-newest, arriving during a flood on the
+  same interface, has its packet dropped until the bucket refills. LXMF retries it. The budget is
+  per interface, so each new connection to a TCP server starts with a full bucket. The ring
+  rotates at least 30 minutes apart within a process, and once at every process start (the first
+  announce after `.enableRatchets` rotates, as in reference), so a host that relaunches often
+  cycles the ring faster: 512 retained keys cover 10.7 days only for a process that stays up, and
+  the 16 shallow keys at least 7.5 hours on the same terms. A downloaded propagated message to our newest
+  ratchet costs one decrypt, and one addressed to another destination costs none.
 - The announce grows by 32 bytes, so `LXMFNode` cuts the display name to
   `LXMFAnnounceData.maxAppDataBytesWithRatchet` (283 bytes of app data, 32 fewer than without a
   ratchet).

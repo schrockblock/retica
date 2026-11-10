@@ -92,3 +92,11 @@ Added after the 2026-11-10 parity survey (`/tmp/ReTiCA/parity-gap-report.md`): `
 ## Status
 
 Not started.
+
+- Task 2 (inbound ratchet-decrypt budget): done. Deliberate divergence from reference (RNS 1.6.0
+  Destination.py:720-752 scans the whole ring): shallow 16 ratchets then the identity key, deep scan
+  of the rest only with a per-interface token (burst 8, 1/s). Cost if wrong: a sender holding a
+  ratchet older than our 16th-newest, arriving during a flood on the same interface, has its packet
+  dropped. LXMF retries it later. Budgets are per registered interface (an unregistered id gets no
+  deep scan) and dropped on disconnect, so each new remote connection starts with a full bucket.
+  The LXMF propagated-download decrypt still scans the whole ring (host-pulled, out of scope).

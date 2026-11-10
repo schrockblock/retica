@@ -316,6 +316,10 @@ public struct Transport {
         /// (TCPInterface.py:270-297). At most `Transport.maxDepartedInterfaceAges`; an id evicted
         /// from here returns as a new interface (stricter, never looser).
         public var departedInterfaceAges: [Transport.DepartedInterfaceAge] = []
+        /// Per registered interface, the budget for scanning our own ratchets past the newest
+        /// `Transport.ratchetShallowDepth` (see the decrypt site in `.received`). Made on the first deep
+        /// scan, dropped when the interface disconnects; an unregistered id never gets one.
+        public var ratchetDeepScanBudgets: [InterfaceID: Transport.RatchetDeepScanBudget] = [:]
 
         /// An outbound single packet awaiting its delivery proof (RNS `PacketReceipt`,
         /// Packet.py:402-419), recorded by `.send(..., receiptToken:)`.
@@ -1010,6 +1014,7 @@ public struct Transport {
                 state.announceArrivals[id] = nil
                 state.ingressBursts[id] = nil
                 state.heldAnnounces[id] = nil
+                state.ratchetDeepScanBudgets[id] = nil
                 if let connectedAt = state.interfaceConnectedAt[id] {
                     state.departedInterfaceAges.removeAll { $0.id == id }
                     state.departedInterfaceAges.append(Transport.DepartedInterfaceAge(id: id, connectedAt: connectedAt))
@@ -1570,29 +1575,58 @@ public struct Transport {
                         guard let raw = forwardTowardDest(packet, entry) else { return .none }
                         return .send(.delegate(.transmit(entry.interfaceID, raw)))
                     }
-                    // With our own ratchets enabled, every retained ratchet is tried (newest first), then
-                    // the identity key unless enforced — reference `Destination.decrypt`
-                    // (Destination.py:720-752), minus its reload-from-disk retry: the ring here is the
-                    // only copy in the process. An empty ring passes no ratchets, as reference does.
+                    // With our own ratchets enabled, decrypting is shallow-then-budgeted-deep. This
+                    // DIVERGES from reference `Destination.decrypt` (RNS 1.6.0 Destination.py:720-752),
+                    // which always tries every retained ratchet, newest first, then the identity key
+                    // unless enforced, and on a failure reloads the ring file and scans again
+                    // (:738-745). (No reload here: the ring in state is the only copy in the process.)
+                    //  1. Shallow: the newest `ratchetShallowDepth` (16) ratchets, then the identity key
+                    //     unless enforced. Any sender holding one of our 16 newest ratchets, or that
+                    //     encrypts to the identity key, is served here at a cost of at most 17 X25519
+                    //     agreements, flood or not.
+                    //  2. Deep: the rest of the ring (up to 496 more agreements), only if the receiving
+                    //     interface's token bucket (`ratchetDeepScanBudgets`: burst
+                    //     `ratchetDeepScanBurst` = 8, refilled at `ratchetDeepScanPerSecond` = 1 by
+                    //     `\.transportDate`) has a scan left. An unregistered interface gets none. Out
+                    //     of tokens, the packet is dropped. A scan costs a token whether it finds a key.
+                    // Trying the identity key before the deep scan changes no outcome: a ciphertext
+                    // authenticates (Token HMAC) under one key at most.
                     //
-                    // Cost: up to `ratchetCount` (512) X25519 agreements, plus one for the identity key,
-                    // for every SINGLE packet to an enabled destination that no ratchet opens: junk, and
-                    // every legitimate packet to the identity key. Measured about 15-20 ms per packet on
-                    // a Mac with a full ring (reviewer probe, 2026-11-08); unmeasured on a phone. It runs
-                    // here, on the reducer's thread (the main actor in a TCA host), and no inbound rate
-                    // bound covers DATA (ingress control limits announces only; `seenPacketHashes` stops
-                    // exact replays only). Accepted as parity: reference does the same scan and, on a
-                    // failure, reloads the ring file and scans again (Destination.py:738-745). The
-                    // ciphertext names no ratchet, so there is no cheaper lookup. The ring grows one key
-                    // per announce at most every 30 minutes, so it takes at least 10.7 days to fill.
-                    // Opt-in only (`.enableRatchets`). Follow-up recorded in the ratchets plan's status:
-                    // an inbound decrypt budget, or decrypting off the main actor.
+                    // Why: the ciphertext names no ratchet, so a packet no ratchet opens (junk, or a
+                    // legitimate one to the identity key) cost the whole scan: 513 agreements, measured
+                    // about 15-20 ms per packet on a Mac with a full ring (reviewer probe, 2026-11-08),
+                    // run on the reducer's thread (the main actor in a TCA host). No inbound rate bound
+                    // covers DATA (ingress control limits announces only, `seenPacketHashes` stops exact
+                    // replays only). The budget caps that at 8 deep scans per burst and 1 per second
+                    // per interface.
+                    //
+                    // Cost if wrong: a sender holding a ratchet older than our 16th-newest (it heard
+                    // none of our last 16 rotations, so its ratchet stopped being our newest at least
+                    // 7.5 hours ago at the 30-minute rotation floor), arriving during a flood on the
+                    // same interface, has its packet dropped unanswered. LXMF retries it later and it
+                    // lands once the bucket refills. The budget is per interface, so new remote
+                    // connections (a TCP server, BLE peers) each start with a full bucket.
                     let own = state.ownRatchets[packet.destinationHash]
                     guard let destination = state.localDestinations[packet.destinationHash],
-                          destination.kind == packet.destinationType,
-                          let plaintext = destination.decrypt(packet.payload, ratchets: own?.ring,
-                                                              enforceRatchets: own?.enforce ?? false)
+                          destination.kind == packet.destinationType
                     else { return .none }
+                    var plaintext = destination.decrypt(
+                        packet.payload, ratchets: own.map { Array($0.ring.prefix(Transport.ratchetShallowDepth)) },
+                        enforceRatchets: own?.enforce ?? false)
+                    if plaintext == nil, destination.kind == .single, let own,
+                       own.ring.count > Transport.ratchetShallowDepth,
+                       state.interfaces[interfaceID] != nil {
+                        let take = Transport.takeDeepScan(from: state.ratchetDeepScanBudgets[interfaceID],
+                                                          now: date.now)
+                        state.ratchetDeepScanBudgets[interfaceID] = take.budget
+                        if take.granted {
+                            // `enforceRatchets: true` only skips the identity key, already tried above.
+                            plaintext = destination.decrypt(
+                                packet.payload, ratchets: Array(own.ring.dropFirst(Transport.ratchetShallowDepth)),
+                                enforceRatchets: true)
+                        }
+                    }
+                    guard let plaintext else { return .none }
                     return .send(.delegate(.received(destinationHash: packet.destinationHash,
                                                      plaintext: plaintext,
                                                      packetHash: packet.packetHash,
@@ -2151,6 +2185,42 @@ public struct Transport {
     public static let ratchetInterval: TimeInterval = 30 * 60
     /// A ratchet key's length, private or public (X25519): reference `RATCHETSIZE / 8`.
     public static let ratchetKeyLength = 32
+    /// How many of our newest ratchets every inbound SINGLE packet tries before the identity key. A
+    /// sender holding one of these is served from here, whatever the budget says.
+    /// ReTiCA's own bound: reference has no shallow depth and scans the whole ring
+    /// (Destination.py:720-752). See the decrypt site in `.received`.
+    public static let ratchetShallowDepth = 16
+    /// The deep-scan budget per receiving interface: a token bucket holding at most this many scans of
+    /// the rest of the ring (ratchets past `ratchetShallowDepth`)...
+    public static let ratchetDeepScanBurst = 8
+    /// ...refilled at this many scans per second, by `\.transportDate`.
+    public static let ratchetDeepScanPerSecond: Double = 1
+
+    /// One interface's deep-scan budget (`State.ratchetDeepScanBudgets`): a token bucket.
+    public struct RatchetDeepScanBudget: Equatable, Sendable {
+        /// Scans available, at most `ratchetDeepScanBurst`, as of `updatedAt`.
+        public var tokens: Double
+        public var updatedAt: Date
+        public init(tokens: Double, updatedAt: Date) {
+            self.tokens = tokens
+            self.updatedAt = updatedAt
+        }
+    }
+
+    /// Takes one deep scan from `budget` at `now`, refilling it for the time since it was last touched
+    /// first. A missing budget is a full one. A clock that went backwards refills nothing.
+    static func takeDeepScan(from budget: RatchetDeepScanBudget?, now: Date)
+        -> (granted: Bool, budget: RatchetDeepScanBudget) {
+        let burst = Double(ratchetDeepScanBurst)
+        guard let budget else { return (true, RatchetDeepScanBudget(tokens: burst - 1, updatedAt: now)) }
+        let elapsed = now.timeIntervalSince(budget.updatedAt)
+        let refill = elapsed.isFinite && elapsed > 0 ? elapsed * ratchetDeepScanPerSecond : 0
+        var tokens = min(burst, budget.tokens + refill)
+        let granted = tokens >= 1
+        if granted { tokens -= 1 }
+        return (granted, RatchetDeepScanBudget(tokens: tokens, updatedAt: max(now, budget.updatedAt)))
+    }
+
     /// Whether a ratchet first heard at `received` is still usable at `now`. A non-finite time is not.
     static func ratchetIsFresh(received: Date, now: Date) -> Bool {
         let age = now.timeIntervalSince(received)

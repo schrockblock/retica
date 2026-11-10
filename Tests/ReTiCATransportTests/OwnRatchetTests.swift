@@ -109,6 +109,11 @@ private func dataPacket(to dest: Destination, _ plaintext: Data, ratchetPublic: 
                        payload: recipient.encrypt(plaintext, ratchet: ratchetPublic)).packed()
 }
 
+/// A DATA packet to `dest` that no key of ours opens: encrypted to a ratchet we never held.
+private func junk(to dest: Destination) -> Data {
+    dataPacket(to: dest, Data("junk".utf8), ratchetPublic: Identity.ratchetPublicKey(privateKey: newRatchetPrivate()))
+}
+
 @Suite @MainActor struct OwnRatchetTests {
     // MARK: Review Focus 2 — rotation
 
@@ -320,6 +325,139 @@ private func dataPacket(to dest: Destination, _ plaintext: Data, ratchetPublic: 
         }
         #expect(recovered == msg.packed)
         #expect(counter.value == 1)
+    }
+
+    // MARK: Parity follow-ups Task 2 — the inbound deep-scan budget (a deliberate divergence: reference
+    // Destination.decrypt, Destination.py:720-752, always scans the whole ring)
+
+    /// Review Focus: a junk flood empties the receiving interface's deep-scan budget, and a packet to our
+    /// newest ratchet (or to the identity key) still decrypts, from the shallow attempt alone.
+    @Test func aJunkFloodEmptiesTheBudgetButTheNewestRatchetStillDecrypts() async throws {
+        let dest = ownDestination()
+        let log = DelegateLog([])
+        let store = await makeStore(dest, log, clock: LockIsolated(start))
+        let ring = (0..<512).map { _ in newRatchetPrivate() }
+        await store.send(.enableRatchets(destinationHash: dest.hash, ring: ring))
+        // Each junk packet that finds a token scans the whole ring (513 agreements). The ninth finds none.
+        for n in 0..<Transport.ratchetDeepScanBurst {
+            let counter = Identity.LockedCounter()
+            await Identity.$decryptAgreementProbe.withValue(counter) {
+                await store.send(.received(i0, junk(to: dest)))
+            }
+            #expect(counter.value == 513, "junk #\(n) with a token scans the whole ring and the identity key")
+        }
+        for _ in 0..<40 {
+            let counter = Identity.LockedCounter()
+            await Identity.$decryptAgreementProbe.withValue(counter) {
+                await store.send(.received(i0, junk(to: dest)))
+            }
+            #expect(counter.value == Transport.ratchetShallowDepth + 1,
+                    "with the budget empty a junk packet costs the shallow ratchets and the identity key only")
+        }
+        await store.send(.received(i0, dataPacket(to: dest, Data("newest".utf8),
+                                                  ratchetPublic: Identity.ratchetPublicKey(privateKey: ring[0]))))
+        await store.send(.received(i0, dataPacket(to: dest, Data("16th".utf8),
+                                                  ratchetPublic: Identity.ratchetPublicKey(privateKey: ring[15]))))
+        await store.send(.received(i0, dataPacket(to: dest, Data("identity".utf8), ratchetPublic: nil)))
+        await store.skipReceivedActions(strict: false)
+        #expect(delivered(log) == ["newest", "16th", "identity"].map { Data($0.utf8) })
+    }
+
+    @Test func aPacketToThe100thRatchetDecryptsWithATokenAndIsDroppedWithout() async throws {
+        let dest = ownDestination()
+        let log = DelegateLog([])
+        let store = await makeStore(dest, log, clock: LockIsolated(start))
+        let ring = (0..<512).map { _ in newRatchetPrivate() }
+        await store.send(.enableRatchets(destinationHash: dest.hash, ring: ring))
+        let to100 = Identity.ratchetPublicKey(privateKey: ring[100])
+        await store.send(.received(i0, dataPacket(to: dest, Data("with a token".utf8), ratchetPublic: to100)))
+        for _ in 1..<Transport.ratchetDeepScanBurst { await store.send(.received(i0, junk(to: dest))) }
+        await store.send(.received(i0, dataPacket(to: dest, Data("without".utf8), ratchetPublic: to100)))
+        await store.skipReceivedActions(strict: false)
+        #expect(delivered(log) == [Data("with a token".utf8)])
+    }
+
+    @Test func theBudgetRefillsWithTimeUpToTheBurst() async throws {
+        let dest = ownDestination()
+        let log = DelegateLog([])
+        let now = LockIsolated(start)
+        let store = await makeStore(dest, log, clock: now)
+        let ring = (0..<512).map { _ in newRatchetPrivate() }
+        await store.send(.enableRatchets(destinationHash: dest.hash, ring: ring))
+        let to100 = Identity.ratchetPublicKey(privateKey: ring[100])
+        for _ in 0..<Transport.ratchetDeepScanBurst { await store.send(.received(i0, junk(to: dest))) }
+        await store.send(.received(i0, dataPacket(to: dest, Data("empty".utf8), ratchetPublic: to100)))
+
+        // Half a token is not a token, one second (ratchetDeepScanPerSecond = 1) is.
+        now.setValue(start.addingTimeInterval(0.5))
+        await store.send(.received(i0, dataPacket(to: dest, Data("half".utf8), ratchetPublic: to100)))
+        now.setValue(start.addingTimeInterval(1))
+        await store.send(.received(i0, dataPacket(to: dest, Data("refilled".utf8), ratchetPublic: to100)))
+        await store.send(.received(i0, dataPacket(to: dest, Data("spent again".utf8), ratchetPublic: to100)))
+
+        // A long quiet refills to the burst, no further.
+        now.setValue(start.addingTimeInterval(3600))
+        for n in 0...Transport.ratchetDeepScanBurst {
+            await store.send(.received(i0, dataPacket(to: dest, Data("after quiet \(n)".utf8), ratchetPublic: to100)))
+        }
+        await store.skipReceivedActions(strict: false)
+        #expect(delivered(log) == [Data("refilled".utf8)]
+                + (0..<Transport.ratchetDeepScanBurst).map { Data("after quiet \($0)".utf8) })
+    }
+
+    @Test func enforcementRefusesTheIdentityKeyAtBothDepths() async throws {
+        let dest = ownDestination()
+        let log = DelegateLog([])
+        let store = await makeStore(dest, log, clock: LockIsolated(start))
+        let ring = (0..<512).map { _ in newRatchetPrivate() }
+        await store.send(.enableRatchets(destinationHash: dest.hash, ring: ring))
+        await store.send(.setEnforceRatchets(destinationHash: dest.hash, true))
+        // With tokens: the whole ring is scanned and the identity key never tried.
+        let withTokens = Identity.LockedCounter()
+        await Identity.$decryptAgreementProbe.withValue(withTokens) {
+            await store.send(.received(i0, dataPacket(to: dest, Data("identity, deep".utf8), ratchetPublic: nil)))
+        }
+        #expect(withTokens.value == 512)
+        await store.send(.received(i0, dataPacket(to: dest, Data("ratchet 300".utf8),
+                                                  ratchetPublic: Identity.ratchetPublicKey(privateKey: ring[300]))))
+        for _ in 2..<Transport.ratchetDeepScanBurst { await store.send(.received(i0, junk(to: dest))) }
+        // Without: only the shallow ratchets, still not the identity key.
+        let without = Identity.LockedCounter()
+        await Identity.$decryptAgreementProbe.withValue(without) {
+            await store.send(.received(i0, dataPacket(to: dest, Data("identity, shallow".utf8), ratchetPublic: nil)))
+        }
+        #expect(without.value == Transport.ratchetShallowDepth)
+        await store.skipReceivedActions(strict: false)
+        #expect(delivered(log) == [Data("ratchet 300".utf8)])
+    }
+
+    @Test func budgetsArePerInterfaceAndADisconnectDropsOne() async throws {
+        let i1 = InterfaceID("i1")
+        let dest = ownDestination()
+        let log = DelegateLog([])
+        let store = await makeStore(dest, log, clock: LockIsolated(start))
+        await store.send(.interfaceConnected(i1, .default))
+        let ring = (0..<512).map { _ in newRatchetPrivate() }
+        await store.send(.enableRatchets(destinationHash: dest.hash, ring: ring))
+        let to100 = Identity.ratchetPublicKey(privateKey: ring[100])
+        for _ in 0..<Transport.ratchetDeepScanBurst { await store.send(.received(i0, junk(to: dest))) }
+        await store.send(.received(i0, dataPacket(to: dest, Data("i0, flooded".utf8), ratchetPublic: to100)))
+        await store.send(.received(i1, dataPacket(to: dest, Data("i1".utf8), ratchetPublic: to100)))
+        #expect(store.state.ratchetDeepScanBudgets.keys.sorted { $0.rawValue < $1.rawValue } == [i0, i1])
+
+        await store.send(.interfaceDisconnected(i0))
+        #expect(store.state.ratchetDeepScanBudgets[i0] == nil)
+        #expect(store.state.ratchetDeepScanBudgets[i1] != nil)
+
+        // An id that never registered gets no deep scan and mints no budget, so arbitrary ids cannot
+        // grow the dictionary. The shallow attempt still runs.
+        let ghost = InterfaceID("ghost")
+        await store.send(.received(ghost, dataPacket(to: dest, Data("ghost, deep".utf8), ratchetPublic: to100)))
+        await store.send(.received(ghost, dataPacket(to: dest, Data("ghost, newest".utf8),
+                                                     ratchetPublic: Identity.ratchetPublicKey(privateKey: ring[0]))))
+        #expect(store.state.ratchetDeepScanBudgets[ghost] == nil)
+        await store.skipReceivedActions(strict: false)
+        #expect(delivered(log) == ["i1", "ghost, newest"].map { Data($0.utf8) })
     }
 
     // MARK: Review Focus 4 — the announce budget and captured app data
