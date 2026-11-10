@@ -195,13 +195,34 @@ import ComposableArchitecture
         #expect(Set(h.store.state.peers.keys) == ["fe80::aa", "fe80::bb"], "24 is not past 2.5 + 22")
         await h.advance(to: 28)
         #expect(Set(h.store.state.peers.keys) == ["fe80::bb"])
-        #expect(h.delegates.value.contains(.peerRemoved(addr: "fe80::aa")))
+        #expect(h.delegates.value.contains(.peersRemoved(addrs: ["fe80::aa"])))
         await h.advance(to: 40)
         #expect(h.store.state.peers["fe80::bb"] != nil)
         await h.advance(to: 44)
         #expect(h.store.state.peers.isEmpty)
-        #expect(h.delegates.value.filter { if case .peerRemoved = $0 { true } else { false } }
-                == [.peerRemoved(addr: "fe80::aa"), .peerRemoved(addr: "fe80::bb")])
+        #expect(h.delegates.value.filter { if case .peersRemoved = $0 { true } else { false } }
+                == [.peersRemoved(addrs: ["fe80::aa"]), .peersRemoved(addrs: ["fe80::bb"])])
+        await h.finish()
+    }
+
+    /// Every peer one tick removes, by eviction AND with a vanished NIC, is reported in ONE delegate,
+    /// sorted: a host checking "was that my last interface?" must see them leave together.
+    @Test func everyPeerOneTickRemovesIsReportedInOnePeersRemoved() async {
+        let h = AutoHarness()
+        await h.startAndAccept()
+        await h.advance(to: 2.5)
+        await h.discovery(autoEn1, from: "fe80::bb")
+        await h.discovery(autoEn0, from: "fe80::aa")
+        await h.advance(to: 20)
+        await h.discovery(autoEn1, from: "fe80::cc")       // fresh, so not evicted at 28
+        await h.advance(to: 24)                             // 24 is not past 2.5 + 22: nothing goes
+        #expect(h.store.state.peers.count == 3)
+        h.nics.setValue([autoEn0])                          // en1 vanishes at the 28 s tick
+        await h.advance(to: 28)
+        let removals = h.delegates.value.filter { if case .peersRemoved = $0 { true } else { false } }
+        #expect(removals == [.peersRemoved(addrs: ["fe80::aa", "fe80::bb", "fe80::cc"])],
+                "aa evicted, bb evicted, cc with its NIC: one delegate")
+        #expect(h.store.state.peers.isEmpty)
         await h.finish()
     }
 
@@ -342,7 +363,7 @@ import ComposableArchitecture
         #expect(h.store.state.peers.isEmpty)
         #expect(h.store.state.status == .noUsableInterfaces)
         #expect(h.delegates.value == [.noUsableInterfaces, .peerAdded(addr: "fe80::aa", nic: "en0"),
-                                      .peerRemoved(addr: "fe80::aa"), .noUsableInterfaces])
+                                      .peersRemoved(addrs: ["fe80::aa"]), .noUsableInterfaces])
         await h.finish()
     }
 

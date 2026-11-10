@@ -109,7 +109,8 @@ struct AutoInterfaceDriverLiveTests {
     }
 
     // 4. Same host, same data port: the second data bind fails `EADDRINUSE` (§4.10.2) because the data
-    //    socket sets no reuse options, while both discovery sockets coexist (SO_REUSEPORT).
+    //    socket sets no reuse options. It is the only failure reported: the data plane binds first
+    //    and a failed one opens no discovery socket (test 14).
     @Test func secondDataBindOnSamePortReportsAddressInUse() async throws {
         let first = AutoInterfaceDriver.liveValue
         let second = AutoInterfaceDriver.liveValue
@@ -310,6 +311,147 @@ struct AutoInterfaceDriverLiveTests {
         #expect(failures.isEmpty, "\(failures.count) of 10 rebinds failed: \(failures.prefix(3))")
     }
 
+    // 14. A co-running NomadNet (here `holder`) holds the data port, so our data bind fails. Our NIC
+    //     must then open NO discovery socket, neither on the first bind nor on the D3 retry every
+    //     peer-job tick. On Darwin the most recently bound SO_REUSEPORT socket receives all unicast
+    //     to (ll, port), so a unicast discovery socket of ours, re-created every tick, took every
+    //     reverse announce meant for the holder (0 of 20 reached it, /tmp/ReTiCA/reuseport_unicast_probe.py).
+    @Test func aFailedDataBindOpensNoDiscoverySocketSoTheHolderKeepsItsUnicast() async throws {
+        let holder = AutoInterfaceDriver.liveValue
+        let ours = AutoInterfaceDriver.liveValue
+        let b = binding(discoveryPort: 39_836, dataPort: 52_801)
+        let holderLog = EventLog(holder.run([b]))
+        defer { Task { await holder.stop() } }
+        #expect(await holderLog.waitFor { $0.contains(.bound(nic: "lo0")) }, "holder never bound: \(holderLog.snapshot())")
+
+        let ourLog = EventLog(ours.run([b]))
+        defer { Task { await ours.stop() } }
+        let clash = AutoSocketEvent.bindFailed(nic: "lo0", plane: .data, errno: EADDRINUSE)
+        #expect(await ourLog.waitFor { $0.contains(clash) }, "our data bind did not clash: \(ourLog.snapshot())")
+        await ours.rebind(b)   // the D3 retry
+        #expect(await ourLog.waitFor { $0.filter { $0 == clash }.count == 2 }, "retry did not clash: \(ourLog.snapshot())")
+
+        let reverse = (0..<20).map { Data("reverse-\($0)".utf8) }
+        for d in reverse {
+            #expect(await holder.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.discoveryPort + 1, d) == .sent)
+        }
+        #expect(await holderLog.waitFor { log in reverse.allSatisfy { log.contains(datagram(.unicastDiscovery, $0)) } },
+                "the holder lost reverse announces to our socket: \(holderLog.snapshot().count) events")
+        let ourDatagrams = ourLog.snapshot().filter { if case .datagram = $0 { return true } else { return false } }
+        #expect(ourDatagrams.isEmpty, "a NIC whose data bind failed received \(ourDatagrams.count) datagrams")
+        #expect(ourLog.snapshot() == [clash, clash], "only the two clashes: \(ourLog.snapshot())")
+    }
+
+    // 15. Spec R11 with the data plane bound first: a multicast join that fails (here the "group" is
+    //     not a multicast address) is still reported as a failed `.multicastDiscovery` plane, so the
+    //     reducer skips the NIC, and the data socket already bound stays open until it unbinds it.
+    @Test func aFailedMulticastJoinAfterTheDataBindIsReportedAndDataStaysBound() async throws {
+        let driver = AutoInterfaceDriver.liveValue
+        var b = binding(discoveryPort: 39_846, dataPort: 52_811)
+        b.group = [0xfe, 0x80] + [UInt8](repeating: 0, count: 13) + [0x01]   // fe80::1, unicast
+        let log = EventLog(driver.run([b]))
+        defer { Task { await driver.stop() } }
+        #expect(await log.waitFor { $0.contains { if case .bindFailed(_, .multicastDiscovery, _) = $0 { true } else { false } } },
+                "a failed join was not reported: \(log.snapshot())")
+        let payload = Data("data-after-failed-join".utf8)
+        #expect(await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, payload) == .sent)
+        #expect(await log.waitFor { $0.contains(datagram(.data, payload)) }, "data plane not bound: \(log.snapshot())")
+        let failures = log.snapshot().filter { if case .bindFailed = $0 { return true } else { return false } }
+        #expect(failures.count == 1, "only the join failed: \(failures)")
+        #expect(!log.snapshot().contains(.bound(nic: "lo0")))
+        await driver.unbind("lo0")
+        #expect(await bindsCleanly(binding(discoveryPort: 39_846, dataPort: 52_811)), "unbind left the data port bound")
+    }
+
+    // 16. Flood with a consumer that is not reading (the main actor busy): the stream buffers at most
+    //     `eventBufferLimit` events, not one per datagram, and delivery resumes once it reads again.
+    @Test func aFloodBuffersAtMostTheStreamBoundAndDeliveryResumesAfterwards() async throws {
+        let batches = BatchCounter()
+        let driver = AutoInterfaceDriver.live(deliveryGate: { batches.increment() })
+        let b = binding(discoveryPort: 39_856, dataPort: 52_821)
+        let stream = driver.run([b])
+        defer { Task { await driver.stop() } }
+        #expect(await isBound(driver, b), "never bound")
+
+        await flood(driver, b, count: 3000)
+        #expect(await batches.settled(), "deliveries never settled")
+        let log = EventLog(stream)
+        #expect(await log.drained(), "nothing was buffered")
+        let flooded = log.snapshot().filter(isFlood).count
+        let after = Data("after-flood".utf8)
+        #expect(await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, after) == .sent)
+        #expect(await log.waitFor { $0.contains(datagram(.data, after)) }, "delivery blocked after the flood")
+        let limit = AutoInterfaceDriver.eventBufferLimit
+        #expect(flooded < limit, "\(flooded) flood datagrams buffered, bound \(limit)")
+        #expect(flooded >= limit / 2, "the flood never filled the buffer (\(flooded)), so the bound was not exercised")
+    }
+
+    // 17. While a delivery is held (the actor busy), a socket has at most ONE delivery Task pending:
+    //     reads coalesce into it, up to `pendingDatagramLimit`, and the rest are dropped. One Task per
+    //     read batch grew without bound. Once released, later datagrams are delivered.
+    @Test func aHeldDeliveryKeepsOnePendingTaskPerSocketAndCoalescesUpToTheLimit() async throws {
+        let gate = HoldAll()
+        let driver = AutoInterfaceDriver.live(deliveryGate: { await gate.pass() })
+        let b = binding(discoveryPort: 39_866, dataPort: 52_831)
+        let log = EventLog(driver.run([b]))
+        defer { Task { await driver.stop() } }
+        #expect(await log.waitFor { $0.contains(.bound(nic: "lo0")) }, "trio never bound: \(log.snapshot())")
+
+        await flood(driver, b, count: 3000)
+        try await Task.sleep(for: .milliseconds(300))
+        let pending = await gate.waiting
+        #expect(pending == 1, "\(pending) delivery Tasks pending for one socket")
+        await gate.open()
+        let after = Data("after-hold".utf8)
+        #expect(await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, after) == .sent)
+        #expect(await log.waitFor { $0.contains(datagram(.data, after)) }, "delivery blocked after the hold")
+        let flooded = log.snapshot().filter(isFlood).count
+        let cap = AutoInterfaceDriver.maxDatagramsPerRead + AutoInterfaceDriver.pendingDatagramLimit
+        #expect(flooded <= cap, "\(flooded) flood datagrams delivered from one held socket, cap \(cap)")
+    }
+
+    // 18. Bind and read outcomes are never lost to a full stream: a `.bound` from a rebind made while
+    //     a flood fills it is held back and delivered, in order, once the consumer reads again.
+    @Test func aControlEventDuringAFullStreamIsDeliveredOnceThereIsRoom() async throws {
+        let batches = BatchCounter()
+        let driver = AutoInterfaceDriver.live(deliveryGate: { batches.increment() })
+        let b = binding(discoveryPort: 39_876, dataPort: 52_841)
+        let stream = driver.run([b])
+        defer { Task { await driver.stop() } }
+        #expect(await isBound(driver, b), "never bound")
+        await flood(driver, b, count: 3000)
+        #expect(await batches.settled(), "deliveries never settled")
+        await driver.rebind(b)
+
+        let log = EventLog(stream)
+        #expect(await log.drained(), "nothing was buffered")
+        let after = Data("after-rebind".utf8)
+        #expect(await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, after) == .sent)
+        #expect(await log.waitFor { $0.contains(datagram(.data, after)) }, "delivery blocked: \(log.snapshot().count)")
+        let events = log.snapshot()
+        #expect(events.filter { $0 == .bound(nic: "lo0") }.count == 2, "the rebind's .bound was lost")
+        if let second = events.lastIndex(of: .bound(nic: "lo0")), let fresh = events.firstIndex(of: datagram(.data, after)) {
+            #expect(second < fresh, "the held .bound must come before later traffic")
+        }
+    }
+
+    private func isFlood(_ e: AutoSocketEvent) -> Bool {
+        if case let .datagram(_, _, _, _, payload) = e { return payload.starts(with: Data("flood".utf8)) }
+        return false
+    }
+
+    /// The NIC has an entry (so `run` bound it) without reading the stream: a multicast to a port
+    /// nothing listens on succeeds only for a bound NIC.
+    private func isBound(_ driver: AutoInterfaceDriver, _ b: AutoBinding) async -> Bool {
+        await poll { await driver.sendMulticast(b.nic, Data(repeating: 9, count: 32), 9) == .sent }
+    }
+
+    private func flood(_ driver: AutoInterfaceDriver, _ b: AutoBinding, count: Int) async {
+        for i in 0..<count {
+            _ = await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, Data("flood-\(i)".utf8))
+        }
+    }
+
     /// Whether a fresh live driver can bind `b` fully (so no earlier socket still holds the data port).
     /// Retries for a while: a cancelled source closes its fd on the socket queue, asynchronously.
     private func bindsCleanly(_ b: AutoBinding) async -> Bool {
@@ -362,6 +504,61 @@ private final class EventLog: @unchecked Sendable {
 
     func waitFor(timeout: Duration = .seconds(3), _ predicate: @escaping @Sendable ([AutoSocketEvent]) -> Bool) async -> Bool {
         await poll(timeout: timeout) { predicate(self.snapshot()) }
+    }
+
+    /// Something arrived, then nothing for 200 ms: the consumer has read what was buffered.
+    func drained() async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(5)
+        var last = -1
+        while ContinuousClock.now < deadline {
+            let now = snapshot().count
+            if now > 0, now == last { return true }
+            last = now
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return false
+    }
+}
+
+/// Holds every caller until `open()`, counting how many wait. After `open()` callers pass straight through.
+private actor HoldAll {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var waiting: Int { waiters.count }
+
+    func pass() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        for w in waiters { w.resume() }
+        waiters.removeAll()
+    }
+}
+
+/// Counts delivery batches (the delivery gate's calls), so a test can wait until a flood's reads and
+/// deliveries are over without reading the stream.
+private final class BatchCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+    private var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+
+    /// Some batch arrived, then none for 300 ms.
+    func settled() async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(10)
+        var last = -1
+        while ContinuousClock.now < deadline {
+            let now = value
+            if now > 0, now == last { return true }
+            last = now
+            try? await Task.sleep(for: .milliseconds(300))
+        }
+        return false
     }
 }
 

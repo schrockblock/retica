@@ -302,6 +302,16 @@ Live actor (Darwin, `import Darwin`):
    generation. `stop`/`unbind`/`rebind` bump it, and stale events are dropped before they reach the
    continuation (the `NWConnectionActor` lesson, `TCPConnection.swift:97-112`).
 5. `source` = `inet_ntop` text with no scope; `sourceScope` = `sin6_scope_id`.
+6. Bounded (final-review fix I1): the stream is `.bufferingOldest(512)`, and each read socket has at
+   most one delivery Task pending, with reads coalescing into it up to 256 datagrams. Datagrams over
+   either bound are dropped, as a full kernel buffer drops them. `bound`/`bindFailed`/`readFailed`
+   are never dropped: one the full stream refuses is held and yielded again, ahead of any datagram,
+   at the next actor entry (every delivery, send and announce tick).
+7. Bind order (final-review fix I2): data first. When the data bind fails, neither discovery socket
+   is opened. Those carry `SO_REUSEPORT`, and on Darwin the most recently bound reuseport socket gets
+   all unicast to `(ll, port)`, so ours, re-created by every D3 retry, took every reverse announce
+   meant for the rnsd or NomadNet holding the data port. A failed multicast join is still reported
+   after a good data bind (R11).
 
 Network.framework is **possible**: `NWConnectionGroup`/`NWMulticastGroup`, `requiredInterface` and
 `requiredLocalEndpoint` all exist. POSIX is still recommended. It reproduces the reference's per-NIC
@@ -330,10 +340,13 @@ Actions and behaviour, numbered to match §4:
 4. `.socketEvent(.datagram(_, .data, src, _, payload))`: drop unless `accepting` and `peers[src]`
    exists. Drop if `payload.count > 1196 + ifacSize` (Transport has no MTU check: grep of
    `Transport.swift`). Dedupe (§4.8.3). Refresh, then `.delegate(.packetReceived(addr:data:))`.
-5. `.peerJobTick`, in the order of §4.7: evict (`.peerRemoved`), reverse announce, re-enumerate NICs
+5. `.peerJobTick`, in the order of §4.7: evict, reverse announce, re-enumerate NICs
    (change → `rebind`, plus D1 and D2 below), then the echo watchdog. The watchdog emits
    `.carrierLost(nic)` / `.carrierRecovered(nic)` on transitions and `.multicastUnavailable(nic)`
-   **once** while no echo has ever arrived after 6.5 s.
+   **once** while no echo has ever arrived after 6.5 s. Every peer the tick removes (evicted, or
+   with a vanished NIC) is reported in ONE `.peersRemoved(addrs:)`, emitted first (final-review fix
+   M1: one delegate per peer let each host arm see the others still registered, so the shared
+   maintenance loop never stopped when the last two left together).
 6. `.send(addr:data:)`: `sendUnicast(addr, peer.index, dataPort, data)`. `.failed(EHOSTUNREACH |
    ENETUNREACH | EPERM)` feeds §8.4.
 7. `.stop`: invalidate the epoch, cancel every timer and the stream, `driver.stop()`, clear peers, the
@@ -368,8 +381,8 @@ Actions and behaviour, numbered to match §4:
   `maintenanceStartEffect(state)` **before** mutating `peerInterfaces[id]`. Then
   `.transport(.interfaceConnected(id, profile))`. This is the BLE arm's shape
   (`TransportEndpoint.swift:416-422`).
-- `.peerRemoved`: `interfaceDisconnected`, then `linkPlane(.interfaceDisconnected)`, then
-  `maintenanceStopEffect(state, departing: id)`.
+- `.peersRemoved(addrs)`: for each id, `interfaceDisconnected`, then `linkPlane(.interfaceDisconnected)`,
+  then one `maintenanceStopEffect(state, departing: Set(ids))`, as `disconnectAllServerConnections` does.
 - `.packetReceived(addr, data)`: `.transport(.received(id, data))`.
 - `.auto(.interface(.stop))` and stream failure: a bulk disconnect from `peerInterfaces`, modelled on
   `disconnectAllServerConnections`.
@@ -406,7 +419,7 @@ Actions and behaviour, numbered to match §4:
 
 ## 6. Delegates for the app
 
-`.peerAdded`, `.peerRemoved`, `.carrierLost`/`.carrierRecovered`, `.multicastUnavailable(nic)`,
+`.peerAdded`, `.peersRemoved`, `.carrierLost`/`.carrierRecovered`, `.multicastUnavailable(nic)`,
 `.dataPortInUse(nic)` (on a Mac this usually means a local rnsd or NomadNet is running: say so),
 `.noUsableInterfaces`, and `.localNetworkDenied` (§8.4). Keep them hatch-only, off the unified
 surface, the way BLE's `adapterUnavailable` is (`TransportEndpoint.swift:435-439`).

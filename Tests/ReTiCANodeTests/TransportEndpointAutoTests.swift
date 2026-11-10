@@ -63,6 +63,8 @@ private final class AutoEndpointHarness {
     let log = LockIsolated<[Event]>([])
     let sessions = LockIsolated<[AsyncStream<AutoSocketEvent>.Continuation]>([])
     let holdStop = LockIsolated(false)
+    /// What the mock driver's `interfaces()` reports.
+    let nics = LockIsolated([en0, en1])
     let transportNow = LockIsolated(Date(timeIntervalSince1970: 0))
     let tcpEvents = AsyncStream<TCPEvent>.makeStream()
     static let base = Date(timeIntervalSince1970: 1_000_000)
@@ -71,6 +73,7 @@ private final class AutoEndpointHarness {
         start = clock.now
         let clock = self.clock, start = self.start, log = self.log, sessions = self.sessions
         let hold = self.holdStop, transportNow = self.transportNow, tcp = self.tcpEvents.stream
+        let nics = self.nics
         let slot = AutoEndpoint.State(ifacNetworkName: ifac?.0, ifacPassphrase: ifac?.1)
         let initial = TransportEndpoint.State(
             tcpClients: withTCPClient ? [TCPEndpoint.State(host: "peer", port: 4242, reconnectOnDrop: false)] : [],
@@ -79,7 +82,7 @@ private final class AutoEndpointHarness {
             Recorder(log: log)
         } withDependencies: {
             $0.autoInterfaceDriver = AutoInterfaceDriver(
-                interfaces: { [en0, en1] },
+                interfaces: { nics.value },
                 run: { _ in
                     log.withValue { $0.append(.run) }
                     let s = AsyncStream<AutoSocketEvent>.makeStream()
@@ -209,6 +212,57 @@ private func dataPacket(to destHash: Data) -> Data {
     #expect(h.count(.disconnected(idA)) == 1)
     #expect(h.count(.linkDisconnected(idA)) == 1, "the link plane hears the departure too")
     #expect(h.count(.stopMaintenance) == 1, "the node's last interface stops maintenance")
+    await h.finish()
+}
+
+/// Two peers evicted in ONE peer-job tick, and they are the node's only interfaces. Reported one
+/// delegate per peer, each container arm still saw the other peer registered and neither stopped the
+/// shared loop: it ran on with nothing registered. One batched removal sees both leave together.
+@Test @MainActor func twoAutoPeersEvictedInOneTickAsTheLastInterfacesStopMaintenance() async {
+    let h = AutoEndpointHarness()
+    await h.startAndAccept()
+    await h.discover(peerA, on: en0)
+    await h.discover(peerB, on: en1)
+    #expect(h.store.state.interfaces.count == 2)
+
+    // Both heard at 1.92 s: both evicted at the 24 s tick.
+    await h.advance(to: 26)
+    #expect(h.store.state.interfaces.isEmpty, "both peers left the router")
+    #expect(h.count(.disconnected(idA)) == 1 && h.count(.disconnected(idB)) == 1)
+    #expect(h.count(.linkDisconnected(idA)) == 1 && h.count(.linkDisconnected(idB)) == 1)
+    #expect(h.count(.stopMaintenance) == 1, "the last interfaces left together: maintenance stops once")
+    await h.finish()
+}
+
+/// The same burst with a TCP client up: it keeps the shared loop running.
+@Test @MainActor func twoAutoPeersEvictedInOneTickWithATCPClientUpKeepMaintenanceRunning() async {
+    let h = AutoEndpointHarness(withTCPClient: true)
+    await h.startAndAccept()
+    h.tcpEvents.continuation.yield(.connected)
+    await h.settle()
+    await h.discover(peerA, on: en0)
+    await h.discover(peerB, on: en1)
+    #expect(h.store.state.interfaces.count == 3)
+
+    await h.advance(to: 26)
+    #expect(h.store.state.interfaces.count == 1, "only the TCP client remains")
+    #expect(h.count(.stopMaintenance) == 0, "a live TCP client keeps the shared loop running")
+    await h.finish()
+}
+
+/// Both NICs vanish in one tick (D2), each taking its peer: the same single batched removal.
+@Test @MainActor func twoNICsVanishingInOneTickWithTheLastPeersStopMaintenance() async {
+    let h = AutoEndpointHarness()
+    await h.startAndAccept()
+    await h.discover(peerA, on: en0)
+    await h.discover(peerB, on: en1)
+    #expect(h.store.state.interfaces.count == 2)
+
+    h.nics.setValue([])
+    await h.advance(to: 4)
+    #expect(h.store.state.interfaces.isEmpty, "both peers left with their NICs")
+    #expect(h.count(.disconnected(idA)) == 1 && h.count(.disconnected(idB)) == 1)
+    #expect(h.count(.stopMaintenance) == 1, "the last interfaces left together: maintenance stops once")
     await h.finish()
 }
 

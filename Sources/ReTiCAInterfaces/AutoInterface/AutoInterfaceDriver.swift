@@ -57,11 +57,16 @@ public struct AutoBinding: Equatable, Sendable {
 /// The three receiving sockets of one NIC (§4.4).
 public enum AutoPlane: Sendable, Equatable { case multicastDiscovery, unicastDiscovery, data }
 
+/// Bind and read outcomes (`bound`, `bindFailed`, `readFailed`) are never dropped. Datagrams are:
+/// a session buffers at most `AutoInterfaceDriver.eventBufferLimit` events for a consumer that is
+/// not reading, and further datagrams are dropped, as a full kernel socket buffer drops them.
 public enum AutoSocketEvent: Sendable, Equatable {
     /// Every plane of the NIC bound. Emitted once per `run` binding or `rebind` that fully succeeds.
     case bound(nic: String)
-    /// One plane of one NIC failed to open or bind. The other planes and NICs are unaffected, and
-    /// the planes that did bind stay open. `EADDRINUSE` on `.data` is the same-host clash of §4.10.
+    /// One plane of one NIC failed to open or bind. Other NICs are unaffected. The data plane binds
+    /// first: when it fails (`EADDRINUSE` is the same-host clash of §4.10) it is the only event and
+    /// NEITHER discovery socket is opened, so a co-running rnsd or NomadNet keeps its unicast. When
+    /// a discovery plane fails, the planes that did bind stay open.
     case bindFailed(nic: String, plane: AutoPlane, errno: Int32)
     /// One received datagram. `source` is `inet_ntop` text with no scope, `sourceScope` is the
     /// `sin6_scope_id` (§4.3.2). `payload` is the whole datagram (at most 8192 bytes).
@@ -117,6 +122,15 @@ public struct AutoInterfaceDriver: Sendable {
     }
 }
 
+extension AutoInterfaceDriver {
+    /// The most events a live session's stream buffers for a consumer that is not reading.
+    static let eventBufferLimit = 512
+    /// The most datagrams one read socket holds for its one pending delivery.
+    static let pendingDatagramLimit = 256
+    /// The most datagrams one read event takes from the kernel.
+    static let maxDatagramsPerRead = 64
+}
+
 extension AutoInterfaceDriver: DependencyKey {
     public static var liveValue: AutoInterfaceDriver { live(deliveryGate: nil) }
 
@@ -142,7 +156,13 @@ extension AutoInterfaceDriver: DependencyKey {
                 // Taken synchronously, so a `stop` (or a later `run`) issued before this session's
                 // start reaches the actor wins: the start then finds its ticket stale.
                 let t = ticket.bump()
-                return AsyncStream { continuation in
+                // Bounded, oldest kept: a full buffer refuses the NEW event, as a full kernel socket
+                // buffer drops new datagrams. Keeping the oldest also means a refused yield names
+                // exactly the event refused, so the actor can hold a refused bind or read outcome
+                // back and yield it again (`flushControl`) instead of losing it. Unbounded, any LAN
+                // host sending to the (unauthenticated) ports grew this buffer without limit.
+                return AsyncStream(AutoSocketEvent.self,
+                                   bufferingPolicy: .bufferingOldest(AutoInterfaceDriver.eventBufferLimit)) { continuation in
                     // Installed here, before the start can run, so a consumer that drops the stream
                     // early still retires the ticket and its start binds nothing. The strong capture
                     // of the actor is released when the stream terminates (onTermination runs once).
@@ -244,8 +264,46 @@ private actor AutoSocketActor {
         let closed: DispatchSemaphore
     }
 
+    /// What one read socket has read and not yet handed to the actor. At most ONE delivery Task per
+    /// socket runs at a time: reads made while it is pending coalesce here, up to
+    /// `pendingDatagramLimit`, and the rest are dropped (UDP semantics). One Task per read batch,
+    /// with the actor slow, grew without bound under a flood.
+    private final class Mailbox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: [ReceivedDatagram] = []
+        private var error: Int32?
+        private var scheduled = false
+
+        /// Adds a batch. Returns true when the caller must start the delivery Task (none runs).
+        func put(_ batch: [ReceivedDatagram], error: Int32?) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            let room = max(0, AutoInterfaceDriver.pendingDatagramLimit - pending.count)
+            pending.append(contentsOf: batch.prefix(room))
+            if let error, self.error == nil { self.error = error }
+            if scheduled { return false }
+            scheduled = true
+            return true
+        }
+
+        /// Takes everything pending. Nil when there is nothing: the Task ends, and the next `put`
+        /// starts a new one (one lock, so no batch is stranded between the two).
+        func take() -> (datagrams: [ReceivedDatagram], error: Int32?)? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !pending.isEmpty || error != nil else {
+                scheduled = false
+                return nil
+            }
+            let out = (pending, error)
+            pending = []
+            error = nil
+            return out
+        }
+    }
+
     private static let readBufferSize = AutoInterfaceWire.dataRecvSize
-    private static let maxDatagramsPerRead = 64
+    private static let maxDatagramsPerRead = AutoInterfaceDriver.maxDatagramsPerRead
 
     private let deliveryGate: (@Sendable () async -> Void)?
     private let queue: DispatchQueue
@@ -254,6 +312,9 @@ private actor AutoSocketActor {
     private var activeTicket: UInt64 = 0
     private var generation: UInt64 = 0
     private var nics: [String: NICSockets] = [:]
+    /// Bind and read outcomes the full stream refused, oldest first. Yielded again, ahead of any
+    /// datagram, at every actor entry, so none is lost (the reducer's retries depend on them).
+    private var pendingControl: [AutoSocketEvent] = []
     /// The one shared unbound socket for every unicast send (§5.3.3), opened on first use.
     private var unicastSender: Int32 = -1
 
@@ -309,7 +370,34 @@ private actor AutoSocketActor {
         }
         let c = continuation
         continuation = nil
+        pendingControl = []
         c?.finish()
+    }
+
+    // MARK: Yielding
+
+    /// Queues a bind or read outcome and yields what the stream will take.
+    private func emitControl(_ event: AutoSocketEvent) {
+        guard continuation != nil else { return }
+        pendingControl.append(event)
+        flushControl()
+    }
+
+    /// Yields held-back control events in order. True when none is left (the stream has room).
+    @discardableResult
+    private func flushControl() -> Bool {
+        guard let continuation else { return false }
+        while let first = pendingControl.first {
+            switch continuation.yield(first) {
+            case .enqueued: pendingControl.removeFirst()
+            case .dropped: return false
+            case .terminated:
+                pendingControl = []
+                return false
+            @unknown default: return false
+            }
+        }
+        return true
     }
 
     // MARK: Per-NIC binding
@@ -344,31 +432,45 @@ private actor AutoSocketActor {
         let gen = generation
         var entry = NICSockets(binding: binding, generation: gen, sources: [:], multicastSender: -1)
         var allBound = true
-        for plane in [AutoPlane.multicastDiscovery, .unicastDiscovery, .data] {
+        // The data plane FIRST, and when it fails open neither discovery socket. Those carry
+        // SO_REUSEPORT, and on Darwin the most recently bound reuseport socket receives all unicast
+        // to (ll, port): a unicast discovery socket of ours, re-created by every D3 retry, took every
+        // reverse announce meant for the rnsd or NomadNet holding the data port (0 of 20 reached it,
+        // probe /tmp/ReTiCA/reuseport_unicast_probe.py). The reference never gets there: its data
+        // clash panics the process (`RT:1307-1311`). A failed multicast join is still reported
+        // after a good data bind, for the reducer's skip (spec R11).
+        planes: for plane in [AutoPlane.data, .multicastDiscovery, .unicastDiscovery] {
             switch Self.openReceiver(plane, binding) {
             case let .success(fd):
                 entry.sources[plane] = makeSource(fd: fd, nic: binding.nic, plane: plane, generation: gen)
             case let .failure(err):
                 allBound = false
-                continuation?.yield(.bindFailed(nic: binding.nic, plane: plane, errno: err.code))
+                emitControl(.bindFailed(nic: binding.nic, plane: plane, errno: err.code))
+                if plane == .data { break planes }
             }
         }
         nics[binding.nic] = entry
-        if allBound { continuation?.yield(.bound(nic: binding.nic)) }
+        if allBound { emitControl(.bound(nic: binding.nic)) }
     }
 
     private func makeSource(fd: Int32, nic: String, plane: AutoPlane, generation gen: UInt64) -> ReadSocket {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         let closed = DispatchSemaphore(value: 0)
         let gate = deliveryGate
+        let mailbox = Mailbox()
         source.setEventHandler { [weak self, weak source] in
             let (datagrams, error) = Self.drain(fd)
             // A hard read error would make the source fire for ever: close this socket now.
             if error != nil { source?.cancel() }
             guard !datagrams.isEmpty || error != nil else { return }
+            // A delivery already pending picks this batch up (see `Mailbox`).
+            guard mailbox.put(datagrams, error: error) else { return }
             Task {
-                if let gate { await gate() }
-                await self?.deliver(nic: nic, plane: plane, generation: gen, datagrams: datagrams, error: error)
+                while let batch = mailbox.take() {
+                    if let gate { await gate() }
+                    await self?.deliver(nic: nic, plane: plane, generation: gen,
+                                        datagrams: batch.datagrams, error: batch.error)
+                }
             }
         }
         source.setCancelHandler {
@@ -385,19 +487,27 @@ private actor AutoSocketActor {
     ) {
         // Stale: read by a socket that `rebind`/`unbind`/`stop` has since replaced or closed.
         guard let continuation, let entry = nics[nic], entry.generation == gen else { return }
-        for d in datagrams {
-            continuation.yield(.datagram(
-                nic: nic, plane: plane, source: d.source, sourceScope: d.scope, payload: d.payload))
+        // Held-back control events go first; while any is still refused the stream is full and
+        // these datagrams would be refused too.
+        if flushControl() {
+            for d in datagrams {
+                let result = continuation.yield(.datagram(
+                    nic: nic, plane: plane, source: d.source, sourceScope: d.scope, payload: d.payload))
+                if case .dropped = result { break }   // full: the rest would drop as well
+            }
         }
         if let error {
             nics[nic]?.sources[plane] = nil
-            continuation.yield(.readFailed(nic: nic, plane: plane, errno: error))
+            emitControl(.readFailed(nic: nic, plane: plane, errno: error))
         }
     }
 
     // MARK: Sends
 
     func sendMulticast(nic: String, token: Data, port: UInt16) -> AutoSendResult {
+        // Every announce tick passes here, so a control event held back by a flood that has since
+        // ended is yielded within 1.6 s even if no datagram arrives.
+        flushControl()
         guard var entry = nics[nic] else { return .failed(errno: ENXIO) }
         if entry.multicastSender < 0 {
             switch Self.openMulticastSender(index: entry.binding.index) {
@@ -416,6 +526,7 @@ private actor AutoSocketActor {
         // Outside a session: `teardownAll` closed the shared sender, and reopening it here would leak
         // it until the next session's teardown. Same answer as a multicast send on an unbound NIC.
         guard continuation != nil else { return .failed(errno: ENXIO) }
+        flushControl()
         guard let bytes = Self.parseIPv6(addr) else { return .failed(errno: EINVAL) }
         if unicastSender < 0 {
             switch Self.openSocket() {

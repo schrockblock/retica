@@ -10,7 +10,7 @@ import Darwin
 /// plane, over the `AutoInterfaceDriver` sockets.
 ///
 /// Reference: RNS 1.6.0 `Interfaces/AutoInterface.py` (`AI`). The reducer owns no Transport
-/// registration: the host registers one interface per `peerAdded` and deregisters on `peerRemoved`
+/// registration: the host registers one interface per `peerAdded` and deregisters on `peersRemoved`
 /// and on `.stop` (spec §5.7), the reference parent being a no-op sink (`AI:617`).
 ///
 /// Divergences (spec §5.6, none visible on the wire): D1 an address change rebinds all three
@@ -115,7 +115,12 @@ public struct AutoInterface {
         @CasePathable
         public enum Delegate: Equatable, Sendable {
             case peerAdded(addr: String, nic: String)
-            case peerRemoved(addr: String)
+            /// Every peer that left in one reduction (an eviction tick, vanished NICs, a skipped NIC),
+            /// sorted, never empty. One delegate for the lot, so the host sees them leave together:
+            /// reported one by one, each of the host's arms would still see the others registered
+            /// (TCA runs the queued sends in order), and a "was that the last interface?" check
+            /// would never fire.
+            case peersRemoved(addrs: [String])
             case packetReceived(addr: String, data: Data)
             case carrierLost(nic: String)
             case carrierRecovered(nic: String)
@@ -333,7 +338,9 @@ public struct AutoInterface {
             // that never bound: a join that fails on a later rebind (an address change, a retry) is a
             // transient failed plane, retried every tick like any other (below).
             guard state.nics[nic] != nil else { return .none }
-            var effects = removeNIC(nic, &state)
+            var removed: [String] = []
+            var effects = [removeNIC(nic, &state, removed: &removed)]
+            if let gone = Self.peersRemoved(removed) { effects.append(gone) }
             state.skippedNICs.insert(nic)
             effects.append(.send(.delegate(.multicastUnavailable(nic: nic))))
             effects.append(updateStatus(&state))
@@ -428,12 +435,15 @@ public struct AutoInterface {
     private func peerJob(_ state: inout State) -> Effect<Action> {
         let now = date.now
         var effects: [Effect<Action>] = []
+        // Every peer this tick removes (evicted here, or with a vanished NIC in step 3), reported
+        // in ONE `peersRemoved` (see that case).
+        var removed: [String] = []
 
         // 1. Evict peers not heard for more than 22 s (`AI:383-396`).
         let timedOut = state.peers.filter { now > $0.value.lastHeard.addingTimeInterval(AutoInterfaceWire.peeringTimeout) }
         for addr in timedOut.keys.sorted() {
             state.peers[addr] = nil
-            effects.append(.send(.delegate(.peerRemoved(addr: addr))))
+            removed.append(addr)
         }
 
         // 2. Reverse announce: our token for the peer's NIC, to its unicast discovery port
@@ -457,7 +467,9 @@ public struct AutoInterface {
         }
 
         // 3. Re-enumerate NICs (`AI:410-457`, D1, D2, D3).
-        effects.append(reenumerate(&state, now: now))
+        effects.append(reenumerate(&state, now: now, removed: &removed))
+        // First, so the host deregisters the departed before it hears anything else from this tick.
+        if let gone = Self.peersRemoved(removed) { effects.insert(gone, at: 0) }
 
         // 4. Echo watchdog (`AI:462-480`): transitions only, the first pass is silent. A NIC with a
         //    failed plane is skipped: it sends no announces (D3), so a missing echo says nothing
@@ -481,7 +493,7 @@ public struct AutoInterface {
         return .merge(effects)
     }
 
-    private func reenumerate(_ state: inout State, now: Date) -> Effect<Action> {
+    private func reenumerate(_ state: inout State, now: Date, removed: inout [String]) -> Effect<Action> {
         let snapshot = driver.interfaces().filter { state.config.isEligible(nicName: $0.name) }
         let present = Dictionary(snapshot.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
         var effects: [Effect<Action>] = []
@@ -490,7 +502,7 @@ public struct AutoInterface {
             guard var nic = state.nics[name] else { continue }
             guard let fresh = present[name], let ll = Self.adoptedLinkLocal(fresh) else {
                 // D2: a vanished NIC is unbound and its peers evicted at once.
-                effects += removeNIC(name, &state)
+                effects.append(removeNIC(name, &state, removed: &removed))
                 continue
             }
             if ll != nic.linkLocal || fresh.index != nic.index {
@@ -529,19 +541,24 @@ public struct AutoInterface {
         }
     }
 
-    /// Drops a NIC: unbinds it and evicts its peers.
-    private func removeNIC(_ name: String, _ state: inout State) -> [Effect<Action>] {
+    /// Drops a NIC: evicts its peers (appended to `removed`, for the caller's one `peersRemoved`)
+    /// and returns the unbind.
+    private func removeNIC(_ name: String, _ state: inout State, removed: inout [String]) -> Effect<Action> {
         state.nics[name] = nil
-        let epoch = state.epoch, generation = epoch.current
-        var effects: [Effect<Action>] = [.run { [driver] _ in
-            guard epoch.current == generation else { return }
-            await driver.unbind(name)
-        }]
         for addr in state.peers.keys.sorted() where state.peers[addr]?.nic == name {
             state.peers[addr] = nil
-            effects.append(.send(.delegate(.peerRemoved(addr: addr))))
+            removed.append(addr)
         }
-        return effects
+        let epoch = state.epoch, generation = epoch.current
+        return .run { [driver] _ in
+            guard epoch.current == generation else { return }
+            await driver.unbind(name)
+        }
+    }
+
+    /// The one delegate for every peer a reduction removed, or nil when it removed none.
+    private static func peersRemoved(_ addrs: [String]) -> Effect<Action>? {
+        addrs.isEmpty ? nil : .send(.delegate(.peersRemoved(addrs: addrs.sorted())))
     }
 
     /// Keeps `status` in step with the adopted NICs and the accept gate. Emits

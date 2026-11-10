@@ -693,21 +693,31 @@ public struct TransportEndpoint {
                 state.auto?.peerInterfaces[id] = AutoEndpoint.AutoPeer(addr: addr, nic: nic)
                 return .merge([.send(.transport(.interfaceConnected(id, auto.profile)))] + startEffects)
 
-            case let .auto(.interface(.delegate(.peerRemoved(addr)))):
-                // The interface reports the address only: the slot's map gives back the NIC.
-                guard let (id, _) = state.auto?.peer(addr: addr) else { return .none }
-                state.auto?.peerInterfaces[id] = nil
-                return .merge([.send(.transport(.interfaceDisconnected(id))),
-                               .send(.linkPlane(.interfaceDisconnected(id)))]
-                              + maintenanceStopEffect(state, departing: id))
+            case let .auto(.interface(.delegate(.peersRemoved(addrs)))):
+                // The interface reports addresses only: the slot's map gives back the NICs. All of
+                // them leave in this one arm, so the stop check sees them depart together (one arm
+                // per peer would each see the others still registered, and never stop the loop).
+                var departing = Set<InterfaceID>()
+                for addr in addrs {
+                    guard let (id, _) = state.auto?.peer(addr: addr) else { continue }
+                    state.auto?.peerInterfaces[id] = nil
+                    departing.insert(id)
+                }
+                guard !departing.isEmpty else { return .none }
+                var effects: [Effect<Action>] = []
+                for id in departing.sorted(by: { $0.rawValue < $1.rawValue }) {
+                    effects.append(.send(.transport(.interfaceDisconnected(id))))
+                    effects.append(.send(.linkPlane(.interfaceDisconnected(id))))
+                }
+                return .merge(effects + maintenanceStopEffect(state, departing: departing))
 
             case let .auto(.interface(.delegate(.packetReceived(addr, data)))):
                 guard let (id, _) = state.auto?.peer(addr: addr) else { return .none }
                 return .send(.transport(.received(id, data)))
 
-            // A stop clears the interface's peers without a `peerRemoved` each (its stream and
-            // timers are cancelled): deregister them here from the slot's own map. The interface's
-            // only other way to lose peers, eviction and a vanished NIC, reports each one. Its
+            // A stop clears the interface's peers without a `peersRemoved` (its stream and timers
+            // are cancelled): deregister them here from the slot's own map. The interface's other
+            // ways to lose peers (eviction, a vanished or skipped NIC) report them in `peersRemoved`. Its
             // stream has no terminal failure event: per-NIC failures are retried every tick (D3).
             case .auto(.interface(.stop)):
                 return disconnectAllAutoPeers(&state)
@@ -806,7 +816,7 @@ public struct TransportEndpoint {
     }
 
     /// Report every registered auto peer disconnected, from the slot's own map, and forget them so a
-    /// late `peerRemoved` is a no-op. Stops the shared loop iff nothing else is live.
+    /// late `peersRemoved` is a no-op. Stops the shared loop iff nothing else is live.
     private func disconnectAllAutoPeers(_ state: inout State) -> Effect<Action> {
         guard let peers = state.auto?.peerInterfaces, !peers.isEmpty else { return .none }
         state.auto?.peerInterfaces = [:]

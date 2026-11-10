@@ -21,7 +21,7 @@ import ComposableArchitecture
 // and note the hash in the log line "will respond to probe requests on <...>".
 //
 // This Mac:
-//     RETICA_LIVE_AUTO_DEVICE=en0 RETICA_LIVE_AUTO_PROBE=<probe hash, 32 hex> \
+//     RETICA_LIVE_AUTO_DEVICE=en0 RETICA_LIVE_AUTO_PROBE='<probe hash: 32 hex, or the <...> as logged>' \
 //       swift test --no-parallel --filter LiveAutoInterface
 //
 // Pass criteria, in order (§7.4 step 3), each asserted below:
@@ -36,6 +36,28 @@ import ComposableArchitecture
 private let autoDevice = ProcessInfo.processInfo.environment["RETICA_LIVE_AUTO_DEVICE"]
 private let autoProbe = ProcessInfo.processInfo.environment["RETICA_LIVE_AUTO_PROBE"]
 private let liveAutoEnabled = autoDevice != nil && autoProbe != nil
+
+/// The probe destination hash from RETICA_LIVE_AUTO_PROBE: bare hex, `<hex>`, or the destination
+/// exactly as rnsd logs it, `<name:hex>` (RNS 1.6.0 `Transport.py:650` logs `str(destination)`,
+/// which is `"<"+name+":"+hexhash+">"`, `Destination.py:226`).
+func liveAutoProbeHash(_ raw: String) -> Data? {
+    var hex = Substring(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    if hex.hasPrefix("<"), hex.hasSuffix(">") { hex = hex.dropFirst().dropLast() }
+    if let colon = hex.lastIndex(of: ":") { hex = hex[hex.index(after: colon)...] }
+    return Data(hexString: String(hex))
+}
+
+/// Not gated: the parsing the live test depends on.
+@Test func liveAutoProbeHashAcceptsTheHashAsRnsdPrintsIt() {
+    let hash = Data(hexString: "0123456789abcdef0123456789abcdef")
+    #expect(liveAutoProbeHash("0123456789abcdef0123456789abcdef") == hash)
+    #expect(liveAutoProbeHash("<0123456789abcdef0123456789abcdef>") == hash,
+            "pasted from rnsd's \"will respond to probe requests on <...>\" log line")
+    #expect(liveAutoProbeHash("  <0123456789abcdef0123456789abcdef>\n") == hash)
+    #expect(liveAutoProbeHash("<rnstransport.probe:0123456789abcdef0123456789abcdef>") == hash,
+            "the whole destination as Transport.py:650 logs it")
+    #expect(liveAutoProbeHash("<nothex>") == nil)
+}
 
 /// Delegate events as rendered strings (`TransportEndpoint.Action.Delegate` is not Sendable).
 @Reducer
@@ -52,7 +74,7 @@ private struct AutoHarness {
             case let .endpoint(.auto(.interface(.delegate(d)))):
                 switch d {
                 case let .peerAdded(addr, nic): sink("peerAdded addr=\(addr) nic=\(nic)")
-                case let .peerRemoved(addr): sink("peerRemoved addr=\(addr)")
+                case let .peersRemoved(addrs): sink("peersRemoved addrs=\(addrs)")
                 case let .dataPortInUse(nic): sink("dataPortInUse nic=\(nic)")
                 case .noUsableInterfaces: sink("noUsableInterfaces")
                 case let .multicastUnavailable(nic): sink("multicastUnavailable nic=\(nic)")
@@ -89,8 +111,8 @@ private struct AutoHarness {
 
     @Test func reTiCAPeersWithAReferenceRnsdOverAutoInterfaceAndGetsAProbeProved() async throws {
         let nic = try #require(autoDevice)
-        let probeHex = try #require(autoProbe).trimmingCharacters(in: .whitespacesAndNewlines)
-        let probe = try #require(Data(hexString: probeHex), "RETICA_LIVE_AUTO_PROBE must be hex")
+        let probeText = try #require(autoProbe)
+        let probe = try #require(liveAutoProbeHash(probeText), "RETICA_LIVE_AUTO_PROBE must be hex, optionally in <...>")
         #expect(probe.count == 16, "a destination hash is 16 bytes (32 hex characters)")
 
         let events = LockIsolated<[String]>([])
@@ -108,7 +130,11 @@ private struct AutoHarness {
 
         // 1 and 2. A peer on the NIC. A bind failure surfaces as dataPortInUse/noUsableInterfaces,
         // and that is the likely cause of a miss on a Mac that also runs rnsd or NomadNet.
-        let peered = await waitFor(peerWindow) { seen("peerAdded") != nil }
+        // Ends early on a bind failure: waiting the whole window for a peer that cannot come only
+        // hides the cause.
+        let peered = await waitFor(peerWindow) {
+            seen("peerAdded") != nil || seen("dataPortInUse") != nil || seen("noUsableInterfaces") != nil
+        } && seen("peerAdded") != nil
         let elapsed = ContinuousClock.now - started
         #expect(seen("dataPortInUse") == nil,
                 "this Mac's data port is held by another process (NomadNet or rnsd?): stop it first")

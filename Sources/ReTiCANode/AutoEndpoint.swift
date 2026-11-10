@@ -15,15 +15,15 @@ import ReTiCATransport
 /// `TransportEndpoint` does all the wiring; this slot only carries the interface, the peer map and
 /// the profile every peer is registered with.
 ///
-/// App-facing signals (`peerAdded`, `peerRemoved`, `carrierLost`/`carrierRecovered`,
+/// App-facing signals (`peerAdded`, `peersRemoved`, `carrierLost`/`carrierRecovered`,
 /// `multicastUnavailable`, `dataPortInUse`, `noUsableInterfaces`, `localNetworkDenied`) stay on
 /// this hatch, at `.auto(.interface(.delegate(...)))`, off the unified surface (spec §6). For the
-/// live peer count read `peerInterfaces`: a `.stop` clears the interface's peers without one
-/// `peerRemoved` each, and the container deregisters them from this map.
+/// live peer count read `peerInterfaces`: a `.stop` clears the interface's peers without a
+/// `peersRemoved`, and the container deregisters them from this map.
 @Reducer
 public struct AutoEndpoint {
     /// One registered peer: the address the interface keys it by, and the NIC it was first heard on
-    /// (part of its `InterfaceID`; the interface reports `peerRemoved(addr:)` without it).
+    /// (part of its `InterfaceID`; the interface reports `peersRemoved(addrs:)` without it).
     public struct AutoPeer: Equatable, Sendable {
         public var addr: String
         public var nic: String
