@@ -621,7 +621,7 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Interfaces: TCP client and server | Implemented | HDLC framing cross-validated. |
 | Interface: BLE | Implemented | ble-reticulum protocol v2.2 (GATT) plus v3 (L2CAP). Fragmentation cross-validated against ble-reticulum. |
 | Interface: Meshtastic | Implemented | Fragment codec cross-validated against landandair's RNS_Over_Meshtastic. |
-| Interface: AutoInterface | Implemented | Group address and discovery token cross-validated against RNS 1.6.0. Not yet tested live against a reference peer: that needs a second host on the LAN. |
+| Interface: AutoInterface | Implemented | Group address and discovery token cross-validated against RNS 1.6.0. Not yet tested live against a reference peer: that needs a second host on the LAN (live test written, see Part 2 section 4). |
 | Interfaces: UDP, RNode/KISS, serial, I2P, pipe, shared instance (LocalInterface) | **Missing** | |
 | Persistence | The host's job | See Part 1. The packet-hash dedup ring and the announce cache are deliberately not persisted. |
 | Admission control | **Partial** | The number of inbound links is capped; Resources per link are not, and there is no `accepts_links`-style per-destination policy. |
@@ -789,6 +789,18 @@ Both are skipped unless an environment variable is set.
   ```
 
   The harness keeps its configs and identities under `/tmp/ReTiCA/linkprobe`.
+
+- **AutoInterface against a real `rnsd`** (`Tests/ReTiCANodeTests/LiveAutoInterfaceTests.swift`).
+  Needs a SECOND host on the same LAN segment (a Linux VM must use bridged networking): two
+  AutoInterfaces on one Mac never peer. No run is recorded yet. The full recipe and config for host B
+  are in `docs/superpowers/specs/2026-11-10-autointerface.md` §7.4. In short:
+
+  ```sh
+  # host B: rnsd with an AutoInterface on its LAN NIC, respond_to_probes = Yes; note the probe hash
+  rnsd --config /tmp/rns-auto -vv      # log line "will respond to probe requests on <hash>"
+  # this Mac: stop NomadNet and any local rnsd first (they hold the ports: dataPortInUse)
+  RETICA_LIVE_AUTO_DEVICE=en0 RETICA_LIVE_AUTO_PROBE=<hash> swift test --no-parallel --filter LiveAutoInterface
+  ```
 
 ### 5. By hand
 

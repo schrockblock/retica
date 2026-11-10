@@ -489,8 +489,22 @@ Host B config (`/tmp/rns-auto/config`):
 ```
 1. `…/rns-latest/bin/rnsd --config /tmp/rns-auto -vv`. Note the probe hash in the log line "will
    respond to probe requests on <…>" (`TP:645-650`).
-2. On the Mac: `RETICA_LIVE_AUTO_DEVICE=en0 RETICA_LIVE_AUTO_PROBE=<hash> swift test --filter LiveAutoInterface`.
-   Gate it with `@Test(.enabled(if: env != nil))`, as `LiveEndpointTests.swift:12` does.
+2. On the Mac (the test is `Tests/ReTiCANodeTests/LiveAutoInterfaceTests.swift`, enabled only when BOTH
+   variables are set, so it shows as skipped otherwise):
+   ```
+   RETICA_LIVE_AUTO_DEVICE=en0 RETICA_LIVE_AUTO_PROBE=<32-hex probe hash from step 1> \
+     swift test --no-parallel --filter LiveAutoInterface
+   ```
+   `RETICA_LIVE_AUTO_DEVICE` is this Mac's LAN NIC (check `route get default`). **Stop NomadNet and any
+   `rnsd` on this Mac first**: they hold the default discovery and data ports (§4.10), and ReTiCA
+   then reports `dataPortInUse` (the test fails with that message named).
+   The test asserts, in order: no `dataPortInUse`/`noUsableInterfaces`/`localNetworkDenied`; a
+   `peerAdded` on that NIC with an `fe80:` address within 8 s (the elapsed time is printed, the spec
+   target is about 2 s); a path request makes B announce the probe destination and the learned route
+   is `auto:<nic>/fe80:...`; a packet to the probe destination gets `singlePacketDelivered`; after
+   `.stop` no peer interface remains.
+   **Status: written, compiles, skipped by default. No second-host run has been recorded yet.**
+   The user runs it and records the result here.
 3. Pass criteria: ReTiCA emits `peerAdded` for B within about 2 s. `rnstatus --config /tmp/rns-auto -a`
    on B lists `AutoInterfacePeer[en0/<Mac fe80>]` (`rnstatus.py:464`, `RT:1727`). ReTiCA sends a path
    request, receives B's announce (path learned via `auto:en0/<B fe80>`), sends a packet to the probe
