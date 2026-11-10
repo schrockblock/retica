@@ -252,17 +252,6 @@ public struct PropagationStore: Equatable {
         stored.values.sorted { $0.sequence < $1.sequence }.map { $0.transientId }
     }
 
-    /// The stored transient_ids a peer accepting at `minimum` will take, oldest-first: those whose
-    /// `stampValue` (nil counts as 0) is at least `minimum`. Reference drops every entry with
-    /// `get_stamp_value(tid) < min_accepted_cost` from a peer's offer (LXMPeer.py:343-361), because a
-    /// receiving reference node tears the link down and throttles the sender on any entry it finds
-    /// invalid (LXMRouter.py:2786-2793). `minimum` comes from `LXMFPropagation.peerMinimumAcceptedCost`;
-    /// +infinity keeps nothing.
-    public func transientIds(acceptedAt minimum: Double) -> [Data] {
-        stored.values.filter { ($0.stampValue ?? 0) >= minimum }
-            .sorted { $0.sequence < $1.sequence }.map { $0.transientId }
-    }
-
     /// The offer a sync sends a peer: reference's `LXMPeer.sync` selection (LXMPeer.py:339-384), over
     /// the stored entries not in `handled` (the peer's handled set; everything else stands in for
     /// reference's per-peer unhandled list).
@@ -270,7 +259,10 @@ public struct PropagationStore: Equatable {
     /// - `lowValue`: entries whose `stampValue` (nil as 0) is below `minimum`, the peer's
     ///   `max(0, cost - flex)`. Reference removes these from the peer's unhandled list
     ///   (LXMPeer.py:345, :359-361), so it never offers them to that peer again; a caller matches that
-    ///   by adding them to the peer's handled set.
+    ///   by adding them to the peer's handled set. Offering one would be worse than useless: a
+    ///   receiving reference node tears the link down and throttles the sender on any entry it finds
+    ///   invalid (LXMRouter.py:2786-2793). `minimum` comes from
+    ///   `LXMFPropagation.peerMinimumAcceptedCost`; +infinity keeps nothing.
     /// - The rest are sorted by weight ascending (LXMPeer.py:363), ties in ingest order as Python's
     ///   stable sort over `propagation_entries` order leaves them. Weight is reference's `get_weight`
     ///   (LXMRouter.py:1188-1199): `priority_weight * max(1, age_seconds/60/60/24/4) * size`.

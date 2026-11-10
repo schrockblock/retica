@@ -357,10 +357,14 @@ private func stampedEntry(valueIn range: Range<Double>, label: String = "flex") 
     let highId = try #require(store.preflightTransientId(ofStampedEntry: high.entry))
     #expect(store.entries(forTransientIds: [lowId, highId]).map(\.stampValue) == [low.value, high.value])
 
-    #expect(store.transientIds(acceptedAt: high.value) == [highId])
-    #expect(store.transientIds(acceptedAt: high.value + 1.0 / 256).isEmpty)
-    #expect(store.transientIds(acceptedAt: low.value) == [lowId, highId])           // oldest-first
-    #expect(store.transientIds(acceptedAt: .infinity).isEmpty)
+    func offered(_ minimum: Double) -> Set<Data> {
+        Set(store.offerCandidates(acceptedAt: minimum, transferLimitKB: nil, syncLimitKB: nil, excluding: [],
+                                  now: Date(timeIntervalSince1970: 1700000000)).offer)
+    }
+    #expect(offered(high.value) == [highId])
+    #expect(offered(high.value + 1.0 / 256).isEmpty)
+    #expect(offered(low.value) == [lowId, highId])
+    #expect(offered(.infinity).isEmpty)
 }
 
 /// Flexibility at or above the target gives an acceptance cost of 0 (reference's `max(0, …)`), not a

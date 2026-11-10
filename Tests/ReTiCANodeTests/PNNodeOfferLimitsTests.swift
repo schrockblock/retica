@@ -177,8 +177,27 @@ private func respond(_ store: TestStore<PNNode.State, PNNode.Action>, linkID: Da
         data: MsgPack.encode(.array([.bin(Data(repeating: 0, count: 32)), .array([.bin(ids[1]), .bin(unknown)])]))))))
     await store.receive { if case .node(.delegate(.peerValidated(peerDest, true))) = $0 { return true }; return false }
     await store.skipReceivedActions(strict: false)
-    #expect(store.state.handledByPeer[peerDest] == [ids[1], unknown])
+    #expect(store.state.handledByPeer[peerDest] == [ids[1]])                // the id we do not hold is not kept
     #expect(await sync(store, linkID: link(1)) == [ids[0], ids[2]])
-    // The sync pruned the id we never received out of the set; the held one stays.
     #expect(store.state.handledByPeer[peerDest] == [ids[1]])
+}
+
+/// An unpeered identity (key valid at peering cost 0) offering only ids we do not hold leaves no
+/// state behind: no `handledByPeer` key, not even an empty set. Its offer is still answered.
+@MainActor @Test func pnNodeKeepsNoHandledStateForAStrangerOfferingUnknownIds() async {
+    let (initial, _) = makeState(sizes: [100])
+    let store = makeStore(initial)
+    let stranger = Identity()
+    let strangerDest = Destination.hash(identityHash: stranger.hash, appName: LXMessage.appName, aspects: ["propagation"])
+    let inbound = link(8)
+    let junk = (0..<50).map { Data(repeating: UInt8($0), count: 32) }
+    await store.send(.endpoint(.delegate(.linkIdentified(linkID: inbound, remoteIdentity: stranger))))
+    await store.send(.endpoint(.delegate(.requestReceived(
+        linkID: inbound, requestID: Data([2]), pathHash: Crypto.truncatedHash(Data("/offer".utf8)),
+        data: MsgPack.encode(.array([.bin(Data(repeating: 0, count: 32)), .array(junk.map { .bin($0) })]))))))
+    await store.receive { if case .node(.delegate(.peerValidated(strangerDest, true))) = $0 { return true }; return false }
+    await store.receive { if case .endpoint(.sendResponseOverLink(inbound, _, _)) = $0 { return true }; return false }
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.handledByPeer[strangerDest] == nil)
+    #expect(store.state.handledByPeer.isEmpty)
 }

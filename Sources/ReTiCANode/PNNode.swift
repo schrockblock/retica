@@ -42,9 +42,10 @@ public struct PNNode {
         /// us by it (see `peerValidated`).
         ///
         /// In memory only: a relaunch forgets it, costing one redundant offer per peer (the peer
-        /// declines what it has, and that marks them again). Bounded: each time a peer's set is
-        /// touched it is pruned to ids still in the store (reference's lists live inside the store
-        /// entries and go with them), plus, on an inbound offer, the ids just offered.
+        /// declines what it has, and that marks them again). Holds only ids the store holds: each
+        /// time a peer's set is touched it is pruned to them (reference's lists live inside the store
+        /// entries and go with them), and a set that prunes to empty is removed. A set is not pruned
+        /// when an entry leaves the store between touches, so it can outlive its entries until then.
         public var handledByPeer: [Data: Set<Data>] = [:]
         public init(identity: Identity, endpoint: TransportEndpoint.State, storageLimitBytes: Int? = nil,
                     targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
@@ -122,12 +123,15 @@ public struct PNNode {
         Scope(state: \.endpoint, action: \.endpoint) { TransportEndpoint() }
         Scope(state: \.node, action: \.node) { PropagationNode() }
         Reduce { [date] state, action in
-            /// Adds `ids` to `peer`'s handled set, first pruning it to ids the store still holds.
+            /// Adds `ids` to `peer`'s handled set, keeping only ids the store holds (the set is pruned
+            /// to them each time). An empty set is removed rather than stored, so a peer leaves no key
+            /// behind unless it has handled ids we hold.
             func markHandled(_ state: inout State, _ peer: Data, _ ids: some Sequence<Data>) {
                 let store = state.node.store
-                var handled = state.handledByPeer[peer, default: []].filter { store.contains(transientId: $0) }
+                var handled = state.handledByPeer[peer, default: []]
                 handled.formUnion(ids)
-                state.handledByPeer[peer] = handled
+                handled = handled.filter { store.contains(transientId: $0) }
+                state.handledByPeer[peer] = handled.isEmpty ? nil : handled
             }
             func clearLink(_ state: inout State, _ linkID: Data) {
                 state.offerLinks[linkID] = nil
@@ -235,13 +239,14 @@ public struct PNNode {
             case let .node(.delegate(.peerValidated(peerHash, valid))):
                 guard let pending = state.pendingOffer[peerHash] else { return .none }
                 if valid {
-                    // A peer that offers an id holds it, so it is handled for that peer. Earlier than
-                    // reference, which marks only the ids it then RECEIVES from the peer
-                    // (`queue_handled_message`, LXMRouter.py:2784) and so offers a held-but-declined id
-                    // back once, to be declined. Every id a peer sends us in a sync was in its offer, so
-                    // this is a superset; the cost of the extra marks is none (the peer holds them). An
-                    // offered id not yet stored is kept only until the set is next pruned (an id still
-                    // in transit then is offered back once).
+                    // A peer that offers an id holds it, so an offered id WE also hold is handled for
+                    // that peer (we will not want it, and should not offer it back). Only held ids are
+                    // marked: any identity whose key validates (every one at peering cost 0) reaches
+                    // here, and ids we do not hold would be state chosen by an unpeered stranger.
+                    // Reference marks only the ids it RECEIVES from a peer (`queue_handled_message`,
+                    // LXMRouter.py:2784), so it offers a held-but-declined id back once; we skip that
+                    // round trip. The ids we want are NOT marked when they arrive (reference does): we
+                    // offer them back once, and the peer declines them, which marks them.
                     markHandled(&state, peerHash, pending.offeredIds)
                     return .send(.node(.peerOffered(peerHash: peerHash, transientIds: pending.offeredIds)))
                 }

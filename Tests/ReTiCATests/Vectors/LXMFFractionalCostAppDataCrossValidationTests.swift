@@ -208,7 +208,7 @@ private func sameNumber(_ a: Double, _ b: Double) -> Bool { a == b || (a.isNaN &
 /// infinity, flexibility above the cost, a seven-element integer announce), the stamp values reference
 /// offers are exactly those at or above our `peerMinimumAcceptedCost` of the parsed announce, and where
 /// reference sends no offer ours keeps nothing. The same rule run through a store
-/// (`transientIds(acceptedAt:)`) is in PropagationStoreTests and PNNodeOfferFilterTests.
+/// (`offerCandidates(acceptedAt:…)`) is in PropagationStoreTests and PNNodeOfferFilterTests.
 ///
 /// Anti-vacuity: the cases include an all-offered, a none-offered and several partial sets, so a
 /// formula that ignored the flexibility, clamped NaN to anything but 0, or let +infinity through fails.
