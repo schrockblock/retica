@@ -77,4 +77,24 @@
 
 ## Status
 
-Not started.
+**Done 2026-11-10.** ReTiCA aa07080 (wire + fixtures), 69fac31..19f14bb (driver), 891e8fa..8260b9e (reducer),
+69bdf3c (endpoint), b05c512 (gated live test), 3cbf15c (final-review fixes: bounded flood path, data-plane-first
+bind so a clash no longer steals a co-running NomadNet's reverse announces, batched peer removal so maintenance
+stops). ReTiCAMsgr f24379d, 4033f70, dd26cca. Every task reviewed; whole-branch review "with fixes", fixes
+re-reviewed clean.
+
+Rulings: iOS gate is a code constant `AutoInterfaceAvailability.isEntitledOniOS = false` (the app's pbxproj had
+someone else's uncommitted edits); macOS default on even with NomadNet/rnsd on the same Mac (`dataPortInUse`
+names the remedy); R6 (connect+getsockname source check) deferred; peer cap 64 drop-new accepted (R4) though a
+spoofer can lock honest peers out; every auto peer-up still runs the full interface-up fan-out incl. a PN sync
+(spoofed churn ≈ 2.5 PN requests/s) — deferred.
+
+Not verified: the live run against `rnsd` on a second host (recipe in the spec §7.4, test
+`LiveAutoInterfaceTests`); the macOS Local Network prompt; anything on iOS (needs Apple's multicast entitlement).
+
+Deferred minors: a sustained LAN flood still keeps the main actor busy (needs a driver-side peer pre-filter);
+held control events carry no generation (a NIC flap during a flood could mis-skip a NIC); no logger (R4 "log
+once"); stream end without `.stop` gives no bulk disconnect (unreachable with one slot); a persistent join
+failure on a later rebind retries silently; `autoInterfaceRemovalFinished` ignores `disconnectedByUser`; on the
+Mac every window focus clears a user Disconnect (pre-existing); Connecting… can hang with only a failed auto
+slot; README RNode/KISS row contradicts itself and its permissions row; some lo0 tests use settle waits.
