@@ -81,13 +81,17 @@ private struct RecordingNode: Reducer {
     let propagatedHandOvers = LockIsolated<[Data]>([])
     let failures = LockIsolated<[Data]>([])
     let cancellations = LockIsolated<[Data]>([])
+    /// The messages handed to the router, with the stamp each carried.
+    let handedOverMessages = LockIsolated<[LXMessage]>([])
 
     var body: some Reducer<State, Action> {
         Reduce { _, action in
             switch action {
             case let .delegate(.deliveryPreparing(hash, phase)):
                 phases.withValue { $0.append(Recorded(hash: hash, phase: phase)) }
-            case let .router(.send(m, _)): handOvers.withValue { $0.append(m.hash) }
+            case let .router(.send(m, _)):
+                handOvers.withValue { $0.append(m.hash) }
+                handedOverMessages.withValue { $0.append(m) }
             case let .router(.sendViaPropagation(m, _)): propagatedHandOvers.withValue { $0.append(m.hash) }
             case let .delegate(.deliveryFailed(hash)): failures.withValue { $0.append(hash) }
             case let .delegate(.deliveryCancelled(hash)): cancellations.withValue { $0.append(hash) }
@@ -109,15 +113,18 @@ private func learned(_ identity: Identity = Identity(), appData: Data? = nil) ->
 /// A node whose delivery searches wait on `delivery` and propagated packs on `propagation`.
 @MainActor
 private func makeNode(_ recorder: RecordingNode, delivery: StampGate, propagation: StampGate,
-                      me: Identity, propagationNode: Destination? = nil) -> TestStoreOf<RecordingNode> {
+                      me: Identity, propagationNode: Destination? = nil,
+                      ticketGivers: [Identity] = []) -> TestStoreOf<RecordingNode> {
     var ep = TransportEndpoint.State.tcp(TCPEndpoint.State(host: "h", port: 4242, reconnectOnDrop: false))
     ep.transport.learned[propagationRecipient] = learned()
     ep.transport.learned[freePeer] = learned()
+    // Peers that advertised a cost and will give us a ticket while a stamp for them is pending.
+    for giver in ticketGivers { ep.transport.learned[deliveryHash(giver)] = learned(giver) }
     let pnHash = propagationNode?.hash ?? propagationNodeHash
     ep.transport.learned[pnHash] = learned(propagationNode?.identity ?? Identity(), appData: pnAppData(cost: 8))
     var node = LXMFNode.State(identity: me, endpoint: ep)
     node.router.outboundPropagationNode = pnHash
-    for peer in [costlyPeer, ticketPeer] {
+    for peer in [costlyPeer, ticketPeer] + ticketGivers.map(deliveryHash) {
         node.learnedPeers[peer] = LXMFNode.LearnedPeer(displayName: nil, stampCost: 8, supportsCompression: false,
                                                        learnedAt: Date(timeIntervalSince1970: sentAt))
     }
@@ -484,5 +491,142 @@ private func waitForHandOver(_ store: TestStoreOf<RecordingNode>, _ recorder: Re
         #expect(propagation.started.isEmpty)
         #expect(recorder.propagatedHandOvers.value.isEmpty)
         #expect(store.state.preparingPhases.isEmpty)
+    }
+}
+
+// MARK: - A ticket that arrives while a delivery stamp is pending
+
+private func deliveryHash(_ identity: Identity) -> Data { LXMessage.deliveryHash(identityHash: identity.hash) }
+
+private let givenTicket = Data(repeating: 0x3C, count: LXMessage.ticketLength)
+
+/// The ticket stamp `m` gets from `givenTicket`.
+private func ticketStamp(_ m: LXMessage) -> Data { LXMessage.ticketStamp(ticket: givenTicket, messageHash: m.hash) }
+
+/// `giver` sends `me` a message carrying `givenTicket`, and the router delivers it.
+@MainActor
+private func receiveTicket(_ store: TestStoreOf<RecordingNode>, from giver: Identity, to me: Identity) async {
+    let m = LXMessage.create(source: giver, destinationHash: deliveryHash(me), timestamp: sentAt, title: Data(),
+                             content: Data("have a ticket".utf8),
+                             fields: [.init(LXMessage.fieldTicket, .array([.double(sentAt + 86_400), .bin(givenTicket)]))])
+    await store.send(.router(.delegate(.messageDelivered(message: m, signatureValidated: true, method: .opportunistic))))
+}
+
+@MainActor
+private func waitForPropagatedHandOver(_ store: TestStoreOf<RecordingNode>, _ recorder: RecordingNode, _ hash: Data) async {
+    for _ in 0..<2000 {
+        await store.skipReceivedActions(strict: false)
+        if recorder.propagatedHandOvers.value.contains(hash) { return }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    Issue.record("never handed over for propagation")
+}
+
+/// Ruling (parity follow-ups Task 3), beyond reference, which picks the ticket only in
+/// `handle_outbound` (LXMRouter.py:2089-2094, LXMF 1.3.0): a ticket that arrives while a delivery
+/// stamp for its peer is queued or being searched finishes that job with the ticket stamp.
+@Suite(.timeLimit(.minutes(1))) @MainActor struct LXMFStampTicketArrivalTests {
+    /// Review Focus: a queued send leaves the queue at once with the ticket stamp, its search never
+    /// starts, and it is handed over exactly once.
+    @Test func aTicketForAQueuedSendHandsItOverWithTheTicketStampOnce() async {
+        let me = Identity(), giver = Identity(), recorder = RecordingNode(), delivery = StampGate()
+        let store = makeNode(recorder, delivery: delivery, propagation: StampGate(), me: me, ticketGivers: [giver])
+        let held = message(from: me, to: costlyPeer, "held"), queued = message(from: me, to: deliveryHash(giver), "queued")
+        await send(store, held)
+        await send(store, queued)
+        await delivery.waitUntilStarted(held.hash)
+        #expect(recorder.phases(of: queued.hash) == [.queued])
+
+        await receiveTicket(store, from: giver, to: me)
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.handedOverMessages.value.map(\.hash) == [queued.hash])
+        #expect(recorder.handedOverMessages.value.first?.stamp == ticketStamp(queued))
+        #expect(recorder.phases(of: queued.hash) == [.queued, .handedOver])
+        #expect(store.state.stampQueue.isEmpty)
+        #expect(store.state.runningStampJob?.message.hash == held.hash, "another peer's search is untouched")
+        #expect(!store.state.inFlightDeliveryStamps.contains(queued.hash))
+
+        delivery.end(queued.hash)       // were its search to start after all, it would hand over again
+        delivery.end(held.hash)
+        await waitForHandOver(store, recorder, held.hash)
+        try? await Task.sleep(for: .milliseconds(100))
+        await store.skipReceivedActions(strict: false)
+        #expect(delivery.started == [held.hash], "the queued send's search never started")
+        #expect(recorder.handOvers.value == [queued.hash, held.hash])
+        #expect(recorder.failures.value.isEmpty && recorder.cancellations.value.isEmpty)
+    }
+
+    /// Review Focus: the running search is cancelled, the send goes out with the ticket stamp exactly
+    /// once, and the next queued search starts.
+    @Test func aTicketForASendBeingStampedCancelsItsSearchAndHandsItOverWithTheTicketStampOnce() async {
+        let me = Identity(), giver = Identity(), recorder = RecordingNode(), delivery = StampGate()
+        let store = makeNode(recorder, delivery: delivery, propagation: StampGate(), me: me, ticketGivers: [giver])
+        let running = message(from: me, to: deliveryHash(giver), "running"), next = message(from: me, to: costlyPeer, "next")
+        await send(store, running)
+        await send(store, next)
+        await delivery.waitUntilStarted(running.hash)
+        #expect(recorder.phases(of: running.hash) == [.stamping])
+
+        await receiveTicket(store, from: giver, to: me)
+        await delivery.waitUntilStarted(next.hash)
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.handedOverMessages.value.map(\.hash) == [running.hash])
+        #expect(recorder.handedOverMessages.value.first?.stamp == ticketStamp(running))
+        #expect(recorder.phases(of: running.hash) == [.stamping, .handedOver])
+        #expect(store.state.runningStampJob?.message.hash == next.hash)
+
+        delivery.end(running.hash)      // a search still running would now hand over a second copy
+        delivery.end(next.hash)
+        await waitForHandOver(store, recorder, next.hash)
+        try? await Task.sleep(for: .milliseconds(100))
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.handOvers.value == [running.hash, next.hash])
+        #expect(recorder.failures.value.isEmpty && recorder.cancellations.value.isEmpty)
+    }
+
+    /// A ticket restored at launch does the same for a search already running.
+    @Test func aRehydratedTicketFinishesARunningSearchWithTheTicketStamp() async {
+        let me = Identity(), giver = Identity(), recorder = RecordingNode(), delivery = StampGate()
+        let store = makeNode(recorder, delivery: delivery, propagation: StampGate(), me: me, ticketGivers: [giver])
+        let running = message(from: me, to: deliveryHash(giver), "running")
+        await send(store, running)
+        await delivery.waitUntilStarted(running.hash)
+
+        await store.send(.rehydrateTickets(
+            outbound: [deliveryHash(giver): LXMFNode.Ticket(ticket: givenTicket,
+                                                            expires: Date(timeIntervalSince1970: sentAt + 86_400))],
+            inbound: [:], lastDeliveries: [:]))
+        await store.skipReceivedActions(strict: false)
+        delivery.end(running.hash)
+        try? await Task.sleep(for: .milliseconds(100))
+        await store.skipReceivedActions(strict: false)
+        #expect(recorder.handedOverMessages.value.map(\.hash) == [running.hash])
+        #expect(recorder.handedOverMessages.value.first?.stamp == ticketStamp(running))
+        #expect(store.state.runningStampJob == nil)
+    }
+
+    /// Propagation-stamp jobs are untouched: an explicit propagated send to the peer keeps its job
+    /// (and the delivery stamp search inside it) and is handed over once, for propagation.
+    @Test func aTicketLeavesAPropagatedSendsStampJobAlone() async {
+        let me = Identity(), giver = Identity(), recorder = RecordingNode(), delivery = StampGate(),
+            propagation = StampGate()
+        let store = makeNode(recorder, delivery: delivery, propagation: propagation, me: me, ticketGivers: [giver])
+        await store.send(.sendViaPropagation(destinationHash: deliveryHash(giver), title: Data(), content: Data("p".utf8)))
+        guard let explicit = store.state.runningStampJob?.message.hash else {
+            Issue.record("the explicit send is not running"); return
+        }
+        await delivery.waitUntilStarted(explicit)       // its delivery stamp, inside the propagated job
+
+        await receiveTicket(store, from: giver, to: me)
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.runningStampJob?.message.hash == explicit)
+        #expect(recorder.handOvers.value.isEmpty)
+
+        delivery.end(explicit)
+        propagation.end(explicit)
+        await waitForPropagatedHandOver(store, recorder, explicit)
+        #expect(recorder.propagatedHandOvers.value == [explicit])
+        #expect(recorder.handOvers.value.isEmpty)
+        #expect(recorder.phases(of: explicit) == [.stamping, .handedOver])
     }
 }

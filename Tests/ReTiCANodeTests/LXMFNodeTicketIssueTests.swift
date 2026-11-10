@@ -30,6 +30,12 @@ private final class Recorded: Sendable {
     let issued = LockIsolated<[(Data, LXMFNode.Ticket)]>([])
     let delivered = LockIsolated<[(Data, Date)]>([])
     let handedOver = LockIsolated<[LXMessage]>([])
+    /// When set, an action this returns for a reduced action is queued AHEAD of that action's own
+    /// effects (this reducer runs before `LXMFNode`, and its effect is merged first). A test uses it to
+    /// put a terminal outcome between a reduction and the actions it queued.
+    let interleave = LockIsolated<(@Sendable (LXMFNode.Action) -> LXMFNode.Action?)?>(nil)
+    /// The order of the actions the sweep-ordering tests judge "before" and "after" by.
+    let log = LockIsolated<[String]>([])
 }
 
 private struct RecordingNode: Reducer {
@@ -42,10 +48,15 @@ private struct RecordingNode: Reducer {
             switch action {
             case let .delegate(.ticketIssued(dest, ticket)): recorded.issued.withValue { $0.append((dest, ticket)) }
             case let .delegate(.ticketDelivered(dest, at)): recorded.delivered.withValue { $0.append((dest, at)) }
-            case let .router(.send(m, _)): recorded.handedOver.withValue { $0.append(m) }
+            case let .router(.send(m, _)):
+                recorded.handedOver.withValue { $0.append(m) }
+                recorded.log.withValue { $0.append("handOver") }
+            case .router(.delegate(.deliveryConfirmed)): recorded.log.withValue { $0.append("confirmed") }
+            case .delegate(.deliveryFailed): recorded.log.withValue { $0.append("terminal") }
             default: break
             }
-            return .none
+            guard let next = recorded.interleave.value?(action) else { return .none }
+            return .send(next)
         }
         LXMFNode()
     }
@@ -352,6 +363,70 @@ enum TicketSweepTerminal: CaseIterable, Sendable {
         #expect(store.state.ticketCarryingMessages.isEmpty)
         #expect(store.state.ticketMessagesAccepted.isEmpty)
         #expect(store.state.lastTicketDeliveries.isEmpty)
+    }
+
+    /// An explicit `.sendViaPropagation` carrying a ticket: its acceptance is its terminal outcome,
+    /// and that outcome's sweep removes its own entry (nothing else will).
+    @Test func anExplicitPropagatedSendsAcceptanceRemovesItsOwnEntry() async throws {
+        let recipient = Identity(), recorded = Recorded()
+        let store = makePropagationNode(recipient: recipient, recorded: recorded, pnLinkActive: true)
+        await store.send(.sendViaPropagation(destinationHash: deliveryHash(recipient), title: Data("t".utf8),
+                                             content: Data("c".utf8)))
+        let opened = try await openedPropagatedCopy(store, recipient)
+        #expect(opened.ticketField != nil)
+        #expect(store.state.ticketCarryingMessages == [opened.hash: deliveryHash(recipient)])
+
+        await store.send(.router(.delivered(messageHash: opened.hash, leg: .propagated)))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.ticketCarryingMessages.isEmpty)
+        #expect(store.state.ticketMessagesAccepted.isEmpty)
+    }
+
+    /// Sweep ordering 1: a terminal outcome of another message is queued ahead of a ticket-carrying
+    /// send's hand-over. Its sweep runs while nothing holds the message yet (the hand-over is still
+    /// queued), and must keep it, so the confirmation still records the ticket's delivery.
+    @Test func aSweepBetweenASendAndItsHandOverKeepsTheMessage() async throws {
+        let me = Identity(), peer = Identity(), recorded = Recorded()
+        let store = await makeNode(me, peer: peer, recorded) { $0.issueTickets = true }
+        recorded.interleave.setValue { action in
+            if case .send = action { return TicketSweepTerminal.failed.action(otherHash) }
+            return nil
+        }
+        await send(store, to: peer)
+        recorded.interleave.setValue(nil)
+        let m = try #require(recorded.handedOver.value.first)
+        #expect(recorded.log.value == ["terminal", "handOver"], "the sweep ran before the hand-over")
+        #expect(store.state.ticketCarryingMessages[m.hash] == deliveryHash(peer))
+
+        await confirm(store, m.hash)
+        #expect(store.state.lastTicketDeliveries == [deliveryHash(peer): at(0)])
+        #expect(recorded.delivered.value.map(\.0) == [deliveryHash(peer)])
+        #expect(store.state.ticketCarryingMessages.isEmpty)
+    }
+
+    /// Sweep ordering 2: the propagated copy was accepted, then the delivery copy succeeds, and a
+    /// terminal outcome of another message is reduced between the router's success and the node's
+    /// handling of its `deliveryConfirmed`. That sweep must keep the message, so the confirmation
+    /// still records the ticket's delivery.
+    @Test func aSweepBetweenTheDeliveryCopysSuccessAndItsConfirmationStillCounts() async throws {
+        let recipient = Identity(), recorded = Recorded(), clock = TestClock()
+        let store = makePropagationNode(recipient: recipient, recorded: recorded, clock: clock, pnLinkActive: true)
+        let m = try await sendFallbackUntilThePropagatedCopyIsAccepted(store, recipient, clock)
+        #expect(store.state.ticketMessagesAccepted == [m.hash])
+        recorded.log.setValue([])
+
+        recorded.interleave.setValue { action in
+            if case .router(.opportunisticDelivered) = action { return TicketSweepTerminal.failed.action(otherHash) }
+            return nil
+        }
+        await store.send(.router(.opportunisticDelivered(messageHash: m.hash)))
+        await store.skipReceivedActions(strict: false)
+        recorded.interleave.setValue(nil)
+        #expect(recorded.log.value == ["terminal", "confirmed"], "the sweep ran before the confirmation")
+        #expect(store.state.lastTicketDeliveries == [deliveryHash(recipient): at(0)])
+        #expect(recorded.delivered.value.map(\.0) == [deliveryHash(recipient)])
+        #expect(store.state.ticketCarryingMessages.isEmpty)
+        #expect(store.state.ticketMessagesAccepted.isEmpty)
     }
 }
 

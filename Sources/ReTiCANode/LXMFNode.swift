@@ -173,12 +173,18 @@ public struct LXMFNode {
         /// delivery confirmation record `lastTicketDeliveries`. An entry goes at the message's
         /// delivery confirmation, or at the first sweep after it can no longer be confirmed. A sweep
         /// runs at every terminal outcome reported for any message and at every new ticket-carrying
-        /// send. So entries are bounded by the messages still out, plus those ended silently since the
-        /// last sweep (a delivery copy that ends after its propagated copy was accepted reports nothing).
+        /// send, and costs O(entries + the router's outbound work). So entries are bounded by the
+        /// messages still out, plus those ended silently since the last sweep (a delivery copy that
+        /// ends after its propagated copy was accepted reports nothing).
         public internal(set) var ticketCarryingMessages: [Data: Data] = [:]
         /// Ticket-carrying messages whose propagated copy was accepted while their delivery copy was
         /// still out. Tells a sweep that the router's success for them has been handled here.
         public internal(set) var ticketMessagesAccepted: Set<Data> = []
+        /// Ticket-carrying messages whose hand-over to the router (`.router(.send)`) is queued but not
+        /// yet reduced. Nothing else holds such a message in that window, so a sweep reduced in it
+        /// keeps it by this. Added where `deliverySend` hands a message straight over, removed by that
+        /// `.router(.send)`, which always follows.
+        var ticketHandOversQueued: Set<Data> = []
 
         /// Display name advertised in every delivery-destination announce.
         /// Nil means no name is encoded (the announce still carries the full app-data blob per
@@ -245,7 +251,9 @@ public struct LXMFNode {
         /// and an explicit propagated send has its `preparingPhases` entry, from the moment it is
         /// queued, so `.cancelDeliveryStamps`, `.cancelPropagationStamps`, `.setPropagationNode`
         /// and `.cancelOutbound` report it exactly as they report a running one, and remove it here.
-        /// Sends stamped with a ticket and sends to a peer with no cost never enter the queue.
+        /// Sends stamped with a ticket and sends to a peer with no cost never enter the queue. A
+        /// delivery job whose peer gives us a ticket while it waits or runs leaves it then, stamped
+        /// with the ticket (`finishDeliveryStampJobsWithTicket`).
         /// Link-request key searches are not LXMF stamps and are not queued here.
         public internal(set) var stampQueue: [StampJob] = []
         /// The one LXMF stamp search running, or nil. See `stampQueue`.
@@ -490,6 +498,10 @@ public struct LXMFNode {
         /// oldest first (`State.stampQueue`).
         case queued
         /// A stamp search is running (the delivery stamp, or the work for an explicit propagated send).
+        /// An explicit propagated send to a peer that gave us a ticket still reports it: the ticket
+        /// replaces only the delivery stamp, and the propagation stamp is still searched.
+        /// A delivery send whose peer's ticket arrives during its search goes from here (or from
+        /// `.queued`) straight to `.handedOver`, stamped with the ticket.
         case stamping
         /// The message reached the router.
         case handedOver
@@ -786,9 +798,12 @@ public struct LXMFNode {
                     state.lastTicketDeliveries[hash] = at
                 }
                 // A send parked in the first-send cost wait for a peer whose ticket was just restored
-                // gets the ticket stamp at once. A stamp search already running for that peer is not
-                // restarted: it finishes with a valid stamp.
-                return .merge(restoredOutbound.map { handOverWaitingSends(&state, destinationHash: $0) })
+                // gets the ticket stamp at once, and so does every delivery-stamp job for that peer,
+                // queued or running (its search is cancelled).
+                return .merge(restoredOutbound.map { dest in
+                    .merge(handOverWaitingSends(&state, destinationHash: dest),
+                           finishDeliveryStampJobsWithTicket(&state, destinationHash: dest))
+                })
 
             case .registerDelivery:
                 guard let d = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
@@ -1261,12 +1276,13 @@ public struct LXMFNode {
                     if state.outboundTickets[message.sourceHash] != ticket {
                         state.outboundTickets[message.sourceHash] = ticket
                         // A send parked in the first-send cost wait for this peer now gets the
-                        // ticket stamp at once instead of waiting out the timer. A stamp search
-                        // already running for the peer is not restarted: it finishes with a valid stamp.
+                        // ticket stamp at once instead of waiting out the timer, and so does every
+                        // delivery-stamp job for the peer, queued or running (its search is cancelled).
                         ticketEffect = .merge(
                             .send(.delegate(.ticketReceived(destinationHash: message.sourceHash,
                                                             ticket: ticket))),
-                            handOverWaitingSends(&state, destinationHash: message.sourceHash))
+                            handOverWaitingSends(&state, destinationHash: message.sourceHash),
+                            finishDeliveryStampJobsWithTicket(&state, destinationHash: message.sourceHash))
                     }
                 }
 
@@ -1345,6 +1361,7 @@ public struct LXMFNode {
                 // the unstamped fast path (which never appended) and the completed search. Removing an
                 // absent hash is a no-op, which is why no branch is needed here.
                 state.inFlightDeliveryStamps.removeAll { $0 == handedOn.hash }
+                state.ticketHandOversQueued.remove(handedOn.hash)
                 // A fallback packs this copy, so it reuses the stamp rather than searching again.
                 if handedOn.stamp != nil, state.pendingFallbacks[handedOn.hash] != nil {
                     state.pendingFallbacks[handedOn.hash] = handedOn
@@ -1632,28 +1649,28 @@ public struct LXMFNode {
     }
 
     /// Forget every ticket-carrying message that can no longer be confirmed delivered: the router
-    /// holds no copy of it, the node is not preparing, stamping or holding it, and no delivery
-    /// success for it is still on its way. A message the router counts as succeeded is kept until
-    /// the node has handled a success for it (`ticketMessagesAccepted`, or the confirmation itself,
-    /// which removes the entry), so a `deliveryConfirmed` queued behind this sweep still finds it.
+    /// holds no copy of it, the node is not preparing, stamping or holding it, its hand-over is not
+    /// queued (`ticketHandOversQueued`), and no success for it is still on its way to this reducer.
+    /// A success is unhandled while the router counts it and the node has not handled it: the
+    /// confirmation removes the entry, so a router-confirmed delivery copy whose entry is still here
+    /// is unhandled; a propagated copy's acceptance is handled once it is in `ticketMessagesAccepted`.
+    /// So a `deliveryConfirmed` queued behind this sweep still finds its entry, even after the
+    /// propagated copy was accepted.
     ///
-    /// Two gaps, both unproven to occur, both costing only a missed `lastTicketDeliveries` update (a
-    /// ticket may then go to that peer again within a day):
-    ///  - A send recorded here reaches the router through a queued `.router(.send)`. Until it is
-    ///    processed nothing holds the message, so a sweep processed first would drop it. In every
-    ///    send branch the hand-over is queued before anything that reports a terminal outcome.
-    ///  - A message whose propagated copy was already accepted, whose delivery copy then succeeds,
-    ///    is dropped by a sweep processed between that success and its `deliveryConfirmed`.
+    /// The router's outbound work and the node's waiting sends are indexed by message hash once per
+    /// sweep, so a sweep is O(entries + outbound work), not their product.
     private func sweepTicketCarryingMessages(_ state: inout State) {
-        for hash in Array(state.ticketCarryingMessages.keys) {
-            let stillOut = state.router.hasOutboundState(for: hash)
-                || state.preparingPhases[hash] != nil
-                || state.inFlightDeliveryStamps.contains(hash)
-                || state.pendingFallbacks[hash] != nil
-                || state.waitingForPeerCost.values.contains { $0.contains { $0.message.hash == hash } }
-            let successUnhandled = state.router.succeededMessages.contains(hash)
-                && !state.ticketMessagesAccepted.contains(hash)
-            guard !stillOut, !successUnhandled else { continue }
+        guard !state.ticketCarryingMessages.isEmpty else { return }
+        var held = state.router.outboundMessageHashes()
+        held.formUnion(state.preparingPhases.keys)
+        held.formUnion(state.inFlightDeliveryStamps)
+        held.formUnion(state.pendingFallbacks.keys)
+        held.formUnion(state.ticketHandOversQueued)
+        for waiting in state.waitingForPeerCost.values { held.formUnion(waiting.map(\.message.hash)) }
+        for hash in Array(state.ticketCarryingMessages.keys) where !held.contains(hash) {
+            let successUnhandled = state.router.confirmedDeliveryCopies.contains(hash)
+                || (state.router.succeededMessages.contains(hash) && !state.ticketMessagesAccepted.contains(hash))
+            guard !successUnhandled else { continue }
             state.ticketCarryingMessages[hash] = nil
             state.ticketMessagesAccepted.remove(hash)
         }
@@ -1848,19 +1865,27 @@ public struct LXMFNode {
         // as preparing. Before the wait, because the wait exists only to learn a cost (reference
         // `handle_outbound` applies the ticket and un-defers the stamp, LXMRouter.py:2089-2094).
         if let ticketed = ticketStamped(state, message) {
-            return .send(.router(.send(message: ticketed, desiredMethod: method)))
+            return handOverNow(&state, ticketed, method)
         }
         if waitForUnknownCost, message.stamp == nil, state.learnedPeers[dest] == nil, state.endpoint.learned[dest] == nil {
             return waitForPeerCost(&state, message: message, method: method)
         }
         guard message.stamp == nil,
               let cost = deliveryStampCost(state, destinationHash: dest)
-        else { return .send(.router(.send(message: message, desiredMethod: method))) }
+        else { return handOverNow(&state, message, method) }
         if !state.inFlightDeliveryStamps.contains(message.hash) {
             state.inFlightDeliveryStamps.append(message.hash)
         }
         // One search at a time, oldest first: it waits in `stampQueue` behind any running search.
         return enqueueStampJob(&state, message: message, work: .delivery(method: method, cost: cost))
+    }
+
+    /// Hand `message` to the router with no preparing. Until that `.router(.send)` is reduced nothing
+    /// holds the message, so a ticket-carrying one is marked as on its way (`ticketHandOversQueued`).
+    private func handOverNow(_ state: inout State, _ message: LXMessage,
+                             _ method: LXMFRouter.DeliveryMethod) -> Effect<Action> {
+        if state.ticketCarryingMessages[message.hash] != nil { state.ticketHandOversQueued.insert(message.hash) }
+        return .send(.router(.send(message: message, desiredMethod: method)))
     }
 
     /// Put a stamp job at the back of `stampQueue`: it starts now if no search is running (reporting
@@ -1943,6 +1968,37 @@ public struct LXMFNode {
         guard let running = state.runningStampJob, matching(running) else { return .none }
         state.runningStampJob = nil
         return .merge(.cancel(id: CancelID.stampSearch(running.serial)), startNextStampJob(&state))
+    }
+
+    /// A ticket for `dest` has just become usable (remembered from a peer's message, or restored by
+    /// `.rehydrateTickets`): every delivery-stamp job for `dest`, queued or running, is finished with
+    /// the ticket stamp now, and a running search is cancelled (the next job starts).
+    ///
+    /// Ruling (parity follow-ups Task 3), beyond reference: reference picks the ticket only in
+    /// `handle_outbound` (LXMRouter.py:2089-2094, LXMF 1.3.0), so a message already deferred keeps its
+    /// proof-of-work search. Only delivery jobs: a propagated job still needs its propagation stamp, so
+    /// it is untouched, delivery stamp included. A copy already handed to the router is not re-stamped
+    /// (nor in reference). A ticket stamp is as valid to the receiver as the search's stamp; only the
+    /// work is saved.
+    ///
+    /// Exactly once: the job leaves the queue, or stops running, here, so it can neither start later
+    /// nor hand over its search's result (`.stampSearchEnded` checks the running serial). The hand-over
+    /// is the ordinary `.router(.send)`, which takes the message off `inFlightDeliveryStamps` and
+    /// reports `.handedOver` after the `.queued` or `.stamping` it reported. Call it from the reducer
+    /// branch: the `.cancel(id:)` inside `dropStampJobs` cancels when built (86ee622).
+    private func finishDeliveryStampJobsWithTicket(_ state: inout State, destinationHash dest: Data) -> Effect<Action> {
+        var finished: Set<Int> = []
+        var handOvers: [Effect<Action>] = []
+        for job in [state.runningStampJob].compactMap({ $0 }) + state.stampQueue
+        where job.message.destinationHash == dest {
+            guard case let .delivery(method, _) = job.work, let ticketed = ticketStamped(state, job.message)
+            else { continue }
+            finished.insert(job.serial)
+            handOvers.append(.send(.router(.send(message: ticketed, desiredMethod: method))))
+        }
+        guard !finished.isEmpty else { return .none }
+        let dropped = dropStampJobs(&state) { finished.contains($0.serial) }
+        return .merge(.concatenate(handOvers), dropped)
     }
 
     /// A search ended without a stamp and was not cancelled, or a propagated job found no acceptable

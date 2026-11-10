@@ -22,6 +22,10 @@ public struct LXMFRouter {
         /// after the success, as a propagated copy is once its stamp search finishes — is then not
         /// reported as `deliveryFailed`. Bounded like `seen`; see `succeededMessageMemory`.
         var succeededMessages = RingSet(capacity: LXMFRouter.succeededMessageMemory)
+        /// The message hashes in `succeededMessages` whose DELIVERY copy succeeded. Lets `LXMFNode` tell
+        /// a delivery copy that succeeded after a propagated copy was accepted (its `deliveryConfirmed`
+        /// still to be handled) from one that ended silently. Cleared by `uncancel` (a fresh send).
+        var confirmedDeliveryCopies = RingSet(capacity: LXMFRouter.succeededMessageMemory)
         /// Message hashes the app cancelled. A copy of one handed over later (a stamp search that
         /// finished after the cancel) is never armed. Bounded like `succeededMessages`.
         var cancelledMessages = RingSet(capacity: LXMFRouter.succeededMessageMemory)
@@ -498,6 +502,7 @@ public struct LXMFRouter {
                 state.succeededMessages.insert(key.messageHash)
                 var dropped: Effect<Action> = .none
                 if key.leg == .delivery {
+                    state.confirmedDeliveryCopies.insert(key.messageHash)
                     state.fallbackEligible.remove(key.messageHash)
                     dropped = dropUnsentPropagatedCopy(&state, key.messageHash)
                 }
@@ -1268,6 +1273,17 @@ extension LXMFRouter.State {
             || withdrawnDeliveryCopies.contains(messageHash)
     }
 
+    /// Every message hash `hasOutboundState(for:)` is true for, built in one pass, so a caller asking
+    /// about many messages pays O(outbound work) once instead of per message. Keep the two in step.
+    func outboundMessageHashes() -> Set<Data> {
+        var hashes = Set(pendingDeliveries.keys.map(\.messageHash))
+        for queued in outboundQueue.values { hashes.formUnion(queued.map(\.hash)) }
+        for queued in propagationQueue.values { hashes.formUnion(queued.map(\.messageHash)) }
+        hashes.formUnion(pendingPropagatedCopies)
+        hashes.formUnion(withdrawnDeliveryCopies)
+        return hashes
+    }
+
     /// Whether this router holds the delivery copy of `messageHash` and can give it back: queued
     /// behind a link that is not up (so not transmitted), or armed as an opportunistic copy.
     ///
@@ -1339,6 +1355,7 @@ extension LXMFRouter.State {
     mutating func uncancel(_ hash: Data) {
         cancelledMessages.remove(hash)
         abandonedDeliveryCopies.remove(hash)
+        confirmedDeliveryCopies.remove(hash)
     }
 }
 
