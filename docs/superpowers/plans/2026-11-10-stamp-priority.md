@@ -6,8 +6,12 @@ destination-stamp search when they would run next (DIVERGENCE — the destinatio
 waiting behind it broke first sends to new peers). Deferred minors: a queued delivery job is not switched to a
 ticket stamp if a ticket arrives while it waits; announces stay keyed by destination plus interface (reference:
 destination). Parity follow-up Task 4 (2026-11-10): the item whose destination search runs no longer counts
-toward the 32 and is not replaced by a same-key re-announce (reference pops it); a dropped announce starts no
-search. Items waiting behind the running one on the same destination still count.
+toward the 32 (reference pops it), also while our own path request has preempted its search. A dropped
+announce starts no search. DIVERGENCE: a same-key re-announce of the running item replaces it in place (same
+sequence), where reference would queue a second item and send both. Reason: the destination stamp covers
+destination hash, public key and name hash, not app data, so the search needs no restart, and
+`repeatedAnnouncesDuringASearchCollapseToOnePerTarget` (DestinationStampTests) requires one announce per
+target with the newest app data. Items waiting behind the running one on the same destination still count.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

@@ -169,14 +169,16 @@ public struct Transport {
         /// Arrival number of the `pendingStampedAnnounces` item the running destination search was
         /// started for. Reference pops the item it works on out of its queue (`WorkerQueues.get`,
         /// Transport.py:122-132), so that item no longer counts toward the 32. A same-key re-announce
-        /// replaces it and takes over its place (see `waitForStamp`). Only meaningful while `stampingDestinations` is
-        /// non-empty: a later search overwrites it.
+        /// replaces it in place (see `waitForStamp`). Kept through a preemption of its search (the
+        /// item stays pending and excluded) and never cleared: sequences are unique, so once the item
+        /// leaves `pendingStampedAnnounces` the stale number matches nothing, and the next search
+        /// overwrites it.
         var stampingItemSequence: UInt64?
 
         /// What waits in the destination-stamp queue: `pendingStampedAnnounces` less the item whose
-        /// search runs now.
+        /// search runs now or was preempted.
         var queuedStampedAnnounces: [PendingStampedAnnounce] {
-            guard !stampingDestinations.isEmpty, let running = stampingItemSequence else { return pendingStampedAnnounces }
+            guard let running = stampingItemSequence else { return pendingStampedAnnounces }
             return pendingStampedAnnounces.filter { $0.sequence != running }
         }
 
@@ -982,27 +984,34 @@ public struct Transport {
             // answers its own request.
             func waitForStamp(_ item: State.PendingStampedAnnounce, _ state: inout State) -> Effect<Action> {
                 var item = item
-                var replacedRunning = false
+                var runningIndex: Int?
                 if case let .announce(_, interface) = item.kind {
                     if let interface, state.interfaces[interface] == nil { return .none }
-                    let running = state.stampingDestinations.isEmpty ? nil : state.stampingItemSequence
+                    // The running item stays excluded through a preemption of its search, until it
+                    // leaves `pendingStampedAnnounces` (see `stampingItemSequence`).
+                    let running = state.stampingItemSequence
                     state.pendingStampedAnnounces.removeAll {
                         guard $0.destinationHash == item.destinationHash,
                               case let .announce(_, queuedInterface) = $0.kind,
                               queuedInterface == interface else { return false }
-                        if $0.sequence == running { replacedRunning = true }
-                        return true
+                        return $0.sequence != running
+                    }
+                    runningIndex = state.pendingStampedAnnounces.firstIndex {
+                        guard $0.sequence == running, $0.destinationHash == item.destinationHash,
+                              case let .announce(_, runningInterface) = $0.kind else { return false }
+                        return runningInterface == interface
                     }
                 }
                 // DIVERGENCE: reference keeps the item it is working on apart from the queue, so a
                 // same-key re-announce queues a second item and BOTH are sent (Transport.py:107-119,
-                // 122-132). Here the newer announce takes over the running item's place: one announce
-                // with the newest app data goes out when the stamp lands, not an extra stale one. It
-                // is not queued, so the size checks do not apply to it.
-                if replacedRunning {
-                    item.sequence = nextNetworkStampSequence(&state)
-                    state.pendingStampedAnnounces.append(item)
-                    state.stampingItemSequence = item.sequence
+                // 122-132). Here the newer announce replaces the running item IN PLACE (same
+                // sequence, so a preempted search keeps its turn): one announce with the newest app
+                // data goes out when the stamp lands, not an extra stale one. The stamp covers
+                // destination, key and name, not app data, so the search needs no restart. The running
+                // item is not queued, so the size checks do not apply.
+                if let runningIndex {
+                    item.sequence = state.pendingStampedAnnounces[runningIndex].sequence
+                    state.pendingStampedAnnounces[runningIndex] = item
                     return .none
                 }
                 // Path responses share reference's priority-0 queue with our queued path requests.

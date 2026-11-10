@@ -389,7 +389,7 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
                 "32 wait behind the running item")
         #expect(store.state.pendingStampedAnnounces.count == 33)
 
-        // The 33rd is dropped, and no search starts for it.
+        // The 33rd is dropped (the "no search" lines hold on the old code too: not evidence of that clause).
         await store.send(.announce(destinationHash: others[32].hash, appData: nil))
         #expect(!store.state.pendingStampedAnnounces.contains { $0.destinationHash == others[32].hash })
         #expect(store.state.stampingDestinations == [a.hash])
@@ -402,14 +402,84 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         #expect(store.state.queuedStampedAnnounces.last?.kind == .announce(appData: Data([0x09]), interface: nil))
 
         // The running destination's own announce is not queued, so the full queue does not drop it:
-        // it takes over the running item's place.
+        // it replaces the running item in place.
         await store.send(.announce(destinationHash: a.hash, appData: Data([0x0A])))
         #expect(store.state.pendingStampedAnnounces.count == 33)
         #expect(store.state.queuedStampedAnnounces.count == 32)
         let running = try #require(store.state.pendingStampedAnnounces.first { $0.destinationHash == a.hash })
         #expect(running.kind == .announce(appData: Data([0x0A]), interface: nil))
-        #expect(running.sequence > runningSequence)
-        #expect(store.state.stampingItemSequence == running.sequence)
+        #expect(running.sequence == runningSequence, "replaced in place, same sequence")
+        #expect(store.state.pendingStampedAnnounces.first?.destinationHash == a.hash, "same index")
+        #expect(store.state.stampingItemSequence == runningSequence)
+
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// Our own path request preempts the running destination search. The preempted item stays out of
+    /// the count (reference never holds more than 32 because the running item is popped), so with a
+    /// full queue a re-announce of a waiting key, and of the preempted key, both survive.
+    @Test func aPreemptedRunningItemStaysOutOfTheCountSoReAnnouncesSurviveAFullQueue() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let a = newDestination("a")
+        let others = (0..<33).map { newDestination("d\($0)") }
+        await store.send(.interfaceConnected(i0))
+        for d in [a] + others { await store.send(.registerLocalDestination(d)) }
+        await store.send(.announce(destinationHash: a.hash, appData: Data([0x01])))
+        let runningSequence = try #require(store.state.pendingStampedAnnounces.first?.sequence)
+        for d in others[0..<32] { await store.send(.announce(destinationHash: d.hash, appData: nil)) }
+
+        let target = Data(repeating: 0x77, count: 16)
+        await store.send(.requestPath(destinationHash: target))
+        #expect(store.state.stampingDestinations.isEmpty, "A's search was preempted")
+        #expect(store.state.queuedStampedAnnounces.count == 32)
+
+        // A waiting key re-announces into the full queue: kept, at the back.
+        await store.send(.announce(destinationHash: others[5].hash, appData: Data([0x09])))
+        #expect(store.state.queuedStampedAnnounces.count == 32)
+        #expect(store.state.queuedStampedAnnounces.last?.destinationHash == others[5].hash)
+        #expect(store.state.queuedStampedAnnounces.last?.kind == .announce(appData: Data([0x09]), interface: nil))
+
+        // The preempted key re-announces: replaced in place, not lost, still first in line.
+        await store.send(.announce(destinationHash: a.hash, appData: Data([0x0A])))
+        #expect(store.state.pendingStampedAnnounces.count == 33)
+        #expect(store.state.pendingStampedAnnounces.first?.destinationHash == a.hash)
+        #expect(store.state.pendingStampedAnnounces.first?.sequence == runningSequence)
+        #expect(store.state.pendingStampedAnnounces.first?.kind == .announce(appData: Data([0x0A]), interface: nil))
+
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// The same for the per-destination quota of 8: the preempted running item is not one of the
+    /// waiting eight.
+    @Test func aPreemptedRunningItemStaysOutOfThePerDestinationQuota() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let busy = newDestination("busy")
+        let ids = (0..<12).map { InterfaceID("many\($0)") }
+        for id in ids { await store.send(.interfaceConnected(id)) }
+        await store.send(.registerLocalDestination(busy))
+        for id in ids[0..<9] { await store.send(.announce(destinationHash: busy.hash, appData: nil, interface: id)) }
+        #expect(store.state.queuedStampedAnnounces.count == Transport.stampedQueuePerDestinationLimit)
+
+        await store.send(.requestPath(destinationHash: Data(repeating: 0x77, count: 16)))
+        #expect(store.state.stampingDestinations.isEmpty, "the search was preempted")
+
+        // A waiting key re-announces at the quota: kept.
+        await store.send(.announce(destinationHash: busy.hash, appData: Data([0x09]), interface: ids[3]))
+        #expect(store.state.queuedStampedAnnounces.count == Transport.stampedQueuePerDestinationLimit)
+        #expect(store.state.queuedStampedAnnounces.last?.kind == .announce(appData: Data([0x09]), interface: ids[3]))
+        // The preempted key re-announces: replaced in place.
+        await store.send(.announce(destinationHash: busy.hash, appData: Data([0x0A]), interface: ids[0]))
+        #expect(store.state.pendingStampedAnnounces.count == 9)
+        #expect(store.state.pendingStampedAnnounces.first?.kind == .announce(appData: Data([0x0A]), interface: ids[0]))
+        // A ninth waiting key is dropped.
+        await store.send(.announce(destinationHash: busy.hash, appData: nil, interface: ids[9]))
+        #expect(store.state.pendingStampedAnnounces.count == 9)
 
         await store.send(.cancelNetworkStamps)
         store.exhaustivity = .on
