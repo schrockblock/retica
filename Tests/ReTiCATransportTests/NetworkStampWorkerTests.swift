@@ -500,6 +500,74 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         await store.finish()
     }
 
+    /// The RUNNING path response is popped from the priority-0 queue like any running item, so 31
+    /// waiting path responses plus it leave room for the 32nd (reference accepts it, Transport.py:117),
+    /// and our own stamped path request fits then as well. Past 32 the new item is dropped.
+    @Test func theRunningPathResponseDoesNotCountTowardTheSharedQueue() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let b = newDestination("b")
+        let others = (0..<33).map { newDestination("d\($0)") }
+        await store.send(.interfaceConnected(i0))
+        for d in [b] + others { await store.send(.registerLocalDestination(d)) }
+        await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))
+        #expect(store.state.stampingDestinations == [b.hash], "B's path response runs")
+        for (n, d) in others[0..<31].enumerated() {
+            await store.send(.received(i0, pathRequest(for: d.hash, tag: UInt8(n + 2))))
+        }
+        #expect(store.state.queuedStampedAnnounces.filter(\.isPathResponse).count == 31)
+
+        // The 32nd path response fits, the 33rd is dropped.
+        await store.send(.received(i0, pathRequest(for: others[31].hash, tag: 40)))
+        #expect(store.state.queuedStampedAnnounces.filter(\.isPathResponse).count == 32)
+        await store.send(.received(i0, pathRequest(for: others[32].hash, tag: 41)))
+        #expect(store.state.queuedStampedAnnounces.filter(\.isPathResponse).count == 32)
+        #expect(!store.state.pendingStampedAnnounces.contains { $0.destinationHash == others[32].hash })
+
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    @Test func ourOwnPathRequestFitsBesideThirtyOneWaitingPathResponsesWhileOneRuns() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let b = newDestination("b")
+        let others = (0..<31).map { newDestination("d\($0)") }
+        await store.send(.interfaceConnected(i0))
+        for d in [b] + others { await store.send(.registerLocalDestination(d)) }
+        await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))
+        for (n, d) in others.enumerated() {
+            await store.send(.received(i0, pathRequest(for: d.hash, tag: UInt8(n + 2))))
+        }
+        let first = Data(repeating: 0x71, count: 16)
+        await store.send(.requestPath(destinationHash: first))
+        #expect(store.state.queuedPathRequestStamps.map(\.destinationHash) == [first], "the 32nd fits")
+        #expect(store.state.stampingDestinations == [b.hash], "no preemption: earlier path responses wait")
+        await store.send(.requestPath(destinationHash: Data(repeating: 0x72, count: 16)))
+        #expect(store.state.queuedPathRequestStamps.map(\.destinationHash) == [first], "the 33rd is dropped")
+
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
+    /// The per-destination quota of 8 does not count the running path response either.
+    @Test func theRunningPathResponseIsNotOneOfTheEightWaitingForItsDestination() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let b = newDestination("b")
+        await store.send(.interfaceConnected(i0))
+        await store.send(.registerLocalDestination(b))
+        for tag in 1...12 { await store.send(.received(i0, pathRequest(for: b.hash, tag: UInt8(tag)))) }
+        #expect(store.state.queuedStampedAnnounces.count == Transport.stampedQueuePerDestinationLimit)
+        #expect(store.state.pendingStampedAnnounces.count == Transport.stampedQueuePerDestinationLimit + 1)
+
+        await store.send(.cancelNetworkStamps)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
     /// The same for the per-destination quota of 8: the preempted running item is not one of the
     /// waiting eight.
     @Test func aPreemptedRunningItemStaysOutOfThePerDestinationQuota() async throws {

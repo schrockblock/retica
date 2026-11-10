@@ -171,15 +171,21 @@ public struct Transport {
         /// Transport.py:122-132), so that item no longer counts toward the 32. A same-key re-announce
         /// replaces it in place (see `waitForStamp`). Kept through a preemption of its search (the
         /// item stays pending and excluded) and never cleared: sequences are unique, so once the item
-        /// leaves `pendingStampedAnnounces` the stale number matches nothing, and the next search
-        /// overwrites it.
+        /// leaves `pendingStampedAnnounces` the stale number matches nothing. Only the next ANNOUNCE
+        /// search overwrites it.
         var stampingItemSequence: UInt64?
 
-        /// What waits in the destination-stamp queue: `pendingStampedAnnounces` less the item whose
-        /// search runs now or was preempted.
+        /// The same for the path response whose search ran last (path responses share the priority-0
+        /// queue, so the running one is popped from it too). Only the next path-response search
+        /// overwrites it.
+        var stampingPathResponseSequence: UInt64?
+
+        /// What waits in the destination-stamp queue: `pendingStampedAnnounces` less the announce and
+        /// the path response whose searches run now (or, for the announce, was preempted).
         var queuedStampedAnnounces: [PendingStampedAnnounce] {
-            guard let running = stampingItemSequence else { return pendingStampedAnnounces }
-            return pendingStampedAnnounces.filter { $0.sequence != running }
+            pendingStampedAnnounces.filter {
+                $0.sequence != stampingItemSequence && $0.sequence != stampingPathResponseSequence
+            }
         }
 
         /// True while a network stamp search runs or anything waits for one.
@@ -962,9 +968,11 @@ public struct Transport {
                         state.pendingStampedAnnounces.removeAll { $0.destinationHash == hash }
                         continue
                     }
-                    // Only an announce search sets it: a path response's search must not hand the
-                    // exclusion away from an announce that was preempted and still waits.
-                    if !item.isPathResponse { state.stampingItemSequence = item.sequence }
+                    // One field per class: a path response's search must not hand the exclusion away
+                    // from an announce that was preempted and still waits, and the running path
+                    // response is excluded from its own class's count.
+                    if item.isPathResponse { state.stampingPathResponseSequence = item.sequence }
+                    else { state.stampingItemSequence = item.sequence }
                     return .merge(preempted + [startDestinationStampSearch(dest, identity, &state)])
                 }
                 return .merge(preempted)
