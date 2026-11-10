@@ -454,6 +454,52 @@ private func queuedAnnounceOrder(_ state: Transport.State) -> [Data] {
         await store.finish()
     }
 
+    /// A path-response search that runs after the preemption must not hand the exclusion away: the
+    /// preempted announce A still does not count, so re-announces of a waiting key and of A survive,
+    /// and A resumes first once the path response is done.
+    @Test func aPathResponseSearchDoesNotMakeThePreemptedAnnounceCountAgain() async throws {
+        let gate = SearchGate()
+        let store = makeStore(gate)
+        let a = newDestination("a")
+        let b = newDestination("b")
+        let others = (0..<32).map { newDestination("d\($0)") }
+        await store.send(.interfaceConnected(i0))
+        for d in [a, b] + others { await store.send(.registerLocalDestination(d)) }
+        await store.send(.announce(destinationHash: a.hash, appData: Data([0x01])))
+        let aSequence = try #require(store.state.pendingStampedAnnounces.first?.sequence)
+        for d in others { await store.send(.announce(destinationHash: d.hash, appData: nil)) }
+
+        let target = Data(repeating: 0x77, count: 16)
+        await store.send(.requestPath(destinationHash: target))
+        let tag = try #require(store.state.stampingPathRequests[target])
+        await store.send(.received(i0, pathRequest(for: b.hash, tag: 1)))      // B's path response waits
+        #expect(store.state.stampingDestinations.isEmpty)
+
+        gate.finish(target + tag)
+        await receivePathRequestEnd(store, target)
+        #expect(store.state.stampingDestinations == [b.hash], "the path response runs before A resumes")
+
+        // Re-announces into the full queue while the path-response search runs.
+        await store.send(.announce(destinationHash: others[5].hash, appData: Data([0x09])))
+        #expect(store.state.queuedStampedAnnounces.filter { !$0.isPathResponse }.count == 32)
+        #expect(store.state.queuedStampedAnnounces.last { !$0.isPathResponse }?.kind
+                == .announce(appData: Data([0x09]), interface: nil))
+        await store.send(.announce(destinationHash: a.hash, appData: Data([0x0A])))
+        let aItem = try #require(store.state.pendingStampedAnnounces.first { $0.destinationHash == a.hash })
+        #expect(aItem.kind == .announce(appData: Data([0x0A]), interface: nil))
+        #expect(aItem.sequence == aSequence)
+        #expect(store.state.pendingStampedAnnounces.filter { !$0.isPathResponse }.count == 33)
+
+        gate.finish(material(b))
+        await receiveDestinationEnd(store, b.hash)
+        #expect(store.state.stampingDestinations == [a.hash], "A resumes first")
+
+        await store.send(.cancelNetworkStamps)
+        await store.skipReceivedActions(strict: false)
+        store.exhaustivity = .on
+        await store.finish()
+    }
+
     /// The same for the per-destination quota of 8: the preempted running item is not one of the
     /// waiting eight.
     @Test func aPreemptedRunningItemStaysOutOfThePerDestinationQuota() async throws {

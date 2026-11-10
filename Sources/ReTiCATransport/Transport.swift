@@ -166,8 +166,8 @@ public struct Transport {
         /// picked in arrival order between them.
         var networkStampSequence: UInt64 = 0
 
-        /// Arrival number of the `pendingStampedAnnounces` item the running destination search was
-        /// started for. Reference pops the item it works on out of its queue (`WorkerQueues.get`,
+        /// Arrival number of the announce (not path response) the last announce search was started
+        /// for, running or preempted. Reference pops the item it works on out of its queue (`WorkerQueues.get`,
         /// Transport.py:122-132), so that item no longer counts toward the 32. A same-key re-announce
         /// replaces it in place (see `waitForStamp`). Kept through a preemption of its search (the
         /// item stays pending and excluded) and never cleared: sequences are unique, so once the item
@@ -962,7 +962,9 @@ public struct Transport {
                         state.pendingStampedAnnounces.removeAll { $0.destinationHash == hash }
                         continue
                     }
-                    state.stampingItemSequence = item.sequence
+                    // Only an announce search sets it: a path response's search must not hand the
+                    // exclusion away from an announce that was preempted and still waits.
+                    if !item.isPathResponse { state.stampingItemSequence = item.sequence }
                     return .merge(preempted + [startDestinationStampSearch(dest, identity, &state)])
                 }
                 return .merge(preempted)
