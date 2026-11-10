@@ -57,6 +57,8 @@ final class AutoHarness {
     let unicastResult = LockIsolated<AutoSendResult>(.sent)
     /// While true, `driver.stop()` does not return.
     let holdStop = LockIsolated(false)
+    /// While true, a multicast send issued in the first session blocks, and then fails `EHOSTUNREACH`.
+    let holdFirstSessionMulticast = LockIsolated(false)
     static let base = Date(timeIntervalSince1970: 1_000_000)
 
     init(nics: [AutoNIC] = [autoEn0, autoEn1], config: AutoInterfaceConfig = AutoInterfaceConfig()) {
@@ -68,6 +70,7 @@ final class AutoHarness {
         self.nics = nicsBox
         let calls = self.calls, delegates = self.delegates, sessions = self.sessions, ended = self.ended
         let mres = self.multicastResult, ures = self.unicastResult, hold = self.holdStop
+        let holdFirst = self.holdFirstSessionMulticast
         store = TestStore(initialState: AutoInterface.State(config: config)) {
             DelegateRecordingAuto(log: delegates)
         } withDependencies: {
@@ -84,6 +87,10 @@ final class AutoHarness {
                 unbind: { n in calls.withValue { $0.append(.unbind(n)) } },
                 sendMulticast: { nic, token, port in
                     calls.withValue { $0.append(.multicast(nic: nic, token: token, port: port)) }
+                    if sessions.value.count <= 1, holdFirst.value {
+                        while holdFirst.value { await Task.yield() }
+                        return .failed(errno: EHOSTUNREACH)
+                    }
                     return mres.value
                 },
                 sendUnicast: { addr, index, port, d in

@@ -78,6 +78,9 @@ public struct AutoInterface {
         public var failed: Set<AutoPlane> = []
         var multicastUnavailableReported = false
         var dataPortInUseReported = false
+        /// All three planes have been bound at least once since adoption. Only a NIC that never got
+        /// there is skipped for a failed multicast join (R11); later a failed join is a retryable plane.
+        var everBound = false
     }
 
     public struct Peer: Equatable, Sendable {
@@ -103,7 +106,8 @@ public struct AutoInterface {
         /// The 1.92 s initial peering wait passed (`AI:353-356`). Internal.
         case peeringWaitElapsed
         /// A send failed with a local-network-denial errno (spec §8.4). Internal.
-        case sendFailed(errno: Int32)
+        /// `generation` is the epoch the send was issued in. Internal.
+        case sendFailed(errno: Int32, generation: Int)
         /// `driver.stop()` returned: a deferred `.start` may now run. Internal.
         case driverStopped
         case delegate(Delegate)
@@ -193,9 +197,11 @@ public struct AutoInterface {
                 let sends = state.nics.sorted { $0.key < $1.key }.filter { $0.value.failed.isEmpty }
                     .map { (nic: $0.key, token: AutoInterfaceWire.discoveryToken(groupID: groupID, linkLocal: $0.value.linkLocal)) }
                 guard !sends.isEmpty else { return .none }
+                let epoch = state.epoch, generation = epoch.current
                 return .run { [driver] send in
                     for s in sends {
-                        await Self.report(await driver.sendMulticast(s.nic, s.token, port), send)
+                        guard epoch.current == generation else { return }
+                        await Self.report(await driver.sendMulticast(s.nic, s.token, port), generation, send)
                     }
                 }
 
@@ -210,12 +216,15 @@ public struct AutoInterface {
             case let .send(addr, data):
                 guard isLive(state), let peer = state.peers[addr] else { return .none }
                 let port = state.config.dataPort
+                let epoch = state.epoch, generation = epoch.current
                 return .run { [driver] send in
-                    await Self.report(await driver.sendUnicast(addr, peer.index, port, data), send)
+                    guard epoch.current == generation else { return }
+                    await Self.report(await driver.sendUnicast(addr, peer.index, port, data), generation, send)
                 }
 
-            case .sendFailed:
-                guard isLive(state) else { return .none }
+            case let .sendFailed(_, generation):
+                // A send of an earlier session (its effect is not cancellable) must not mark this one.
+                guard isLive(state), generation == state.epoch.current else { return .none }
                 state.deniedSendSeen = true
                 return checkLocalNetworkDenied(&state, now: date.now)
 
@@ -305,14 +314,24 @@ public struct AutoInterface {
     private func socketEvent(_ event: AutoSocketEvent, _ state: inout State) -> Effect<Action> {
         switch event {
         case let .bound(nic):
-            guard state.nics[nic] != nil else { return .none }
-            state.nics[nic]?.failed = []
-            state.nics[nic]?.dataPortInUseReported = false
+            guard var entry = state.nics[nic] else { return .none }
+            if !entry.failed.isEmpty {
+                // Back from a failure: the watchdog skipped this NIC while it was down (it sent no
+                // announces, so it could hear no echo). Restart its echo clock as at adoption.
+                entry.lastEcho = date.now
+                entry.timedOut = nil
+            }
+            entry.failed = []
+            entry.dataPortInUseReported = false
+            entry.everBound = true
+            state.nics[nic] = entry
             return .none
 
-        case let .bindFailed(nic, .multicastDiscovery, _):
+        case let .bindFailed(nic, .multicastDiscovery, _) where state.nics[nic]?.everBound == false:
             // Spec R11: a NIC that cannot join the group is skipped, as the reference's per-NIC `try`
-            // does (`AI:314-319`). The planes that did bind stay open until unbound.
+            // does (`AI:314-319`). The planes that did bind stay open until unbound. Only for a NIC
+            // that never bound: a join that fails on a later rebind (an address change, a retry) is a
+            // transient failed plane, retried every tick like any other (below).
             guard state.nics[nic] != nil else { return .none }
             var effects = removeNIC(nic, &state)
             state.skippedNICs.insert(nic)
@@ -428,17 +447,24 @@ public struct AutoInterface {
         }
         if !reverse.isEmpty {
             let port = state.config.unicastDiscoveryPort
+            let epoch = state.epoch, generation = epoch.current
             effects.append(.run { [driver, reverse] send in
-                for r in reverse { await Self.report(await driver.sendUnicast(r.addr, r.index, port, r.token), send) }
+                for r in reverse {
+                    guard epoch.current == generation else { return }
+                    await Self.report(await driver.sendUnicast(r.addr, r.index, port, r.token), generation, send)
+                }
             })
         }
 
         // 3. Re-enumerate NICs (`AI:410-457`, D1, D2, D3).
         effects.append(reenumerate(&state, now: now))
 
-        // 4. Echo watchdog (`AI:462-480`): transitions only, the first pass is silent.
+        // 4. Echo watchdog (`AI:462-480`): transitions only, the first pass is silent. A NIC with a
+        //    failed plane is skipped: it sends no announces (D3), so a missing echo says nothing
+        //    about multicast, and reporting it would read as "firewall blocks multicast" next to
+        //    the `dataPortInUse` that is the real cause. `.bound` restarts its echo clock.
         for name in state.nics.keys.sorted() {
-            guard var nic = state.nics[name] else { continue }
+            guard var nic = state.nics[name], nic.failed.isEmpty else { continue }
             let lost = now.timeIntervalSince(nic.lastEcho) > AutoInterfaceWire.multicastEchoTimeout
             if lost, nic.timedOut == false { effects.append(.send(.delegate(.carrierLost(nic: name)))) }
             if !lost, nic.timedOut == true { effects.append(.send(.delegate(.carrierRecovered(nic: name)))) }
@@ -474,17 +500,17 @@ public struct AutoInterface {
                 nic.index = fresh.index
                 state.nics[name] = nic
                 for addr in state.peers.keys where state.peers[addr]?.nic == name { state.peers[addr]?.index = fresh.index }
-                effects.append(rebind(Self.binding(name, fresh.index, ll, state.config)))
+                effects.append(rebind(Self.binding(name, fresh.index, ll, state.config), state))
             } else if !nic.failed.isEmpty {
                 // D3: retry a NIC with a failed plane every tick.
-                effects.append(rebind(Self.binding(name, nic.index, nic.linkLocal, state.config)))
+                effects.append(rebind(Self.binding(name, nic.index, nic.linkLocal, state.config), state))
             }
         }
         // D2: adopt NICs that appeared (or gained a link-local address).
         for fresh in snapshot where state.nics[fresh.name] == nil && !state.skippedNICs.contains(fresh.name) {
             guard let ll = Self.adoptedLinkLocal(fresh) else { continue }
             state.nics[fresh.name] = NIC(index: fresh.index, linkLocal: ll, lastEcho: now)
-            effects.append(rebind(Self.binding(fresh.name, fresh.index, ll, state.config)))
+            effects.append(rebind(Self.binding(fresh.name, fresh.index, ll, state.config), state))
         }
         for nic in snapshot { state.ownAddresses.formUnion(Self.linkLocals(nic)) }
         // A skipped NIC that went away may be adopted again when it returns.
@@ -493,14 +519,24 @@ public struct AutoInterface {
         return .merge(effects)
     }
 
-    private func rebind(_ binding: AutoBinding) -> Effect<Action> {
-        .run { [driver] _ in await driver.rebind(binding) }
+    /// Rebind and unbind effects are not cancellable, so each carries the session's epoch: one left
+    /// over from a stopped session must not rebind or tear down a NIC of the next session.
+    private func rebind(_ binding: AutoBinding, _ state: State) -> Effect<Action> {
+        let epoch = state.epoch, generation = epoch.current
+        return .run { [driver] _ in
+            guard epoch.current == generation else { return }
+            await driver.rebind(binding)
+        }
     }
 
     /// Drops a NIC: unbinds it and evicts its peers.
     private func removeNIC(_ name: String, _ state: inout State) -> [Effect<Action>] {
         state.nics[name] = nil
-        var effects: [Effect<Action>] = [.run { [driver] _ in await driver.unbind(name) }]
+        let epoch = state.epoch, generation = epoch.current
+        var effects: [Effect<Action>] = [.run { [driver] _ in
+            guard epoch.current == generation else { return }
+            await driver.unbind(name)
+        }]
         for addr in state.peers.keys.sorted() where state.peers[addr]?.nic == name {
             state.peers[addr] = nil
             effects.append(.send(.delegate(.peerRemoved(addr: addr))))
@@ -521,10 +557,13 @@ public struct AutoInterface {
         return .none
     }
 
-    /// Spec §8.4: denied-class send errors and no echo on any NIC 6.5 s into the session.
+    /// Spec §8.4: denied-class send errors and no echo on any NIC 6.5 s into the session. Only NICs
+    /// with no failed plane count as evidence: one that is down announces nothing, so its silence
+    /// proves nothing (any echo, from any NIC, still disproves denial).
     private func checkLocalNetworkDenied(_ state: inout State, now: Date) -> Effect<Action> {
         guard state.deniedSendSeen, !state.localNetworkDeniedReported, let start = state.sessionStart,
               now.timeIntervalSince(start) > AutoInterfaceWire.multicastEchoTimeout,
+              state.nics.values.contains(where: { $0.failed.isEmpty }),
               !state.nics.values.contains(where: { $0.firstEcho != nil }) else { return .none }
         state.localNetworkDeniedReported = true
         return .send(.delegate(.localNetworkDenied))
@@ -532,8 +571,10 @@ public struct AutoInterface {
 
     // MARK: Helpers
 
-    private static func report(_ result: AutoSendResult, _ send: Send<Action>) async {
-        if case let .failed(errno) = result, deniedErrnos.contains(errno) { await send(.sendFailed(errno: errno)) }
+    private static func report(_ result: AutoSendResult, _ generation: Int, _ send: Send<Action>) async {
+        if case let .failed(errno) = result, deniedErrnos.contains(errno) {
+            await send(.sendFailed(errno: errno, generation: generation))
+        }
     }
 
     /// Every `fe80:` address of the NIC, descoped (`AI:235-240`, `AI:80-85`).

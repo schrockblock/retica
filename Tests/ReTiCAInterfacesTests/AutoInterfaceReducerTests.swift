@@ -346,27 +346,100 @@ import ComposableArchitecture
         await h.finish()
     }
 
-    @Test func aDataPortClashFailsOnlyThatNICSurfacesOnceAndRetriesEveryTick() async {
+    @Test func aDataPortClashSurfacesOnlyDataPortInUseRetriesEveryTickAndTheWatchdogResumesOnceBound() async {
         let h = AutoHarness()
         await h.store.send(.start)
         await h.settle()
-        await h.store.send(.socketEvent(.bindFailed(nic: "en0", plane: .data, errno: EADDRINUSE)))
+        let clash = AutoSocketEvent.bindFailed(nic: "en0", plane: .data, errno: EADDRINUSE)
+        await h.store.send(.socketEvent(clash))
         await h.store.send(.socketEvent(.bound(nic: "en1")))
         await h.advance(to: 1.6)
         #expect(h.multicasts.suffix(1) == [.multicast(nic: "en1", token: autoToken("fe80::2"), port: 29716)],
                 "en0 does not announce while its data plane is down")
-        await h.advance(to: 4)
-        #expect(h.rebinds == [.rebind(autoBinding("en0", 4, "fe80::1"))])
-        await h.store.send(.socketEvent(.bindFailed(nic: "en0", plane: .data, errno: EADDRINUSE)))
-        await h.advance(to: 8)
-        #expect(h.rebinds.count == 2)
+        // The clash persists: every retry fails again. Three ticks, past the 6.5 s echo timeout.
+        for (i, t) in [4.0, 8.0, 12.0].enumerated() {
+            await h.advance(to: t)
+            #expect(h.rebinds.count == i + 1, "retried at \(t)")
+            await h.store.send(.socketEvent(clash))
+        }
+        #expect(h.delegates.value.filter { nicOf($0) == "en0" } == [.dataPortInUse(nic: "en0")],
+                "a down NIC reports only the clash, never carrierLost / multicastUnavailable")
+        #expect(h.delegates.value.contains(.carrierLost(nic: "en1")), "the healthy NIC is still watched")
+        // The clash clears on the next retry.
+        await h.advance(to: 12.5)
         await h.store.send(.socketEvent(.bound(nic: "en0")))
-        await h.advance(to: 9.6)
+        await h.advance(to: 14.5)
         #expect(h.multicasts.suffix(2) == [.multicast(nic: "en0", token: autoToken("fe80::1"), port: 29716),
                                            .multicast(nic: "en1", token: autoToken("fe80::2"), port: 29716)])
+        await h.advance(to: 16)
+        #expect(h.rebinds.count == 3, "no retry once bound")
+        #expect(h.delegates.value.filter { nicOf($0) == "en0" } == [.dataPortInUse(nic: "en0")],
+                "the echo clock restarted at the bind (12.5): 16 is the silent first pass")
+        await h.advance(to: 20)
+        #expect(h.delegates.value.filter { nicOf($0) == "en0" }
+                == [.dataPortInUse(nic: "en0"), .carrierLost(nic: "en0"), .multicastUnavailable(nic: "en0")])
+        await h.finish()
+    }
+
+    @Test func aDownNICIsNoEvidenceOfLocalNetworkDenial() async {
+        let h = AutoHarness(nics: [autoEn0])
+        h.unicastResult.setValue(.failed(errno: EHOSTUNREACH))
+        await h.startAndAccept()
+        await h.store.send(.socketEvent(.bound(nic: "en0")))
+        await h.discovery(autoEn0, from: "fe80::aa")
+        await h.advance(to: 2)
+        await h.store.send(.socketEvent(.readFailed(nic: "en0", plane: .data, errno: EBADF)))
+        await h.store.send(.send(addr: "fe80::aa", data: blob("denied")))      // fails EHOSTUNREACH
         await h.advance(to: 12)
-        #expect(h.rebinds.count == 2)
-        #expect(h.delegates.value.filter { $0 == .dataPortInUse(nic: "en0") }.count == 1)
+        #expect(h.unicasts.count >= 1)
+        #expect(!h.delegates.value.contains(.localNetworkDenied), "only a down NIC is silent")
+        #expect(!h.delegates.value.contains(.carrierLost(nic: "en0")))
+        await h.advance(to: 12.5)
+        await h.store.send(.socketEvent(.bound(nic: "en0")))
+        await h.advance(to: 20)
+        #expect(h.delegates.value.filter { $0 == .localNetworkDenied }.count == 1,
+                "once the NIC is up and still hears no echo, the earlier denied send counts")
+        await h.finish()
+    }
+
+    @Test func aJoinThatFailsOnALaterRebindIsRetriedNotSkipped() async {
+        let h = AutoHarness()
+        await h.store.send(.start)
+        await h.settle()
+        await h.store.send(.socketEvent(.bound(nic: "en0")))
+        await h.store.send(.socketEvent(.bound(nic: "en1")))
+        h.nics.setValue([AutoNIC(name: "en0", index: 4, linkLocals: ["fe80::9"]), autoEn1])
+        await h.advance(to: 4)
+        #expect(h.rebinds == [.rebind(autoBinding("en0", 4, "fe80::9"))])
+        // A transient join failure during the address change.
+        await h.store.send(.socketEvent(.bindFailed(nic: "en0", plane: .multicastDiscovery, errno: EADDRNOTAVAIL)))
+        await h.settle()
+        #expect(!h.calls.value.contains(.unbind("en0")))
+        #expect(h.store.state.nics["en0"]?.failed == [.multicastDiscovery])
+        #expect(!h.delegates.value.contains(.multicastUnavailable(nic: "en0")))
+        await h.advance(to: 8)
+        #expect(h.rebinds == [.rebind(autoBinding("en0", 4, "fe80::9")), .rebind(autoBinding("en0", 4, "fe80::9"))])
+        await h.store.send(.socketEvent(.bound(nic: "en0")))
+        let before = h.multicasts.count
+        await h.advance(to: 9.65)
+        #expect(Array(h.multicasts.dropFirst(before)).first == .multicast(nic: "en0", token: autoToken("fe80::9"), port: 29716))
+        await h.finish()
+    }
+
+    @Test func aDeniedSendFromAStoppedSessionDoesNotMarkTheNextOne() async {
+        let h = AutoHarness()
+        h.holdFirstSessionMulticast.setValue(true)     // session 1's announce returns EHOSTUNREACH, late
+        await h.store.send(.start)
+        await h.settle()
+        #expect(h.multicasts.first == .multicast(nic: "en0", token: autoToken("fe80::1"), port: 29716))
+        await h.store.send(.stop)
+        for _ in 0..<200 where !h.store.state.isIdle { await h.settle() }
+        await h.store.send(.start)                      // session 2: every send succeeds
+        await h.settle()
+        h.holdFirstSessionMulticast.setValue(false)     // the stale failure arrives now
+        await h.settle()
+        await h.advance(to: 12)
+        #expect(!h.delegates.value.contains(.localNetworkDenied), "\(h.delegates.value)")
         await h.finish()
     }
 
@@ -513,6 +586,15 @@ private struct AutoBurstHost: Reducer {
             #expect(calls.value == [.stop], "run \(run): \(calls.value)")
             #expect(store.state.auto.isIdle, "run \(run)")
         }
+    }
+}
+
+/// The NIC a NIC-scoped delegate names.
+func nicOf(_ d: AutoInterface.Action.Delegate) -> String? {
+    switch d {
+    case let .carrierLost(n), let .carrierRecovered(n), let .multicastUnavailable(n), let .dataPortInUse(n): n
+    case let .peerAdded(_, n): n
+    default: nil
     }
 }
 
