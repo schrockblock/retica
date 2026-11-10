@@ -222,7 +222,8 @@ struct AutoInterfaceDriverLiveTests {
     //    nothing.
     @Test func droppingTheStreamBeforeTheStartBindsNothing() async throws {
         let gate = HoldFirst()
-        let driver = AutoInterfaceDriver.live(deliveryGate: nil, startGate: { await gate.pass() })
+        let passed = Flag()
+        let driver = AutoInterfaceDriver.live(deliveryGate: nil, startGate: { await gate.pass(); passed.set() })
         let b = binding(discoveryPort: 39_796, dataPort: 52_751)
         let log = EventLog(driver.run([b]))
         #expect(await poll { await gate.didHold() }, "start never reached the gate")
@@ -230,8 +231,11 @@ struct AutoInterfaceDriverLiveTests {
         #expect(await poll { log.isFinished }, "consumer did not end")
         await gate.release()
 
-        // Give the released start time to reach the actor (it cannot be awaited from here).
-        try await Task.sleep(for: .milliseconds(300))
+        // The released start enqueues on the actor the moment the gate returns, so once the gate has
+        // been passed, actor round-trips (each queued behind that start) cannot overtake it. No sleep:
+        // a fixed wait could end before the start landed and pass vacuously.
+        #expect(await poll(timeout: .seconds(30)) { passed.isSet }, "the released start never passed its gate")
+        for _ in 0..<3 { _ = await driver.sendMulticast("lo0", Data(repeating: 4, count: 32), b.discoveryPort) }
         #expect(await driver.sendMulticast("lo0", Data(repeating: 4, count: 32), b.discoveryPort) == .failed(errno: ENXIO),
                 "the start of a dropped stream bound the NIC")
         #expect(await bindsCleanly(b), "the start of a dropped stream left the data port bound")
@@ -389,25 +393,70 @@ struct AutoInterfaceDriverLiveTests {
     // 17. While a delivery is held (the actor busy), a socket has at most ONE delivery Task pending:
     //     reads coalesce into it, up to `pendingDatagramLimit`, and the rest are dropped. One Task per
     //     read batch grew without bound. Once released, later datagrams are delivered.
+    //
+    //     No settle sleeps: the test waits until the data socket's KERNEL queue is empty (FIONREAD on
+    //     the test process's own fd) and the socket queue has run the handler that emptied it, so every
+    //     flood datagram has been read while the first delivery was still held. Only then is the gate
+    //     opened, so the cap holds on a loaded machine too (a read after the open would refill the
+    //     mailbox and exceed it).
     @Test func aHeldDeliveryKeepsOnePendingTaskPerSocketAndCoalescesUpToTheLimit() async throws {
         let gate = HoldAll()
-        let driver = AutoInterfaceDriver.live(deliveryGate: { await gate.pass() })
+        let queue = DispatchQueue(label: "retica.autointerface.sockets.test17")
+        let driver = AutoInterfaceDriver.live(deliveryGate: { await gate.pass() }, socketQueue: queue)
         let b = binding(discoveryPort: 39_866, dataPort: 52_831)
         let log = EventLog(driver.run([b]))
         defer { Task { await driver.stop() } }
         #expect(await log.waitFor { $0.contains(.bound(nic: "lo0")) }, "trio never bound: \(log.snapshot())")
 
         await flood(driver, b, count: 3000)
-        try await Task.sleep(for: .milliseconds(300))
-        let pending = await gate.waiting
-        #expect(pending == 1, "\(pending) delivery Tasks pending for one socket")
+        #expect(await poll(timeout: .seconds(30)) { await gate.waiting >= 1 }, "no delivery Task ever reached the gate")
+        #expect(await poll(timeout: .seconds(30)) { Self.kernelQueueIsEmpty(port: b.dataPort) },
+                "the data socket's kernel queue never emptied")
+        queue.sync {}   // the handler that took the last datagram has finished (serial queue)
+        // Tasks the mutation (one per read batch) would have spawned reach the gate within this window;
+        // the correct driver never gets there, so this costs time but cannot fail it.
+        _ = await poll(timeout: .seconds(1)) { await gate.peak > 1 }
+        let peak = await gate.peak
+        #expect(peak == 1, "\(peak) delivery Tasks pending for one socket")
         await gate.open()
         let after = Data("after-hold".utf8)
         #expect(await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, after) == .sent)
         #expect(await log.waitFor { $0.contains(datagram(.data, after)) }, "delivery blocked after the hold")
         let flooded = log.snapshot().filter(isFlood).count
-        let cap = AutoInterfaceDriver.maxDatagramsPerRead + AutoInterfaceDriver.pendingDatagramLimit
+        // The held Task took its batch from the mailbox before it reached the gate, and a Task that
+        // starts late takes up to `pendingDatagramLimit` of it (not just the first read's
+        // `maxDatagramsPerRead`). The mailbox then refills to the limit behind it. So the bound for
+        // one held delivery is two limits. (The earlier cap of one read plus one limit assumed the
+        // Task started before the second read, which a loaded machine does not give: it failed a full
+        // suite run on a correct driver.)
+        let cap = 2 * AutoInterfaceDriver.pendingDatagramLimit
         #expect(flooded <= cap, "\(flooded) flood datagrams delivered from one held socket, cap \(cap)")
+        // 3000 were sent and the kernel keeps far more than the limit, so a full mailbox is delivered.
+        #expect(flooded >= AutoInterfaceDriver.pendingDatagramLimit,
+                "only \(flooded) delivered: the mailbox did not fill to its limit")
+    }
+
+    /// True when every socket of this process bound to `port` (UDP over IPv6) has no unread bytes
+    /// queued. False when no such socket is found.
+    private static func kernelQueueIsEmpty(port: UInt16) -> Bool {
+        let fionread: UInt = 0x4004_667F   // FIONREAD = _IOR('f', 127, int), a macro Swift does not import
+        var found = false
+        for fd in Int32(3)..<Int32(2048) {
+            var type: Int32 = 0
+            var typeLen = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &typeLen) == 0, type == SOCK_DGRAM else { continue }
+            var addr = sockaddr_in6()
+            var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+            let ok = withUnsafeMutablePointer(to: &addr) {
+                $0.withMemoryRebound(to: Darwin.sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) == 0 }
+            }
+            guard ok, Int32(addr.sin6_family) == AF_INET6, UInt16(bigEndian: addr.sin6_port) == port else { continue }
+            var queued: Int32 = 0
+            guard ioctl(fd, fionread, &queued) == 0 else { return false }
+            if queued != 0 { return false }
+            found = true
+        }
+        return found
     }
 
     // 18. Bind and read outcomes are never lost to a full stream: a `.bound` from a rebind made while
@@ -525,11 +574,12 @@ private actor HoldAll {
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
+    private(set) var peak = 0
     var waiting: Int { waiters.count }
 
     func pass() async {
         guard !isOpen else { return }
-        await withCheckedContinuation { waiters.append($0) }
+        await withCheckedContinuation { waiters.append($0); peak = max(peak, waiters.count) }
     }
 
     func open() {
@@ -537,6 +587,14 @@ private actor HoldAll {
         for w in waiters { w.resume() }
         waiters.removeAll()
     }
+}
+
+/// A one-way flag a gate closure sets once it has returned.
+private final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func set() { lock.lock(); value = true; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
 
 /// Counts delivery batches (the delivery gate's calls), so a test can wait until a flood's reads and
