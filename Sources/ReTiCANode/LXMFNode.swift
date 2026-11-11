@@ -111,6 +111,14 @@ public struct LXMFNode {
         /// Used to scope packet proving to inbound direct-delivery links only.
         public var deliveryDestinationHash: Data?
 
+        /// The route Transport held for a destination when a link to it last failed PATH-shaped
+        /// (`.noPath`, `.pathStale`, `.establishmentTimedOut`). While Transport still holds exactly
+        /// this route, the router's path requests are not answered from Transport's table (see the
+        /// `.requestPath` case): the router dropped that route on evidence and waits for another.
+        /// Cleared when a link to the destination is established. One entry per destination a link
+        /// has failed to, overwritten on each failure.
+        public var failedRoutes: [Data: LearnedDestination] = [:]
+
         /// Learned peer data, keyed by `lxmf.delivery` destination hash.
         ///
         /// Populated by the `.endpoint(.delegate(.pathLearned))` handler for an announce whose
@@ -1537,7 +1545,24 @@ public struct LXMFNode {
                 return .send(.endpoint(.openLink(destinationHash: dest)))
 
             case let .router(.delegate(.requestPath(dest))):
-                return .send(.endpoint(.requestPath(destinationHash: dest)))
+                let request = Effect<Action>.send(.endpoint(.requestPath(destinationHash: dest)))
+                // The router learns paths only from `.pathLearned`, but Transport may already hold a
+                // usable route it never reported to the router: restored at launch, or kept after the
+                // router gave up on a park. The answers to this request then cannot help: a hub replays
+                // its cached copy of the announce that route came from, which never beats it, so no
+                // `.pathLearned` follows and the park runs out with a good route in hand (seen on a
+                // device with the propagation node, 2026-11-11). Reference has no such gap: LXMF asks
+                // `RNS.Transport.has_path` directly. So report the route now, and still ask, in case
+                // there is a better one. `learnedPath` opens the link from the park and is counted
+                // against the establishment budget like any attempt.
+                //
+                // Not a route a link has just failed on: that is the router's evidence the route is
+                // wrong (`.pathLostAndClosed`), and handing it straight back would retry it at once.
+                // Not `.pathLearned` either: that would also refresh `learnedPeers`, telling the app
+                // the peer had just announced.
+                guard let held = state.endpoint.transport.reachableLearned(dest), state.failedRoutes[dest] != held
+                else { return request }
+                return .concatenate(request, .send(.router(.learnedPath(destinationHash: dest))))
 
             case let .router(.delegate(.sendDirect(linkID, data, asResource))):
                 guard asResource else { return .send(.endpoint(.sendOverLink(linkID: linkID, data: data))) }
@@ -1582,6 +1607,7 @@ public struct LXMFNode {
 
             // --- Direct-over-link: endpoint delegates → router actions ---
             case let .endpoint(.delegate(.linkEstablished(linkID, dest))):
+                state.failedRoutes[dest] = nil
                 state.directLinks[dest] = linkID
                 state.linkDestinations[linkID] = dest
                 return .send(.router(.linkEstablished(destinationHash: dest, linkID: linkID)))
@@ -1600,6 +1626,9 @@ public struct LXMFNode {
                 state.directLinks[dest] = nil
                 switch reason {
                 case .noPath, .pathStale, .establishmentTimedOut:
+                    // Remember the route this failure argues against, so `.requestPath` does not hand
+                    // it straight back to the router. Nil when Transport holds none: nothing to avoid.
+                    state.failedRoutes[dest] = state.endpoint.transport.learned[dest]
                     // PATH-shaped failure: our route to `dest` is wrong, not the peer. Clear the
                     // router's belief that a usable path exists so `establish` parks in
                     // `.awaitingPath` (requesting a fresh path) rather than emitting `requestLink`
