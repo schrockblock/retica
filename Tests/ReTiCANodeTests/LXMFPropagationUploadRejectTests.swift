@@ -184,8 +184,10 @@ private func packets(_ log: LockIsolated<[Seen]>, _ hash: Data) -> Int {
         #expect(log.value.contains(.received(forUs)))
     }
 
-    /// No packet copy awaiting its receipt on the link: nothing is rejected. A copy that went as a
-    /// Resource has its own rejection path; a packet copy whose receipt arrived is settled.
+    /// No packet copy awaiting its receipt on the link: nothing is rejected. A copy in flight as a
+    /// Resource is left transferring by the signal; a packet copy whose receipt arrived is not
+    /// reported rejected. (That the receipt-awaiting filter picks the RIGHT copy is
+    /// `invalidStampSignalSkipsACopyWhoseReceiptArrived`.)
     @Test func invalidStampSignalWithNoOutstandingPacketRejectsNothing() async {
         let log = LockIsolated<[Seen]>([])
         let store = pnStore(log: log)
@@ -204,5 +206,46 @@ private func packets(_ log: LockIsolated<[Seen]>, _ hash: Data) -> Int {
         await signal(store, UploadSignalFixtures.pnRejectData)
         #expect(!log.value.contains { if case .rejected = $0 { return true }; return false })
         #expect(store.state.router.pendingDeliveries[.propagated(big.hash)]?.phase == .transferring)
+    }
+
+    /// The oldest copy on the link is already settled (its receipt arrived): the signal passes over it
+    /// and rejects the next one still awaiting its receipt.
+    @Test func invalidStampSignalSkipsACopyWhoseReceiptArrived() async {
+        let log = LockIsolated<[Seen]>([])
+        let store = pnStore(log: log)
+        let a = message("a"), b = message("b")
+        await propagate(store, a)
+        await propagate(store, b)
+        await store.send(.endpoint(.delegate(.packetDelivered(token: a.hash))))
+        await store.skipReceivedActions(strict: false)
+        await signal(store, UploadSignalFixtures.pnRejectData)
+        #expect(log.value.contains(.rejected(b.hash)))
+        #expect(store.state.router.pendingDeliveries[.propagated(b.hash)] == nil)
+        #expect(!log.value.contains(.rejected(a.hash)))
+        #expect(store.state.router.succeededMessages.contains(a.hash))
+    }
+
+    /// Ruling: the PN was switched with a copy still in flight on the OLD PN's link. A signal on that
+    /// link still rejects the copy it applies to, and is not delivered. A link that never carried a
+    /// propagated packet (an inbound delivery link) is still never a signal link, even then.
+    @Test func signalOnAnOldPNsLinkAfterASwitchStillRejects() async {
+        let log = LockIsolated<[Seen]>([])
+        let store = pnStore(log: log)
+        let m = message("in flight")
+        await propagate(store, m)
+        await store.send(.router(.setOutboundPropagationNode(Data(repeating: 0x6F, count: 16))))
+        await store.skipReceivedActions(strict: false)
+
+        let forUs = message("hello", to: ours).packed
+        await signal(store, UploadSignalFixtures.pnRejectData, on: inboundLink)
+        await signal(store, forUs, on: inboundLink)
+        #expect(!log.value.contains(.rejected(m.hash)))
+        #expect(log.value.contains(.received(forUs)))
+
+        await signal(store, UploadSignalFixtures.pnRejectData)
+        #expect(log.value.contains(.rejected(m.hash)))
+        #expect(store.state.router.pendingDeliveries[.propagated(m.hash)] == nil)
+        // Delivered once: on the inbound link above, not on the old PN's link.
+        #expect(log.value.filter { $0 == .received(UploadSignalFixtures.pnRejectData) }.count == 1)
     }
 }

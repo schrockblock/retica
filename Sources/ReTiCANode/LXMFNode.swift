@@ -713,9 +713,12 @@ public struct LXMFNode {
                 guard let served = state.propagationDestinationHash else { return false }
                 return state.linkDestinations[linkID] == served
             }
-            /// `linkID` is our link to the current outbound propagation node (the one uploads and
-            /// syncs use), by the router's active link or by where the link goes.
+            /// `linkID` is a link we upload propagated copies on: it carries a propagated packet copy
+            /// (which covers an OLD propagation node's link after a switch, while a copy is still in
+            /// flight there), or it is our link to the current outbound propagation node, by the
+            /// router's active link or by where the link goes. A link a peer opened to us is none.
             func isOutboundPropagationLink(_ state: LXMFNode.State, _ linkID: Data) -> Bool {
+                if state.router.propagationPacketsOnLink[linkID] != nil { return true }
                 guard let pn = state.router.outboundPropagationNode else { return false }
                 return state.router.directLinks[pn] == .active(linkID: linkID) || state.linkDestinations[linkID] == pn
             }
@@ -1606,7 +1609,7 @@ public struct LXMFNode {
                 // `LXMFServiceNode` handles proving for propagation-link packets; return early here so
                 // that proving is never double-counted and delivery is not attempted for propagation data.
                 guard !isServedPropagationLink(state, linkID) else { return .none }
-                // On our outbound link to the propagation node a link packet is the PN's upload signal,
+                // On our outbound link to a propagation node a link packet is the PN's upload signal,
                 // never a message: reference sets `propagation_transfer_signalling_packet` as that
                 // link's packet callback (LXMRouter.py:3292). Sync answers come as link RESPONSES
                 // (`.responseReceived`), so they never reach here.
