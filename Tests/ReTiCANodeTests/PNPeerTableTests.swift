@@ -309,8 +309,10 @@ func peerTableSelectionMatchesReference(_ name: String) { replay(name) }
     #expect(parse(.uint(0xF6)) == .throttled)
     #expect(parse(.bool(false)) == .wantsNone)
     #expect(parse(.bool(true)) == .wantsAll)
-    // Offered ids only, in the response's order and as often as listed, as reference sends them.
-    #expect(parse(.array([.bin(c), .bin(Data(repeating: 9, count: 32)), .bin(a), .string("x"), .bin(c)])) == .wants([c, a, c]))
+    // Offered ids only, in the response's order, each once (final review I1: reference sends one copy
+    // per listed id, LXMPeer.py:455-457, which lets a peer multiply our container without bound).
+    #expect(parse(.array([.bin(c), .bin(Data(repeating: 9, count: 32)), .bin(a), .string("x"), .bin(c)])) == .wants([c, a]))
+    #expect(parse(.array(Array(repeating: .bin(b), count: 500) + [.bin(a), .bin(b)])) == .wants([b, a]))
     #expect(parse(.array([])) == .wants([]))
     #expect(parse(.uint(0xF3)) == .other)
     #expect(parse(.uint(0xF4)) == .other)

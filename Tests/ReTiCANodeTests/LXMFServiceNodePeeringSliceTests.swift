@@ -231,3 +231,102 @@ private func serviceState(_ identity: Identity, _ endpoint: TransportEndpoint.St
     s.send(.endpoint(.stop))
     c.send(.endpoint(.stop))
 }
+
+/// Final review I3, whole slice: S sends B's OWN client a message through A. A syncs it to B, its
+/// peer, and B delivers it to its inbox (reference `lxmf_propagation`, LXMRouter.py:2852-2866)
+/// instead of storing it and distributing it to its other peers. It is handled for A (so A never
+/// offers it again) and nothing is left for B's other peer.
+///
+///   S (LXMFNode) --tcp--> A (service node, listener) <--tcp-- B (service node, its client registered)
+@MainActor @Test func aPeerSyncedMessageForTheNodesOwnClientIsDeliveredNotStored() async throws {
+    let w = Wire()
+    let aIdentity = Identity(), bIdentity = Identity(), sIdentity = Identity()
+    let aProp = propagationHash(aIdentity), bProp = propagationHash(bIdentity)
+    let bDelivery = LXMessage.deliveryHash(identityHash: bIdentity.hash)
+    let elsewhere = propagationHash(Identity())
+
+    func common(_ d: inout DependencyValues) {
+        d.continuousClock = TestClock()
+        d.date = .constant(t0)
+        d.transportDate = .constant(t0)
+        d.uuid = .incrementing
+        d.withRandomNumberGenerator = WithRandomNumberGenerator(Seeded(state: 3))
+    }
+
+    let a = Store(initialState: serviceState(aIdentity, TransportEndpoint.State(
+        tcpServer: TCPServerEndpoint.State(port: 4242, profile: .tcp)))) { LXMFServiceNode() } withDependencies: {
+        common(&$0)
+        $0.tcpListener = TCPListener(listen: { _ in w.aListener.stream },
+                                     send: { conn, d in
+                                         if conn == Wire.sAtA { w.sClient.continuation.yield(.data(d)) }
+                                         else { w.bClient.continuation.yield(.data(d)) }
+                                     },
+                                     close: { _ in }, stop: { })
+    }
+    let bDelivered = LockIsolated<[Data]>([])
+    let b = Store(initialState: serviceState(bIdentity, TransportEndpoint.State(
+        tcpClients: [TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false)]))) {
+        ServiceRecorder(delivered: bDelivered)
+    } withDependencies: {
+        common(&$0)
+        $0.tcpConnection = TCPConnection(open: { _, _ in w.bClient.stream },
+                                         send: { d in w.aListener.continuation.yield(.data(Wire.bAtA, d)) },
+                                         close: { })
+    }
+    let s = Store(initialState: LXMFNode.State(identity: sIdentity,
+                                               endpoint: tcpDriverEndpoint(host: "a", port: 4242, reconnectOnDrop: false))) {
+        LXMFNode()
+    } withDependencies: {
+        common(&$0)
+        $0.tcpConnection = TCPConnection(open: { _, _ in w.sClient.stream },
+                                         send: { d in w.aListener.continuation.yield(.data(Wire.sAtA, d)) },
+                                         close: { })
+    }
+
+    a.send(.client(.endpoint(.start)))
+    w.aListener.continuation.yield(.started)
+    b.send(.client(.endpoint(.start)))
+    w.bClient.continuation.yield(.connected)
+    w.aListener.continuation.yield(.accepted(Wire.bAtA))
+    s.send(.endpoint(.start))
+    w.sClient.continuation.yield(.connected)
+    w.aListener.continuation.yield(.accepted(Wire.sAtA))
+    #expect(await eventually { a.client.endpoint.transport.interfaces.count == 2
+        && b.client.endpoint.transport.interfaces.count == 1 && s.endpoint.transport.interfaces.count == 1 })
+
+    a.send(.setNodeMode(true))
+    b.send(.setNodeMode(true))
+    b.send(.client(.registerDelivery))
+    #expect(await eventually { a.peering.peers[bProp] != nil && b.peering.peers[aProp] != nil })
+    #expect(await eventually { s.endpoint.learned[aProp] != nil })
+    // B has a second peer, never reachable here: what B distributes would show in its unhandled set.
+    b.send(.rehydrate(entries: [], peers: [PNPeerTable.Peer(destinationHash: elsewhere, alive: true, lastHeard: t0)]))
+    #expect(b.peering.peers[elsewhere] != nil)
+
+    // S uploads a message for B's own client to A.
+    s.send(.endpoint(.transport(.rehydrateKnownDestinations([
+        bDelivery: KnownDestination(identity: Identity(publicKey: bIdentity.publicKey)!, appData: nil, lastHeard: t0),
+    ]))))
+    s.send(.setPropagationNode(destinationHash: aProp))
+    let content = Data("for B's own inbox".utf8)
+    s.send(.sendViaPropagation(destinationHash: bDelivery, title: Data("t".utf8), content: content))
+    #expect(await eventually { a.pn.store.count == 1 })
+    let tid = try #require(a.pn.store.transientIds.first)
+
+    // A syncs it to B: the first tick mines a key, the next one syncs.
+    a.send(.peerSyncTick)
+    #expect(await eventually { a.peering.peers[bProp]?.peeringKey != nil })
+    a.send(.peerSyncTick)
+    #expect(await eventually { bDelivered.value.contains(content) })
+    #expect(await eventually { a.peering.peers[bProp]?.handled.contains(tid) == true })
+    #expect(!b.pn.store.contains(transientId: tid), "not stored at B")
+    #expect(b.pn.store.count == 0)
+    #expect(b.peering.peers[elsewhere]?.unhandled.isEmpty == true, "not queued for B's other peer")
+    #expect(b.peering.peers[aProp]?.handled.contains(tid) == true, "handled for A, the sender")
+    #expect(b.client.router.downloadedTransientIds.contains(tid))
+    #expect(bDelivered.value == [content])
+
+    a.send(.client(.endpoint(.stop)))
+    b.send(.client(.endpoint(.stop)))
+    s.send(.endpoint(.stop))
+}

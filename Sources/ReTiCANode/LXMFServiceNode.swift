@@ -68,6 +68,18 @@ public struct LXMFServiceNode {
         /// Sync link → the sync transfer's size in bytes, per resource segment (key 0: the container's
         /// size until the sender reports progress), for `transferConcluded(bytes:)`.
         public var peerTransferBytes: [Data: [Int: Int]] = [:]
+        /// The 24 s peer-sync job is running: set when `setNodeMode(true)` starts it, cleared when
+        /// `setNodeMode(false)` cancels it. A redundant enable leaves a running job alone.
+        public var peerSyncJobRunning: Bool = false
+        /// Stamped propagation entries addressed to us whose PN stamp validated, which `deliverOwn`
+        /// delivered (or tried to) and never stored. The packet path's stamp pre-scan treats a
+        /// byte-identical replay of one as it treats a stored entry: already validated, so no
+        /// workblock. Without it, a single valid entry addressed to us could be replayed on one link
+        /// at two workblocks (~44 ms) per packet, each one proved (final re-review, I3). Bounded, as
+        /// a ring: one evicted costs only a re-validation. Holds `Crypto.fullHash(entry)`, not the
+        /// entry, so 1024 large messages cost 32 KB, not their bodies.
+        public var ownDeliveredEntries = RingSet(capacity: State.ownDeliveredEntriesCapacity)
+        public static let ownDeliveredEntriesCapacity = 1024
 
         /// 32 MB — a mobile-appropriate cap for the store-and-forward backlog.
         public static let defaultStorageLimitBytes: Int = 32 * 1024 * 1024
@@ -295,6 +307,7 @@ public struct LXMFServiceNode {
             /// reducer knows the source, and the pre-ingest store state is needed for the duplicates.
             /// The same `PropagationNode` delegates are sent, so the host-facing signals are unchanged.
             func ingest(_ state: inout State, _ container: Data, from source: Data?) -> Effect<Action> {
+                let (container, local) = deliverOwn(&state, container, from: source)
                 var duplicates: [Data] = []
                 if source != nil, let (_, entries) = LXMFPropagation.parseContainer(container) {
                     duplicates = entries.compactMap { entry in
@@ -305,13 +318,79 @@ public struct LXMFServiceNode {
                 let (added, evicted) = state.pn.store.ingest(container: container, now: date.now)
                 if let source { state.peering.markHandled(added + duplicates, for: source) }
                 state.peering.distribute(added, from: source)
-                var effects: [Effect<Action>] = [
+                var effects: [Effect<Action>] = local + [
                     .send(.pn(.delegate(.stored(transientIds: added)))),
                     .send(.pn(.delegate(.storedEntries(entries: state.pn.store.entries(forTransientIds: added))))),
                 ]
                 // The `.purged` handler prunes the peer table, as it does for every removal route.
                 if !evicted.isEmpty { effects.append(.send(.pn(.delegate(.purged(transientIds: evicted))))) }
                 return .merge(effects)
+            }
+
+            /// Reference `lxmf_propagation` (LXMRouter.py:2852-2866): an entry addressed to one of OUR
+            /// delivery destinations is decrypted and delivered locally with method PROPAGATED, and is
+            /// neither stored nor queued for peer distribution. Final review I3: without this, a
+            /// message for this device that a peer synced to us (the normal route once we peer) was
+            /// stored, forwarded to every other peer, and never shown.
+            ///
+            /// Splits such entries off `container` and returns the rest, re-packed, for the store,
+            /// plus the delivery effects. Each split-off entry must carry a valid stamp at the store's
+            /// acceptance cost, as reference delivers only `validated_messages` (an invalid one is
+            /// dropped, as `ingest` drops it). Its transient id is marked handled for `source` (the
+            /// sending peer: reference `queue_handled_message` after every `lxmf_propagation`,
+            /// :2783-2784) and recorded as downloaded by our router, so a later `/get` at our own
+            /// propagation node purges it there as a have. One already downloaded is not delivered
+            /// again (reference's `locally_processed_transient_ids`); the router's message-hash dedup
+            /// backs that up. An entry that does not decrypt is dropped, as reference drops it.
+            ///
+            /// The delivery goes through `LXMFNode.propagatedDelivery`, the path `/get` downloads take:
+            /// this reducer composes the client (`state.client`), so its delivery destination,
+            /// identity and ratchets are right here, and the router's `messageDelivered` reaches the
+            /// host through `LXMFNode`'s delegate as any other delivery does.
+            func deliverOwn(_ state: inout State, _ container: Data,
+                            from source: Data?) -> (container: Data, effects: [Effect<Action>]) {
+                guard let delivery = state.client.deliveryDestinationHash,
+                      let (timestamp, entries) = LXMFPropagation.parseContainer(container),
+                      entries.contains(where: { LXMFPropagation.destinationHash(lxmfData: $0) == delivery })
+                else { return (container, []) }
+                let store = state.pn.store
+                var kept: [Data] = [], handled: [Data] = [], effects: [Effect<Action>] = []
+                for entry in entries {
+                    guard LXMFPropagation.destinationHash(lxmfData: entry) == delivery else {
+                        kept.append(entry)
+                        continue
+                    }
+                    let core: Data
+                    if store.targetStampCost > 0 {
+                        // One we already delivered: the cheap id first, BEFORE the workblock, as the
+                        // store's preflight does for stored entries. It is only marked handled again.
+                        if let known = store.preflightTransientId(ofStampedEntry: entry),
+                           state.client.router.downloadedTransientIds.contains(known) {
+                            handled.append(known)
+                            continue
+                        }
+                        guard let validated = LXStamper.validatePnStamp(transientData: entry,
+                                                                        targetCost: store.minAcceptedStampCost)
+                        else { continue }
+                        core = validated.lxmfData
+                        _ = state.ownDeliveredEntries.insert(Crypto.fullHash(entry))
+                    } else {
+                        core = LXMFPropagation.strippedCore(lxmfData: entry)
+                        // Reference handles only `len(lxmf_data) >= LXMF_OVERHEAD` (LXMRouter.py:2832);
+                        // at cost 0 nothing else stops junk from growing `downloadedTransientIds`.
+                        guard core.count >= LXMessage.lxmfOverhead else { continue }
+                    }
+                    let tid = LXMFPropagation.transientId(lxmfData: core)
+                    handled.append(tid)
+                    guard !state.client.router.downloadedTransientIds.contains(tid),
+                          let delivered = LXMFNode.propagatedDelivery(state.client, lxmfData: core) else { continue }
+                    effects.append(.send(.client(.router(delivered))))
+                }
+                if !handled.isEmpty {
+                    if let source { state.peering.markHandled(handled, for: source) }
+                    effects.append(.send(.client(.router(.propagatedMessagesDeliveredLocally(transientIds: handled)))))
+                }
+                return (LXMFPropagation.container(timestamp: timestamp, entries: kept), effects)
             }
 
             /// The response body for a request: `umsgpack.packb(value)`.
@@ -382,6 +461,16 @@ public struct LXMFServiceNode {
                         guard state.nodeModeEnabled,
                               let identity = state.client.endpoint.recall(destinationHash: peer) else {
                             state.peering.keyFailed(peer: peer, now: now)
+                            continue
+                        }
+                        // One search at a time (final review minor 2). A cost-26 search takes minutes
+                        // on a phone and two at once starve a 2-core pool (`LXStamper.swift`'s note),
+                        // while up to `maxPeers` new peers would each start one. Every running search
+                        // is a peer in `.keyPending` (it leaves that state when the search reports, is
+                        // cancelled, or its peer leaves), so another such peer means one is running:
+                        // this peer goes back to idle, unpenalised, for a later tick to pick.
+                        if state.peering.peers.values.contains(where: { $0.destinationHash != peer && $0.state == .keyPending }) {
+                            state.peering.keyDeferred(peer: peer)
                             continue
                         }
                         let peeringID = identity.hash + state.client.identity.hash
@@ -492,12 +581,22 @@ public struct LXMFServiceNode {
                 // on locally-originated announces, which `Transport` does not have (it paces only
                 // RELAYED announces).
                 //
-                // Enabling also starts the peer-sync job (ruling 6b: it runs only in node mode;
-                // `cancelInFlight` keeps a redundant enable to one timer) and activates the static
-                // peers, as reference's `enable_propagation` does (LXMRouter.py:728-737).
+                // Reference's `enable_propagation` re-announces on every call too
+                // (`announce_propagation_node()`, LXMRouter.py:780, LXMF 1.3.0), so the announce stays.
+                //
+                // Enabling also activates the static peers, as reference's `enable_propagation` does
+                // (LXMRouter.py:728-737), and starts the peer-sync job (ruling 6b: it runs only in node
+                // mode) — but only when it is not already running (final review I2). Restarting it
+                // reset the 24 s period: ReTiCaMsgr sends `setNodeMode(true)` on every
+                // `interfaceConnected`, so interfaces coming up more often than every 24 s (BLE peers
+                // in a crowd, a flapping hub) meant `.peerSyncTick` never fired and nothing was
+                // forwarded to peers. Reference's sync job is its job loop, which enabling never
+                // touches.
                 if enabled {
                     state.nodeModeEnabled = true
-                    return .merge(.send(.registerPropagation), peerSyncJob(),
+                    let job: Effect<Action> = state.peerSyncJobRunning ? .none : peerSyncJob()
+                    state.peerSyncJobRunning = true
+                    return .merge(.send(.registerPropagation), job,
                                   run(activateStaticPeers(&state), &state))
                 }
                 // Disabling is idempotent. Without this guard N calls with the mode already off
@@ -533,6 +632,7 @@ public struct LXMFServiceNode {
                 // nothing is unpeered. A cancelled search reports nothing (its effect is cancelled), so
                 // the table is told here; a link still establishing stays counted in `peerLinkOpens`,
                 // and the table closes it if it establishes later.
+                state.peerSyncJobRunning = false
                 var peering: [Effect<Action>] = [.cancel(id: CancelID.peerSyncJob)]
                 for peer in state.peerPathWaits.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
                     peering.append(.cancel(id: CancelID.peerPathGrace(peer)))
@@ -654,7 +754,11 @@ public struct LXMFServiceNode {
                         // store a second entry point that trusts its caller's validation, and an
                         // attacker can only reach this path at all by doing the ~2^cost work of a
                         // valid stamp themselves. Filed with the admission-control gap.
+                        //
+                        // An entry addressed to us is never stored (`deliverOwn`), so a byte-identical
+                        // replay of one we delivered is recognised by `ownDeliveredEntries` instead.
                         !state.pn.store.containsIdenticalStampedEntry($0)
+                            && !state.ownDeliveredEntries.contains(Crypto.fullHash($0))
                             && LXStamper.validatePnStamp(transientData: $0,
                                                          targetCost: state.pn.store.minAcceptedStampCost) == nil
                     }
@@ -846,7 +950,12 @@ public struct LXMFServiceNode {
                 // bound (built on this branch only: `.cancel` cancels when constructed).
                 state.peerTransferBytes[linkID] = nil
                 state.peerOfferRequests[linkID] = nil
+                // A sync link closing under a transfer is a failed transfer: back off (minor 3).
+                let failedTransfer = peerOnLink(state, linkID).flatMap { dest in
+                    state.peering.peers[dest]?.state == .transferring ? dest : nil
+                }
                 state.peering.linkClosed(linkID: linkID)
+                if let failedTransfer { state.peering.backOff(peer: failedTransfer, now: date.now) }
                 return .cancel(id: CancelID.peerLinkStall(linkID))
 
             case let .client(.endpoint(.delegate(.requestFailed(linkID, requestID)))):
@@ -866,8 +975,10 @@ public struct LXMFServiceNode {
                 return armStall(linkID)
 
             case let .peerLinkStalled(linkID):
-                guard peerOnLink(state, linkID) != nil else { return .none }
+                guard let dest = peerOnLink(state, linkID) else { return .none }
                 state.peering.linkClosed(linkID: linkID)
+                // A stalled sync is retried after a backoff step, not on the next tick (minor 3).
+                state.peering.backOff(peer: dest, now: date.now)
                 return run([.closeLink(linkID)], &state)
 
             // --- Peering: the client half ---
@@ -962,7 +1073,12 @@ public struct LXMFServiceNode {
                 guard let dest = peerOnLink(state, linkID), state.peering.peers[dest]?.state == .transferring
                 else { return .none }
                 state.peerTransferBytes[linkID] = nil
-                return run(state.peering.transferFailed(linkID: linkID), &state)
+                let commands = state.peering.transferFailed(linkID: linkID)
+                // Reference retries a failed transfer on the next sync job (LXMPeer.py:531-537), which
+                // resends the whole container every 24 s to a peer whose transfers always fail; one
+                // backoff step instead (final review minor 3).
+                state.peering.backOff(peer: dest, now: date.now)
+                return run(commands, &state)
 
             // --- Peering: configuration and persistence ---
 

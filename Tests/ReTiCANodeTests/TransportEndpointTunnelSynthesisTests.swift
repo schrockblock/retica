@@ -105,13 +105,77 @@ private func syntheses(_ log: LockIsolated<[(InterfaceID, Data)]>) -> [Interface
         await store.receive { if case .tcpClients(.element(id: idA, action: .interface(.send))) = $0 { return true }; return false }
         await store.skipReceivedActions(strict: false)
 
-        #expect(syntheses(log) == [idA], "client A only: not B (not connected), not the accepted connection")
+        #expect(syntheses(log) == [idA], "client A only, not the accepted connection")
         #expect(serverSends.value.isEmpty)
         #expect((pool.sends.value["a:4242"] ?? []).count == 1, "the synthesis left over A's socket")
         #expect(pool.sends.value["b:4242"] == nil)
-        let sent = try #require(log.value.first { $0.0 == idA }?.1)
-        let packet = try #require(Packet(raw: sent))
-        #expect(Data(packet.payload.prefix(64)) == tunnel.publicKey)
-        #expect(Data(packet.payload.dropFirst(64).prefix(32)) == Transport.tunnelInterfaceHash(profileName: "tcp"))
+
+        // B connects too: its own synthesis, over its own socket, and nothing more over A's or the
+        // accepted connection's.
+        pool.b.continuation.yield(.connected)
+        await store.receive(\.transport.interfaceConnected)
+        await store.receive { if case .tcpClients(.element(id: idB, action: .interface(.send))) = $0 { return true }; return false }
+        await store.skipReceivedActions(strict: false)
+        #expect(syntheses(log) == [idA, idB])
+        #expect((pool.sends.value["a:4242"] ?? []).count == 1)
+        #expect((pool.sends.value["b:4242"] ?? []).count == 1, "the synthesis left over B's socket")
+        #expect(serverSends.value.isEmpty)
+
+        // Each under its own interface id's hash (Ruling 9c'), so the two clients get two tunnels.
+        for id in [idA, idB] {
+            let sent = try #require(log.value.first { $0.0 == id }?.1)
+            let packet = try #require(Packet(raw: sent))
+            #expect(Data(packet.payload.prefix(64)) == tunnel.publicKey)
+            #expect(Data(packet.payload.dropFirst(64).prefix(32)) == Transport.tunnelInterfaceHash(interfaceID: id))
+        }
+        #expect(Transport.tunnelInterfaceHash(interfaceID: idA) != Transport.tunnelInterfaceHash(interfaceID: idB))
+    }
+
+    /// The synthesis goes out on a connecting interface BEFORE the announce a host sends in reaction to
+    /// that connect (ReTiCaMsgr re-announces its delivery destination on every `interfaceConnected`),
+    /// so the hub has filed the tunnel when our announce arrives over it, as reference orders it
+    /// (`synthesize_tunnel` from the interface's connect, before any announce goes out on it).
+    @Test func theSynthesisPrecedesTheHostsAnnounceOnThatInterface() async throws {
+        let pool = Pool()
+        let log = LockIsolated<[(InterfaceID, Data)]>([])
+        let ours = try #require(Destination(kind: .single, direction: .in, appName: "retica", aspects: ["order"],
+                                            identity: Identity()))
+        let initial = TransportEndpoint.State(
+            tcpClients: [TCPEndpoint.State(host: "a", port: 4242, reconnectOnDrop: false, interfaceID: idA)])
+        let store = TestStore(initialState: initial) {
+            TransmitLog(log: log) {
+                CombineReducers {
+                    TransportEndpoint()
+                    // The host: announce on every interface that comes up, as the app does.
+                    Reduce<TransportEndpoint.State, TransportEndpoint.Action> { _, action in
+                        guard case let .transport(.interfaceConnected(id, _)) = action else { return .none }
+                        return .send(.announceOn(interface: id, destinationHash: ours.hash, appData: nil))
+                    }
+                }
+            }
+        } withDependencies: {
+            $0.tcpConnectionPool = pool.pool
+            $0.continuousClock = TestClock()
+            $0.date = .constant(Date(timeIntervalSince1970: 0))
+            $0.transportDate = DateGenerator { Date(timeIntervalSince1970: 0) }
+            $0.uuid = .incrementing
+        }
+        store.exhaustivity = .off
+
+        await store.send(.setTunnelIdentity(Identity()))
+        await store.send(.registerLocalDestination(ours))
+        await store.send(.start)
+        pool.a.continuation.yield(.connected)
+        await store.receive(\.transport.interfaceConnected)
+        await store.receive(\.announceOn)
+        await store.skipReceivedActions(strict: false)
+
+        let onA = log.value.filter { $0.0 == idA }.compactMap { Packet(raw: $0.1) }
+        let synthesis = onA.firstIndex { $0.destinationHash == Transport.tunnelSynthesizeDestinationHash }
+        let announce = onA.firstIndex { $0.packetType == .announce && $0.destinationHash == ours.hash }
+        #expect(synthesis != nil)
+        #expect(announce != nil)
+        if let synthesis, let announce { #expect(synthesis < announce, "the tunnel first, then the announce") }
+        #expect((pool.sends.value["a:4242"] ?? []).count >= 2, "both left over A's socket")
     }
 }

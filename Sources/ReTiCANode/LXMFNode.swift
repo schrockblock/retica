@@ -1227,20 +1227,11 @@ public struct LXMFNode {
                         // `if destination_hash in self.delivery_destinations`, LXMRouter.py:2855); any other
                         // is still marked downloaded above. A decrypt can scan the whole ring, so this
                         // keeps foreign entries from costing one.
-                        guard let delivery = state.deliveryDestinationHash,
-                              LXMFPropagation.destinationHash(lxmfData: blob) == delivery else { continue }
-                        // With our delivery destination's own ratchets enabled, they are tried first and
-                        // enforcement applies, as reference decrypts through `delivery_destination.decrypt`.
-                        let own = state.endpoint.transport.ownRatchets[delivery]
-                        if let packed = LXMFPropagation.recoverPacked(lxmfData: blob, recipientIdentity: state.identity,
-                                                                      ratchets: own?.ring,
-                                                                      enforceRatchets: own?.enforce ?? false) {
+                        if let delivered = LXMFNode.propagatedDelivery(state, lxmfData: blob) {
                             // Our delivery hash: the router drops a message whose own destination is
                             // anyone else. Its transient id is still marked downloaded below (spec settled
                             // detail 5).
-                            effects.append(.send(.router(.received(method: .propagated,
-                                                                   destinationHash: delivery,
-                                                                   data: packed))))
+                            effects.append(.send(.router(delivered)))
                         }
                     }
                     effects.append(.send(.router(.messagesDownloaded(transientIds: tids))))
@@ -1600,7 +1591,11 @@ public struct LXMFNode {
                 // node for it, so dropping it is silent. Its search is cancelled and the router told the
                 // link is gone (it re-establishes if work arrived meanwhile). A link already minted is
                 // left to finish; the router, still `.establishing`, takes its outcome as usual.
-                guard state.endpoint.linkPlane.stampingLinks.contains(where: { $0.destinationHash == dest })
+                // Only the router's OWN (unowned) searches count: `abandonStampSearches` leaves an
+                // owned one (a propagation peer-sync link to the same node) running, so counting it
+                // would tell the router its link is gone while its minted link is still establishing.
+                let plane = state.endpoint.linkPlane
+                guard plane.stampingLinks.contains(where: { $0.destinationHash == dest && plane.linkOwners[$0.id] == nil })
                 else { return .none }
                 return .concatenate(.send(.endpoint(.linkPlane(.abandonStampSearches(destinationHash: dest)))),
                                     .send(.router(.linkClosed(destinationHash: dest))))
@@ -1764,6 +1759,26 @@ public struct LXMFNode {
     /// The delivery destination's announce app data. Its display name is cut to the smaller budget
     /// when the destination announces its own ratchet (`Transport.State.ownRatchets`, read when the
     /// action is handled), so the announce still fits.
+    /// Reference `lxmf_propagation`'s local-delivery branch (LXMRouter.py:2852-2861): a propagated
+    /// entry (`lxmf_data`, stampless) addressed to OUR delivery destination, decrypted and handed to
+    /// the router as a PROPAGATED delivery. nil for an entry addressed to anyone else (no decrypt is
+    /// attempted: one can scan the whole ratchet ring) and for one that does not decrypt. With our
+    /// delivery destination's own ratchets enabled they are tried first and enforcement applies, as
+    /// reference decrypts through `delivery_destination.decrypt`.
+    ///
+    /// The one path for both routes a propagated message reaches us by: a `/get` download from our
+    /// propagation node, and (in `LXMFServiceNode`) a container a client or peer hands our own
+    /// propagation node.
+    static func propagatedDelivery(_ state: State, lxmfData: Data) -> LXMFRouter.Action? {
+        guard let delivery = state.deliveryDestinationHash,
+              LXMFPropagation.destinationHash(lxmfData: lxmfData) == delivery else { return nil }
+        let own = state.endpoint.transport.ownRatchets[delivery]
+        guard let packed = LXMFPropagation.recoverPacked(lxmfData: lxmfData, recipientIdentity: state.identity,
+                                                         ratchets: own?.ring,
+                                                         enforceRatchets: own?.enforce ?? false) else { return nil }
+        return .received(method: .propagated, destinationHash: delivery, data: packed)
+    }
+
     private func deliveryAnnounceAppData(_ state: State) -> Data {
         let ratchet = state.deliveryDestinationHash.map { state.endpoint.transport.ownRatchets[$0] != nil } ?? false
         return LXMFAnnounceData.pack(displayName: state.displayName, stampCost: state.deliveryStampCost,

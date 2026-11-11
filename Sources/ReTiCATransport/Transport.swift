@@ -1086,7 +1086,7 @@ public struct Transport {
                 guard profile.wantsTunnel, let identity = state.tunnelIdentity, identity.privateKey != nil
                 else { return .none }
                 let payload = Transport.tunnelSynthesisPayload(
-                    identity: identity, interfaceHash: Transport.tunnelInterfaceHash(profileName: profile.name),
+                    identity: identity, interfaceHash: Transport.tunnelInterfaceHash(interfaceID: id),
                     randomHash: randomBytes(Crypto.truncatedHashLength))
                 let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                                     destinationType: .plain, context: .none, contextFlag: false, hops: 0,
@@ -2552,12 +2552,15 @@ public struct Transport {
         return signed + identity.sign(signed)
     }
 
-    /// The interface hash a tunnel is synthesized with (Ruling 9c): `full_hash` of the UTF-8 of
-    /// `"TCPInterface[<profile name>]"`. Reference hashes `str(interface)` (Interface.get_hash); only
-    /// we compute ours, so it need not match reference's string, only stay stable across reconnects
-    /// of one configured interface, because the tunnel id depends on it.
-    public static func tunnelInterfaceHash(profileName: String) -> Data {
-        Crypto.fullHash(Data("TCPInterface[\(profileName)]".utf8))
+    /// The interface hash a tunnel is synthesized with (Ruling 9c'): `full_hash` of the UTF-8 of
+    /// `"TCPInterface[<interface id>]"`, the id being the configured entry's (`tcp:<host>:<port>` for a
+    /// TCP client). Reference hashes `str(interface)` (Interface.get_hash), which names the configured
+    /// interface; only we compute ours, so it need not match reference's string, only stay stable
+    /// across reconnects of one configured interface (the tunnel id depends on it) and differ between
+    /// interfaces, so two hubs (or two entries for one hub) get two tunnels. The profile name ("tcp")
+    /// was the same for every TCP client.
+    public static func tunnelInterfaceHash(interfaceID: InterfaceID) -> Data {
+        Crypto.fullHash(Data("TCPInterface[\(interfaceID.rawValue)]".utf8))
     }
 
     /// RNS PR_LEGACY_LENGTH: destination + tag, from a pre-1.6 leaf.
