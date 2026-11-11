@@ -45,6 +45,9 @@ import ReTiCA
 /// marks the peer not alive on an establishment failure too (reference does so only for a missing
 /// path, and its next selection does the same through `sync()`'s backoff check); and `linkClosed`
 /// clears a transfer in flight (reference relies on the resource's own failure callback for that).
+/// Safety bounds reference lacks (final review I1 and minors 1-3): `OfferResponse.parse` takes each
+/// offered id once; a second `ERROR_NO_IDENTITY` on one link ends the sync; the host may defer a key
+/// search (`keyDeferred`) and back a peer off after a failed transfer (`backOff`).
 ///
 /// **Not implemented:** `rotate_peers` (LXMRouter.py:2396-2466); the lazy sync strategy (only
 /// `STRATEGY_PERSISTENT`, LXMPeer.py:33-35). Reference never syncs to a peer whose peering cost is
@@ -128,13 +131,22 @@ public struct PNPeerTable: Equatable, Sendable {
     public enum OfferResponse: Equatable, Sendable {
         case noIdentity, noAccess, throttled, wantsNone, wantsAll, wants([Data]), other
 
-        /// `wants` is the response's ids that we offered, in the response's order and as often as it
-        /// lists them, which is the order (and the duplicates) reference sends them in
-        /// (LXMPeer.py:455-457) and what `PNNode` always did. Narrower than reference, which sends any
-        /// id in the list its store holds, offered or not, and raises on one it does not. An error code matches by value under any integer or float encoding,
-        /// as Python's `==` does. `ERROR_INVALID_KEY`, `ERROR_INVALID_DATA` and anything else are
-        /// `other`; so are the integers 0 and 1, although Python's `0 == False` would read them as the
-        /// booleans (no responder sends them).
+        /// `wants` is the response's ids that we offered, in the response's order, each ONCE (its first
+        /// occurrence). So it never holds more ids than the offer did.
+        ///
+        /// **Deliberate divergence from reference (safety).** Reference sends one container entry per
+        /// listed id, repeats included (`LXMPeer.offer_response`, LXMPeer.py:455-457), and sends any id
+        /// in the list its store holds, offered or not. A peer answering with one id repeated N times
+        /// would make us build, encode and resource-split a container holding that entry N times:
+        /// about 1 MB of decompressed response (≈ 30 800 ids, a few kB on the wire because repeats
+        /// compress to nothing) times a 256 KB entry is gigabytes, a remote jetsam of any device in
+        /// node mode (final review I1). No wire effect: a reference responder builds its wanted list
+        /// from our offer (`offer_request`, LXMRouter.py:2650-2651) and never repeats an id.
+        ///
+        /// An error code matches by value under any integer or float encoding, as Python's `==` does.
+        /// `ERROR_INVALID_KEY`, `ERROR_INVALID_DATA` and anything else are `other`; so are the integers
+        /// 0 and 1, although Python's `0 == False` would read them as the booleans (no responder sends
+        /// them).
         public static func parse(_ data: Data, offered: [Data]) -> OfferResponse {
             guard let value = MsgPack.decodeValue(data) else { return .other }
             let number: Double?
@@ -142,9 +154,11 @@ public struct PNPeerTable: Equatable, Sendable {
             case .bool(false): return .wantsNone
             case .bool(true): return .wantsAll
             case let .array(items):
-                let offeredSet = Set(offered)
+                // Each offered id may be taken once: removing it on first sight drops ids we never
+                // offered and every repeat of one we did.
+                var remaining = Set(offered)
                 return .wants(items.compactMap { item -> Data? in
-                    if case let .bin(d) = item, offeredSet.contains(d) { return d }
+                    if case let .bin(d) = item, remaining.remove(d) != nil { return d }
                     return nil
                 })
             case let .uint(u): number = Double(u)
@@ -168,6 +182,9 @@ public struct PNPeerTable: Equatable, Sendable {
     private var order: [Data] = []
     /// When each peer's sync transfer began (`current_sync_transfer_started`), for the transfer rate.
     private var transferStarted: [Data: Date] = [:]
+    /// The sync link each peer has already re-identified on after an `ERROR_NO_IDENTITY` answer. A
+    /// second such answer on the same link ends the sync there (see `offerResponse`).
+    private var reidentifiedOn: [Data: Data] = [:]
 
     public init(config: Config) { self.config = config }
 
@@ -341,6 +358,29 @@ public struct PNPeerTable: Equatable, Sendable {
         peers[peer] = p
     }
 
+    /// The host did not start the key search for `peer` because another one is running (it runs at
+    /// most one at a time, final review minor 2): back to idle with no backoff, so a later `syncTick`
+    /// that picks the peer asks again. Reference has no such outcome (one thread per search).
+    public mutating func keyDeferred(peer: Data) {
+        guard var p = peers[peer], p.state == .keyPending else { return }
+        p.state = .idle
+        peers[peer] = p
+    }
+
+    /// The host's backoff after a sync that got as far as a transfer and then failed or stalled
+    /// (final review minor 3): one `syncBackoffStep` before the next attempt, as `keyFailed` adds.
+    /// Call it after `transferFailed` / `linkClosed` for that sync. Reference adds none
+    /// (LXMPeer.py:531-537), so a peer whose transfers always fail (a flaky radio link, or a hostile
+    /// peer that answers `True` and never completes) would get the full container every 24 s.
+    /// Kept apart from `transferFailed` so that call stays step-for-step reference (the fixtures
+    /// replay it). A peer not idle is left alone.
+    public mutating func backOff(peer: Data, now: Date) {
+        guard var p = peers[peer], p.state == .idle else { return }
+        p.syncBackoff += Self.syncBackoffStep
+        p.nextSyncAttempt = now + p.syncBackoff
+        peers[peer] = p
+    }
+
     /// A peering key the host mined. Kept when it meets the peer's current cost (`generate_peering_key`,
     /// LXMPeer.py:262-265); the next `syncTick` uses it. Returns no commands, as reference waits for the
     /// next sync job too.
@@ -400,6 +440,7 @@ public struct PNPeerTable: Equatable, Sendable {
 
     /// `LXMPeer.offer_response` (LXMPeer.py:405-495).
     /// - `noIdentity`: identify again and re-run `sync()` on the same link (the host offers again).
+    ///   Once per link: a second `noIdentity` on it is handled as `other` (a divergence, below).
     /// - `noAccess`: unpeer.
     /// - `throttled`: no sync attempt for `pnStampThrottle`.
     /// - `wantsNone`: every offered id still unhandled becomes handled.
@@ -411,6 +452,15 @@ public struct PNPeerTable: Equatable, Sendable {
     public mutating func offerResponse(linkID: Data, _ response: OfferResponse, now: Date) -> [Command] {
         guard let dest = peerOnLink(linkID), var p = peers[dest], p.state == .requestSent else { return [] }
         let wanted: [Data]
+        var response = response
+        // Divergence (final review minor 1): one re-identify per link. Reference re-identifies and
+        // re-offers on every `ERROR_NO_IDENTITY` (LXMPeer.py:413-419), so a peer that always answers
+        // it holds one of our links in an identify + `/offer` loop at round-trip pace, which the
+        // stall bound never ends because every answer re-arms it. A second one on the same link is
+        // taken as `other`: close, idle.
+        if response == .noIdentity {
+            if reidentifiedOn[dest] == linkID { response = .other } else { reidentifiedOn[dest] = linkID }
+        }
         switch response {
         case .noIdentity:
             p.state = .linkReady
@@ -640,6 +690,7 @@ public struct PNPeerTable: Equatable, Sendable {
         peers[dest] = nil
         order.removeAll { $0 == dest }
         transferStarted[dest] = nil
+        reidentifiedOn[dest] = nil
         return link.map { [.closeLink($0)] } ?? []
     }
 

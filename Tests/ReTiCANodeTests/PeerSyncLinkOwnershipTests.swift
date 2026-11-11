@@ -59,6 +59,59 @@ private func makePlane() -> TestStoreOf<LinkPlane> {
     #expect(store.state.linkOwners.isEmpty)
 }
 
+/// Counts the `.router(.linkClosed(dest))` an `LXMFNode` processes.
+private struct RouterLinkClosedCounter: Reducer {
+    typealias State = LXMFNode.State
+    typealias Action = LXMFNode.Action
+    let count: LockIsolated<Int>
+    var body: some ReducerOf<Self> {
+        Reduce { _, action in
+            if case .router(.linkClosed(destinationHash: dest)) = action { count.withValue { $0 += 1 } }
+            return .none
+        }
+        LXMFNode()
+    }
+}
+
+/// Task 6 N1: the router abandoning its establishment to a node counts only ITS OWN key searches. With
+/// only a propagation peer-sync search (owned) to that node, the router's link was already minted and
+/// is still establishing, so the router must not be told it is gone, and the owned search keeps
+/// running. With a plain search there too, that one is abandoned and the router told.
+@MainActor @Test func routerAbandonIgnoresAnOwnedStampSearch() async {
+    var state = LXMFNode.State(identity: Identity(),
+                               endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false))
+    state.router.directLinks[dest] = .establishing
+    let told = LockIsolated(0)
+    let store = TestStore(initialState: state) { RouterLinkClosedCounter(count: told) } withDependencies: {
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 1_700_000_000))
+        $0.uuid = .incrementing
+        $0.tcpConnection = TCPConnection(open: { _, _ in AsyncStream { _ in } }, send: { _ in }, close: { })
+    }
+    store.exhaustivity = .off
+    let peer = Identity()
+    // Cost 20: the search runs far longer than this test.
+    await store.send(.endpoint(.linkPlane(.openOwnedLink(owner: .propagationPeerSync, initiatorTo: peer,
+                                                         destinationHash: dest, interfaceID: iface,
+                                                         relayNextHop: nil, linkCost: 20))))
+    #expect(store.state.endpoint.linkPlane.stampingLinks.count == 1)
+    func routerTold() -> Bool { told.value > 0 }
+
+    await store.send(.router(.delegate(.abandonLink(destinationHash: dest))))
+    await store.skipReceivedActions(strict: false)
+    #expect(!routerTold(), "an owned search is not the router's")
+    #expect(store.state.endpoint.linkPlane.stampingLinks.count == 1)
+
+    await store.send(.endpoint(.linkPlane(.openLink(initiatorTo: peer, destinationHash: dest, interfaceID: iface,
+                                                    relayNextHop: nil, linkCost: 20))))
+    await store.send(.router(.delegate(.abandonLink(destinationHash: dest))))
+    await store.skipReceivedActions(strict: false)
+    #expect(routerTold())
+    #expect(store.state.endpoint.linkPlane.stampingLinks.count == 1, "the owned search still runs")
+    await store.send(.endpoint(.linkPlane(.cancelStampSearches)))
+    await store.skipReceivedActions(strict: false)
+}
+
 /// Counts the links an `LXMFNode` closes.
 private struct CloseCounter: Reducer {
     typealias State = LXMFNode.State

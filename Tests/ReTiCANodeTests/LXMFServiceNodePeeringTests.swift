@@ -22,7 +22,9 @@ private enum Out: Equatable, Sendable {
     /// `openLink`: a sync link (owned); `plainOpen`: a client link.
     case openLink(Data), plainOpen(Data), requestPath(Data), identify(Data)
     case request(link: Data, path: String, data: Data), resource(link: Data, data: Data)
-    case closeLink(Data), tick, peersChanged
+    case closeLink(Data), tick, peersChanged, announce(Data)
+    /// The content of a message the node's client delivered.
+    case delivered(Data)
 }
 
 private struct Recorded: Reducer {
@@ -40,6 +42,8 @@ private struct Recorded: Reducer {
             case let .client(.endpoint(.sendRequestOverLink(link, path, data))): out = .request(link: link, path: path, data: data)
             case let .client(.endpoint(.sendResourceOverLink(link, data))): out = .resource(link: link, data: data)
             case let .client(.endpoint(.closeLink(link))): out = .closeLink(link)
+            case let .client(.endpoint(.announce(dest, _))): out = .announce(dest)
+            case let .client(.delegate(.messageReceived(message, _, _))): out = .delivered(message.content)
             case .peerSyncTick: out = .tick
             case .delegate(.peersChanged): out = .peersChanged
             default: out = nil
@@ -661,6 +665,8 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
     #expect(closes(h.log) == [link])
     #expect(store.state.peering.peers[dest]?.state == .idle)
     #expect(store.state.peering.peers[dest]?.unhandled == [tid(2)])
+    // Final review minor 3: the stalled sync is retried after a backoff step, not on the next tick.
+    #expect(store.state.peering.peers[dest]?.nextSyncAttempt == t0 + PNPeerTable.syncBackoffStep)
 }
 
 /// M1: after node mode off and on, a link left over from before establishes alongside the new one: the
@@ -724,4 +730,192 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
     #expect(closes(h.log) == [link])
     #expect(store.state.peering.peers[dest]?.state == .idle)
     #expect(store.state.peering.peers[dest]?.linkID == nil)
+}
+
+// MARK: - Final fix wave (final-review.md I1, I2, I3, minors 1-3)
+
+/// I1: an `/offer` answer listing one id 500 times (17 KB of msgpack) gets a container with that entry
+/// ONCE, not 500 times (the review's probe built a 2 MB container from it). Ids we never offered are
+/// ignored. Reference sends one copy per listed id (LXMPeer.py:455-457); the divergence is deliberate.
+@MainActor @Test func anAnswerRepeatingAnIdGetsItOnce() async throws {
+    let h = Harness()
+    let (store, dest, link) = await peerWithOfferOut(h)
+    let stranger = Data(repeating: 0x99, count: 32)
+    let answer = MsgPackValue.array(Array(repeating: .bin(tid(2)), count: 500) + [.bin(stranger)])
+    await respond(store, link, answer)
+    #expect(resources(h.log).count == 1)
+    let container = try #require(resources(h.log).first)
+    #expect(LXMFPropagation.parseContainer(container)?.entries == [entry(2)])
+    #expect(store.state.peering.peers[dest]?.transferring == [tid(2)])
+}
+
+/// I2: a redundant `setNodeMode(true)` does not restart the 24 s sync job. The review's probe: an
+/// enable every 20 s for 100 s gave 0 ticks; the job must tick at 24, 48, 72 and 96 s. Every enable
+/// still re-announces, as reference's `enable_propagation` does (LXMRouter.py:780). After off and on
+/// again the job runs again.
+@MainActor @Test func redundantEnablesDoNotRestartTheSyncJob() async {
+    let h = Harness()
+    var initial = nodeState(Identity())
+    initial.nodeModeEnabled = false
+    let store = await makeStore(initial, h)
+    let served = propagationHash(store.state.client.identity)
+    await send(store, .setNodeMode(true))
+    for _ in 0..<5 {
+        await h.clock.advance(by: .seconds(20))
+        await store.skipReceivedActions(strict: false)
+        await send(store, .setNodeMode(true))
+    }
+    let ticks = h.log.value.filter { $0 == .tick }.count
+    #expect(ticks == 4, "ticks at 24, 48, 72 and 96 s")
+    #expect(h.log.value.filter { $0 == .announce(served) }.count == 6, "each enable re-announces")
+
+    await send(store, .setNodeMode(false))
+    await h.clock.advance(by: .seconds(48))
+    await store.skipReceivedActions(strict: false)
+    #expect(h.log.value.filter { $0 == .tick }.count == ticks, "no job while off")
+    await send(store, .setNodeMode(true))
+    await h.clock.advance(by: .seconds(24))
+    await store.skipReceivedActions(strict: false)
+    #expect(h.log.value.filter { $0 == .tick }.count == ticks + 1, "the job again after off and on")
+}
+
+/// Minor 1: one re-identify per link. A peer answering `ERROR_NO_IDENTITY` again on the same link
+/// gets its link closed and is idled, instead of an identify + `/offer` loop for as long as it likes.
+@MainActor @Test func aSecondNoIdentityOnOneLinkEndsTheSync() async {
+    let h = Harness()
+    let (store, dest, link) = await peerWithOfferOut(h)
+    await respond(store, link, .uint(LXMFPropagation.errorNoIdentity))
+    #expect(offers(h.log).count == 2)
+    #expect(closes(h.log).isEmpty)
+    await respond(store, link, .uint(LXMFPropagation.errorNoIdentity))
+    #expect(offers(h.log).count == 2, "no third offer")
+    #expect(h.log.value.filter { $0 == .identify(link) }.count == 2)
+    #expect(closes(h.log) == [link])
+    #expect(store.state.peering.peers[dest]?.state == .idle)
+    #expect(store.state.peering.peers[dest]?.unhandled == [tid(2)])
+
+    // A NEW link gets its own re-identify.
+    h.now.setValue(t0 + 30)
+    await send(store, .client(.endpoint(.delegate(.linkClosed(linkID: link, reason: .initiatorClosed)))))
+    await send(store, .peerSyncTick)
+    let second = Data(repeating: 0x12, count: 16)
+    await established(store, second, dest)
+    await respond(store, second, .uint(LXMFPropagation.errorNoIdentity))
+    #expect(offers(h.log).filter { $0.link == second }.count == 2)
+    #expect(!closes(h.log).contains(second))
+}
+
+/// Minor 2: at most one peering-key search at a time. With one running, a tick that picks another
+/// peer needing a key starts no second search and leaves that peer idle (unpenalised); once the first
+/// search ends, a later tick starts the other's.
+@MainActor @Test func oneKeySearchAtATime() async {
+    let h = Harness()
+    let released = LockIsolated(false)
+    let searches = LockIsolated<[Data]>([])
+    let store = await makeStore(nodeState(Identity()), h, peeringKey: { id, cost in
+        searches.withValue { $0.append(id) }
+        while !released.value && !Task.isCancelled { try? await Task.sleep(for: .milliseconds(2)) }
+        return await LXStamper.generatePeeringKey(peeringId: id, targetCost: cost)
+    })
+    let a = Identity(), b = Identity()
+    let aHash = propagationHash(a), bHash = propagationHash(b)
+    await hear(store, h, a)
+    await hear(store, h, b)
+    await upload(store, 1)
+
+    await send(store, .peerSyncTick)
+    let first = store.state.peering.peers[aHash]?.state == .keyPending ? aHash : bHash
+    let other = first == aHash ? bHash : aHash
+    #expect(store.state.peering.peers[first]?.state == .keyPending)
+    // Tick until the other peer has been picked at least once.
+    for i in 1...20 where store.state.peering.peers[other]?.lastSyncAttempt == nil {
+        h.now.setValue(t0 + Double(i))
+        await send(store, .peerSyncTick)
+    }
+    #expect(store.state.peering.peers[other]?.lastSyncAttempt != nil, "the other peer was picked")
+    for _ in 0..<50 where searches.value.count < 1 { try? await Task.sleep(for: .milliseconds(5)) }
+    try? await Task.sleep(for: .milliseconds(50))
+    #expect(searches.value.count == 1, "no second search while one runs")
+    #expect(store.state.peering.peers[other]?.state == .idle)
+    #expect(store.state.peering.peers[other]?.nextSyncAttempt == PNPeerTable.never, "deferred, not backed off")
+
+    released.setValue(true)
+    await store.receive(\.peeringKeyReady, timeout: .seconds(10))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.peering.peers[first]?.peeringKey != nil)
+    for i in 21...60 where searches.value.count < 2 {
+        h.now.setValue(t0 + Double(i))
+        await send(store, .peerSyncTick)
+        for _ in 0..<10 where searches.value.count < 2 { try? await Task.sleep(for: .milliseconds(2)) }
+    }
+    #expect(searches.value == [first, other].map { peer in
+        let identity = peer == aHash ? a : b
+        return identity.hash + store.state.client.identity.hash
+    }, "the deferred peer's search starts once the first ended")
+}
+
+/// Minor 3: a failed sync transfer backs the peer off one `SYNC_BACKOFF_STEP` (12 min) instead of
+/// resending the whole container on the next 24 s tick; so does its link closing mid-transfer.
+@MainActor @Test func aFailedTransferBacksThePeerOff() async {
+    for closeInstead in [false, true] {
+        let h = Harness()
+        let (store, dest, link) = await peerWithOfferOut(h)
+        await respond(store, link, .bool(true))
+        #expect(resources(h.log).count == 1)
+        if closeInstead {
+            await send(store, .client(.endpoint(.delegate(.linkClosed(linkID: link, reason: .initiatorClosed)))))
+        } else {
+            await send(store, .client(.endpoint(.delegate(.resourceFailed(linkID: link, resourceHash: Data(repeating: 0x5E, count: 32),
+                                                                          rejected: false)))))
+        }
+        #expect(store.state.peering.peers[dest]?.state == .idle)
+        #expect(store.state.peering.peers[dest]?.nextSyncAttempt == t0 + PNPeerTable.syncBackoffStep)
+        for s in [24.0, 48, 72, 719] {
+            h.now.setValue(t0 + s)
+            await send(store, .peerSyncTick)
+        }
+        #expect(opens(h.log) == [dest], "no new sync link inside the backoff (closeInstead \(closeInstead))")
+        h.now.setValue(t0 + 721)
+        await send(store, .peerSyncTick)
+        #expect(opens(h.log) == [dest, dest])
+    }
+}
+
+/// I3, one node: a propagated message for THIS node's delivery destination, synced in by a peer, is
+/// delivered locally (method PROPAGATED, through the same path a `/get` download takes), and neither
+/// stored nor queued for any other peer; the sending peer has it handled and our router records it as
+/// downloaded (LXMRouter.py:2852-2866, :2783-2784). A second copy is not delivered again.
+@MainActor @Test func aPeerSyncedMessageForUsIsDeliveredNotStored() async throws {
+    let h = Harness()
+    let ours = Identity()
+    var initial = nodeState(ours)
+    let ourDelivery = LXMessage.deliveryHash(identityHash: ours.hash)
+    initial.client.deliveryDestinationHash = ourDelivery
+    let store = await makeStore(initial, h)
+    let sender = Identity(), from = Identity(), other = Identity()
+    let fromHash = propagationHash(from), otherHash = propagationHash(other)
+    await hear(store, h, from)
+    await hear(store, h, other)
+    await send(store, .client(.endpoint(.delegate(.linkIdentified(linkID: clientLink, remoteIdentity: from)))))
+
+    let content = Data("for this device".utf8)
+    let message = LXMessage.create(source: sender, destinationHash: ourDelivery, timestamp: 1_700_000_000,
+                                   title: Data("t".utf8), content: content)
+    let (container, transientID) = try #require(await LXMFPropagation.pack(message: message, recipientIdentity: ours,
+                                                                           timestamp: 1_700_000_000, stampCost: 1))
+    // Alongside it, one message for someone else, which is stored and distributed as before.
+    let foreign = LXMFPropagation.container(timestamp: 1_700_000_000, entries: [entry(7)])
+    await send(store, .client(.endpoint(.delegate(.resourceReceived(linkID: clientLink, data: container)))))
+    await send(store, .client(.endpoint(.delegate(.resourceReceived(linkID: clientLink, data: foreign)))))
+
+    #expect(h.log.value.filter { $0 == .delivered(content) }.count == 1)
+    #expect(!store.state.pn.store.contains(transientId: transientID), "not stored")
+    #expect(store.state.pn.store.contains(transientId: tid(7)))
+    #expect(store.state.peering.peers[otherHash]?.unhandled == [tid(7)], "only the foreign one is for the other peer")
+    #expect(store.state.peering.peers[fromHash]?.handled.contains(transientID) == true, "handled for the sender")
+    #expect(store.state.client.router.downloadedTransientIds.contains(transientID))
+
+    await send(store, .client(.endpoint(.delegate(.resourceReceived(linkID: clientLink, data: container)))))
+    #expect(h.log.value.filter { $0 == .delivered(content) }.count == 1, "a second copy is not delivered again")
+    #expect(!store.state.pn.store.contains(transientId: transientID))
 }

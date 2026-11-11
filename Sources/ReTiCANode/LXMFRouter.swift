@@ -314,6 +314,12 @@ public struct LXMFRouter {
         /// grows in practice. Revisit trigger: a user report that the table is growing uncomfortably
         /// large, or operational data showing a representative steady-state size.
         case rehydrateDedup(seenHashes: [Data], downloadedTransientIds: [Data])
+        /// Propagated messages for us that reached our OWN propagation node (synced in by a peer or
+        /// uploaded by a client) and were delivered locally: recorded as downloaded, so a later `/get`
+        /// at our outbound propagation node reports them as haves (and so purges them there) rather
+        /// than fetching them again. Unlike `messagesDownloaded` it is not the end of a sync and
+        /// leaves `propagationTransferState` alone. A host that persists downloaded ids persists these.
+        case propagatedMessagesDeliveredLocally(transientIds: [Data])
         case learnedIdentity(destinationHash: Data, identity: Identity)
         /// `destinationHash`: for `.opportunistic`, the packet's destination, from which the message
         /// is rebuilt. For `.direct` and `.propagated`, OUR delivery destination hash (empty when none
@@ -921,6 +927,10 @@ public struct LXMFRouter {
                 // determines which hashes survive. Oldest-first ensures the newest 10 000 are retained,
                 // matching what would have happened had the same inserts been live.
                 for hash in seenHashes { state.seen.insert(hash) }
+                state.downloadedTransientIds.formUnion(transientIds)
+                return .none
+
+            case let .propagatedMessagesDeliveredLocally(transientIds):
                 state.downloadedTransientIds.formUnion(transientIds)
                 return .none
 
