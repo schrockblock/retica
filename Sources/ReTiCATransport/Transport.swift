@@ -65,6 +65,19 @@ public struct Transport {
         public var tunnelIdentity: Identity? = nil
         var seenPacketHashes = RingSet(capacity: Transport.seenPacketRingSize)
         public var linkTable: [Data: LinkTableEntry] = [:]
+        /// Where the proof of each single packet we forwarded as a relay goes back to, keyed by
+        /// the packet's truncated hash, which is the address its proof is sent to (reference
+        /// `Transport.reverse_table`). Without it the packet arrives and its sender is never told.
+        /// An entry is used once, expires after `Transport.reverseTableExpiry`, and the table holds
+        /// at most `Transport.maxReverseEntries`. Relay-only and session-only.
+        var reverseTable: [Data: ReverseEntry] = [:]
+        struct ReverseEntry: Equatable, Sendable {
+            /// The interface the packet arrived on: where its proof is sent.
+            var receivedOn: InterfaceID
+            /// The interface the packet was forwarded on: the only one its proof is accepted from.
+            var forwardedOn: InterfaceID
+            var forwardedAt: Date
+        }
         /// LinkIDs of links we are an endpoint of (initiator or responder). A link we own is never
         /// relay traffic: Transport must not table a reflected LINKREQUEST that collides with our
         /// own linkID, nor forward our own link's packets. Kept in sync by LinkPlane via
@@ -1166,6 +1179,7 @@ public struct Transport {
                     .map { Effect<Action>.cancel(id: CancelID.announceRetransmit($0)) }
                 state.announceTable = [:]
                 state.linkTable = [:]
+                state.reverseTable = [:]
                 state.discoveryPathRequests = [:]   // in-flight recursive searches are relay-only state
                 return cancels.isEmpty ? .none : .merge(cancels)
 
@@ -1678,6 +1692,13 @@ public struct Transport {
                         guard let entry = state.learned[packet.destinationHash],
                               Int(packet.hops) + 1 < Int(Packet.maxHops) else { return .none }
                         guard let raw = forwardTowardDest(packet, entry) else { return .none }
+                        // Remember where the packet came from, so its proof can go back there
+                        // (reference `reverse_table`, written at the same point for every forwarded
+                        // packet that is not a link request).
+                        Transport.rememberForwarded(&state, proofAddress: Data(packet.packetHash.prefix(16)),
+                                                    entry: State.ReverseEntry(receivedOn: interfaceID,
+                                                                              forwardedOn: entry.interfaceID,
+                                                                              forwardedAt: date.now))
                         return .send(.delegate(.transmit(entry.interfaceID, raw)))
                     }
                     // With our own ratchets enabled, decrypting is shallow-then-budgeted-deep. This
@@ -1770,9 +1791,30 @@ public struct Transport {
                     // addressed to our packet's ProofDestination, `packetHash[:16]`, which is exactly
                     // the `pendingReceipts` key — so where reference tries an implicit proof against
                     // every outstanding receipt, one lookup finds the only candidate.
-                    guard packet.destinationType == .single,
-                          let receipt = state.pendingReceipts[packet.destinationHash]
-                    else { return .none }
+                    guard packet.destinationType == .single else { return .none }
+                    guard let receipt = state.pendingReceipts[packet.destinationHash] else {
+                        // Not for a packet of ours. As a relay, pass on the proof of a packet we
+                        // forwarded, back the way that packet came (reference `reverse_table`,
+                        // Transport.py:2338-2339, RNS 1.4.1 fork; written at :1690). It is accepted
+                        // only from the interface the packet went out on, and the entry is used
+                        // once, so a repeated proof stops here.
+                        //
+                        // DIVERGES from reference, which removes the entry before checking the
+                        // interface: there, one proof-shaped packet from any other interface uses up
+                        // the route and the genuine proof is then dropped. Here a proof from the
+                        // wrong side leaves the entry in place. The proof is not validated (a relay
+                        // does not hold the recipient's identity for the packet, as in reference).
+                        guard state.transportIdentity != nil,
+                              let reverse = state.reverseTable[packet.destinationHash],
+                              reverse.forwardedOn == interfaceID,
+                              Int(packet.hops) + 1 < Int(Packet.maxHops)
+                        else { return .none }
+                        state.reverseTable[packet.destinationHash] = nil
+                        var returned = packet
+                        returned.hops = packet.hops + 1
+                        guard let raw = try? returned.packed() else { return .none }
+                        return .send(.delegate(.transmit(reverse.receivedOn, raw)))
+                    }
                     let valid: Bool
                     switch packet.payload.count {
                     case Transport.implicitProofLength:
@@ -1831,6 +1873,9 @@ public struct Transport {
                         ? now.timeIntervalSince(entry.refreshedAt) > Transport.linkTableExpiry
                         : now > entry.proofDeadline
                     if expired { state.linkTable[link] = nil }
+                }
+                state.reverseTable = state.reverseTable.filter {
+                    now.timeIntervalSince($0.value.forwardedAt) <= Transport.reverseTableExpiry
                 }
                 for (dest, startedAt) in state.discoveryPathRequests
                 where now.timeIntervalSince(startedAt) > Transport.pathRequestTimeout {
@@ -2502,6 +2547,25 @@ public struct Transport {
     /// (Transport.py:570-575); ReTiCA evicts the one expiring soonest, which is the one least
     /// likely to still be proved.
     static let maxPendingReceipts = 1024
+    /// How long a relay waits for the proof of a packet it forwarded (reference
+    /// `Transport.REVERSE_TIMEOUT`, 8 minutes).
+    static let reverseTableExpiry: TimeInterval = 480
+    /// Cap on `State.reverseTable`. Reference has none and relies on the timeout alone, which
+    /// lets a flood of forwarded packets grow the table for eight minutes. Past the cap the entry
+    /// that has waited longest is dropped: its proof, if one comes, is not passed on, and its
+    /// sender retries.
+    static let maxReverseEntries = 4096
+
+    /// Record a forwarded packet in `State.reverseTable`, dropping the longest-waiting entry when a
+    /// NEW key would exceed `maxReverseEntries`.
+    static func rememberForwarded(_ state: inout State, proofAddress: Data, entry: State.ReverseEntry) {
+        if state.reverseTable[proofAddress] == nil,
+           state.reverseTable.count >= maxReverseEntries,
+           let oldest = state.reverseTable.min(by: { $0.value.forwardedAt < $1.value.forwardedAt })?.key {
+            state.reverseTable[oldest] = nil
+        }
+        state.reverseTable[proofAddress] = entry
+    }
     /// RNS `PacketReceipt.IMPL_LENGTH` (Packet.py:399): an implicit proof is the bare signature.
     static let implicitProofLength = 64
     /// RNS `PacketReceipt.EXPL_LENGTH` (Packet.py:398): packet hash (32) ‖ signature (64).

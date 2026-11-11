@@ -651,12 +651,6 @@ final class Messenger {
                                                      downloadedTransientIds: saved.downloadedTransientIds)))
             await store.send(.rehydrateLearnedPeers(saved.contacts))
             await store.send(.endpoint(.transport(.rehydrateLearnedDestinations(saved.paths))))
-            // The library restores routes but not whose signature to expect: ReTiCAMsgr writes the
-            // router's `knownIdentities` itself for every restored delivery route (AppFeature,
-            // `.rehydrateLearnedDestinations`). This is that step, through the router's own action.
-            for (hash, path) in saved.paths where hash == LXMessage.deliveryHash(identityHash: path.identity.hash) {
-                await store.send(.router(.learnedIdentity(destinationHash: hash, identity: path.identity)))
-            }
         }
         world.connect(port)
         await world.settle()

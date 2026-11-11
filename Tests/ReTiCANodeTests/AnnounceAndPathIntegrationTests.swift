@@ -45,14 +45,9 @@ private func named(_ name: String) -> (inout LXMFNode.State) -> Void {
         await world.shutDown()
     }
 
-    /// KNOWN DEFECT (found by this suite, 2026-11-11): a ReTiCA relay forwards a single DATA packet
-    /// but keeps no reverse-table entry for it, so the recipient's proof is dropped at the relay
-    /// (`Transport.swift`, `.proof` consults only our own `pendingReceipts`; reference forwards it
-    /// through `reverse_table`). The message arrives, the sender is never told, retries five times
-    /// and reports it failed. Links are unaffected (they route by the link table). The other tests
-    /// here therefore assert on arrival, not on the sender's confirmation of a short message.
-    /// When the relay learns to route proofs this test fails as "known issue not recorded":
-    /// delete the wrapper, and restore the confirmation assertions in this file.
+    /// The recipient's proof of receipt has to come back through the relay too. A relay that
+    /// forwards the packet but not its proof delivers the message and leaves the sender to retry
+    /// and report a failure (the defect this suite found on 2026-11-11).
     @Test func aShortMessageThroughTheRelayIsConfirmedToItsSender() async {
         let world = MessagingWorld()
         let alice = world.messenger("alice", on: [.uplink]), bob = world.messenger("bob", on: [.uplink])
@@ -64,9 +59,13 @@ private func named(_ name: String) -> (inout LXMFNode.State) -> Void {
         await world.advance(upTo: 120, until: { !bob.outcomes(of: sent).isEmpty })
 
         #expect(alice.inbox.map(\.content) == ["did it arrive?"])
-        withKnownIssue("a ReTiCA relay drops the proof of a single packet it forwarded") {
-            #expect(bob.outcomes(of: sent) == [.confirmed(sent)])
-        }
+        #expect(bob.outcomes(of: sent) == [.confirmed(sent)])
+        #expect(world.elapsed < .seconds(LXMFDelivery.retryWaitSeconds), "confirmed without a retry")
+
+        // Nothing more comes of it: no resend arrives and no second outcome is reported.
+        await world.advance(seconds: 90)
+        #expect(alice.inbox.count == 1)
+        #expect(bob.outcomes(of: sent) == [.confirmed(sent)])
         await world.shutDown()
     }
 
@@ -126,9 +125,9 @@ private func named(_ name: String) -> (inout LXMFNode.State) -> Void {
         // And the route is good once she is back.
         world.plug(alice.port)
         let sent = await bob.send("found you", to: alice)
-        _ = sent
-        await world.advance(upTo: 60, until: { !alice.inbox.isEmpty })
+        await world.advance(upTo: 60, until: { !bob.outcomes(of: sent).isEmpty })
         #expect(alice.inbox.map(\.content) == ["found you"])
+        #expect(bob.outcomes(of: sent) == [.confirmed(sent)])
         await world.shutDown()
     }
 
@@ -143,10 +142,11 @@ private func named(_ name: String) -> (inout LXMFNode.State) -> Void {
         #expect(!bob.hasPath(to: alice))
 
         let sent = await bob.send("who are you?", to: alice)
-        await world.advance(upTo: 120, until: { !alice.inbox.isEmpty })
+        await world.advance(upTo: 120, until: { !bob.outcomes(of: sent).isEmpty })
 
         #expect(alice.inbox.map(\.content) == ["who are you?"])
         #expect(bob.hadToLookForRecipient(of: sent))
+        #expect(bob.outcomes(of: sent) == [.confirmed(sent)])
         await world.shutDown()
     }
 
@@ -197,6 +197,8 @@ private func named(_ name: String) -> (inout LXMFNode.State) -> Void {
         #expect(bob.inbox.map(\.content) == ["back again"])
         #expect(world.elapsed == before, "it went at once")
         #expect(!alice.hadToLookForRecipient(of: sent))
+        await world.run(until: { !alice.outcomes(of: sent).isEmpty })
+        #expect(alice.outcomes(of: sent) == [.confirmed(sent)])
         await world.shutDown()
     }
 
@@ -239,6 +241,53 @@ private func named(_ name: String) -> (inout LXMFNode.State) -> Void {
         let bob = await world.relaunch(first, restoring: first.saved())
         await world.advance(seconds: 5)
         #expect(bob.nameKnown(for: alice) == "Alice")
+
+        let sent = await alice.send("welcome back", to: bob)
+        _ = sent
+        await world.advance(upTo: 60, until: { !bob.inbox.isEmpty })
+
+        #expect(bob.inbox == [Received(content: "welcome back", from: alice.address, validated: true, method: .opportunistic)])
+        await world.shutDown()
+    }
+
+    /// A contact is remembered longer than the route to it. Bob comes back with his contacts but
+    /// no saved routes, and still knows whose signature to check.
+    @Test func afterARestartWithNoSavedRoutesARecipientStillVerifiesAContactItHeardBefore() async {
+        let world = MessagingWorld()
+        let alice = world.messenger("alice", on: [.uplink]), first = world.messenger("bob", on: [.uplink])
+        let relay = world.relay()
+        await relay.comeOnline()
+        await world.bringOnline(alice, first)
+        await world.quiet()
+
+        var saved = first.saved()
+        saved.paths = [:]
+        let bob = await world.relaunch(first, restoring: saved)
+        await world.advance(seconds: 5)
+        #expect(!bob.hasPath(to: alice))
+
+        let sent = await alice.send("welcome back", to: bob)
+        _ = sent
+        await world.advance(upTo: 60, until: { !bob.inbox.isEmpty })
+
+        #expect(bob.inbox == [Received(content: "welcome back", from: alice.address, validated: true, method: .opportunistic)])
+        await world.shutDown()
+    }
+
+    /// And the other way round: saved routes alone are enough to know whose signature to check.
+    @Test func afterARestartWithOnlySavedRoutesARecipientStillVerifiesAContactItHeardBefore() async {
+        let world = MessagingWorld()
+        let alice = world.messenger("alice", on: [.uplink]), first = world.messenger("bob", on: [.uplink])
+        let relay = world.relay()
+        await relay.comeOnline()
+        await world.bringOnline(alice, first)
+        await world.quiet()
+
+        var saved = first.saved()
+        saved.knownDestinations = [:]
+        saved.contacts = [:]
+        let bob = await world.relaunch(first, restoring: saved)
+        await world.advance(seconds: 5)
 
         let sent = await alice.send("welcome back", to: bob)
         _ = sent

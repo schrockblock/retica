@@ -1287,8 +1287,21 @@ public struct LXMFNode {
                 // future-dated rows), not the payload. Every aspect, as live `.pathLearned` does.
                 // One pass of plain inserts, not a send per row (a 24,603-row table once overflowed
                 // the stack through chained sends at launch).
-                for hash in destinations.keys where state.endpoint.transport.learned[hash] != nil {
+                for hash in destinations.keys {
+                    guard let kept = state.endpoint.transport.learned[hash] else { continue }
                     state.router.knownPaths.insert(hash)
+                    restoreSenderIdentity(&state, hash, kept.identity)
+                }
+                return .none
+
+            case let .endpoint(.transport(.rehydrateKnownDestinations(destinations))):
+                // A known destination outlives its path, so a contact can come back from storage
+                // with no route. Its messages still have to verify: the router checks a signature
+                // against `knownIdentities`, which is otherwise fed only by a live announce.
+                // As above, read what Transport kept, in one pass of plain inserts.
+                for hash in destinations.keys {
+                    guard let kept = state.endpoint.transport.knownDestinations[hash] else { continue }
+                    restoreSenderIdentity(&state, hash, kept.identity)
                 }
                 return .none
 
@@ -1917,6 +1930,15 @@ public struct LXMFNode {
         return enqueueStampJob(&state, message: message,
                                work: .propagated(explicit: false, deliveryCost: deliveryCost, recipient: recipient,
                                                  timestamp: ts))
+    }
+
+    /// Give the router the identity to check a restored contact's signatures against. Only for an
+    /// `lxmf.delivery` destination, the only kind a message can come from: stored tables hold every
+    /// aspect ever heard, and the check also refuses a stored row whose identity does not belong
+    /// to its hash.
+    private func restoreSenderIdentity(_ state: inout State, _ destinationHash: Data, _ identity: Identity) {
+        guard destinationHash == LXMessage.deliveryHash(identityHash: identity.hash) else { return }
+        state.router.knownIdentities[destinationHash] = identity
     }
 
     /// Copy Transport's CURRENT next hop for `destinationHash` into the router's retry-wait table
