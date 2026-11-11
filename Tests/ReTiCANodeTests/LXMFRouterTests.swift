@@ -1389,7 +1389,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.pendingDownloadFromPN == false)
     // The `#expect` above only catches a resurrection that ALSO sets the flag; a `requestMessageList`
     // decoupled from the flag would slip past it. Assert its ABSENCE with a flip-then-send AFTER the
-    // second establish: flip .on, send a genuine no-op (empty offer → router returns .none) so TCA
+    // second establish: flip .on, send a genuine no-op (a router `.delegate` action: `.none`, no state change) so TCA
     // runs the "must handle received actions" check and fails on any stray requestMessageList queued
     // by that establish, then flip back to .off so teardown tolerates the F5.2 idle timer.
     store.exhaustivity = .on

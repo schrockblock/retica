@@ -167,6 +167,32 @@ private func respond(_ store: TestStoreOf<Recorded>, _ data: Data) async {
         #expect(!reported(log).contains { $0.state == .linkFailed || $0.state == .transferFailed })
     }
 
+    /// The propagation node was switched mid-sync and both have active links. The OLD node's link
+    /// answering `ERROR_NO_ACCESS` tears down that link only, and the new node's sync state is
+    /// untouched, by the answer and by the old link's close.
+    @Test func aSwitchedAwayNodesErrorClosesOnlyItsOwnLink() async {
+        let log = LockIsolated<[Seen]>([])
+        let store = syncStore(phase: .awaitingList, transfer: .requestSent, log: log)
+        let newPN = Data(repeating: 0x6F, count: 16)
+        let newLink = Data(repeating: 0xC3, count: 16)
+        // Set up through the router's own events: the new PN, then its link.
+        await store.send(.router(.setOutboundPropagationNode(newPN)))
+        await store.send(.endpoint(.delegate(.linkEstablished(linkID: newLink, destinationHash: newPN))))
+        await store.skipReceivedActions(strict: false)
+        #expect(store.state.router.directLinks[newPN] == .active(linkID: newLink))
+        #expect(store.state.router.propagationTransferState == .requestSent)
+
+        await respond(store, MsgPack.encode(.uint(LXMFPropagation.errorNoAccess)))
+        #expect(closedSyncLink(log))
+        #expect(!log.value.contains(.closeLink(newLink)))
+        #expect(store.state.router.propagationTransferState == .requestSent)
+
+        await closeSyncLink(store)
+        #expect(store.state.router.propagationTransferState == .requestSent)
+        #expect(store.state.router.directLinks[newPN] == .active(linkID: newLink))
+        #expect(!reported(log).contains { $0.state == .noAccess || $0.state == .transferFailed })
+    }
+
     /// Review Focus 2. The link drops after the download completes, before the purge lands: idle, the
     /// downloaded ids stay downloaded, and no failure is reported.
     @Test func completeThenCloseGoesIdleAndKeepsDownloaded() async throws {

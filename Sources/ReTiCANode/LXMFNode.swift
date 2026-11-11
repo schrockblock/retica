@@ -503,6 +503,13 @@ public struct LXMFNode {
         }
     }
 
+    /// A sync answered with `error` on `linkID`: tell the router (which sets the state only if
+    /// `linkID` is its current PN link), then tear down THAT link, the one the answer came on.
+    static func endSync(_ error: LXMFRouter.SyncError, linkID: Data) -> Effect<Action> {
+        .concatenate(.send(.router(.syncError(error, linkID: linkID))),
+                     .send(.endpoint(.closeLink(linkID: linkID))))
+    }
+
     /// Where a send stands before the router has it. See `Action.Delegate.deliveryPreparing`.
     public enum PreparingPhase: Equatable, Sendable {
         /// A first send to a peer we have no path and no stamp cost for, waiting for its announce.
@@ -1135,13 +1142,14 @@ public struct LXMFNode {
             case let .endpoint(.delegate(.responseReceived(linkID, _, data))):
                 switch state.syncPhase[linkID] {
                 case .awaitingList:
-                    // An error code or a non-list answer ends the sync: the router sets the state and
-                    // tears the link down (LXMRouter.py:1780-1823). `ERROR_NO_ACCESS` is what an
-                    // auth-required node answers an identity outside its allowed list.
+                    // An error code or a non-list answer ends the sync: the link it arrived on is torn
+                    // down, and the router sets the state if that is its PN link (LXMRouter.py:1780-1823).
+                    // `ERROR_NO_ACCESS` is what an auth-required node answers an identity outside its
+                    // allowed list.
                     let value = MsgPack.decodeValue(data)
                     guard case let .array(items)? = value else {
                         state.syncPhase[linkID] = nil
-                        return .send(.router(.syncError(LXMFNode.classifySyncError(value))))
+                        return LXMFNode.endSync(LXMFNode.classifySyncError(value), linkID: linkID)
                     }
                     let ids = items.compactMap { item -> Data? in
                         if case let .bin(d) = item { return d } else { return nil }
@@ -1150,10 +1158,13 @@ public struct LXMFNode {
                 case .awaitingMessages:
                     state.syncPhase[linkID] = nil
                     // As for the list (LXMRouter.py:1825-1836). A non-list, non-error answer is
-                    // `.invalid` here; reference raises on it and keeps its state (plan ruling 1b).
+                    // `.invalid` here (plan ruling 1b). Reference cannot be compared on it: for nil it
+                    // sets PR_COMPLETE (LXMRouter.py:1858) and then raises on `len(None)` (:1861), and
+                    // a reference PN never sends nil anyway (RNS sends no response for a None handler
+                    // result, Link.py:931).
                     let value = MsgPack.decodeValue(data)
                     guard case let .array(items)? = value else {
-                        return .send(.router(.syncError(LXMFNode.classifySyncError(value))))
+                        return LXMFNode.endSync(LXMFNode.classifySyncError(value), linkID: linkID)
                     }
                     let blobs = items.compactMap { item -> Data? in
                         if case let .bin(d) = item { return d } else { return nil }

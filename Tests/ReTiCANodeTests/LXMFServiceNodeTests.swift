@@ -788,7 +788,7 @@ import ComposableArchitecture
     // The claim "no stray .router(.received) from the disabled-but-still-open link" is an absence
     // assertion. F5.2 always-arms a router idle timer at .linkEstablished, so a trailing .on would
     // trip teardown on that in-flight timer for an unrelated reason. Use flip-then-send instead:
-    // flip .on, send a genuine no-op (empty offer → router returns .none) so TCA runs the
+    // flip .on, send a genuine no-op (a router `.delegate` action: `.none`, no state change) so TCA runs the
     // "must handle received actions" check and catches any stray, then flip back to .off so
     // teardown tolerates the idle timer.
     store.exhaustivity = .on

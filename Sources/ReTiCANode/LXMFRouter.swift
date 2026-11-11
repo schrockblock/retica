@@ -321,9 +321,10 @@ public struct LXMFRouter {
         case offeredMessageList(transientIds: [Data])
         /// The PN's answer to the wanted-messages request: completes the sync (last result `count`).
         case messagesDownloaded(transientIds: [Data])
-        /// The PN answered a sync request with an error or with something that is not a list. Tears
-        /// the sync link down; `noIdentity` / `noAccess` also set their (sticky) state.
-        case syncError(SyncError)
+        /// The PN answered a sync request on `linkID` with an error or with something that is not a
+        /// list. `LXMFNode` tears that link down itself. If `linkID` is the active link to the current
+        /// propagation node, `noIdentity` / `noAccess` set their (sticky) state; otherwise nothing.
+        case syncError(SyncError, linkID: Data)
         case linkEstablished(destinationHash: Data, linkID: Data)
         case linkClosed(destinationHash: Data)
         case learnedPath(destinationHash: Data)
@@ -1064,17 +1065,20 @@ public struct LXMFRouter {
                 state.propagationTransferLastResult = transientIds.count
                 return .none
 
-            case let .syncError(error):
-                // LXMRouter.py:1781-1791, 1820-1823, 1826-1836: tear the link down; the two PN error
-                // codes also set their state, which the close that follows keeps (it is above
-                // `complete`). Anything else leaves the state, so the close reports `transferFailed`.
+            case let .syncError(error, linkID):
+                // LXMRouter.py:1781-1791, 1820-1823, 1826-1836. `LXMFNode` tears down `linkID`, the link
+                // the answer arrived on. The two PN error codes set their state, which the close that
+                // follows keeps (it is above `complete`); anything else leaves it, so the close reports
+                // `transferFailed`. Only an answer on the CURRENT propagation node's active link is the
+                // sync's: an old PN's link answering after a switch must not mark the new one.
+                guard let pn = state.outboundPropagationNode, state.directLinks[pn] == .active(linkID: linkID)
+                else { return .none }
                 switch error {
                 case .noIdentity: state.propagationTransferState = .noIdentityReceived
                 case .noAccess: state.propagationTransferState = .noAccess
                 case .invalid: break
                 }
-                guard let pn = state.outboundPropagationNode, case .active = state.directLinks[pn] else { return .none }
-                return .send(.delegate(.closeLink(destinationHash: pn)))
+                return .none
 
             case let .linkEstablished(dest, linkID):
                 // Defensive (unreachable through `establish` today, which only runs with no active
