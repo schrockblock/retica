@@ -56,25 +56,24 @@ this is the surviving copy. Each still needs checking against current code befor
 
 ## Deferred by the 2026-11-08 plan's reviews (all minor)
 
-- NetworkStamp: the bisect_right test pins `tabClimb`, not `value` end to end; a comment says "default
-  announce cost" for the destination cost; "none of these hashes EQUALS the target" is unasserted.
+- NetworkStamp: **closed by f9127a8** (`value` pinned end to end at a bisect_right boundary, the
+  destination-cost comment fixed, "no hash equals the target" asserted).
 - Per-interface costs: propagation is tested for the radio drivers; TCP client, TCP server and BLE only by
-  reading. A path-request gate comment in Transport.swift is one overlong line.
-- LinkPlane driver stop tests: after the 3600 s clock advance, `links.isEmpty` is not rechecked and no
-  assertion that nothing was transmitted; the wiring test could assert the found key is the transmitted key.
-  `hasLinkWork`'s doc is one overlong line. `abandonStampSearches` relies on LXMFNode being the only link
-  opener (true today, unenforced).
-- Path requests: a request made with no interface connected is dropped, not started when one connects
-  (reference queues it; the router re-requests anyway) — say so in a comment. The race test injects the old
-  search end by hand, so the `Task.isCancelled` guard is untested. TransportTests.swift ~:2662's sender-ID
-  check is vacuous (its stub returns the same bytes for every draw). The `megaYield` timing fixes are a
-  heuristic.
-- `pnCopyAbandonWhileTheDeliveryStampIsSearchedDoesNotFailTheMessage` assumes a cost-20 search never
-  finishes during the test; it occasionally does, and the test flakes.
-- Destination-stamp queue: a newest-dropped item still starts a stamp search; the path-response quota test
-  uses one interface; an in-place replacement keeps its queue position (reference moves it to the back).
-- Verdict cache: the enforcement guard on the valid-hit path is untested (matters only if `enforceStamps`
-  changes at runtime); `announceVerdicts` is in State equality, so exhaustive tests that send announces must
-  account for it.
+  reading. The overlong path-request gate comment in Transport.swift was split by f9127a8.
+- LinkPlane driver stop tests: **closed by f9127a8** (`links.isEmpty` rechecked after the 3600 s advance,
+  no LINKREQUEST sent, the wiring test asserts the found key is the transmitted key, `hasLinkWork`'s doc
+  split). `abandonStampSearches` relies on LXMFNode being the only link opener (true today, unenforced).
+- Path requests: the comment on a stamped request made with no interface connected, the race test (a
+  search that ends after its cancel sends nothing) and the non-vacuous sender-ID check are **closed by
+  f9127a8**. The `Task.isCancelled` guard was kept, though it is redundant: TCA drops sends from a
+  cancelled effect. The `megaYield` timing fixes are a heuristic.
+- `pnCopyAbandonWhileTheDeliveryStampIsSearchedDoesNotFailTheMessage` flaked when its cost-20 search
+  finished: **closed by f9127a8** (the search is parked until cancelled).
+- Destination-stamp queue: "a newest-dropped item still starts a stamp search" is **closed by
+  185c444..1013f69** (a dropped announce starts no search, and the item being searched does not count).
+  The path-response quota test uses one interface; an in-place replacement keeps its queue position
+  (reference moves it to the back).
+- Verdict cache: the enforcement guard on the valid-hit path is **tested since f9127a8**.
+  `announceVerdicts` is in State equality, so exhaustive tests that send announces must account for it.
 - TCP server: no test of a stop racing a connection mid-accept. Host-set `name` and `hwMTU` are ignored by
   the radio drivers (by design today).

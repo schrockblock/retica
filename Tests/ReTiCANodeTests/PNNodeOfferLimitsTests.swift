@@ -165,8 +165,10 @@ private func respond(_ store: TestStore<PNNode.State, PNNode.Action>, linkID: Da
     #expect(await sync(store, linkID: link(2)) == ids)
 }
 
-/// An id the peer offered US is handled for it: our next sync to it leaves that id out.
-@MainActor @Test func pnNodeDoesNotOfferAPeerWhatItOfferedUs() async {
+/// An id a peer offers US is not marked handled by the offer (reference marks handled only on receipt,
+/// and only for a peer in `self.peers`, LXMRouter.py:2772-2784): our next sync offers it back once, and
+/// the peer's decline is what marks it.
+@MainActor @Test func pnNodeOffersBackAHeldIdThePeerOfferedUsUntilItDeclines() async {
     let (initial, ids) = makeState(sizes: [100, 200, 300])
     let store = makeStore(initial)
     let inbound = link(7)
@@ -177,9 +179,31 @@ private func respond(_ store: TestStore<PNNode.State, PNNode.Action>, linkID: Da
         data: MsgPack.encode(.array([.bin(Data(repeating: 0, count: 32)), .array([.bin(ids[1]), .bin(unknown)])]))))))
     await store.receive { if case .node(.delegate(.peerValidated(peerDest, true))) = $0 { return true }; return false }
     await store.skipReceivedActions(strict: false)
-    #expect(store.state.handledByPeer[peerDest] == [ids[1]])                // the id we do not hold is not kept
-    #expect(await sync(store, linkID: link(1)) == [ids[0], ids[2]])
+    #expect(store.state.handledByPeer[peerDest] == nil)
+    #expect(await sync(store, linkID: link(1)) == ids)
+    await respond(store, linkID: link(1), .array([.bin(ids[0]), .bin(ids[2])]))
     #expect(store.state.handledByPeer[peerDest] == [ids[1]])
+}
+
+/// Forty strangers (any identity validates at peering cost 0), each offering an id we hold, leave no
+/// `handledByPeer` key behind: the offer marks nothing, so state does not grow per stranger.
+@MainActor @Test func pnNodeKeepsNoHandledStateForStrangersOfferingHeldIds() async {
+    let (initial, ids) = makeState(sizes: [100])
+    let store = makeStore(initial)
+    for n in 0..<40 {
+        let stranger = Identity()
+        let strangerDest = Destination.hash(identityHash: stranger.hash, appName: LXMessage.appName,
+                                            aspects: ["propagation"])
+        let inbound = Data(repeating: UInt8(n), count: 15) + Data([0xEE])
+        await store.send(.endpoint(.delegate(.linkIdentified(linkID: inbound, remoteIdentity: stranger))))
+        await store.send(.endpoint(.delegate(.requestReceived(
+            linkID: inbound, requestID: Data([UInt8(n)]), pathHash: Crypto.truncatedHash(Data("/offer".utf8)),
+            data: MsgPack.encode(.array([.bin(Data(repeating: 0, count: 32)), .array([.bin(ids[0])])]))))))
+        await store.receive { if case .node(.delegate(.peerValidated(strangerDest, true))) = $0 { return true }; return false }
+        await store.receive { if case .endpoint(.sendResponseOverLink(inbound, _, _)) = $0 { return true }; return false }
+        await store.skipReceivedActions(strict: false)
+    }
+    #expect(store.state.handledByPeer.isEmpty)
 }
 
 /// An unpeered identity (key valid at peering cost 0) offering only ids we do not hold leaves no

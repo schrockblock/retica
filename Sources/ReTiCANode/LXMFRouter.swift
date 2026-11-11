@@ -22,9 +22,12 @@ public struct LXMFRouter {
         /// after the success, as a propagated copy is once its stamp search finishes — is then not
         /// reported as `deliveryFailed`. Bounded like `seen`; see `succeededMessageMemory`.
         var succeededMessages = RingSet(capacity: LXMFRouter.succeededMessageMemory)
-        /// The message hashes in `succeededMessages` whose DELIVERY copy succeeded. Lets `LXMFNode` tell
-        /// a delivery copy that succeeded after a propagated copy was accepted (its `deliveryConfirmed`
-        /// still to be handled) from one that ended silently. Cleared by `uncancel` (a fresh send).
+        /// Message hashes whose DELIVERY copy succeeded, inserted alongside `succeededMessages` (in
+        /// either order relative to a propagated copy). It records only that success, not whether
+        /// `LXMFNode` has handled the `deliveryConfirmed` it produced: `LXMFNode`'s ticket sweep pairs
+        /// it with its own entry, which the confirmation removes. Bounded to the same capacity as
+        /// `succeededMessages`, but evicts on its own, as only delivery copies are inserted. Removed by
+        /// `uncancel` (a fresh send), which leaves `succeededMessages` alone.
         var confirmedDeliveryCopies = RingSet(capacity: LXMFRouter.succeededMessageMemory)
         /// Message hashes the app cancelled. A copy of one handed over later (a stamp search that
         /// finished after the cancel) is never armed. Bounded like `succeededMessages`.

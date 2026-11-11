@@ -53,9 +53,8 @@ the peer's `max(0, cost - flex)` from its announce, waits for that announce befo
 skips the key search and offer when nothing qualifies. `PropagationNode.offerToPeer` takes the peer's
 minimum and filters the same way. Docs M1 and M2 are fixed in the same commit.
 
-**Follow-up (review M3, predates the plan, not done):** offers still ignore the peer's per-transfer and
-per-sync limits. Reference skips an entry larger than `propagation_transfer_limit*1000` and marks it
-handled for that peer, and stops adding entries at `propagation_sync_limit*1000`, filling in weight
-order (size times age, prioritised destinations lighter; LXMPeer.py:363-384, LXMRouter.py:1188-1199).
-We keep no per-entry receive time and no per-peer handled set, so a version on the same line would
-pick a different subset under the sync limit. It needs both before it can match.
+**Follow-up (review M3, predates the plan): closed by 0076d46 and f38fb2c**, in `PNNode` only (the
+app's `LXMFServiceNode` makes no offers). A sync offer now honours the peer's per-transfer and
+per-sync limits in reference weight order (LXMPeer.py:336-395, LXMRouter.py:1188-1199), using a
+per-entry receive time and an in-memory per-peer handled set. See the parity follow-ups plan
+(`2026-11-10-parity-followups.md`, Task 1).

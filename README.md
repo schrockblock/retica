@@ -342,7 +342,8 @@ Once enabled, ReTiCA behaves as reference (RNS 1.6.0 `Destination.py`):
 - `.endpoint(.setEnforceRatchets(destinationHash:_:))` drops anything only the identity key opens.
   It is ignored until ratchets are enabled, as in reference.
 - Cost: a packet that no ratchet opens (junk, or one a peer encrypted to the identity key) costs
-  17 key agreements, or 513 with a full ring when it takes a deep scan. A full scan was measured
+  17 key agreements, or 513 with a full ring when it takes a deep scan. These figures are with
+  enforcement off: with it on the identity key is not tried, so the costs are 16 and 512. A full scan was measured
   at about 15-20 ms on a Mac, and it runs on the reducer's thread (the main actor in a TCA host),
   so the budget holds a flood on one interface to 8 full scans, then one a second. The price: a
   peer still encrypting to a ratchet older than our 16th-newest, arriving during a flood on the
@@ -351,7 +352,9 @@ Once enabled, ReTiCA behaves as reference (RNS 1.6.0 `Destination.py`):
   rotates at least 30 minutes apart within a process, and once at every process start (the first
   announce after `.enableRatchets` rotates, as in reference), so a host that relaunches often
   cycles the ring faster: 512 retained keys cover 10.7 days only for a process that stays up, and
-  the 16 shallow keys at least 7.5 hours on the same terms. A downloaded propagated message to our newest
+  the 16 shallow keys at least 7.5 hours on the same terms. Every process start that enables
+  ratchets rotates once (ReTiCAMsgr enables them on every launch), so 16 cold launches can push a
+  peer's ratchet out of the shallow window in minutes. A downloaded propagated message to our newest
   ratchet costs one decrypt, and one addressed to another destination costs none.
 - The announce grows by 32 bytes, so `LXMFNode` cuts the display name to
   `LXMFAnnounceData.maxAppDataBytesWithRatchet` (283 bytes of app data, 32 fewer than without a
@@ -647,7 +650,7 @@ or compares ReTiCA's output with them. [The evidence](#how-to-tell-the-evidence)
 | Propagated delivery (client sends to a node) | Implemented, cross-validated (container, stamps) | |
 | Sync from a propagation node (`/get`) | Implemented | Identifies on the link first, as the reference node requires. |
 | Running a propagation node (serving clients) | Implemented | `LXMFServiceNode`, `PNNode`. In memory; the host persists. |
-| Propagation node peering (node-to-node sync, peering keys) | **Partial** | Offer/wanted exchange and peering-key generation and validation exist, and the keys are cross-validated. An offer holds only the entries whose stamp value meets the peer's advertised cost minus flexibility (cross-validated against reference `LXMPeer.sync`), and no sync starts until the peer's announce is known. Offers do not yet honour the peer's per-transfer and per-sync limits. Stamp validation is not throttled (reference refuses with `ERROR_THROTTLED`), and peering has not been tested against a reference `lxmd` in this repo. |
+| Propagation node peering (node-to-node sync, peering keys) | **Partial** | Offer/wanted exchange and peering-key generation and validation exist, and the keys are cross-validated. An offer holds only the entries whose stamp value meets the peer's advertised cost minus flexibility (cross-validated against reference `LXMPeer.sync`), and no sync starts until the peer's announce is known. Offers honour the peer's per-transfer and per-sync limits in reference weight order (cross-validated against reference `LXMPeer.sync`), and `PNNode` never re-offers ids in its in-memory handled set for that peer. Stamp validation is not throttled (reference refuses with `ERROR_THROTTLED`), and peering has not been tested against a reference `lxmd` in this repo. |
 | Delivery announce app data (display name, stamp cost) | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | Fractional costs are read and written exactly (LXMF 1.3.0's four-element form). A peer's cost outside 0 < cost < 100 is read as no cost, where reference keeps the raw value. |
 | Propagation node announces | Implemented, cross-validated, including RNS 1.6.0 / LXMF 1.3.0 | Fractional costs, flexibility and peering cost are read and written exactly (element [7], ceilings in [5]); float limits are accepted. |
 | Delivery stamps | Implemented, cross-validated, tested live against RNS 1.6.0 / LXMF 1.3.0 | Generated when a peer asks for a cost of 20 or less, on the delivery copy and on propagated copies; above 20 ReTiCA sends unstamped (reference has no ceiling). Inbound validation once you set a cost; enforcement off by default, as in reference. MeshChatX turns enforcement on with a default cost of 8. |

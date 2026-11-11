@@ -405,6 +405,30 @@ private func junk(to dest: Destination) -> Data {
                 + (0..<Transport.ratchetDeepScanBurst).map { Data("after quiet \($0)".utf8) })
     }
 
+    /// A wall clock set back (here: an hour ahead, then corrected) does not freeze the bucket: the
+    /// baseline moves back to the new time without refilling, and refill resumes from there.
+    @Test func theBudgetRefillsAgainAfterTheClockIsSetBack() async throws {
+        let dest = ownDestination()
+        let log = DelegateLog([])
+        let ahead = start.addingTimeInterval(3600)
+        let now = LockIsolated(ahead)
+        let store = await makeStore(dest, log, clock: now)
+        let ring = (0..<512).map { _ in newRatchetPrivate() }
+        await store.send(.enableRatchets(destinationHash: dest.hash, ring: ring))
+        let to100 = Identity.ratchetPublicKey(privateKey: ring[100])
+        for _ in 0..<Transport.ratchetDeepScanBurst { await store.send(.received(i0, junk(to: dest))) }
+
+        // Back to real time: the step back refills nothing.
+        now.setValue(start)
+        await store.send(.received(i0, dataPacket(to: dest, Data("set back".utf8), ratchetPublic: to100)))
+        // Ten seconds later there are tokens again.
+        now.setValue(start.addingTimeInterval(10))
+        await store.send(.received(i0, dataPacket(to: dest, Data("10 s later".utf8), ratchetPublic: to100)))
+        await store.skipReceivedActions(strict: false)
+        #expect(delivered(log) == [Data("10 s later".utf8)])
+        #expect(store.state.ratchetDeepScanBudgets[i0]?.updatedAt == start.addingTimeInterval(10))
+    }
+
     @Test func enforcementRefusesTheIdentityKeyAtBothDepths() async throws {
         let dest = ownDestination()
         let log = DelegateLog([])

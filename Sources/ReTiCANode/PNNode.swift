@@ -38,8 +38,8 @@ public struct PNNode {
         /// ids reference drops from the peer's unhandled list without marking handled (low value,
         /// LXMPeer.py:359-361), since neither is offered again. An id becomes handled when it is
         /// oversized for the peer (LXMPeer.py:375-378), below its stamp cost, declined in its offer
-        /// response (:432-437, :448-453), sent to it in a concluded transfer (:505-507), or offered to
-        /// us by it (see `peerValidated`).
+        /// response (:432-437, :448-453), or sent to it in a concluded transfer (:505-507). Only peers
+        /// we sync TO get a key: an inbound offer marks nothing (see `peerValidated`).
         ///
         /// In memory only: a relaunch forgets it, costing one redundant offer per peer (the peer
         /// declines what it has, and that marks them again). Holds only ids the store holds: each
@@ -239,15 +239,12 @@ public struct PNNode {
             case let .node(.delegate(.peerValidated(peerHash, valid))):
                 guard let pending = state.pendingOffer[peerHash] else { return .none }
                 if valid {
-                    // A peer that offers an id holds it, so an offered id WE also hold is handled for
-                    // that peer (we will not want it, and should not offer it back). Only held ids are
-                    // marked: any identity whose key validates (every one at peering cost 0) reaches
-                    // here, and ids we do not hold would be state chosen by an unpeered stranger.
-                    // Reference marks only the ids it RECEIVES from a peer (`queue_handled_message`,
-                    // LXMRouter.py:2784), so it offers a held-but-declined id back once; we skip that
-                    // round trip. The ids we want are NOT marked when they arrive (reference does): we
-                    // offer them back once, and the peer declines them, which marks them.
-                    markHandled(&state, peerHash, pending.offeredIds)
+                    // An offer marks nothing handled. Any identity whose key validates (every one at
+                    // peering cost 0) reaches here, so marking would leave a `handledByPeer` key per
+                    // stranger, forever. Reference marks only ids it RECEIVES, and only from a peer in
+                    // `self.peers` (`queue_handled_message`, LXMRouter.py:2772-2784). PNNode keeps no
+                    // peer list, so it does not mark on receipt either: an id the peer offered us is
+                    // offered back to it once, and its decline marks it.
                     return .send(.node(.peerOffered(peerHash: peerHash, transientIds: pending.offeredIds)))
                 }
                 state.pendingOffer[peerHash] = nil                     // invalid key → drop

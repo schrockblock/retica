@@ -3,8 +3,8 @@
 **Status 2026-11-09: done.** ReTiCA 6bff1d4, 68cf0ca, 378bada, 82155af, 0fb0b8f; ReTiCAMsgr 0271f94. Rulings:
 link-request key searches stay uncapped (one per link, reference); our own path requests preempt a running
 destination-stamp search when they would run next (DIVERGENCE — the destination search is memoryless, and
-waiting behind it broke first sends to new peers). Deferred minors: a queued delivery job is not switched to a
-ticket stamp if a ticket arrives while it waits; announces stay keyed by destination plus interface (reference:
+waiting behind it broke first sends to new peers). Deferred minors: a queued delivery job not switched to a
+ticket stamp when a ticket arrives while it waits is **closed by f8d4e29**; announces stay keyed by destination plus interface (reference:
 destination). Parity follow-up Task 4 (2026-11-10): the item whose destination search runs no longer counts
 toward the 32 (reference pops it), also while our own path request has preempted its search. A dropped
 announce starts no search. DIVERGENCE: a same-key re-announce of the running item replaces it in place (same

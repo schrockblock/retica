@@ -250,8 +250,10 @@ public struct Transport {
         /// Announces and path responses waiting for their destination's stamp (reference
         /// `stamp_queues`, Transport.py:1453-1463), in arrival order: those whose search runs now
         /// and those whose search has not started. At most one announce per destination and target
-        /// interface (the newest, moved to the back), and bounded overall, not counting the item whose
-        /// search runs (`queuedStampedAnnounces`), by
+        /// interface (the newest, moved to the back), and bounded overall, not counting up to two items
+        /// at once (`queuedStampedAnnounces`): the announce whose search runs or was preempted
+        /// (`stampingItemSequence`) and the path response whose search runs
+        /// (`stampingPathResponseSequence`), by
         /// `Transport.stampedAnnounceQueueLimit` and `Transport.stampedPathResponseQueueLimit` (the
         /// latter shared with `queuedPathRequestStamps`); dropped if the search ends without a stamp.
         /// The worker starts a destination's search when that destination's oldest path response is
@@ -1657,8 +1659,10 @@ public struct Transport {
                     //
                     // Cost if wrong: a sender holding a ratchet older than our 16th-newest (it heard
                     // none of our last 16 rotations, so its ratchet stopped being our newest at least
-                    // 7.5 hours ago at the 30-minute rotation floor), arriving during a flood on the
-                    // same interface, has its packet dropped unanswered. LXMF retries it later and it
+                    // 7.5 hours ago at the 30-minute rotation floor — within one process: every
+                    // process start that enables ratchets rotates once, and the app enables them on
+                    // every launch, so 16 cold launches can do it in minutes), arriving during a flood
+                    // on the same interface, has its packet dropped unanswered. LXMF retries it later and it
                     // lands once the bucket refills. The budget is per interface, so new remote
                     // connections (a TCP server, BLE peers) each start with a full bucket.
                     let own = state.ownRatchets[packet.destinationHash]
@@ -2268,7 +2272,9 @@ public struct Transport {
     }
 
     /// Takes one deep scan from `budget` at `now`, refilling it for the time since it was last touched
-    /// first. A missing budget is a full one. A clock that went backwards refills nothing.
+    /// first. A missing budget is a full one. A clock that went backwards refills nothing and moves the
+    /// baseline back to `now`, so refill resumes from there (keeping the later baseline would freeze
+    /// the bucket until the clock caught up with it).
     static func takeDeepScan(from budget: RatchetDeepScanBudget?, now: Date)
         -> (granted: Bool, budget: RatchetDeepScanBudget) {
         let burst = Double(ratchetDeepScanBurst)
@@ -2278,7 +2284,8 @@ public struct Transport {
         var tokens = min(burst, budget.tokens + refill)
         let granted = tokens >= 1
         if granted { tokens -= 1 }
-        return (granted, RatchetDeepScanBudget(tokens: tokens, updatedAt: max(now, budget.updatedAt)))
+        // Forward, or set back: either way `now` is the new baseline.
+        return (granted, RatchetDeepScanBudget(tokens: tokens, updatedAt: now))
     }
 
     /// Whether a ratchet first heard at `received` is still usable at `now`. A non-finite time is not.
