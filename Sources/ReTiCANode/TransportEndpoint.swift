@@ -197,6 +197,10 @@ public struct TransportEndpoint {
         case enableRelay(Identity)
         case requestPath(destinationHash: Data)
         case openLink(destinationHash: Data)
+        /// `.openLink` on behalf of `owner`: its establishment and every failure before it come back
+        /// only as `ownedLinkEstablished` / `ownedLinkFailed` (see `LinkPlane.openOwnedLink`), so a
+        /// composition that opens plain links (`LXMFNode`) never takes it for its own.
+        case openOwnedLink(destinationHash: Data, owner: LinkPlane.LinkOwner)
         case sendOverLink(linkID: Data, data: Data)
         case sendResourceOverLink(linkID: Data, data: Data)
         case cancelResource(linkID: Data, hash: Data)
@@ -224,6 +228,12 @@ public struct TransportEndpoint {
             case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
             case linkFailed(destinationHash: Data, reason: LinkFailure)
+            /// Forwarded from `LinkPlane` for links opened with `.openOwnedLink`, in place of
+            /// `linkEstablished` / `linkFailed`.
+            case ownedLinkEstablished(owner: LinkPlane.LinkOwner, linkID: Data, destinationHash: Data)
+            case ownedLinkFailed(owner: LinkPlane.LinkOwner, destinationHash: Data, reason: LinkFailure)
+            /// A request went out on `linkID` under `requestID`, which its response will carry.
+            case requestSent(linkID: Data, requestID: Data, path: String)
             case resourceReceived(linkID: Data, data: Data)
             case resourceConcluded(linkID: Data, resourceHash: Data)
             case resourceFailed(linkID: Data, resourceHash: Data, rejected: Bool)
@@ -330,18 +340,37 @@ public struct TransportEndpoint {
                 return .send(.transport(.proveSingle(packetHash: h, interfaceID: id, identity: identity)))
 
             case let .openLink(destinationHash):
+                return openLink(state, destinationHash, owner: nil)
+            case let .openOwnedLink(destinationHash, owner):
+                return openLink(state, destinationHash, owner: owner)
+
+            // The link verbs (`.sendOverLink`, `.closeLink`, `.registerRequestHandler`, …) are
+            // NOT forwarded here: they are aliased straight into the shared `LinkPlane` by
+            // `linkPlaneRoute` and have already been consumed by the `Scope` above. Forwarding
+            // them again would double-deliver (e.g. two `.close`s to one element — a "forEach
+            // received an action for a missing element" crash).
+            default:
+                return wiringRest(&state, action)
+            }
+        }
+    }
+
+    /// `.openLink` / `.openOwnedLink`: a plain link when `owner` is nil.
+    private func openLink(_ state: State, _ destinationHash: Data, owner: LinkPlane.LinkOwner?) -> Effect<Action> {
+                func failed(_ reason: LinkFailure) -> Effect<Action> {
+                    guard let owner else {
+                        return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: reason)))
+                    }
+                    return .send(.delegate(.ownedLinkFailed(owner: owner, destinationHash: destinationHash, reason: reason)))
+                }
                 // F8 stale-path gate, on the SHARED router. `learned` is deliberately
                 // non-destructive, so an entry outlives the interface it names: the socket drops,
                 // Transport drops the interface, the path stays. Minting a LinkSession on a dead
                 // interface transmits into nothing and exits only via the establishment
                 // deadline — misreported as a dead ROUTE (soliciting a pointless path request)
                 // rather than a dead interface. `Transport.send` gates the same way.
-                guard let learned = state.transport.learned[destinationHash] else {
-                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .noPath)))
-                }
-                guard state.transport.reachableLearned(destinationHash) != nil else {
-                    return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .pathStale)))
-                }
+                guard let learned = state.transport.learned[destinationHash] else { return failed(.noPath) }
+                guard state.transport.reachableLearned(destinationHash) != nil else { return failed(.pathStale) }
                 // Via a relay (a next hop that is not the destination, at on-wire hops >= 1) →
                 // HEADER_2 LINKREQUEST to the relay; otherwise HEADER_1, including to a local client
                 // of the next hop (`LearnedDestination.relayNextHop`, the same rule `Transport.send`
@@ -355,19 +384,26 @@ public struct TransportEndpoint {
                 // RNS 1.6.0: a destination that announced a link cost gets a stamped LINKREQUEST
                 // (Link.py:310). Read from the known destinations, which every valid announce
                 // refreshes, not from `learned`, which only a better announce replaces.
-                return .send(.linkPlane(.openLink(initiatorTo: learned.identity,
-                                                  destinationHash: destinationHash,
-                                                  interfaceID: learned.interfaceID,
-                                                  relayNextHop: relayNextHop,
-                                                  establishmentTimeout: timeout,
-                                                  linkCost: state.transport.recallLinkCost(destinationHash: destinationHash))))
+                let linkCost = state.transport.recallLinkCost(destinationHash: destinationHash)
+                guard let owner else {
+                    return .send(.linkPlane(.openLink(initiatorTo: learned.identity,
+                                                      destinationHash: destinationHash,
+                                                      interfaceID: learned.interfaceID,
+                                                      relayNextHop: relayNextHop,
+                                                      establishmentTimeout: timeout,
+                                                      linkCost: linkCost)))
+                }
+                return .send(.linkPlane(.openOwnedLink(owner: owner, initiatorTo: learned.identity,
+                                                       destinationHash: destinationHash,
+                                                       interfaceID: learned.interfaceID,
+                                                       relayNextHop: relayNextHop,
+                                                       establishmentTimeout: timeout,
+                                                       linkCost: linkCost)))
+    }
 
-            // The link verbs (`.sendOverLink`, `.closeLink`, `.registerRequestHandler`, …) are
-            // NOT forwarded here: they are aliased straight into the shared `LinkPlane` by
-            // `linkPlaneRoute` and have already been consumed by the `Scope` above. Forwarding
-            // them again would double-deliver (e.g. two `.close`s to one element — a "forEach
-            // received an action for a missing element" crash).
-
+    /// The rest of the container's wiring (a separate function so the compiler type-checks it apart).
+    private func wiringRest(_ state: inout State, _ action: Action) -> Effect<Action> {
+            switch action {
             // --- TCP client interface events → shared router (per client, by id) ---
             case let .tcpClients(.element(id, .interface(.delegate(.packetReceived(data))))):
                 return .send(.transport(.received(id, data)))
@@ -654,6 +690,12 @@ public struct TransportEndpoint {
                 return .send(.delegate(.linkClosed(linkID: linkID, reason: reason)))
             case let .linkPlane(.delegate(.linkFailed(destHash, reason))):
                 return .send(.delegate(.linkFailed(destinationHash: destHash, reason: reason)))
+            case let .linkPlane(.delegate(.ownedLinkEstablished(owner, linkID, destHash))):
+                return .send(.delegate(.ownedLinkEstablished(owner: owner, linkID: linkID, destinationHash: destHash)))
+            case let .linkPlane(.delegate(.ownedLinkFailed(owner, destHash, reason))):
+                return .send(.delegate(.ownedLinkFailed(owner: owner, destinationHash: destHash, reason: reason)))
+            case let .linkPlane(.delegate(.requestSent(linkID, rid, path))):
+                return .send(.delegate(.requestSent(linkID: linkID, requestID: rid, path: path)))
             case let .linkPlane(.delegate(.resourceReceived(linkID, data))):
                 return .send(.delegate(.resourceReceived(linkID: linkID, data: data)))
             case let .linkPlane(.delegate(.resourceConcluded(linkID, hash))):
@@ -756,13 +798,10 @@ public struct TransportEndpoint {
 
             // Everything else (child scopes already ran; the link verbs were consumed by the
             // `linkPlaneRoute` alias Scope).
-            case .tcpClients, .tcpServer, .ble, .meshtastic, .meshCore, .rnode, .auto, .transport, .linkPlane, .link, .delegate,
-                 .sendOverLink, .sendResourceOverLink, .cancelResource, .identifyOverLink, .sendRequestOverLink,
-                 .sendResponseOverLink, .sendWithReceiptOverLink, .provePacketOverLink,
-                 .closeLink, .registerRequestHandler, .deregisterRequestHandler:
+            // (The verbs `wiring` handles never reach here.)
+            default:
                 return .none
             }
-        }
     }
 
     /// `.start` reaches the auto slot unless `.removeAuto` is waiting for its stop to return.
@@ -928,7 +967,7 @@ extension TransportEndpoint.Action.AllCasePaths {
                     return .registerRequestHandler(path: path, policy: policy)
                 case let .deregisterRequestHandler(path):
                     return .deregisterRequestHandler(path: path)
-                case .openLink, .acceptLinkRequest, .routeLinkPacket, .interfaceDisconnected, .delegate,
+                case .openLink, .openOwnedLink, .acceptLinkRequest, .routeLinkPacket, .interfaceDisconnected, .delegate,
                      .stampedKeyFound, .stampSearchTimedOut, .cancelStampSearches, .abandonStampSearches:
                     return .linkPlane(plane)
                 }

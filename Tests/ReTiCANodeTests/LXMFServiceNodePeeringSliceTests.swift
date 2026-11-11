@@ -45,6 +45,22 @@ private struct ClientRecorder: Reducer {
     }
 }
 
+/// Logs what a service node's own client delivers.
+private struct ServiceRecorder: Reducer {
+    typealias State = LXMFServiceNode.State
+    typealias Action = LXMFServiceNode.Action
+    let delivered: LockIsolated<[Data]>
+    var body: some ReducerOf<Self> {
+        Reduce { _, action in
+            if case let .client(.delegate(.messageReceived(message, _, _))) = action {
+                delivered.withValue { $0.append(message.content) }
+            }
+            return .none
+        }
+        LXMFServiceNode()
+    }
+}
+
 /// The in-memory sockets: what one side writes arrives on the other's stream.
 private final class Wire: @unchecked Sendable {
     let aListener = AsyncStream<TCPListenerEvent>.makeStream()
@@ -89,8 +105,11 @@ private func serviceState(_ identity: Identity, _ endpoint: TransportEndpoint.St
         d.withRandomNumberGenerator = WithRandomNumberGenerator(Seeded(state: 3))
     }
 
+    let aDelivered = LockIsolated<[Data]>([])
     let a = Store(initialState: serviceState(aIdentity, TransportEndpoint.State(
-        tcpServer: TCPServerEndpoint.State(port: 4242, profile: .tcp)))) { LXMFServiceNode() } withDependencies: {
+        tcpServer: TCPServerEndpoint.State(port: 4242, profile: .tcp)))) {
+        ServiceRecorder(delivered: aDelivered)
+    } withDependencies: {
         common(&$0)
         $0.tcpListener = TCPListener(listen: { _ in w.aListener.stream },
                                      send: { conn, d in
@@ -180,6 +199,32 @@ private func serviceState(_ identity: Identity, _ endpoint: TransportEndpoint.St
     c.send(.setPropagationNode(destinationHash: bProp))
     c.send(.syncFromPropagationNode)
     #expect(await eventually { delivered.value.contains(content) })
+
+    // Fix round 1 (C1, probes A/A2/B): A's own client syncs from B, its propagation node, while A's
+    // sync job syncs to B, its peer, at the same time. Two links from A to B, one each: neither reads
+    // the other's answers, so A's client gets its message and B gets A's new one.
+    let aDelivery = LXMessage.deliveryHash(identityHash: aIdentity.hash)
+    a.send(.client(.registerDelivery))
+    c.send(.endpoint(.transport(.rehydrateKnownDestinations([
+        aDelivery: KnownDestination(identity: Identity(publicKey: aIdentity.publicKey)!, appData: nil, lastHeard: t0),
+    ]))))
+    let forA = Data("from C, held at B for A".utf8)
+    c.send(.sendViaPropagation(destinationHash: aDelivery, title: Data("a".utf8), content: forA))
+    #expect(await eventually { b.pn.store.entries(forDestination: aDelivery).count == 1 })
+    let second = Data("a second one through A".utf8)
+    s.send(.sendViaPropagation(destinationHash: cDelivery, title: Data("u".utf8), content: second))
+    #expect(await eventually { a.pn.store.count == 2 })
+    let tid2 = try #require(a.pn.store.transientIds.first { $0 != tid })
+    #expect(a.peering.peers[bProp]?.unhandled == [tid2])
+
+    a.send(.client(.setPropagationNode(destinationHash: bProp)))
+    a.send(.client(.syncFromPropagationNode))
+    a.send(.peerSyncTick)
+    #expect(await eventually { aDelivered.value.contains(forA) })
+    #expect(await eventually { b.pn.store.contains(transientId: tid2) })
+    #expect(await eventually { a.peering.peers[bProp]?.handled.contains(tid2) == true })
+    #expect(await eventually { a.peering.peers[bProp]?.state == .idle })
+    #expect(a.client.router.propagationTransferState == .complete)
 
     a.send(.client(.endpoint(.stop)))
     b.send(.client(.endpoint(.stop)))

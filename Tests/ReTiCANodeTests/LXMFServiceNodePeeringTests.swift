@@ -19,7 +19,8 @@ private let offerPathHash = Crypto.truncatedHash(Data("/offer".utf8))
 
 /// What the node sends, as these tests look for it.
 private enum Out: Equatable, Sendable {
-    case openLink(Data), requestPath(Data), identify(Data)
+    /// `openLink`: a sync link (owned); `plainOpen`: a client link.
+    case openLink(Data), plainOpen(Data), requestPath(Data), identify(Data)
     case request(link: Data, path: String, data: Data), resource(link: Data, data: Data)
     case closeLink(Data), tick, peersChanged
 }
@@ -32,7 +33,8 @@ private struct Recorded: Reducer {
         Reduce { _, action in
             let out: Out?
             switch action {
-            case let .client(.endpoint(.openLink(dest))): out = .openLink(dest)
+            case let .client(.endpoint(.openOwnedLink(dest, .propagationPeerSync))): out = .openLink(dest)
+            case let .client(.endpoint(.openLink(dest))): out = .plainOpen(dest)
             case let .client(.endpoint(.requestPath(dest))): out = .requestPath(dest)
             case let .client(.endpoint(.identifyOverLink(link, _))): out = .identify(link)
             case let .client(.endpoint(.sendRequestOverLink(link, path, data))): out = .request(link: link, path: path, data: data)
@@ -157,7 +159,8 @@ private func send(_ store: TestStoreOf<Recorded>, _ action: LXMFServiceNode.Acti
 
 @MainActor
 private func established(_ store: TestStoreOf<Recorded>, _ link: Data, _ peer: Data) async {
-    await send(store, .client(.endpoint(.delegate(.linkEstablished(linkID: link, destinationHash: peer)))))
+    await send(store, .client(.endpoint(.delegate(.ownedLinkEstablished(owner: .propagationPeerSync, linkID: link,
+                                                                        destinationHash: peer)))))
 }
 
 @MainActor
@@ -298,7 +301,7 @@ private func cachedPeer(_ dest: Data, announce: PNAnnounce = pnAnnounce(), handl
     await hear(store, h, peer)
     await upload(store, 1, 2)
     let key = Data(repeating: 0x4B, count: 32)
-    await send(store, .rehydratePeers([cachedPeer(dest, handled: [tid(1)], unhandled: [tid(2)], key: key)]))
+    await send(store, .rehydrate(entries: [], peers: [cachedPeer(dest, handled: [tid(1)], unhandled: [tid(2)], key: key)]))
 
     await send(store, .peerSyncTick)
     #expect(opens(h.log) == [dest])
@@ -319,7 +322,7 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
     let peer = Identity(), dest = propagationHash(peer)
     await hear(store, h, peer)
     for b in unhandled { await upload(store, b) }
-    await send(store, .rehydratePeers([cachedPeer(dest, unhandled: Set(unhandled.map(tid)))]))
+    await send(store, .rehydrate(entries: [], peers: [cachedPeer(dest, unhandled: Set(unhandled.map(tid)))]))
     await send(store, .peerSyncTick)
     let link = Data(repeating: 0x11, count: 16)
     await established(store, link, dest)
@@ -399,10 +402,14 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
     let peer = Identity(), dest = propagationHash(peer)
     await hear(store, h, peer)
     await upload(store, 2)
-    await send(store, .rehydratePeers([cachedPeer(dest, unhandled: [tid(2)])]))
+    await send(store, .rehydrate(entries: [], peers: [cachedPeer(dest, unhandled: [tid(2)])]))
     await send(store, .peerSyncTick)
     #expect(opens(h.log) == [dest])
+    // The client's own link to the same destination failing is not ours.
     await send(store, .client(.endpoint(.delegate(.linkFailed(destinationHash: dest, reason: .establishmentTimedOut)))))
+    #expect(store.state.peering.peers[dest]?.state == .linkEstablishing)
+    await send(store, .client(.endpoint(.delegate(.ownedLinkFailed(owner: .propagationPeerSync, destinationHash: dest,
+                                                                   reason: .establishmentTimedOut)))))
     let p = store.state.peering.peers[dest]
     #expect(p?.alive == false)
     #expect(p?.state == .idle)
@@ -422,7 +429,7 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
     let store = await makeStore(nodeState(Identity()), h, peeringKey: { _, _ in nil })
     let peer = Identity(), dest = propagationHash(peer)
     await upload(store, 2)
-    await send(store, .rehydratePeers([cachedPeer(dest, unhandled: [tid(2)])]))
+    await send(store, .rehydrate(entries: [], peers: [cachedPeer(dest, unhandled: [tid(2)])]))
     await send(store, .peerSyncTick)
     #expect(h.log.value.contains(.requestPath(dest)))
     #expect(opens(h.log).isEmpty)
@@ -464,7 +471,7 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
     await hear(store, h, offering)
     await hear(store, h, mining)
     await upload(store, 2)
-    await send(store, .rehydratePeers([cachedPeer(offeringHash, unhandled: [tid(2)])]))
+    await send(store, .rehydrate(entries: [], peers: [cachedPeer(offeringHash, unhandled: [tid(2)])]))
 
     // The job ticks every 24 s; each tick syncs one peer: the keyed one gets a link (established here
     // and offered to), the other a key search.
@@ -507,16 +514,15 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
 
 // MARK: - Review Focus 3
 
-/// A node-mode relaunch: the host rehydrates 500 stored entries, then 3 persisted peers. No entry may
+/// A node-mode relaunch: ONE `.rehydrate` hands back 500 stored entries and 3 persisted peers, so the
+/// store is full before the peers are pruned to it (the order cannot be got wrong, I4). No entry may
 /// become unhandled for any peer, so the first sync offers only what was unhandled before; a store
-/// chunk rehydrated after the peers distributes nothing either.
+/// chunk rehydrated later distributes nothing either.
 @MainActor @Test func rehydrateStoreThenPeersMarksNothingUnhandled() async {
     let h = Harness()
     let store = await makeStore(nodeState(Identity()), h, peeringKey: { _, _ in nil })
     let entries = (0..<500).map { i in Data([UInt8(i & 0xFF), UInt8(i >> 8)]) + Data(repeating: 0xE0, count: 118) }
     let tids = entries.map { LXMFPropagation.transientId(lxmfData: LXMFPropagation.strippedCore(lxmfData: $0)) }
-    await send(store, .rehydrateStore(entries: entries))
-    #expect(store.state.pn.store.count == 500)
 
     let identities = [Identity(), Identity(), Identity()]
     for identity in identities { await hear(store, h, identity) }
@@ -524,11 +530,15 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
         cachedPeer(propagationHash(identity), handled: Set(tids[(i * 100)..<(i * 100 + 50)]),
                    unhandled: Set(tids[(i * 100 + 50)..<(i * 100 + 53)]))
     }
-    await send(store, .rehydratePeers(persisted))
-    for p in persisted { #expect(store.state.peering.peers[p.destinationHash]?.unhandled == p.unhandled) }
+    await send(store, .rehydrate(entries: entries, peers: persisted))
+    #expect(store.state.pn.store.count == 500)
+    for p in persisted {
+        #expect(store.state.peering.peers[p.destinationHash]?.unhandled == p.unhandled)
+        #expect(store.state.peering.peers[p.destinationHash]?.handled == p.handled)
+    }
 
     let late = (0..<10).map { i in Data([0xF0, UInt8(i)]) + Data(repeating: 0xE1, count: 118) }
-    await send(store, .rehydrateStore(entries: late))
+    await send(store, .rehydrate(entries: late, peers: []))
     #expect(store.state.pn.store.count == 510)
     for p in persisted {
         #expect(store.state.peering.peers[p.destinationHash]?.unhandled == p.unhandled)
@@ -568,4 +578,150 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
 
     await upload(store, 1)                              // distributes to both peers
     #expect(h.log.value.filter { $0 == .peersChanged }.count == 2)
+}
+
+// MARK: - Fix round 1: link ownership, request routing, stall bound
+
+/// Probe A: with the `/offer` out under a known request id, an answer to some other request on the link
+/// (the client's `/get` list, `[]`, which reads as "wants none") changes nothing: the offered id stays
+/// unhandled and the link open. The offer's own answer is then taken.
+@MainActor @Test func offerAnswerIsMatchedByRequestID() async {
+    let h = Harness()
+    let (store, dest, link) = await peerWithOfferOut(h)
+    let offerID = Data(repeating: 0x0F, count: 16)
+    await send(store, .client(.endpoint(.delegate(.requestSent(linkID: link, requestID: offerID, path: "/offer")))))
+    await send(store, .client(.endpoint(.delegate(.responseReceived(linkID: link, requestID: Data(repeating: 0x0E, count: 16),
+                                                                    data: MsgPack.encode(.array([])))))))
+    await send(store, .client(.endpoint(.delegate(.requestFailed(linkID: link, requestID: Data(repeating: 0x0D, count: 16))))))
+    #expect(store.state.peering.peers[dest]?.state == .requestSent)
+    #expect(store.state.peering.peers[dest]?.unhandled == [tid(2)])
+    #expect(closes(h.log).isEmpty)
+    await send(store, .client(.endpoint(.delegate(.responseReceived(linkID: link, requestID: offerID,
+                                                                    data: MsgPack.encode(.bool(true)))))))
+    #expect(resources(h.log).count == 1)
+}
+
+/// I2: a sync link is the service node's alone. Its establishment is never recorded as the client's
+/// link to that node (so the router neither arms its idle timer on it nor sends over it), its failure
+/// leaves the client's own link to the node alone, and the client's link failing is not taken as ours.
+@MainActor @Test func syncLinkNeverEntersTheClientsLinkBookkeeping() async {
+    let h = Harness()
+    let store = await makeStore(nodeState(Identity()), h, peeringKey: { _, _ in nil })
+    let peer = Identity(), dest = propagationHash(peer)
+    await hear(store, h, peer)
+    await upload(store, 2)
+    await send(store, .rehydrate(entries: [], peers: [cachedPeer(dest, unhandled: [tid(2)])]))
+    // The client's own link to the same node, already up.
+    let clientLinkToPeer = Data(repeating: 0x22, count: 16)
+    await send(store, .client(.endpoint(.delegate(.linkEstablished(linkID: clientLinkToPeer, destinationHash: dest)))))
+    #expect(store.state.client.directLinks[dest] == clientLinkToPeer)
+
+    await send(store, .peerSyncTick)
+    #expect(opens(h.log) == [dest])
+    #expect(!h.log.value.contains(.plainOpen(dest)))
+    // A stale attempt of ours fails: the client's link is untouched.
+    await send(store, .client(.endpoint(.delegate(.ownedLinkFailed(owner: .propagationPeerSync, destinationHash: dest,
+                                                                   reason: .establishmentTimedOut)))))
+    #expect(store.state.client.directLinks[dest] == clientLinkToPeer)
+    #expect(store.state.client.router.directLinks[dest] == .active(linkID: clientLinkToPeer))
+
+    h.now.setValue(t0 + 721)
+    await send(store, .peerSyncTick)
+    let syncLink = Data(repeating: 0x11, count: 16)
+    await established(store, syncLink, dest)
+    #expect(offers(h.log).first?.link == syncLink)
+    #expect(store.state.client.directLinks[dest] == clientLinkToPeer)
+    #expect(store.state.client.linkDestinations[syncLink] == nil)
+    #expect(store.state.client.router.directLinks[dest] == .active(linkID: clientLinkToPeer))
+}
+
+/// Probe C / the stall bound: a slow sync keeps its link while the transfer moves (sender progress every
+/// 100 s, far past the router's 600 s idle timer, which never applies to a sync link), and a sync that
+/// stops moving is closed after `peerLinkStallTimeout` (720 s) and its peer idled.
+@MainActor @Test func slowSyncKeepsItsLinkAndAStalledOneIsClosed() async {
+    let h = Harness()
+    let (store, dest, link) = await peerWithOfferOut(h)
+    await respond(store, link, .bool(true))
+    #expect(resources(h.log).count == 1)
+    let hash = Data(repeating: 0x5E, count: 32)
+    for step in 1...9 {
+        await h.clock.advance(by: .seconds(100))
+        await send(store, .client(.endpoint(.delegate(.resourceProgress(linkID: link, resourceHash: hash, role: .sender,
+                                                                        bytesDone: step * 10, bytesTotal: 100,
+                                                                        segment: 1, segments: 1)))))
+    }
+    #expect(closes(h.log).isEmpty)
+    #expect(store.state.peering.peers[dest]?.state == .transferring)
+
+    await h.clock.advance(by: .seconds(719))
+    await store.skipReceivedActions(strict: false)
+    #expect(closes(h.log).isEmpty)
+    await h.clock.advance(by: .seconds(1))
+    await store.skipReceivedActions(strict: false)
+    #expect(closes(h.log) == [link])
+    #expect(store.state.peering.peers[dest]?.state == .idle)
+    #expect(store.state.peering.peers[dest]?.unhandled == [tid(2)])
+}
+
+/// M1: after node mode off and on, a link left over from before establishes alongside the new one: the
+/// first to establish becomes the sync link and the other is closed, and the stale attempt failing does
+/// not fail the current one.
+@MainActor @Test func aStaleSyncLinkAfterNodeModeOffOnIsClosedNotKept() async {
+    let h = Harness()
+    let store = await makeStore(nodeState(Identity()), h, peeringKey: { _, _ in nil })
+    let peer = Identity(), dest = propagationHash(peer)
+    await hear(store, h, peer)
+    await upload(store, 2)
+    await send(store, .rehydrate(entries: [], peers: [cachedPeer(dest, unhandled: [tid(2)])]))
+    await send(store, .peerSyncTick)                       // attempt 1
+    await send(store, .setNodeMode(false))
+    await send(store, .setNodeMode(true))
+    h.now.setValue(t0 + 721)
+    await send(store, .peerSyncTick)                       // attempt 2
+    await send(store, .peerSyncTick)                       // attempt 3 is not made: one is establishing
+    #expect(opens(h.log) == [dest, dest])
+    #expect(store.state.peering.peers[dest]?.state == .linkEstablishing)
+
+    // One of the two attempts fails: the other is still awaited.
+    await send(store, .client(.endpoint(.delegate(.ownedLinkFailed(owner: .propagationPeerSync, destinationHash: dest,
+                                                                   reason: .establishmentTimedOut)))))
+    #expect(store.state.peering.peers[dest]?.state == .linkEstablishing)
+    // Both then establish (a late stale one included): the first is used, the second closed.
+    let first = Data(repeating: 0x11, count: 16), second = Data(repeating: 0x12, count: 16)
+    await established(store, first, dest)
+    await established(store, second, dest)
+    #expect(offers(h.log).map(\.link) == [first])
+    #expect(closes(h.log) == [second])
+}
+
+/// M2: a peer unpeered while its key search runs (here it announces its node disabled) has the search
+/// cancelled, not left mining to completion for nobody.
+@MainActor @Test func unpeeringAMiningPeerCancelsItsKeySearch() async {
+    let h = Harness()
+    let cancelled = LockIsolated(false)
+    let store = await makeStore(nodeState(Identity()), h, peeringKey: { _, _ in
+        while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(2)) }
+        cancelled.setValue(true)
+        return nil
+    })
+    let peer = Identity(), dest = propagationHash(peer)
+    await hear(store, h, peer)
+    await upload(store, 2)
+    await send(store, .peerSyncTick)
+    #expect(store.state.peering.peers[dest]?.state == .keyPending)
+    await hear(store, h, peer, announce: pnAnnounce(timebase: 2, nodeState: false))
+    #expect(store.state.peering.peers[dest] == nil)
+    for _ in 0..<200 where !cancelled.value { try? await Task.sleep(for: .milliseconds(5)) }
+    #expect(cancelled.value)
+}
+
+/// M3: a rehydrate that replaces a peer in the middle of a sync closes the link that peer held, instead
+/// of forgetting it open.
+@MainActor @Test func rehydrateMidSyncClosesTheReplacedPeersLink() async {
+    let h = Harness()
+    let (store, dest, link) = await peerWithOfferOut(h)
+    await send(store, .rehydrate(entries: [], peers: [cachedPeer(dest, unhandled: [tid(2)])]))
+    #expect(closes(h.log) == [link])
+    #expect(store.state.peering.peers[dest]?.state == .idle)
+    #expect(store.state.peering.peers[dest]?.linkID == nil)
 }

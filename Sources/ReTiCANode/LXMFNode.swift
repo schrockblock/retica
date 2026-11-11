@@ -97,6 +97,10 @@ public struct LXMFNode {
         public var identity: Identity
         public var directLinks: [Data: Data] = [:]   // destinationHash → linkID (close/linkClosed correlation)
         public var syncPhase: [Data: SyncPhase] = [:]   // linkID → current download phase (one sync/link)
+        /// linkID → the request id of the sync's latest `/get` on it (from the endpoint's
+        /// `requestSent`). A response or failure carrying another id is not the sync's and is
+        /// ignored, so nothing else on the link can be read as a sync answer.
+        public var syncRequestIDs: [Data: Data] = [:]
         /// linkID → the destination hash that link terminates on. For an inbound (responder) link this is
         /// OUR local destination; for an outbound link it is the remote one.
         public var linkDestinations: [Data: Data] = [:]
@@ -1166,7 +1170,14 @@ public struct LXMFNode {
                 return .send(.endpoint(.sendRequestOverLink(linkID: linkID, path: "/get", data: payload)))
 
             // --- Propagation sync: dispatch on responseReceived based on phase ---
-            case let .endpoint(.delegate(.responseReceived(linkID, _, data))):
+            case let .endpoint(.delegate(.requestSent(linkID, requestID, path))):
+                guard path == "/get", state.syncPhase[linkID] != nil else { return .none }
+                state.syncRequestIDs[linkID] = requestID
+                return .none
+
+            case let .endpoint(.delegate(.responseReceived(linkID, requestID, data))):
+                // Only the answer to the sync's own `/get` (when its id is known).
+                if let expected = state.syncRequestIDs[linkID], expected != requestID { return .none }
                 switch state.syncPhase[linkID] {
                 case .awaitingList:
                     // An error code or a non-list answer ends the sync: the link it arrived on is torn
@@ -1236,9 +1247,11 @@ public struct LXMFNode {
 
             // A sync request that failed (timed out) tears its link down, as reference
             // `message_get_failed` does (LXMRouter.py:1869-1872); the close then reports the state.
-            case let .endpoint(.delegate(.requestFailed(linkID, _))):
+            case let .endpoint(.delegate(.requestFailed(linkID, requestID))):
                 guard state.syncPhase[linkID] != nil else { return .none }
+                if let expected = state.syncRequestIDs[linkID], expected != requestID { return .none }
                 state.syncPhase[linkID] = nil
+                state.syncRequestIDs[linkID] = nil
                 return .send(.endpoint(.closeLink(linkID: linkID)))
 
             case let .router(.delegate(.propagationTransferStateChanged(transferState, lastResult))):
@@ -1562,6 +1575,7 @@ public struct LXMFNode {
                 state.outboundTransfers[linkID] = nil
                 state.inboundProgress[linkID] = nil
                 state.syncPhase[linkID] = nil   // Minor-2: clear leak from a mid-phase sync death
+                state.syncRequestIDs[linkID] = nil
                 guard let dest = state.directLinks.first(where: { $0.value == linkID })?.key else { return .none }
                 state.directLinks[dest] = nil
                 return .send(.router(.linkClosed(destinationHash: dest)))

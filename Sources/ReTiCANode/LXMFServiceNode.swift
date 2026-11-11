@@ -17,19 +17,19 @@ import ReTiCATransport
 /// (a `PNPeerTable`), auto-peering with a recallable sender. Client half: auto-peering from announces
 /// (`.announceReceived`), static peers, the 24 s peer-sync job (`.peerSyncTick`, node mode only),
 /// peering keys mined per peer and cached with it, the `/offer` exchange and the sync transfer, and
-/// the persistence hooks (`.rehydratePeers`, `.rehydrateStore`, `Delegate.peersChanged`). This
-/// reducer is `PNPeerTable`'s host: it carries out the table's `Command`s (see its host protocol).
-/// Time-based expiry is not driven here. Inbound proving of PACKET-framed propagation offers is in
-/// scope and lives at the `.linkDataReceived` handler below (reference LXMRouter.py:2255);
-/// Resource-framed offers are proved by the resource transfer protocol.
+/// the persistence hooks (`.rehydrate(entries:peers:)`, `Delegate.peersChanged`). This reducer is
+/// `PNPeerTable`'s host: it carries out the table's `Command`s (see its host protocol). Time-based
+/// expiry is not driven here. Inbound proving of PACKET-framed propagation offers is in scope and lives
+/// at the `.linkDataReceived` handler below (reference LXMRouter.py:2255); Resource-framed offers are
+/// proved by the resource transfer protocol.
 ///
-/// **Known limitation (sync links share the client's link bookkeeping).** `LXMFNode` sees every
-/// link establishment and failure by destination, so an outbound sync link to a peer is also recorded
-/// as the client's direct link to that destination, and `LXMFRouter` arms its idle timer on it. When
-/// the peer is ALSO this node's own outbound propagation node, the client router can use the sync link
-/// for its own work, and a client link and a sync link opened to that destination at the same time are
-/// told apart only by which one establishes first. Reference keeps the two apart (separate `RNS.Link`
-/// objects with their own callbacks). Separating them needs the link plane to tag links by opener.
+/// **Sync links are this reducer's own.** They are opened with `.openOwnedLink(owner:
+/// .propagationPeerSync)`, so their establishment and failure reach only this reducer
+/// (`ownedLinkEstablished` / `ownedLinkFailed`): `LXMFNode` never records one as its router's link,
+/// never arms the router's idle timer on it, and never sends a sync or an upload over it, even when the
+/// peer is also this node's outbound propagation node. Reference keeps them apart the same way, as
+/// separate `RNS.Link` objects with their own callbacks. Two links to one node (the client's and the
+/// sync's) can be up at once. The `/offer` answer is also matched by request id.
 @Reducer
 public struct LXMFServiceNode {
     @ObservableState
@@ -49,15 +49,20 @@ public struct LXMFServiceNode {
         /// (which the announce advertises), inbound syncs mark ids handled for the sending peer and
         /// distribute fresh ones to the others. Outbound: announces, the sync job, keys, offers and
         /// transfers drive it. Every store removal prunes it. The host persists `peering.persisted`
-        /// (reported by `Delegate.peersChanged`) and hands it back with `.rehydratePeers`.
+        /// (reported by `Delegate.peersChanged`) and hands it back with `.rehydrate(entries:peers:)`.
         public var peering: PNPeerTable
         /// Links on which a peer presented a peering key valid at our cost (reference
         /// `validated_peer_links`, LXMRouter.py:2649). Only such a link may deliver more than one
         /// message per container (:2716-2724). Cleared when the link closes and on node-mode disable.
         public var validatedOfferLinks: Set<Data> = []
-        /// Peers we asked the endpoint to open a sync link to: their `linkEstablished` /
-        /// `linkFailed` (reported by destination) are ours. Removed when either arrives.
-        public var peerLinksOpening: Set<Data> = []
+        /// Sync links still being opened, per peer: each `.openOwnedLink` adds one, each
+        /// `ownedLinkEstablished` / `ownedLinkFailed` takes one away. A failure is the peer's
+        /// `linkFailed` only when it was the last attempt outstanding, so a stale attempt (one from
+        /// before a node-mode off/on) cannot fail the current one.
+        public var peerLinkOpens: [Data: Int] = [:]
+        /// Sync link → the request id of the `/offer` on it (from `requestSent`). Only the response
+        /// or failure carrying it is the offer's.
+        public var peerOfferRequests: [Data: Data] = [:]
         /// Peers waiting out `PNPeerTable.pathRequestGrace` after a path request.
         public var peerPathWaits: Set<Data> = []
         /// Sync link → the sync transfer's size in bytes, per resource segment (key 0: the container's
@@ -120,19 +125,21 @@ public struct LXMFServiceNode {
         case peeringKeyFailed(peer: Data)
         /// `PATH_REQUEST_GRACE` after a path request for `peer`'s sync link ran out (internal).
         case peerPathRequestGraceElapsed(peer: Data)
-        /// Persisted peers (`Delegate.peersChanged`), handed back after a relaunch. Send AFTER
-        /// `.rehydrateStore`: each peer's handled and unhandled ids are pruned to what the store holds
-        /// at that moment (as `LXMPeer.from_bytes` does), so peers loaded into an empty store lose them.
-        case rehydratePeers([PNPeerTable.Peer])
+        /// A sync link saw no sync activity for `peerLinkStallTimeout` (internal).
+        case peerLinkStalled(linkID: Data)
+        /// A relaunch: the stored entries (each `lxmf_data ‖ stamp`, as `PropagationStore.Entry.lxmfData`
+        /// holds it) and the persisted peers (`Delegate.peersChanged`), in ONE action so the order is
+        /// fixed: the entries are ingested first, WITHOUT distribution to peers and without
+        /// `messagesStored` (an eviction still reports `messagesPurged`), then each peer is loaded with
+        /// its handled and unhandled ids pruned to the store (as `LXMPeer.from_bytes` does) — Review
+        /// Focus 3. A peer already in the table is replaced; a sync link it held is closed and its key
+        /// search cancelled first.
+        case rehydrate(entries: [Data], peers: [PNPeerTable.Peer])
         /// The configured static peers (lxmd `static_peers`): each gets a table entry, with a path
         /// request when it has never been heard (LXMRouter.py:728-737). Never culled.
         case setStaticPeers(Set<Data>)
         /// lxmd `autopeer` (default true).
         case setAutopeer(Bool)
-        /// Stored entries (each `lxmf_data ‖ stamp`, as `PropagationStore.Entry.lxmfData` holds it)
-        /// handed back after a relaunch. Ingested WITHOUT distribution to peers (Review Focus 3) and
-        /// without `messagesStored`; an eviction still reports `messagesPurged`.
-        case rehydrateStore(entries: [Data])
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -142,12 +149,23 @@ public struct LXMFServiceNode {
             case messagesPurged(transientIds: [Data])
             /// The peer table changed: `peering.persisted`, every peer in table order. Emitted at most
             /// once per action, after it. The host replaces its stored copy and hands it back with
-            /// `.rehydratePeers`. It includes each peer's cached peering key (ruling 6c).
+            /// `.rehydrate(entries:peers:)`. It includes each peer's cached peering key (ruling 6c).
             case peersChanged([PNPeerTable.Peer])
         }
     }
 
-    enum CancelID: Hashable { case peerSyncJob, peeringKey(Data), peerPathGrace(Data) }
+    enum CancelID: Hashable { case peerSyncJob, peeringKey(Data), peerPathGrace(Data), peerLinkStall(Data) }
+
+    /// How long a sync link may go without sync activity (establishment, the `/offer` going out, its
+    /// answer, sender progress on the transfer) before this node closes it: RNS's `Link.STALE_TIME`,
+    /// `STALE_FACTOR` 2 × `KEEPALIVE` 360 s = 720 s (Link.py:92-99), the silence after which reference
+    /// itself declares a link stale. Reference's own sync has no separate bound; it relies on the
+    /// request timeout (which `LinkSession` reports as `requestFailed`) and on the resource's own
+    /// failure. This bound catches the case those miss: a peer that keeps the link alive with
+    /// keepalives but stops moving the transfer. Progress is reported per whole percent, so even a
+    /// 256 KB transfer at LoRa rates (about 2.6 KB per percent at ~25 B/s ≈ 100 s) re-arms well
+    /// inside it.
+    public static let peerLinkStallTimeout: TimeInterval = 720
 
     @Dependency(\.date) var date
     @Dependency(\.continuousClock) var clock
@@ -309,6 +327,20 @@ public struct LXMFServiceNode {
                 state.peering.peers.values.first { $0.linkID == linkID }?.destinationHash
             }
 
+            /// Opens a sync link to `peer`, owned by this reducer.
+            func openSyncLink(_ state: inout State, _ peer: Data) -> Effect<Action> {
+                state.peerLinkOpens[peer, default: 0] += 1
+                return .send(.client(.endpoint(.openOwnedLink(destinationHash: peer, owner: .propagationPeerSync))))
+            }
+
+            /// (Re)arms the stall bound on sync link `linkID`.
+            func armStall(_ linkID: Data) -> Effect<Action> {
+                .run { send in
+                    try await clock.sleep(for: .seconds(LXMFServiceNode.peerLinkStallTimeout))
+                    await send(.peerLinkStalled(linkID: linkID))
+                }.cancellable(id: CancelID.peerLinkStall(linkID), cancelInFlight: true)
+            }
+
             /// Carries out the table's commands. Link packets (identify, `/offer`, the resource, closes)
             /// go out in command order, before the offer a caller appends; timers and key searches run
             /// alongside. With node mode off only closes go out (ruling 6b), and a command that would
@@ -328,8 +360,7 @@ public struct LXMFServiceNode {
                         // Reference `sync()` (LXMPeer.py:297-306): with no path, request one, wait
                         // PATH_REQUEST_GRACE, and give up (`linkFailed`) if there is still none.
                         if state.client.endpoint.transport.reachableLearned(peer) != nil {
-                            state.peerLinksOpening.insert(peer)
-                            ordered.append(.send(.client(.endpoint(.openLink(destinationHash: peer)))))
+                            ordered.append(openSyncLink(&state, peer))
                         } else {
                             state.peerPathWaits.insert(peer)
                             ordered.append(.send(.client(.endpoint(.requestPath(destinationHash: peer)))))
@@ -500,8 +531,8 @@ public struct LXMFServiceNode {
                 // conclusion starts nothing new (`interpret` sends only closes in node mode off). Every
                 // peer is idled through the table's own failure calls, and the table itself is kept:
                 // nothing is unpeered. A cancelled search reports nothing (its effect is cancelled), so
-                // the table is told here; a link still establishing stays in `peerLinksOpening`, and
-                // the table closes it if it establishes later.
+                // the table is told here; a link still establishing stays counted in `peerLinkOpens`,
+                // and the table closes it if it establishes later.
                 var peering: [Effect<Action>] = [.cancel(id: CancelID.peerSyncJob)]
                 for peer in state.peerPathWaits.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
                     peering.append(.cancel(id: CancelID.peerPathGrace(peer)))
@@ -811,19 +842,33 @@ public struct LXMFServiceNode {
                     let remaining = queue.filter { $0.linkID != linkID }
                     return remaining.isEmpty ? nil : remaining
                 }
-                // A sync link: idle its peer (`link_closed`, LXMPeer.py:549-551).
+                // A sync link: idle its peer (`link_closed`, LXMPeer.py:549-551), and end its stall
+                // bound (built on this branch only: `.cancel` cancels when constructed).
                 state.peerTransferBytes[linkID] = nil
+                state.peerOfferRequests[linkID] = nil
                 state.peering.linkClosed(linkID: linkID)
-                return .none
+                return .cancel(id: CancelID.peerLinkStall(linkID))
 
-            case let .client(.endpoint(.delegate(.requestFailed(linkID, _)))):
+            case let .client(.endpoint(.delegate(.requestFailed(linkID, requestID)))):
                 state.pendingGet = state.pendingGet.compactMapValues { queue in
                     let remaining = queue.filter { $0.linkID != linkID }
                     return remaining.isEmpty ? nil : remaining
                 }
-                // Our `/offer` failed (`request_failed`, LXMPeer.py:400-403).
-                guard peerOnLink(state, linkID) != nil else { return .none }
+                // Our `/offer` failed (`request_failed`, LXMPeer.py:400-403): only its own request id.
+                guard peerOnLink(state, linkID) != nil,
+                      state.peerOfferRequests[linkID].map({ $0 == requestID }) ?? true else { return .none }
+                state.peerOfferRequests[linkID] = nil
                 return run(state.peering.requestFailed(linkID: linkID), &state)
+
+            case let .client(.endpoint(.delegate(.requestSent(linkID, requestID, path)))):
+                guard path == "/offer", peerOnLink(state, linkID) != nil else { return .none }
+                state.peerOfferRequests[linkID] = requestID
+                return armStall(linkID)
+
+            case let .peerLinkStalled(linkID):
+                guard peerOnLink(state, linkID) != nil else { return .none }
+                state.peering.linkClosed(linkID: linkID)
+                return run([.closeLink(linkID)], &state)
 
             // --- Peering: the client half ---
 
@@ -862,38 +907,48 @@ public struct LXMFServiceNode {
                 state.peerPathWaits.remove(peer)
                 guard state.peering.peers[peer]?.state == .linkEstablishing else { return .none }
                 if state.nodeModeEnabled, state.client.endpoint.transport.reachableLearned(peer) != nil {
-                    state.peerLinksOpening.insert(peer)
-                    return .send(.client(.endpoint(.openLink(destinationHash: peer))))
+                    return openSyncLink(&state, peer)
                 }
                 state.peering.linkFailed(peer: peer, now: date.now)
                 return .none
 
-            case let .client(.endpoint(.delegate(.linkEstablished(linkID, dest)))):
-                // Only a link we opened to a peer. The table answers a link for a peer no longer
-                // establishing one (unpeered, or idled by node mode off) with `.closeLink`.
-                guard state.peerLinksOpening.remove(dest) != nil else { return .none }
-                return run(state.peering.linkEstablished(peer: dest, linkID: linkID, now: date.now), &state,
-                           offerFor: dest)
+            case let .client(.endpoint(.delegate(.ownedLinkEstablished(owner, linkID, dest)))):
+                // Every sync link we opened goes to the table, which answers one for a peer not
+                // establishing a link (unpeered, idled by node mode off, or already given an earlier
+                // link after a node-mode off/on) with `.closeLink`, so none is left open.
+                guard owner == .propagationPeerSync else { return .none }
+                if let open = state.peerLinkOpens[dest] { state.peerLinkOpens[dest] = open > 1 ? open - 1 : nil }
+                let commands = state.peering.linkEstablished(peer: dest, linkID: linkID, now: date.now)
+                let stall = commands.contains(.closeLink(linkID)) ? Effect<Action>.none : armStall(linkID)
+                return .merge(run(commands, &state, offerFor: dest), stall)
 
-            case let .client(.endpoint(.delegate(.linkFailed(dest, _)))):
-                guard state.peerLinksOpening.remove(dest) != nil else { return .none }
+            case let .client(.endpoint(.delegate(.ownedLinkFailed(owner, dest, _)))):
+                // THE call for every sync link that never establishes (no path, timed out, rejected,
+                // key search failed or cancelled), but only for the last attempt outstanding.
+                guard owner == .propagationPeerSync else { return .none }
+                let open = state.peerLinkOpens[dest] ?? 0
+                state.peerLinkOpens[dest] = open > 1 ? open - 1 : nil
+                guard open <= 1 else { return .none }
                 state.peering.linkFailed(peer: dest, now: date.now)
                 return .none
 
-            case let .client(.endpoint(.delegate(.responseReceived(linkID, _, data)))):
+            case let .client(.endpoint(.delegate(.responseReceived(linkID, requestID, data)))):
                 guard let dest = peerOnLink(state, linkID), let p = state.peering.peers[dest],
-                      p.state == .requestSent else { return .none }
+                      p.state == .requestSent,
+                      state.peerOfferRequests[linkID].map({ $0 == requestID }) ?? true else { return .none }
+                state.peerOfferRequests[linkID] = nil
                 let response = PNPeerTable.OfferResponse.parse(data, offered: p.lastOffer)
                 // `noIdentity` leaves the peer link-ready on the same link: offer again.
-                return run(state.peering.offerResponse(linkID: linkID, response, now: date.now), &state,
-                           offerFor: dest)
+                return .merge(run(state.peering.offerResponse(linkID: linkID, response, now: date.now), &state,
+                                  offerFor: dest),
+                              armStall(linkID))
 
             case let .client(.endpoint(.delegate(.resourceProgress(linkID, _, role, _, total, segment, _)))):
                 guard role == .sender, var bytes = state.peerTransferBytes[linkID] else { return .none }
                 bytes[0] = nil
                 bytes[segment] = total
                 state.peerTransferBytes[linkID] = bytes
-                return .none
+                return armStall(linkID)
 
             case let .client(.endpoint(.delegate(.resourceConcluded(linkID, _)))):
                 guard let dest = peerOnLink(state, linkID), state.peering.peers[dest]?.state == .transferring
@@ -911,10 +966,32 @@ public struct LXMFServiceNode {
 
             // --- Peering: configuration and persistence ---
 
-            case let .rehydratePeers(peers):
+            case let .rehydrate(entries, peers):
+                // Entries first, so the peers are pruned to a full store (Review Focus 3). No
+                // `distribute`: these entries were in the store before the relaunch, and each peer's
+                // unhandled set comes back with it.
+                var effects: [Effect<Action>] = []
+                if !entries.isEmpty {
+                    let container = LXMFPropagation.container(timestamp: date.now.timeIntervalSince1970,
+                                                              entries: entries)
+                    let (_, evicted) = state.pn.store.ingest(container: container, now: date.now)
+                    if !evicted.isEmpty { effects.append(.send(.pn(.delegate(.purged(transientIds: evicted))))) }
+                }
+                // A peer being replaced mid-sync: close the link it holds and stop its key search, which
+                // `rehydrate` would otherwise forget (its fresh state is idle, link-less).
+                for loaded in peers {
+                    guard let current = state.peering.peers[loaded.destinationHash] else { continue }
+                    if let link = current.linkID {
+                        state.peering.linkClosed(linkID: link)
+                        effects.append(.send(.client(.endpoint(.closeLink(linkID: link)))))
+                    }
+                    if current.state == .keyPending {
+                        effects.append(.cancel(id: CancelID.peeringKey(loaded.destinationHash)))
+                    }
+                }
                 state.peering.rehydrate(peers, stored: Set(state.pn.store.transientIds))
-                guard state.nodeModeEnabled else { return .none }
-                return run(activateStaticPeers(&state), &state)
+                if state.nodeModeEnabled { effects.append(run(activateStaticPeers(&state), &state)) }
+                return .merge(effects)
 
             case let .setStaticPeers(peers):
                 state.peering.config.staticPeers = peers
@@ -924,15 +1001,6 @@ public struct LXMFServiceNode {
             case let .setAutopeer(enabled):
                 state.peering.config.autopeer = enabled
                 return .none
-
-            case let .rehydrateStore(entries):
-                guard !entries.isEmpty else { return .none }
-                // No `distribute`: these entries were in the store before the relaunch, and each
-                // peer's unhandled set comes back with `.rehydratePeers` (Review Focus 3).
-                let container = LXMFPropagation.container(timestamp: date.now.timeIntervalSince1970, entries: entries)
-                let (_, evicted) = state.pn.store.ingest(container: container, now: date.now)
-                guard !evicted.isEmpty else { return .none }
-                return .send(.pn(.delegate(.purged(transientIds: evicted))))
 
             case .client, .pn, .delegate:
                 return .none
@@ -944,8 +1012,14 @@ public struct LXMFServiceNode {
             // identity); `persisted` then decides, so a config-only change reports nothing.
             if case .delegate = action { return handle(&state, action) }
             let before = state.peering
-            let effect = handle(&state, action)
-            guard state.peering != before, state.peering.persisted != before.persisted else { return effect }
+            var effect = handle(&state, action)
+            guard state.peering != before else { return effect }
+            // A peer that left the table (unpeered, culled) while mining a key: stop the search, which
+            // would otherwise run on to completion (up to cost 26) for nobody.
+            for (dest, p) in before.peers where p.state == .keyPending && state.peering.peers[dest] == nil {
+                effect = .merge(effect, .cancel(id: CancelID.peeringKey(dest)))
+            }
+            guard state.peering.persisted != before.persisted else { return effect }
             return .merge(effect, .send(.delegate(.peersChanged(state.peering.persisted))))
         }
     }

@@ -96,6 +96,11 @@ public struct LinkPlane {
         /// timeout starts after the search, as reference's does (`Link.__initiate` sends the request,
         /// and starts the watchdog, only once the key exists).
         public var stampingLinks: IdentifiedArrayOf<StampingLink> = []
+        /// Initiator links (and their key searches) opened with `.openOwnedLink`, by element id. Their
+        /// establishment and failure are reported only as `ownedLinkEstablished` / `ownedLinkFailed`,
+        /// so a consumer that opens plain links never mistakes one for its own. Removed when the link
+        /// closes or fails.
+        public var linkOwners: [UUID: LinkOwner] = [:]
         public init(links: IdentifiedArrayOf<LinkSession.State> = [],
                     registrations: [Data: RequestRegistration] = [:],
                     maxResponderLinks: Int? = 256,
@@ -120,6 +125,16 @@ public struct LinkPlane {
         public let linkCost: Double
         let ed25519PrivateKey: Data
         public let ed25519PublicKey: Data
+    }
+
+    /// Who opened a link that is not the host's ordinary (client) link. Reference keeps such links
+    /// apart by being separate `RNS.Link` objects with their own callbacks; here the owner tag routes
+    /// their establishment and failure to the owner only.
+    public struct LinkOwner: Hashable, Sendable {
+        public let name: String
+        public init(_ name: String) { self.name = name }
+        /// `LXMFServiceNode`'s outbound propagation-node sync links.
+        public static let propagationPeerSync = LinkOwner("lxmf.propagation.peer-sync")
     }
 
     /// The highest announced link cost we will search for. Above it, `openLink` fails the link at once
@@ -149,6 +164,13 @@ public struct LinkPlane {
                       interfaceID: InterfaceID, relayNextHop: Data?,
                       establishmentTimeout: TimeInterval = LinkTiming.defaultEstablishmentTimeout,
                       linkCost: Double? = nil)
+        /// `.openLink` for `owner`: the same link, but its establishment and every failure before it
+        /// are reported only as `ownedLinkEstablished` / `ownedLinkFailed`, and
+        /// `abandonStampSearches` never touches its key search.
+        case openOwnedLink(owner: LinkOwner, initiatorTo: Identity, destinationHash: Data,
+                           interfaceID: InterfaceID, relayNextHop: Data?,
+                           establishmentTimeout: TimeInterval = LinkTiming.defaultEstablishmentTimeout,
+                           linkCost: Double? = nil)
         /// A search for `stampingLinks[id]` found an X25519 key meeting the cost.
         case stampedKeyFound(id: UUID, x25519PrivateKey: Data, x25519PublicKey: Data)
         /// A search for `stampingLinks[id]` ran out `NetworkStamp.linkStampTimeout`.
@@ -161,9 +183,8 @@ public struct LinkPlane {
         /// The host sends this when it has given up on that destination's link, so nobody is waiting
         /// for the outcome. A link already minted (its search done, or none needed) is not touched.
         ///
-        /// It drops EVERY search to the destination, whoever opened it: one a host opened for some
-        /// other purpose would end without a `linkFailed` too. `LXMFNode`, the only sender, opens links
-        /// only for its router.
+        /// It drops only the plain (`.openLink`) searches: an owned link's search is its owner's, and
+        /// the owner must hear how it ends (`ownedLinkFailed`), so it is never abandoned here.
         case abandonStampSearches(destinationHash: Data)
         /// Create a responder link for an inbound LINKREQUEST and accept it. `arrivalBitrate` is
         /// the bitrate of the interface the request arrived on (`nil` = unknown → 15 s); it sets the
@@ -203,6 +224,13 @@ public struct LinkPlane {
             case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
             case linkClosed(linkID: Data, reason: LinkSession.CloseReason)
             case linkFailed(destinationHash: Data, reason: LinkFailure)
+            /// `linkEstablished` / `linkFailed` for a link opened with `.openOwnedLink`, in place of
+            /// them. Everything after establishment (`linkClosed`, data, requests, resources) is
+            /// reported as for any link, keyed by its link id.
+            case ownedLinkEstablished(owner: LinkOwner, linkID: Data, destinationHash: Data)
+            case ownedLinkFailed(owner: LinkOwner, destinationHash: Data, reason: LinkFailure)
+            /// A request went out on `linkID` under `requestID` (see `LinkSession`'s `requestSent`).
+            case requestSent(linkID: Data, requestID: Data, path: String)
             case resourceReceived(linkID: Data, data: Data)
             case resourceConcluded(linkID: Data, resourceHash: Data)
             case resourceFailed(linkID: Data, resourceHash: Data, rejected: Bool)
@@ -242,13 +270,23 @@ public struct LinkPlane {
         for pending in searches { state.stampingLinks.remove(id: pending.id) }
         return .merge(searches.map { pending in
             .merge(.cancel(id: CancelID.stampSearch(pending.id)),
-                   .send(.delegate(.linkFailed(destinationHash: pending.destinationHash, reason: .pathStale))))
+                   Self.failed(&state, id: pending.id, pending.destinationHash, .pathStale))
         })
     }
 
-    /// The `.stampFailure` outcome for a link to `destinationHash`: nothing was sent.
-    private static func stampFailed(_ destinationHash: Data) -> Effect<Action> {
-        .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: .stampFailure)))
+    /// The `.stampFailure` outcome for link `id` to `destinationHash`: nothing was sent.
+    private static func stampFailed(_ state: inout State, id: UUID, _ destinationHash: Data) -> Effect<Action> {
+        failed(&state, id: id, destinationHash, .stampFailure)
+    }
+
+    /// A link that will never establish: `ownedLinkFailed` to its owner (whose tag it drops), or the
+    /// plain `linkFailed`.
+    private static func failed(_ state: inout State, id: UUID, _ destinationHash: Data,
+                               _ reason: LinkFailure) -> Effect<Action> {
+        if let owner = state.linkOwners.removeValue(forKey: id) {
+            return .send(.delegate(.ownedLinkFailed(owner: owner, destinationHash: destinationHash, reason: reason)))
+        }
+        return .send(.delegate(.linkFailed(destinationHash: destinationHash, reason: reason)))
     }
 
     /// An initiator link session. Without `ephemeral` it gets an ordinary random key.
@@ -281,7 +319,61 @@ public struct LinkPlane {
         Reduce { state, action in
             switch action {
             case let .openLink(identity, destinationHash, interfaceID, relayNextHop, establishmentTimeout, linkCost):
+                return open(&state, owner: nil, identity, destinationHash, interfaceID, relayNextHop,
+                            establishmentTimeout, linkCost)
+
+            case let .openOwnedLink(owner, identity, destinationHash, interfaceID, relayNextHop,
+                                    establishmentTimeout, linkCost):
+                return open(&state, owner: owner, identity, destinationHash, interfaceID, relayNextHop,
+                            establishmentTimeout, linkCost)
+
+            case let .stampedKeyFound(id, x25519PrivateKey, x25519PublicKey):
+                guard let pending = state.stampingLinks.remove(id: id) else { return .none }
+                // Reference re-derives the key and aborts on a mismatch (Link.py:373-376). The
+                // ephemeral identity is X25519 private ‖ Ed25519 private, the same layout as any
+                // `Identity`, so `LinkSession` sends its public half as the LINKREQUEST payload.
+                guard let ephemeral = Identity(privateKey: x25519PrivateKey + pending.ed25519PrivateKey),
+                      ephemeral.publicKey == x25519PublicKey + pending.ed25519PublicKey
+                else { return Self.stampFailed(&state, id: id, pending.destinationHash) }
+                state.links.append(Self.initiatorLink(id: id, to: pending.destinationIdentity,
+                                                      destinationHash: pending.destinationHash,
+                                                      interfaceID: pending.interfaceID,
+                                                      ephemeral: ephemeral,
+                                                      establishmentTimeout: pending.establishmentTimeout,
+                                                      relayNextHop: pending.relayNextHop))
+                // `.establish` arms the establishment timer, so it starts now, after the search.
+                return .send(.link(.element(id: id, action: .establish)))
+
+            case let .stampSearchTimedOut(id):
+                guard let pending = state.stampingLinks.remove(id: id) else { return .none }
+                return Self.stampFailed(&state, id: id, pending.destinationHash)
+
+            case .cancelStampSearches:
+                return failStampSearches(state.stampingLinks, from: &state)
+
+            case let .abandonStampSearches(destinationHash):
+                // Silent: no `linkFailed`. The host has already moved on. Plain searches only: an
+                // owned link's owner is still waiting for its outcome.
+                let abandoned = state.stampingLinks.filter {
+                    $0.destinationHash == destinationHash && state.linkOwners[$0.id] == nil
+                }
+                for pending in abandoned { state.stampingLinks.remove(id: pending.id) }
+                return .merge(abandoned.map { .cancel(id: CancelID.stampSearch($0.id)) })
+
+            default:
+                return coreRest(&state, action)
+            }
+        }
+        .forEach(\.links, action: \.link) { LinkSession() }
+    }
+
+    /// Opens an initiator link (after a key search when the destination announced a link cost),
+    /// tagged with `owner` when one is given.
+    private func open(_ state: inout State, owner: LinkOwner?, _ identity: Identity, _ destinationHash: Data,
+                      _ interfaceID: InterfaceID, _ relayNextHop: Data?, _ establishmentTimeout: TimeInterval,
+                      _ linkCost: Double?) -> Effect<Action> {
                 let newID = uuid()
+                if let owner { state.linkOwners[newID] = owner }
                 // Reference stamps when `stamp_cost` is truthy (Link.py:313): no cost, or zero, means an
                 // ordinary random key and no search. A negative or NaN cost is met by any key, so it
                 // gets the same. STAMP_LRS is on by default in 1.6.0 and ALWAYS_STAMP_LRS off, so we
@@ -294,7 +386,7 @@ public struct LinkPlane {
                                                           relayNextHop: relayNextHop))
                     return .send(.link(.element(id: newID, action: .establish)))
                 }
-                guard cost <= Self.maxLinkStampCost else { return Self.stampFailed(destinationHash) }
+                guard cost <= Self.maxLinkStampCost else { return Self.stampFailed(&state, id: newID, destinationHash) }
                 // Link.py:355-361: a fresh Ed25519 key first, because the stamp material is
                 // `destinationHash + ed25519Public`; then search X25519 keys against it.
                 let signing = Curve25519.Signing.PrivateKey()
@@ -336,37 +428,11 @@ public struct LinkPlane {
                     }
                 }
                 .cancellable(id: CancelID.stampSearch(newID))
+    }
 
-            case let .stampedKeyFound(id, x25519PrivateKey, x25519PublicKey):
-                guard let pending = state.stampingLinks.remove(id: id) else { return .none }
-                // Reference re-derives the key and aborts on a mismatch (Link.py:373-376). The
-                // ephemeral identity is X25519 private ‖ Ed25519 private, the same layout as any
-                // `Identity`, so `LinkSession` sends its public half as the LINKREQUEST payload.
-                guard let ephemeral = Identity(privateKey: x25519PrivateKey + pending.ed25519PrivateKey),
-                      ephemeral.publicKey == x25519PublicKey + pending.ed25519PublicKey
-                else { return Self.stampFailed(pending.destinationHash) }
-                state.links.append(Self.initiatorLink(id: id, to: pending.destinationIdentity,
-                                                      destinationHash: pending.destinationHash,
-                                                      interfaceID: pending.interfaceID,
-                                                      ephemeral: ephemeral,
-                                                      establishmentTimeout: pending.establishmentTimeout,
-                                                      relayNextHop: pending.relayNextHop))
-                // `.establish` arms the establishment timer, so it starts now, after the search.
-                return .send(.link(.element(id: id, action: .establish)))
-
-            case let .stampSearchTimedOut(id):
-                guard let pending = state.stampingLinks.remove(id: id) else { return .none }
-                return Self.stampFailed(pending.destinationHash)
-
-            case .cancelStampSearches:
-                return failStampSearches(state.stampingLinks, from: &state)
-
-            case let .abandonStampSearches(destinationHash):
-                // Silent: no `linkFailed`. The host has already moved on.
-                let abandoned = state.stampingLinks.filter { $0.destinationHash == destinationHash }
-                for pending in abandoned { state.stampingLinks.remove(id: pending.id) }
-                return .merge(abandoned.map { .cancel(id: CancelID.stampSearch($0.id)) })
-
+    /// Every action but opening links and their key searches.
+    private func coreRest(_ state: inout State, _ action: Action) -> Effect<Action> {
+            switch action {
             case let .acceptLinkRequest(owner, destinationHash, interfaceID, data, arrivalBitrate):
                 // A responder cannot sign the LRPROOF without a private key: `Link.buildProof` →
                 // `Identity.sign` `preconditionFailure`s (the only one in `Sources`). The endpoints
@@ -532,6 +598,11 @@ public struct LinkPlane {
 
             case let .link(.element(elementID, .delegate(.established(linkID, _)))):
                 guard let promoted = state.links[id: elementID] else { return .none }
+                if let owner = state.linkOwners[elementID] {
+                    // An owned link is an initiator link: nothing below (responder eviction) applies.
+                    return .send(.delegate(.ownedLinkEstablished(owner: owner, linkID: linkID,
+                                                                 destinationHash: promoted.destinationHash)))
+                }
                 let established = Effect<Action>
                     .send(.delegate(.linkEstablished(linkID: linkID, destinationHash: promoted.destinationHash)))
                 // EVICT HERE, NOT AT THE REQUEST. This action is emitted only after a handshake
@@ -594,6 +665,7 @@ public struct LinkPlane {
             case let .link(.element(elementID, .delegate(.closed(reason)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
                 state.links.remove(id: elementID)
+                state.linkOwners[elementID] = nil
                 return .merge(.send(.delegate(.linkClosed(linkID: linkID, reason: reason))),
                               .send(.delegate(.localLinkClosed(linkID: linkID))))
 
@@ -607,7 +679,7 @@ public struct LinkPlane {
                 // it would tell the delivery layer that a peer it never contacted is unreachable.
                 // Still remove the element either way — that is the leak-prevention half, and it must
                 // not become conditional on role.
-                guard session.role == .initiator else { return unregister }
+                guard session.role == .initiator else { state.linkOwners[elementID] = nil; return unregister }
                 // Exhaustive switch, deliberately not a ternary: a new EstablishmentFailure case must
                 // be a COMPILE error here, not a silent default into `.handshakeRejected` — that is
                 // the one PEER-shaped reason, and the only one the delivery layer does NOT answer
@@ -617,7 +689,7 @@ public struct LinkPlane {
                 case .timedOut:          reason = .establishmentTimedOut
                 case .handshakeRejected: reason = .handshakeRejected
                 }
-                return .merge(unregister, .send(.delegate(.linkFailed(destinationHash: session.destinationHash, reason: reason))))
+                return .merge(unregister, Self.failed(&state, id: elementID, session.destinationHash, reason))
 
             case let .link(.element(elementID, .delegate(.resourceReceived(data)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
@@ -656,6 +728,10 @@ public struct LinkPlane {
                         await send(.sendResponseOverLink(linkID: linkID, requestID: rid, data: response))
                     }
                 }
+
+            case let .link(.element(elementID, .delegate(.requestSent(rid, path)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.requestSent(linkID: linkID, requestID: rid, path: path)))
 
             case let .link(.element(elementID, .delegate(.responseReceived(rid, data)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
@@ -706,10 +782,9 @@ public struct LinkPlane {
             case let .link(.element(_, .delegate(.linkIDAssigned(linkID)))):
                 return .send(.delegate(.localLinkOpened(linkID: linkID)))
 
-            case .link, .delegate:
+            case .link, .delegate, .openLink, .openOwnedLink, .stampedKeyFound, .stampSearchTimedOut,
+                 .cancelStampSearches, .abandonStampSearches:
                 return .none
             }
-        }
-        .forEach(\.links, action: \.link) { LinkSession() }
     }
 }

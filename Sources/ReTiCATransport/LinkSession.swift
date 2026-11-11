@@ -240,6 +240,10 @@ public struct LinkSession {
             case resourceProgress(hash: Data, role: ResourceTransfer.Role, bytesDone: Int,
                                   bytesTotal: Int, segment: Int, segments: Int)
             case identified(Identity)
+            /// A request went out under `requestID` (RNS `RequestReceipt.request_id`): what its
+            /// `responseReceived` / `requestFailed` will carry, so the sender can route the answer to
+            /// the request it asked rather than to whatever else waits on the link.
+            case requestSent(requestID: Data, path: String)
             case responseReceived(requestID: Data, data: Data)
             case requestFailed(requestID: Data)
             case requestReceived(requestID: Data, pathHash: Data, data: Data)
@@ -900,7 +904,8 @@ public struct LinkSession {
                     guard let raw = try? packet.packed() else { return .none }
                     state.pendingRequests.insert(requestID)
                     return .merge(
-                        .send(.delegate(.transmit(ifID, raw))),
+                        .concatenate(.send(.delegate(.requestSent(requestID: requestID, path: path))),
+                                     .send(.delegate(.transmit(ifID, raw)))),
                         .run { send in
                             try await clock.sleep(for: .seconds(timeout)); await send(.requestDeadline(requestID))
                         }.cancellable(id: CancelID.request(requestID), cancelInFlight: true))
@@ -918,7 +923,8 @@ public struct LinkSession {
                         sdu: Self.resourceSDU, requestID: requestID, isResponse: false,
                         rtt: .seconds(state.rtt ?? 1), id: newID))
                     return .merge(
-                        .send(.transfer(.element(id: newID, action: .advertise))),
+                        .concatenate(.send(.delegate(.requestSent(requestID: requestID, path: path))),
+                                     .send(.transfer(.element(id: newID, action: .advertise)))),
                         .run { send in
                             try await clock.sleep(for: .seconds(timeout)); await send(.requestDeadline(requestID))
                         }.cancellable(id: CancelID.request(requestID), cancelInFlight: true))
