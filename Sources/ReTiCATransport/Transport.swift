@@ -1503,6 +1503,18 @@ public struct Transport {
                                                               hops: packet.hops,
                                                               isPathResponse: packet.context == .pathResponse,
                                                               appData: parsed.appData)))))
+                    } else if packet.context == .pathResponse, state.pathRequests[packet.destinationHash] != nil,
+                              let held = state.learned[packet.destinationHash] {
+                        // An answer to OUR path request that does not improve the route we hold:
+                        // typically a hub replaying its cached copy of the very announce the held
+                        // route came from (same emission time, same hops), e.g. after a relaunch
+                        // restored that route. The route stays as it is, but the request has been
+                        // answered: a path exists. Report it, or the asker (LXMFRouter, parked in
+                        // `.awaitingPath`) waits for an announce that may not come for hours and
+                        // spends its establishment budget. No `.announceReceived`: nothing new was
+                        // adopted. Only fresh blobs reach here; a replay was dropped above.
+                        effects.append(.send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
+                                                                    hops: held.hops))))
                     }
                     // Relay mode: instead of re-broadcasting now, HOLD this fresh announce and
                     // re-broadcast it once after a jittered delay in [0, PATHFINDER_RW) — RNS

@@ -1277,6 +1277,22 @@ public struct LXMFNode {
                                                                  identity: state.identity))),
                               deliver)
 
+            case let .endpoint(.transport(.rehydrateLearnedDestinations(destinations))):
+                // The router's `knownPaths` is otherwise fed only by a live `.pathLearned`, which a
+                // restore does not emit. Without this, the first send to every contact after a
+                // relaunch parks in `.awaitingPath` though Transport holds a valid route, and the
+                // usual answer to its path request (a hub's cached copy of the same announce) does
+                // not beat that route, so only the peer's next announce would release it.
+                //
+                // Transport's Scope has run: read what it actually kept (it sweeps expired and
+                // future-dated rows), not the payload. Every aspect, as live `.pathLearned` does.
+                // One pass of plain inserts, not a send per row (a 24,603-row table once overflowed
+                // the stack through chained sends at launch).
+                for hash in destinations.keys where state.endpoint.transport.learned[hash] != nil {
+                    state.router.knownPaths.insert(hash)
+                }
+                return .none
+
             case let .endpoint(.delegate(.pathLearned(h, _))):
                 // Synchronous, before the router sees anything for `h` (Transport already holds the
                 // new path: its Scope ran first).
