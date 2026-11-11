@@ -135,7 +135,8 @@ let package = Package(
             ],
             resources: [.process("Vectors/stamped_announce_packet_fixtures.json"),
                         .process("Vectors/lxmf_sync_state_fixtures.json"),
-                        .process("Vectors/lxmf_pn_upload_signal_fixtures.json")]
+                        .process("Vectors/lxmf_pn_upload_signal_fixtures.json"),
+                        .process("Vectors/lxmf_peer_state_fixtures.json")]
         ),
         // Shared per-device identity storage (Keychain access group). Depends only on the
         // dependency-free core so any app can adopt it without pulling in TCA or transports.

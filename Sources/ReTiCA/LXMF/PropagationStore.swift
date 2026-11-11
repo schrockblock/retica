@@ -277,13 +277,19 @@ public struct PropagationStore: Equatable {
     ///   offered and counted. nil limit = no limit (reference's `!= None` tests).
     ///
     /// A limit whose `* 1000` overflows Int saturates (a huge limit is no limit) instead of trapping.
+    ///
+    /// `candidates`, when given, is the peer's explicit unhandled set (`PNPeerTable.Peer.unhandled`,
+    /// reference's per-peer list): only stored entries in it are considered, and ids in it that the
+    /// store no longer holds are simply absent (reference drops those as purged, LXMPeer.py:353-357).
+    /// nil considers every stored entry, which is `PNNode`'s whole-store-minus-handled behaviour.
     public func offerCandidates(acceptedAt minimum: Double, transferLimitKB: Int?, syncLimitKB: Int?,
+                                among candidates: Set<Data>? = nil,
                                 excluding handled: Set<Data>,
                                 now: Date) -> (offer: [Data], oversized: [Data], lowValue: [Data]) {
         var lowValue: [Data] = []
         var weighted: [(entry: Entry, weight: Double)] = []
         for entry in stored.values.sorted(by: { $0.sequence < $1.sequence })
-        where !handled.contains(entry.transientId) {
+        where !handled.contains(entry.transientId) && candidates?.contains(entry.transientId) ?? true {
             if (entry.stampValue ?? 0) < minimum { lowValue.append(entry.transientId); continue }
             weighted.append((entry, Self.offerWeight(entry, now: now)))
         }

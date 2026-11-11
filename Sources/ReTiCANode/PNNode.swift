@@ -307,16 +307,18 @@ public struct PNNode {
                 state.offerLinks[linkID] = nil
                 let peer = state.offerLinkPeers[linkID]
                 let wanted: [Data]
-                switch MsgPack.decodeValue(data) {
-                case .bool(false):      wanted = []                          // peer has all → nothing
-                case .bool(true):       wanted = offeredIds                  // peer wants all offered
-                case let .array(items):
+                // The parser `PNPeerTable` shares. PNNode answers only the three wanted forms; the
+                // error codes and anything malformed end the exchange, as before.
+                switch PNPeerTable.OfferResponse.parse(data, offered: offeredIds) {
+                case .wantsNone:        wanted = []                          // peer has all → nothing
+                case .wantsAll:         wanted = offeredIds                  // peer wants all offered
+                case let .wants(ids):
                     // Only ids we offered, which were filtered to what the peer accepts. Narrower than
                     // reference, which sends any id in the response that its store holds, offered or
                     // not (LXMPeer.py:455-457), and raises on one it does not hold.
-                    let offered = Set(offeredIds)
-                    wanted = items.compactMap { if case let .bin(d) = $0, offered.contains(d) { return d } else { return nil } }
-                default:                return .none                         // malformed
+                    wanted = ids
+                case .noIdentity, .noAccess, .throttled, .other:
+                    return .none
                 }
                 // The offered ids the peer did not want it already has (from another peer): handled,
                 // never offered to it again (`False`, LXMPeer.py:432-437; a list, :448-453).

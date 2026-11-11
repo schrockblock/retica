@@ -13,7 +13,7 @@ import Foundation
 /// including negatives, NaN and infinities, because reference's validity test does (`float()` of each).
 /// Every consumer gates the value it uses: `LXMFNode.propagationStampCost` (client),
 /// `LXMFPropagation.peeringCostAcceptable` (peering).
-public struct PNAnnounce: Equatable {
+public struct PNAnnounce: Equatable, Sendable {
     public var timebase: Int
     public var nodeState: Bool
     public var perTransferLimit: Int
