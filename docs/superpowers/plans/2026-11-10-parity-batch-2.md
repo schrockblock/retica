@@ -371,4 +371,67 @@ The hub half matters only for `TCPServerEndpoint` in relay mode. It is about M-L
 
 ## Status
 
-(Fill in on completion: commits, rulings that changed, live checks run or skipped, and the `tunnel-hub` and admission-control follow-ups.)
+**DONE 2026-11-11.** All nine tasks plus the final fix wave landed. Library merged to main as 7ba42e8. App commits on ReTiCAMsgr main: 2f100a1, da84883, 09cc2b7, 8c41a37, 94ee5d8, 5f7e689. Nothing pushed.
+
+**Library commits:**
+- T1 5f6244d, 677119e
+- T2 d5eaf96, bbf9391
+- T4 d68a486, ff1e94d
+- T5 2147760
+- T6 8a3a8bf, b660f4f, 9205c2d
+- T8 4df0bd2
+- T9 f09a475
+- Final fixes (on branch batch2/finish): 65bb42c, 3f72cca, e6ac49d, ef78d4b
+- Side fix: ce54fef (AutoInterface test 17)
+
+f09a475 also carries part of another session's revert in Transport.swift. fb96b76 records this; the commit is not bisect-clean, and main was not rewritten.
+
+**Rulings that changed the plan:**
+- **T6, link ownership.** Peer-sync links belong to the service node. They never enter the router's bookkeeping or idle timer. Responses are matched by request ID. A 720 s stall bound applies (RNS `Link.STALE_TIME`).
+- **T6, rehydrate.** `.rehydrateStore` and `.rehydratePeers` became one action, `.rehydrate(entries:peers:)`, so the order can't be wrong.
+- **T7.** The app gates node mode on the launch rehydrate. Peering config is seeded from stored settings in `onLaunch`. After a failed launch read, peer writes are upsert-only.
+- **9c'.** The tunnel interface hash is `full_hash("TCPInterface[<interfaceID.rawValue>]")`, one per node entry, not one per profile name.
+- **Final fixes:**
+  - `OfferResponse.parse` drops duplicate IDs. This deliberately diverges from LXMPeer.py:455-457.
+  - The 24 s job starts only when node mode goes from off to on.
+  - Propagated messages addressed to us are delivered locally, not stored (as LXMRouter.py:2852-2866). A replay of an already-delivered entry costs no stamp work: a 1024-hash ring plus a preflight ID check.
+  - One re-identify per link.
+  - One peering-key search at a time.
+  - A flat 12-minute backoff after a failed or stalled transfer.
+
+**Live checks run:**
+- auth-required lxmd sync (T1)
+- lxmd 1.3.0 peering both ways (T6, and again after the T6 fix)
+- real rnsd files our tunnel (T9 and final). The fast-fail on a held port was checked too.
+
+**Not verified:**
+- that a phone becomes reachable sooner through tunnel restore;
+- any of this on a device.
+
+**Known flakes under load:** each passed alone.
+- stamp-search timing tests
+- `anAbandonedSearchReportsNothingAndStops`
+- `nonImprovingFreshAnnounceIsStillRebroadcast`
+- photo-fallback stamp tests
+- `aMessageToSomeoneOutOfReach…`
+
+**Parked minors:**
+- T3: a nil lastResult renders "0 new messages".
+- T4: a stale linkEstablished after unpeering then re-peering; `noAccess` reads `unpeer(...).isEmpty`.
+- T5: a differently-but-validly stamped duplicate is not marked handled.
+- T6: the M3 key-search cancel is untested; the owned no-path failure is unreachable.
+- T7: the Settings toggle is ungated in the sub-second launch window.
+- T8: no positive control for the PN-stamp validator.
+- T9: a keychain read failure is never retried.
+- Final review:
+  - `peersChanged` rewrites the whole table;
+  - a stall timer can outlive its link (no-op);
+  - rehydrate resets receive times;
+  - a crash between DB writes;
+  - a cost-flipping peer can hold the single key-search slot (no search time bound);
+  - an undecryptable own entry is marked downloaded.
+
+**Follow-ups:**
+- **`tunnel-hub` plan:** the hub half, for `TCPServerEndpoint` in relay mode, with the tunnel table, path capture, restore, culling and persistence. It should decide whether ReTiCA persists tunnels at all.
+- **Admission control (5a gap list):** include "teardown + throttle on invalid stamp in a sync resource".
+- **PNNode:** a test harness and deprecation candidate. It advertises cost 0, so lxmd peers with it but never offers to it.
