@@ -140,6 +140,17 @@ public enum LXMFPropagation {
     /// `umsgpack.packb(0xf0)` → `CC F0` (uint8), which `MsgPack.encode(.uint(240))` reproduces.
     public static let errorNoIdentity: UInt64 = 0xF0
 
+    /// `LXMPeer.ERROR_NO_ACCESS` (lxmf 1.3.0 LXMPeer.py:25): an auth-required node refusing an
+    /// identity not in its allowed list. A WIRE error, not a client state: the same byte 0xF1 is
+    /// `PR_LINK_FAILED` in `LXMRouter.PropagationTransferState`; this one maps to `.noAccess` (0xF4).
+    public static let errorNoAccess: UInt64 = 0xF1
+    /// `LXMPeer.ERROR_INVALID_KEY` (lxmf 1.3.0 LXMPeer.py:26): an offer whose peering key is invalid.
+    public static let errorInvalidKey: UInt64 = 0xF3
+    /// `LXMPeer.ERROR_INVALID_DATA` (lxmf 1.3.0 LXMPeer.py:27).
+    public static let errorInvalidData: UInt64 = 0xF4
+    /// `LXMPeer.ERROR_THROTTLED` (lxmf 1.3.0 LXMPeer.py:29).
+    public static let errorThrottled: UInt64 = 0xF6
+
     /// `LXMPeer.ERROR_INVALID_STAMP` (lxmf 1.1.0 LXMPeer.py:28) — sent as a raw data packet (not a
     /// response) on the link when an inbound PACKET-framed propagation offer contains entries with
     /// invalid or absent PN stamps (LXMRouter.py:2258). After sending, the reference tears the link down

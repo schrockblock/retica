@@ -85,6 +85,17 @@ public struct LXMFRouter {
         var propagationQueue: [Data: [PropagationItem]] = [:]
         /// Set when a sync was requested but the PN link is not yet active; drained on `.linkEstablished`.
         var pendingDownloadFromPN: Bool = false
+        /// Where the propagation node sync stands, on reference's `PR_*` scale
+        /// (`LXMRouter.propagation_transfer_state`). Failure states are sticky until the next
+        /// `.syncFromPropagationNode`; see `PropagationTransferState`. Every change is reported as
+        /// `.delegate(.propagationTransferStateChanged)`.
+        public var propagationTransferState: PropagationTransferState = .idle
+        /// The number of messages the last completed sync downloaded (0 for an empty offer), as
+        /// reference's `propagation_transfer_last_result`. Cleared to nil whenever the sync's link
+        /// closes, as `acknowledge_sync_completion` does (LXMRouter.py:1875).
+        public var propagationTransferLastResult: Int? = nil
+        /// What `.propagationTransferStateChanged` last reported; the body reports when it differs.
+        var reportedTransfer = TransferReport(state: .idle, lastResult: nil)
         /// Client "have" set: transient_ids already downloaded from a PN. Drives the wants/haves split on
         /// the next offer (wants = offered we lack; haves = offered we have → PN purges). Unbounded for now.
         public var downloadedTransientIds: Set<Data> = []
@@ -134,8 +145,8 @@ public struct LXMFRouter {
         ///
         /// Queued copies are failed at the ceiling through `fail` (`deliveryFailed` unless the
         /// message's other copy is outstanding or already succeeded); a PN SYNC has no message
-        /// to fail, so it terminates silently — the flag is cleared but the app is not told. See the
-        /// give-up branch.
+        /// to fail: its flag is cleared and `propagationTransferState` becomes `noPath` (the park ran
+        /// out) or `linkFailed` (the establishment ceiling). See the give-up branch.
         ///
         /// Reset on `linkEstablished` — the one event that proves the destination is
         /// reachable again. Deliberately NOT reset on `learnedPath`; see that case for why a
@@ -238,6 +249,44 @@ public struct LXMFRouter {
     }
     public struct PropagationItem: Equatable { public var messageHash: Data; public var propagationPacked: Data }
 
+    /// Reference's client sync states, raw values verbatim from `LXMRouter.PR_*` (lxmf 1.3.0
+    /// LXMRouter.py:78-91). A CLIENT STATE space: 0xF0/0xF1 here are `noPath`/`linkFailed`, while
+    /// the same bytes on the wire are `ERROR_NO_IDENTITY`/`ERROR_NO_ACCESS` (`LXMFPropagation`).
+    ///
+    /// Transitions follow reference (LXMRouter.py:579-621, 1096-1106, 1683-1692, 1780-1883):
+    /// a sync request sets `pathRequested`, `linkEstablishing` or `requestSent`; an empty offer or a
+    /// download sets `complete`; `ERROR_NO_IDENTITY` / `ERROR_NO_ACCESS` set `noIdentityReceived` /
+    /// `noAccess`. When the sync's link closes: `complete` → `idle`; below `linkEstablished` →
+    /// `linkFailed`; from `linkEstablished` up to `complete` → `transferFailed`; anything above
+    /// `complete` is kept (sticky until the next sync request).
+    ///
+    /// ReTiCA retries link establishment (`establishAttempts`) where reference fails on the first
+    /// closed link, so `noPath` and `linkFailed` are set only where the router gives up: the park
+    /// ending at `.pathRequestDeadline` gives `noPath`, the establishment ceiling `linkFailed`.
+    /// `receiving` and `responseReceived` are declared but never entered: there is no response
+    /// progress for link requests. `failed` is reference's catch-all, also never entered.
+    public enum PropagationTransferState: UInt8, Equatable, Sendable {
+        case idle = 0x00
+        case pathRequested = 0x01
+        case linkEstablishing = 0x02
+        case linkEstablished = 0x03
+        case requestSent = 0x04
+        case receiving = 0x05
+        case responseReceived = 0x06
+        case complete = 0x07
+        case noPath = 0xF0
+        case linkFailed = 0xF1
+        case transferFailed = 0xF2
+        case noIdentityReceived = 0xF3
+        case noAccess = 0xF4
+        case failed = 0xFE
+    }
+
+    /// A propagation node's sync response that is not a usable answer, as `LXMFNode` classifies it.
+    /// `noIdentity`: `ERROR_NO_IDENTITY` (0xF0). `noAccess`: `ERROR_NO_ACCESS` (0xF1). `invalid`:
+    /// anything else that is not a list (another error code, nil, garbage).
+    public enum SyncError: Equatable, Sendable { case noIdentity, noAccess, invalid }
+
     public enum Action: Equatable {
         /// Restore dedup state from a previous session so a cold-start does not re-deliver messages
         /// the router already processed, and does not re-request transient IDs already downloaded
@@ -268,8 +317,13 @@ public struct LXMFRouter {
         case setOutboundPropagationNode(Data?)
         case sendViaPropagation(message: LXMessage, propagationPacked: Data)
         case syncFromPropagationNode
+        /// The PN's answer to the list request. An empty list completes the sync (last result 0).
         case offeredMessageList(transientIds: [Data])
+        /// The PN's answer to the wanted-messages request: completes the sync (last result `count`).
         case messagesDownloaded(transientIds: [Data])
+        /// The PN answered a sync request with an error or with something that is not a list. Tears
+        /// the sync link down; `noIdentity` / `noAccess` also set their (sticky) state.
+        case syncError(SyncError)
         case linkEstablished(destinationHash: Data, linkID: Data)
         case linkClosed(destinationHash: Data)
         case learnedPath(destinationHash: Data)
@@ -379,6 +433,9 @@ public struct LXMFRouter {
             /// A fallback-eligible message's delivery copy stalled: pack and hand over its propagated
             /// copy (`.sendViaPropagation`). Already marked pending. For `LXMFNode`, not the app.
             case propagationFallbackDue(messageHash: Data)
+            /// `State.propagationTransferState` or `propagationTransferLastResult` changed. Once per
+            /// change, with the new values.
+            case propagationTransferStateChanged(PropagationTransferState, lastResult: Int?)
         }
     }
 
@@ -388,8 +445,62 @@ public struct LXMFRouter {
     /// more than this many successes later could be reported failed; far beyond any retry saga.
     static let succeededMessageMemory = 1024
 
+    /// `transitions`, plus one `.propagationTransferStateChanged` whenever an action changed the sync
+    /// state or its last result — whichever case changed it.
     public var body: some ReducerOf<Self> {
+        transitions
+        Reduce { state, _ in
+            let current = TransferReport(state: state.propagationTransferState,
+                                         lastResult: state.propagationTransferLastResult)
+            guard current != state.reportedTransfer else { return .none }
+            state.reportedTransfer = current
+            return .send(.delegate(.propagationTransferStateChanged(current.state, lastResult: current.lastResult)))
+        }
+    }
+
+    /// The sync state and last result as last reported by `.propagationTransferStateChanged`.
+    struct TransferReport: Equatable {
+        var state: PropagationTransferState
+        var lastResult: Int?
+    }
+
+    var transitions: some ReducerOf<Self> {
         Reduce { [clock] state, action in
+            /// Reference `acknowledge_sync_completion` (LXMRouter.py:1874-1883): clear the last result,
+            /// and move to `failure` (or idle) only from a state up to `complete`. A state above
+            /// `complete` is a failure already reported, kept until the next sync request.
+            func acknowledgeSync(_ state: inout State, failure: PropagationTransferState?) {
+                state.propagationTransferLastResult = nil
+                if state.propagationTransferState.rawValue <= PropagationTransferState.complete.rawValue {
+                    state.propagationTransferState = failure ?? .idle
+                }
+            }
+            /// A sync waiting for its link reports how the link is coming: a path request or an
+            /// establishment. Unchanged when no link is under way (held).
+            func syncAwaitingLink(_ state: inout State, _ pn: Data) {
+                switch state.directLinks[pn] {
+                case .awaitingPath: state.propagationTransferState = .pathRequested
+                case .establishing: state.propagationTransferState = .linkEstablishing
+                case .active, nil: break
+                }
+            }
+            /// Reference `clean_links` on a closed outbound propagation link (LXMRouter.py:1096-1106).
+            /// One departure: from `idle` nothing changes. Reference would report `linkFailed` when a
+            /// link it opened only to SEND propagated messages closes with no sync ever run; here the
+            /// PN link also carries those sends, and its routine idle close is not a sync failure.
+            func syncLinkClosed(_ state: inout State) {
+                let current = state.propagationTransferState
+                guard current != .idle else { return }
+                if current == .complete {
+                    acknowledgeSync(&state, failure: nil)
+                } else if current.rawValue < PropagationTransferState.linkEstablished.rawValue {
+                    acknowledgeSync(&state, failure: .linkFailed)
+                } else if current.rawValue < PropagationTransferState.complete.rawValue {
+                    acknowledgeSync(&state, failure: .transferFailed)
+                } else {
+                    acknowledgeSync(&state, failure: nil)
+                }
+            }
             func retryTimer(_ key: DeliveryKey, _ seconds: Int) -> Effect<Action> {
                 .run { send in
                     try await clock.sleep(for: .seconds(seconds))
@@ -616,7 +727,10 @@ public struct LXMFRouter {
             /// forget the path, and clear all establishment state. Both call sites (the `establish`
             /// ceiling and `.pathRequestDeadline`) must terminate identically — extract here rather
             /// than duplicate.
-            func giveUp(_ state: inout State, _ dest: Data) -> Effect<Action> {
+            ///
+            /// `syncFailure` is the state an outstanding sync to this destination ends in: `noPath`
+            /// when the path-request park ran out, `linkFailed` at the establishment ceiling.
+            func giveUp(_ state: inout State, _ dest: Data, syncFailure: PropagationTransferState) -> Effect<Action> {
                 state.establishAttempts[dest] = nil
                 state.knownPaths.remove(dest)
                 let orphaned = clearDirectLink(&state, dest)
@@ -631,7 +745,10 @@ public struct LXMFRouter {
                 // so every later `linkClosed(pn)` re-enters establish, and (b) let an unrelated
                 // future PN link resurrect the abandoned sync with a surprise `requestMessageList`.
                 // Guarded on the PN: an unrelated destination giving up says nothing about the sync.
-                if dest == state.outboundPropagationNode { state.pendingDownloadFromPN = false }
+                if dest == state.outboundPropagationNode {
+                    if state.pendingDownloadFromPN { acknowledgeSync(&state, failure: syncFailure) }
+                    state.pendingDownloadFromPN = false
+                }
                 var effects: [Effect<Action>] = [orphaned, .cancel(id: CancelID.pathRequest(dest))]
                 // `fail` hands off a fallback-eligible copy whose earlier trigger never fired.
                 for message in queued { effects.append(fail(&state, .delivery(message.hash))) }
@@ -689,7 +806,7 @@ public struct LXMFRouter {
                         // Give up on this destination: fail everything queued for it, and forget the
                         // path — our belief that we know a usable route has been empirically falsified,
                         // so the NEXT send should request a fresh one rather than retry links.
-                        return giveUp(&state, dest)
+                        return giveUp(&state, dest, syncFailure: .linkFailed)
                     }
                     state.establishAttempts[dest] = attempts
                     let wasAwaitingPath = state.directLinks[dest] == .awaitingPath
@@ -715,6 +832,17 @@ public struct LXMFRouter {
             /// `knownPaths` was cleared before this runs, which decides which branch `establish`
             /// takes.
             func closed(_ state: inout State, _ dest: Data) -> Effect<Action> {
+                // The sync's state on its link closing. A sync still waiting for a link (it never
+                // got one) re-establishes below and reports how; `giveUp` ends it at the ceiling.
+                // Otherwise the link the sync ran on is gone: reference `clean_links`.
+                let isPN = dest == state.outboundPropagationNode
+                let syncWasWaiting = isPN && state.pendingDownloadFromPN
+                defer {
+                    if isPN {
+                        if state.pendingDownloadFromPN { syncAwaitingLink(&state, dest) }
+                        else if !syncWasWaiting { syncLinkClosed(&state) }
+                    }
+                }
                 let orphaned = clearDirectLink(&state, dest)
                 if state.hasLinkWork(for: dest) {
                     return .merge(orphaned, establish(&state, dest))
@@ -897,17 +1025,31 @@ public struct LXMFRouter {
 
             case .syncFromPropagationNode:
                 guard let pn = state.outboundPropagationNode else { return .none }
+                // A new request overwrites any state, a sticky failure included
+                // (`request_messages_from_propagation_node`, LXMRouter.py:588-616).
                 if case let .active(linkID) = state.directLinks[pn] {
+                    state.propagationTransferState = .requestSent
                     return .send(.delegate(.requestMessageList(linkID: linkID)))
                 }
                 state.pendingDownloadFromPN = true
                 if state.directLinks[pn] == nil {
-                    return establish(&state, pn)
+                    // Set before `establish`, which may give up at once (a spent budget): the give-up
+                    // must then see a state it can fail, not a sticky failure from the last sync.
+                    state.propagationTransferState = state.knownPaths.contains(pn) ? .linkEstablishing : .pathRequested
+                    let effect = establish(&state, pn)
+                    if state.pendingDownloadFromPN { syncAwaitingLink(&state, pn) }
+                    return effect
                 }
+                syncAwaitingLink(&state, pn)
                 return .none
 
             case let .offeredMessageList(offered):
-                guard !offered.isEmpty else { return .none }            // empty offer → nothing to fetch
+                guard !offered.isEmpty else {
+                    // Empty offer: nothing to fetch, the sync is complete (LXMRouter.py:1815-1818).
+                    state.propagationTransferState = .complete
+                    state.propagationTransferLastResult = 0
+                    return .none
+                }
                 let wants = offered.filter { !state.downloadedTransientIds.contains($0) }
                 let haves = offered.filter { state.downloadedTransientIds.contains($0) }
                 guard let pn = state.outboundPropagationNode,
@@ -916,7 +1058,23 @@ public struct LXMFRouter {
 
             case let .messagesDownloaded(transientIds):
                 state.downloadedTransientIds.formUnion(transientIds)
+                // LXMRouter.py:1858-1861. The purge request `LXMFNode` sends next does not change it:
+                // the link dropping before the purge lands goes from here to idle, not to a failure.
+                state.propagationTransferState = .complete
+                state.propagationTransferLastResult = transientIds.count
                 return .none
+
+            case let .syncError(error):
+                // LXMRouter.py:1781-1791, 1820-1823, 1826-1836: tear the link down; the two PN error
+                // codes also set their state, which the close that follows keeps (it is above
+                // `complete`). Anything else leaves the state, so the close reports `transferFailed`.
+                switch error {
+                case .noIdentity: state.propagationTransferState = .noIdentityReceived
+                case .noAccess: state.propagationTransferState = .noAccess
+                case .invalid: break
+                }
+                guard let pn = state.outboundPropagationNode, case .active = state.directLinks[pn] else { return .none }
+                return .send(.delegate(.closeLink(destinationHash: pn)))
 
             case let .linkEstablished(dest, linkID):
                 // Defensive (unreachable through `establish` today, which only runs with no active
@@ -969,6 +1127,7 @@ public struct LXMFRouter {
                 effects.append(idleTimer(dest, linkID))
                 if dest == state.outboundPropagationNode, state.pendingDownloadFromPN {
                     state.pendingDownloadFromPN = false
+                    state.propagationTransferState = .requestSent
                     effects.append(.send(.delegate(.requestMessageList(linkID: linkID))))
                 }
                 effects.append(cancelPathTimer)
@@ -1219,7 +1378,7 @@ public struct LXMFRouter {
                 guard !state.held else { return pathRequestTimer(dest) }
                 let attempts = (state.establishAttempts[dest] ?? 0) + 1
                 if attempts > LXMFDelivery.maxAttempts {
-                    return giveUp(&state, dest)
+                    return giveUp(&state, dest, syncFailure: .noPath)
                 }
                 state.establishAttempts[dest] = attempts
                 return .merge(startFallbackForQueued(&state, dest, attempts: attempts),

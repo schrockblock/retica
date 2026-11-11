@@ -487,6 +487,19 @@ public struct LXMFNode {
             /// A message carrying a ticket we issued to `destinationHash` was confirmed delivered at
             /// `at`, now in `State.lastTicketDeliveries`. Persist it.
             case ticketDelivered(destinationHash: Data, at: Date)
+            /// The propagation node sync changed state (`LXMFRouter.State.propagationTransferState`,
+            /// reference's `PR_*` scale) or its last result. Reported once per change.
+            case propagationTransferStateChanged(LXMFRouter.PropagationTransferState, lastResult: Int?)
+        }
+    }
+
+    /// A sync response that is not a list, as a `SyncError`: the two PN error codes by value,
+    /// anything else `.invalid`. 0xF1 here is the WIRE code `ERROR_NO_ACCESS`, not `PR_LINK_FAILED`.
+    static func classifySyncError(_ value: MsgPackValue?) -> LXMFRouter.SyncError {
+        switch value {
+        case .uint(LXMFPropagation.errorNoIdentity)?: return .noIdentity
+        case .uint(LXMFPropagation.errorNoAccess)?: return .noAccess
+        default: return .invalid
         }
     }
 
@@ -1122,23 +1135,26 @@ public struct LXMFNode {
             case let .endpoint(.delegate(.responseReceived(linkID, _, data))):
                 switch state.syncPhase[linkID] {
                 case .awaitingList:
-                    // Detect the ERROR_NO_IDENTITY error value: the reference PN sends this when the link
-                    // was never IDENTIFY'd (LXMRouter.py:1483). Reference clients branch on exactly this
-                    // value (LXMRouter.py:1563-1567) to tear the link down and set PR_NO_IDENTITY_RCVD.
-                    // Not reachable against our own node (we IDENTIFY before the first /get) but reachable
-                    // against any reference PN. Leaving the phase as .awaitingList would stall the sync.
-                    if case .uint(LXMFPropagation.errorNoIdentity)? = MsgPack.decodeValue(data) {
+                    // An error code or a non-list answer ends the sync: the router sets the state and
+                    // tears the link down (LXMRouter.py:1780-1823). `ERROR_NO_ACCESS` is what an
+                    // auth-required node answers an identity outside its allowed list.
+                    let value = MsgPack.decodeValue(data)
+                    guard case let .array(items)? = value else {
                         state.syncPhase[linkID] = nil
-                        return .send(.endpoint(.closeLink(linkID: linkID)))
+                        return .send(.router(.syncError(LXMFNode.classifySyncError(value))))
                     }
-                    guard case let .array(items)? = MsgPack.decodeValue(data) else { return .none }
                     let ids = items.compactMap { item -> Data? in
                         if case let .bin(d) = item { return d } else { return nil }
                     }
                     return .send(.router(.offeredMessageList(transientIds: ids)))
                 case .awaitingMessages:
                     state.syncPhase[linkID] = nil
-                    guard case let .array(items)? = MsgPack.decodeValue(data) else { return .none }
+                    // As for the list (LXMRouter.py:1825-1836). A non-list, non-error answer is
+                    // `.invalid` here; reference raises on it and keeps its state (plan ruling 1b).
+                    let value = MsgPack.decodeValue(data)
+                    guard case let .array(items)? = value else {
+                        return .send(.router(.syncError(LXMFNode.classifySyncError(value))))
+                    }
                     let blobs = items.compactMap { item -> Data? in
                         if case let .bin(d) = item { return d } else { return nil }
                     }
@@ -1179,6 +1195,16 @@ public struct LXMFNode {
                 case .none:
                     return .none
                 }
+
+            // A sync request that failed (timed out) tears its link down, as reference
+            // `message_get_failed` does (LXMRouter.py:1869-1872); the close then reports the state.
+            case let .endpoint(.delegate(.requestFailed(linkID, _))):
+                guard state.syncPhase[linkID] != nil else { return .none }
+                state.syncPhase[linkID] = nil
+                return .send(.endpoint(.closeLink(linkID: linkID)))
+
+            case let .router(.delegate(.propagationTransferStateChanged(transferState, lastResult))):
+                return .send(.delegate(.propagationTransferStateChanged(transferState, lastResult: lastResult)))
 
             case let .router(.delegate(.sendOpportunistic(dest, payload, messageHash))):
                 // The message hash is the receipt token: every resend is a new packet with its own

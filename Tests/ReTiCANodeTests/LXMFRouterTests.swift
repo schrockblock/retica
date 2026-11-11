@@ -306,7 +306,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // absence assertion, vacuous under .off — enforce it with flip-then-send, which unlike a
     // trailing `.on` does not also assert that the armed park timer has completed.
     store.exhaustivity = .on
-    await store.send(.offeredMessageList(transientIds: []))   // no-op send; forces the stray check
+    await store.send(.delegate(.duplicateDropped(hash: Data())))   // no-op send; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -364,7 +364,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // teardown under `.on` additionally asserts no in-flight effects, which the armed park timer
     // would trip for an unrelated reason.) Flip back to .off so teardown tolerates that timer.
     store.exhaustivity = .on
-    await store.send(.offeredMessageList(transientIds: []))   // no-op send; forces the stray check
+    await store.send(.delegate(.duplicateDropped(hash: Data())))   // no-op send; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -448,9 +448,10 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     await clock.advance(by: .seconds(LXMFDelivery.pathRequestWaitSeconds * 3))
     // Send a state-preserving no-op while still in .on mode. TCA checks the received-actions
     // queue before processing a new send. If a stale pathRequestDeadline landed, this send
-    // fails with "must handle N received actions before sending". The empty-offer action is
-    // a genuine no-op (guard !offered.isEmpty returns immediately with no state change).
-    await store.send(.offeredMessageList(transientIds: []))
+    // fails with "must handle N received actions before sending". A router `.delegate` action is
+    // a genuine no-op (the router returns `.none` with no state change). An empty offer no longer
+    // is: it completes the sync.
+    await store.send(.delegate(.duplicateDropped(hash: Data())))
 
     // OK: no stale timer fired. Now drain the open link-establishment (burn remaining budget).
     store.exhaustivity = .off
@@ -797,7 +798,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
 
     // And no deliveryFailed rode along with that requestLink — absence, so flip-then-send.
     store.exhaustivity = .on
-    await store.send(.offeredMessageList(transientIds: []))   // no-op send; forces the stray check
+    await store.send(.delegate(.duplicateDropped(hash: Data())))   // no-op send; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -1018,7 +1019,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // the absence half with flip-then-send; a trailing `.on` would also catch a stray but would
     // additionally trip on the now-armed park timer for an unrelated reason.
     store.exhaustivity = .on
-    await store.send(.offeredMessageList(transientIds: []))   // no-op send; forces the stray check
+    await store.send(.delegate(.duplicateDropped(hash: Data())))   // no-op send; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -1392,7 +1393,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     // runs the "must handle received actions" check and fails on any stray requestMessageList queued
     // by that establish, then flip back to .off so teardown tolerates the F5.2 idle timer.
     store.exhaustivity = .on
-    await store.send(.offeredMessageList(transientIds: []))   // no-op; forces the stray check
+    await store.send(.delegate(.duplicateDropped(hash: Data())))   // no-op; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -1474,7 +1475,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     #expect(store.state.directLinks[pn] == .active(linkID: linkID))
     #expect(store.state.pendingDownloadFromPN == false)   // not resurrected
     store.exhaustivity = .on
-    await store.send(.offeredMessageList(transientIds: []))   // no-op; forces the stray check
+    await store.send(.delegate(.duplicateDropped(hash: Data())))   // no-op; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -1555,7 +1556,7 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     }
 }
 
-/// An empty offer → sync done, no phase-2 request.
+/// An empty offer → sync done (`complete`, last result 0), no phase-2 request.
 @Test @MainActor func routerEmptyOfferedListRequestsNothing() async {
     let pn = Data(repeating: 0xBB, count: 16)
     let linkID = Data(repeating: 0xC0, count: 16)
@@ -1565,7 +1566,10 @@ private func makeMessage(source: Identity, recipientIdentityHash: Data = Identit
     let store = TestStore(initialState: initial) { LXMFRouter() }
     store.exhaustivity = .off
     await store.send(.offeredMessageList(transientIds: []))
-    store.exhaustivity = .on   // a stray requestMessages would fail teardown
+    // The completion report is the one action expected; a stray requestMessages would fail teardown.
+    await store.receive(.delegate(.propagationTransferStateChanged(.complete, lastResult: 0)))
+    #expect(store.state.propagationTransferState == .complete)
+    store.exhaustivity = .on
 }
 
 /// No active PN link (offer arrived after the link dropped) → abort, no phase-2 request.

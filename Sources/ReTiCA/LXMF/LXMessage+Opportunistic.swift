@@ -10,19 +10,17 @@ extension LXMessage {
         Data(packed.dropFirst(LXMessage.destinationLength))
     }
 
-    /// Reference LXMF's `ENCRYPTED_PACKET_MDU` (= 391): RNS `Packet.ENCRYPTED_MDU` + 8. Kept for the
-    /// cross-validation against reference; `opportunisticFits` does NOT use it (see there).
+    /// The OLDER reference value of LXMF's `ENCRYPTED_PACKET_MDU` (391 = RNS `Packet.ENCRYPTED_MDU`
+    /// + 8, LXMF 1.1.0). Kept only for its existing cross-validation test; `opportunisticFits` does
+    /// NOT use it, and LXMF 1.3.0 no longer has this value (see there).
     public static let encryptedPacketMDU = 391
 
     /// True if this message fits a single opportunistic packet (else DIRECT is required).
     ///
-    /// Deliberate departure from reference LXMF, which falls back opportunistic→direct only above
-    /// `ENCRYPTED_PACKET_MDU` (391; LXMessage.py:397-401). A payload of 384...391 bytes pads to one
-    /// more AES block and fits a 500-byte packet only under HEADER_1. Toward a destination behind a
-    /// relay — or once any relay on the way adds its transport header — it is 515 bytes: Transport
-    /// refuses to pack it (`sendFailed(.tooLarge)`), and every retry fails the same way. So the
-    /// limit is RNS `Packet.ENCRYPTED_MDU` (383), which fits any header. Larger messages go over a
-    /// link, which the recipient accepts as readily.
+    /// The limit is RNS `Packet.ENCRYPTED_MDU` (383), as in LXMF 1.3.0:
+    /// `ENCRYPTED_PACKET_MDU = RNS.Packet.ENCRYPTED_MDU` (LXMessage.py:68). Larger messages go over a
+    /// link. A 384...391-byte payload pads to one more AES block and would fit a 500-byte packet only
+    /// under HEADER_1; behind a relay it would be refused as too large on every retry.
     public var opportunisticFits: Bool {
         opportunisticPayload.count <= Packet.encryptedMDU
     }

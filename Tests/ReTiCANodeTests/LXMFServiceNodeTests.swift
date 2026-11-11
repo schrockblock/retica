@@ -676,7 +676,7 @@ import ComposableArchitecture
     await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: otherLink, data: Data("msg".utf8),
                                                                    packetHash: Data(repeating: 0xF8, count: 32))))))
     await store.receive { if case .client(.router(.received)) = $0 { return true }; return false }
-    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
+    await store.send(.client(.router(.delegate(.duplicateDropped(hash: Data())))))   // no-op; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -792,7 +792,7 @@ import ComposableArchitecture
     // "must handle received actions" check and catches any stray, then flip back to .off so
     // teardown tolerates the idle timer.
     store.exhaustivity = .on
-    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
+    await store.send(.client(.router(.delegate(.duplicateDropped(hash: Data())))))   // no-op; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -938,7 +938,7 @@ import ComposableArchitecture
     // at .linkEstablished, so a trailing .on would trip teardown on that in-flight timer for an
     // unrelated reason — flip back to .off after the check so teardown tolerates the timer.
     store.exhaustivity = .on
-    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
+    await store.send(.client(.router(.delegate(.duplicateDropped(hash: Data())))))   // no-op; forces the stray check
     store.exhaustivity = .off
     #expect(store.state.pendingGet.isEmpty)
 }
@@ -1420,7 +1420,7 @@ import ComposableArchitecture
     // reason. Flip .on, force the received-actions check with a no-op send to catch any stray prove,
     // then flip back to .off so teardown tolerates the idle timer.
     store.exhaustivity = .on
-    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
+    await store.send(.client(.router(.delegate(.duplicateDropped(hash: Data())))))   // no-op; forces the stray check
     store.exhaustivity = .off
 }
 
@@ -1456,7 +1456,7 @@ import ComposableArchitecture
     store.exhaustivity = .on
     await store.send(.client(.endpoint(.delegate(.linkDataReceived(linkID: linkID, data: garbage,
                                                                    packetHash: packetHash)))))
-    await store.send(.client(.router(.offeredMessageList(transientIds: []))))   // no-op; forces the stray check
+    await store.send(.client(.router(.delegate(.duplicateDropped(hash: Data())))))   // no-op; forces the stray check
     store.exhaustivity = .off
     #expect(store.state.pn.store.count == 0)
 }
@@ -1570,8 +1570,13 @@ import ComposableArchitecture
         identity: identity,
         endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false))
     let linkID = Data(repeating: 0xC1, count: 16)
+    let pn = Data(repeating: 0xAB, count: 16)
     initial.syncPhase[linkID] = .awaitingList   // simulate: we sent a phase-1 /get, waiting for list
-    initial.linkDestinations[linkID] = Data(repeating: 0xAB, count: 16)
+    initial.linkDestinations[linkID] = pn
+    // The sync runs on the router's link to its propagation node, which the router tears down.
+    initial.directLinks[pn] = linkID
+    initial.router.outboundPropagationNode = pn
+    initial.router.directLinks[pn] = .active(linkID: linkID)
 
     let store = TestStore(initialState: initial) { LXMFNode() } withDependencies: {
         $0.continuousClock = TestClock()
@@ -1601,6 +1606,7 @@ import ComposableArchitecture
     // drain any remaining actions before checking state.
     await store.skipReceivedActions(strict: false)
     #expect(store.state.syncPhase[linkID] == nil, "syncPhase must be cleared on ERROR_NO_IDENTITY")
+    #expect(store.state.router.propagationTransferState == .noIdentityReceived)
 }
 
 // MARK: - FIX 5: packet-path prove crosses the real link stack
