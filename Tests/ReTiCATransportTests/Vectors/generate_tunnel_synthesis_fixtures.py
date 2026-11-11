@@ -15,7 +15,7 @@
 #   - STUB RNS.Identity.get_random_hash -> returns FIXED_RANDOM_HASH
 #   - STUB StubInterface               -> a stand-in interface whose get_hash() returns the fixed
 #                                         interface hash full_hash(b"TCPInterface[tcp]") (ReTiCA's
-#                                         Ruling 9c derivation for a profile named "tcp")
+#                                         Ruling 9c' derivation for an interface whose id is "tcp")
 #   - STUB RNS.Packet.send             -> packs the packet (genuine Packet.pack) and records raw
 #                                         bytes instead of handing them to Transport.outbound
 #   - STUB RNS.Transport.handle_tunnel -> records the tunnel id the handler validated

@@ -40,8 +40,11 @@ private struct Fixture: Decodable {
     }
 }
 
-/// A TCP-client profile as `TCPEndpoint` registers it: the reference capture's interface is named
-/// "TCPInterface[tcp]", which is what Ruling 9c derives from a profile named "tcp".
+/// The interface id whose Ruling 9c' hash is the reference capture's: its stub interface is named
+/// "TCPInterface[tcp]".
+private let fixtureInterfaceID = InterfaceID("tcp")
+
+/// A TCP-client profile as `TCPEndpoint` registers it.
 private func tunnelProfile(_ name: String = "tcp") -> InterfaceProfile {
     var profile = InterfaceProfile(name: name, bitrate: 10_000_000, hwMTU: 262_144)
     profile.wantsTunnel = true
@@ -86,8 +89,8 @@ private func makeStore(_ initial: Transport.State = Transport.State(), recorder:
 @Suite @MainActor struct TunnelSynthesisTests {
     @Test func payloadPrefixMatchesReference() throws {
         let f = try Fixture.load()
-        #expect(Transport.tunnelInterfaceHash(profileName: "tcp") == f.interfaceHash,
-                "Ruling 9c: full_hash of \"TCPInterface[<name>]\", as the capture's stub interface hashed it")
+        #expect(Transport.tunnelInterfaceHash(interfaceID: fixtureInterfaceID) == f.interfaceHash,
+                "Ruling 9c': full_hash of \"TCPInterface[<interface id>]\", as the capture's stub interface hashed it")
         let ours = Transport.tunnelSynthesisPayload(identity: f.identity, interfaceHash: f.interfaceHash,
                                                     randomHash: f.randomHash)
         #expect(ours.count == 176)
@@ -107,8 +110,7 @@ private func makeStore(_ initial: Transport.State = Transport.State(), recorder:
         var initial = Transport.State()
         initial.tunnelIdentity = f.identity
         let store = makeStore(initial, recorder: recorder, randomBytes: RandomBytesGenerator { _ in f.randomHash })
-        let id = InterfaceID("tcp:hub:4242")
-        await store.send(.interfaceConnected(id, tunnelProfile()))
+        await store.send(.interfaceConnected(fixtureInterfaceID, tunnelProfile()))
         await store.skipReceivedActions(strict: false)
 
         let raw = try #require(recorder.transmits.value.first?.1)
@@ -133,7 +135,7 @@ private func makeStore(_ initial: Transport.State = Transport.State(), recorder:
         #expect(Data(hexString: f.handler_tunnel_id)! == expected, "the id the reference handler filed the tunnel under")
         #expect(Transport.tunnelID(publicKey: f.identity.publicKey, interfaceHash: f.interfaceHash) == expected)
         #expect(Transport.tunnelID(publicKey: f.identity.publicKey,
-                                   interfaceHash: Transport.tunnelInterfaceHash(profileName: "tcp")) == expected)
+                                   interfaceHash: Transport.tunnelInterfaceHash(interfaceID: fixtureInterfaceID)) == expected)
     }
 
     @Test func synthesisSentOnEveryConnectOfTunnelInterfaceOnly() async throws {
@@ -160,8 +162,12 @@ private func makeStore(_ initial: Transport.State = Transport.State(), recorder:
         await store.send(.interfaceConnected(hubA, tunnelProfile()))
         await store.skipReceivedActions(strict: false)
         #expect(recorder.syntheses.map(\.0) == [hubB, hubA, hubA])
-        for (_, packet) in recorder.syntheses {
+        // Ruling 9c': each interface synthesizes under its own id's hash, so the two hubs get two
+        // tunnels, and a reconnect of one keeps its tunnel id.
+        #expect(Transport.tunnelInterfaceHash(interfaceID: hubA) != Transport.tunnelInterfaceHash(interfaceID: hubB))
+        for (id, packet) in recorder.syntheses {
             #expect(packet.payload.count == 176)
+            #expect(Data(packet.payload.dropFirst(64).prefix(32)) == Transport.tunnelInterfaceHash(interfaceID: id))
             #expect(Data(packet.payload.prefix(64)) == tunnel.publicKey)
             #expect(tunnel.validate(signature: Data(packet.payload.suffix(64)), message: Data(packet.payload.prefix(112))))
         }
