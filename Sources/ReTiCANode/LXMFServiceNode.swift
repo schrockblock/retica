@@ -11,12 +11,25 @@ import ReTiCATransport
 /// delegates and the propagation node's actions. Every serve behavior is gated on `nodeModeEnabled`, so
 /// with node-mode off this behaves exactly like a bare `LXMFNode`.
 ///
-/// Serve scope: register/announce, ingest offers, two-phase `/get`, and the server half of PN↔PN
-/// peering — `/offer` answered as reference does, multi-message containers refused on links without a
-/// validated peering key, inbound syncs accounted in `peering` (a `PNPeerTable`), auto-peering with a
-/// recallable sender. Outbound syncing to peers and time-based expiry are not driven here. Inbound proving
-/// of PACKET-framed propagation offers is in scope and lives at the `.linkDataReceived` handler below
-/// (reference LXMRouter.py:2255); Resource-framed offers are proved by the resource transfer protocol.
+/// Serve scope: register/announce, ingest offers, two-phase `/get`, and both halves of PN↔PN peering,
+/// as a default lxmd does it. Server half: `/offer` answered as reference does, multi-message
+/// containers refused on links without a validated peering key, inbound syncs accounted in `peering`
+/// (a `PNPeerTable`), auto-peering with a recallable sender. Client half: auto-peering from announces
+/// (`.announceReceived`), static peers, the 24 s peer-sync job (`.peerSyncTick`, node mode only),
+/// peering keys mined per peer and cached with it, the `/offer` exchange and the sync transfer, and
+/// the persistence hooks (`.rehydratePeers`, `.rehydrateStore`, `Delegate.peersChanged`). This
+/// reducer is `PNPeerTable`'s host: it carries out the table's `Command`s (see its host protocol).
+/// Time-based expiry is not driven here. Inbound proving of PACKET-framed propagation offers is in
+/// scope and lives at the `.linkDataReceived` handler below (reference LXMRouter.py:2255);
+/// Resource-framed offers are proved by the resource transfer protocol.
+///
+/// **Known limitation (sync links share the client's link bookkeeping).** `LXMFNode` sees every
+/// link establishment and failure by destination, so an outbound sync link to a peer is also recorded
+/// as the client's direct link to that destination, and `LXMFRouter` arms its idle timer on it. When
+/// the peer is ALSO this node's own outbound propagation node, the client router can use the sync link
+/// for its own work, and a client link and a sync link opened to that destination at the same time are
+/// told apart only by which one establishes first. Reference keeps the two apart (separate `RNS.Link`
+/// objects with their own callbacks). Separating them needs the link plane to tag links by opener.
 @Reducer
 public struct LXMFServiceNode {
     @ObservableState
@@ -32,15 +45,24 @@ public struct LXMFServiceNode {
         /// possible. Using a queue per key prevents the second request from silently overwriting the
         /// first (the first's linkID would be lost and its response never sent).
         public var pendingGet: [Data: [PendingGet]] = [:]
-        /// Our propagation-node peers. This task drives only the inbound side: `/offer` validates keys
-        /// at `peering.config.peeringCost` (which the announce advertises), inbound syncs mark ids
-        /// handled for the sending peer and distribute fresh ones to the others, and every store
-        /// removal prunes it. Outbound syncing (`syncTick`, offers, key mining) is not driven here yet.
+        /// Our propagation-node peers. Inbound: `/offer` validates keys at `peering.config.peeringCost`
+        /// (which the announce advertises), inbound syncs mark ids handled for the sending peer and
+        /// distribute fresh ones to the others. Outbound: announces, the sync job, keys, offers and
+        /// transfers drive it. Every store removal prunes it. The host persists `peering.persisted`
+        /// (reported by `Delegate.peersChanged`) and hands it back with `.rehydratePeers`.
         public var peering: PNPeerTable
         /// Links on which a peer presented a peering key valid at our cost (reference
         /// `validated_peer_links`, LXMRouter.py:2649). Only such a link may deliver more than one
         /// message per container (:2716-2724). Cleared when the link closes and on node-mode disable.
         public var validatedOfferLinks: Set<Data> = []
+        /// Peers we asked the endpoint to open a sync link to: their `linkEstablished` /
+        /// `linkFailed` (reported by destination) are ours. Removed when either arrives.
+        public var peerLinksOpening: Set<Data> = []
+        /// Peers waiting out `PNPeerTable.pathRequestGrace` after a path request.
+        public var peerPathWaits: Set<Data> = []
+        /// Sync link → the sync transfer's size in bytes, per resource segment (key 0: the container's
+        /// size until the sender reports progress), for `transferConcluded(bytes:)`.
+        public var peerTransferBytes: [Data: [Int: Int]] = [:]
 
         /// 32 MB — a mobile-appropriate cap for the store-and-forward backlog.
         public static let defaultStorageLimitBytes: Int = 32 * 1024 * 1024
@@ -89,6 +111,28 @@ public struct LXMFServiceNode {
         case pn(PropagationNode.Action)
         case registerPropagation
         case setNodeMode(Bool)
+        /// The peer-sync job (`sync_peers`, every 24 s: LXMRouter.py:38, :973). Sent by the timer
+        /// `setNodeMode(true)` starts; ignored with node mode off.
+        case peerSyncTick
+        /// A peering key mined for `peer`, worth `value` (internal: the key search's result).
+        case peeringKeyReady(peer: Data, key: Data, value: Double)
+        /// The key search for `peer` failed or was cancelled (internal).
+        case peeringKeyFailed(peer: Data)
+        /// `PATH_REQUEST_GRACE` after a path request for `peer`'s sync link ran out (internal).
+        case peerPathRequestGraceElapsed(peer: Data)
+        /// Persisted peers (`Delegate.peersChanged`), handed back after a relaunch. Send AFTER
+        /// `.rehydrateStore`: each peer's handled and unhandled ids are pruned to what the store holds
+        /// at that moment (as `LXMPeer.from_bytes` does), so peers loaded into an empty store lose them.
+        case rehydratePeers([PNPeerTable.Peer])
+        /// The configured static peers (lxmd `static_peers`): each gets a table entry, with a path
+        /// request when it has never been heard (LXMRouter.py:728-737). Never culled.
+        case setStaticPeers(Set<Data>)
+        /// lxmd `autopeer` (default true).
+        case setAutopeer(Bool)
+        /// Stored entries (each `lxmf_data ‖ stamp`, as `PropagationStore.Entry.lxmfData` holds it)
+        /// handed back after a relaunch. Ingested WITHOUT distribution to peers (Review Focus 3) and
+        /// without `messagesStored`; an eviction still reports `messagesPurged`.
+        case rehydrateStore(entries: [Data])
         case delegate(Delegate)
 
         public enum Delegate: Equatable {
@@ -96,11 +140,28 @@ public struct LXMFServiceNode {
             case messagesStored(entries: [PropagationStore.Entry])
             /// Entries just removed — the host deletes its mirrored copies.
             case messagesPurged(transientIds: [Data])
+            /// The peer table changed: `peering.persisted`, every peer in table order. Emitted at most
+            /// once per action, after it. The host replaces its stored copy and hands it back with
+            /// `.rehydratePeers`. It includes each peer's cached peering key (ruling 6c).
+            case peersChanged([PNPeerTable.Peer])
         }
     }
 
+    enum CancelID: Hashable { case peerSyncJob, peeringKey(Data), peerPathGrace(Data) }
+
     @Dependency(\.date) var date
+    @Dependency(\.continuousClock) var clock
+    @Dependency(\.withRandomNumberGenerator) var withRandomNumberGenerator
+    @Dependency(\.lxmfStampGenerator) var stampGenerator
     public init() {}
+
+    /// Reference's hop count for a path or announce that ReTiCA holds at `wireHops`: reference adds
+    /// one on receipt (RNS Transport.py:2028), ReTiCA keeps the on-wire count (Transport.swift, the
+    /// `LearnedDestination` built from `packet.hops`). Every `autopeerMaxDepth` comparison goes
+    /// through this, so both auto-peer paths (announce and inbound sync) peer at depth 6 and not 7.
+    static func referenceHops(_ wireHops: UInt8) -> UInt8 {
+        wireHops == .max ? .max : wireHops + 1
+    }
 
     private static func arrayOfBin(_ value: MsgPackValue) -> [Data] {
         guard case let .array(items) = value else { return [] }
@@ -152,7 +213,7 @@ public struct LXMFServiceNode {
     public var body: some ReducerOf<Self> {
         Scope(state: \.client, action: \.client) { LXMFNode() }
         Scope(state: \.pn, action: \.pn) { PropagationNode() }
-        Reduce { [date] state, action in
+        Reduce { [date, clock, stampGenerator] state, action in
             /// True when this link terminates on the lxmf.propagation destination WE serve — i.e. the
             /// peer is a propagation client of ours, not a direct correspondent.
             func isPropagationLink(_ state: State, _ linkID: Data) -> Bool {
@@ -202,9 +263,15 @@ public struct LXMFServiceNode {
             /// queues each FRESH id for every other peer (`enqueue_peer_distribution(transient_id,
             /// from_peer)`, :2882, flushed by :2811-2824). The handled set here is the fresh ids
             /// plus entries byte-identical to ones already stored: `ingest` skips a stored entry before
-            /// validating it, and a byte-identical one is known valid because it was accepted. An entry
-            /// pairing a stored core with a different stamp is not counted (reference would validate it
-            /// and find it invalid).
+            /// validating it, and a byte-identical one is known valid because it was accepted.
+            ///
+            /// Known divergence: an entry pairing a stored core with a DIFFERENT stamp is not counted.
+            /// Reference validates it, and when that other stamp is also valid (a sender that stamped the
+            /// same message twice, or a peer holding another copy) it marks the id handled for the peer;
+            /// we do not, because `ingest` skips the stored core before any validation and validating
+            /// here would cost a 256 KB workblock per such entry. The cost is one wasted offer round
+            /// trip: we offer the id back to that peer, it answers that it has it, and that marks it.
+            /// An entry whose other stamp is invalid is not counted by reference either.
             ///
             /// Done here rather than through `PropagationNode.ingestContainer` because only this
             /// reducer knows the source, and the pre-ingest store state is needed for the duplicates.
@@ -235,6 +302,155 @@ public struct LXMFServiceNode {
                                                               data: MsgPack.encode(value)))))
             }
 
+            // --- Peering: `PNPeerTable`'s host ---
+
+            /// The peer whose sync link `linkID` is, if any. Only an ESTABLISHED sync link has an id.
+            func peerOnLink(_ state: State, _ linkID: Data) -> Data? {
+                state.peering.peers.values.first { $0.linkID == linkID }?.destinationHash
+            }
+
+            /// Carries out the table's commands. Link packets (identify, `/offer`, the resource, closes)
+            /// go out in command order, before the offer a caller appends; timers and key searches run
+            /// alongside. With node mode off only closes go out (ruling 6b), and a command that would
+            /// have started work is reported back to the table as that work's failure, so no peer is
+            /// left waiting for an outcome that will never come.
+            func interpret(_ commands: [PNPeerTable.Command], _ state: inout State,
+                           ordered: inout [Effect<Action>], concurrent: inout [Effect<Action>]) {
+                let now = date.now
+                for command in commands {
+                    switch command {
+                    case let .closeLink(link):
+                        state.peerTransferBytes[link] = nil
+                        ordered.append(.send(.client(.endpoint(.closeLink(linkID: link)))))
+
+                    case let .openLink(peer):
+                        guard state.nodeModeEnabled else { state.peering.linkFailed(peer: peer, now: now); continue }
+                        // Reference `sync()` (LXMPeer.py:297-306): with no path, request one, wait
+                        // PATH_REQUEST_GRACE, and give up (`linkFailed`) if there is still none.
+                        if state.client.endpoint.transport.reachableLearned(peer) != nil {
+                            state.peerLinksOpening.insert(peer)
+                            ordered.append(.send(.client(.endpoint(.openLink(destinationHash: peer)))))
+                        } else {
+                            state.peerPathWaits.insert(peer)
+                            ordered.append(.send(.client(.endpoint(.requestPath(destinationHash: peer)))))
+                            concurrent.append(.run { send in
+                                try await clock.sleep(for: .seconds(PNPeerTable.pathRequestGrace))
+                                await send(.peerPathRequestGraceElapsed(peer: peer))
+                            }.cancellable(id: CancelID.peerPathGrace(peer), cancelInFlight: true))
+                        }
+
+                    case let .identify(link):
+                        guard state.nodeModeEnabled else { continue }
+                        ordered.append(.send(.client(.endpoint(.identifyOverLink(linkID: link,
+                                                                                 identity: state.client.identity)))))
+
+                    case let .generatePeeringKey(peer, cost):
+                        // `LXMPeer.generate_peering_key` (LXMPeer.py:240-267): a stamp over the peer's
+                        // identity hash followed by ours, on the 25-round workblock. Its value is
+                        // recorded with it, so a later, higher cost discards it (ruling 6c).
+                        guard state.nodeModeEnabled,
+                              let identity = state.client.endpoint.recall(destinationHash: peer) else {
+                            state.peering.keyFailed(peer: peer, now: now)
+                            continue
+                        }
+                        let peeringID = identity.hash + state.client.identity.hash
+                        concurrent.append(.run { send in
+                            guard let key = await stampGenerator.peeringKey(peeringID, cost) else {
+                                await send(.peeringKeyFailed(peer: peer))
+                                return
+                            }
+                            let workblock = LXStamper.stampWorkblock(material: peeringID,
+                                                                     expandRounds: LXStamper.workblockExpandRoundsPeering)
+                            await send(.peeringKeyReady(peer: peer, key: key,
+                                                        value: LXStamper.stampValue(workblock: workblock, stamp: key)))
+                        }.cancellable(id: CancelID.peeringKey(peer), cancelInFlight: true))
+
+                    case let .sendOffer(link, key, ids):
+                        guard state.nodeModeEnabled else {
+                            state.peering.linkClosed(linkID: link)
+                            ordered.append(.send(.client(.endpoint(.closeLink(linkID: link)))))
+                            continue
+                        }
+                        // `[peering_key, offered_ids]` (LXMPeer.py:390-393).
+                        let body = MsgPack.encode(.array([.bin(key), .array(ids.map { .bin($0) })]))
+                        ordered.append(.send(.client(.endpoint(.sendRequestOverLink(linkID: link, path: "/offer",
+                                                                                    data: body)))))
+
+                    case let .sendResource(link, ids):
+                        let entries = state.pn.store.entries(forTransientIds: ids)
+                        // Nothing left to send (evicted since the offer), or node mode off: the
+                        // transfer fails, which closes the link and marks nothing.
+                        guard state.nodeModeEnabled, !entries.isEmpty else {
+                            interpret(state.peering.transferFailed(linkID: link), &state,
+                                      ordered: &ordered, concurrent: &concurrent)
+                            continue
+                        }
+                        // Reference packs `[time.time(), lxm_list]` (LXMPeer.py:474-478).
+                        let container = LXMFPropagation.container(timestamp: now.timeIntervalSince1970,
+                                                                  entries: entries.map(\.lxmfData))
+                        state.peerTransferBytes[link] = [0: container.count]
+                        ordered.append(.send(.client(.endpoint(.sendResourceOverLink(linkID: link, data: container)))))
+
+                    case let .requestPath(peer):
+                        guard state.nodeModeEnabled else { continue }
+                        ordered.append(.send(.client(.endpoint(.requestPath(destinationHash: peer)))))
+                    }
+                }
+            }
+
+            /// The offer reference's `sync()` prepares on a ready link (LXMPeer.py:339-395), when `peer`
+            /// is left in `.linkReady`: the store's candidates among its unhandled ids, at its accepted
+            /// cost and limits, with the unhandled ids the store no longer holds as `purged`.
+            func offerIfReady(_ state: inout State, _ peer: Data) -> [PNPeerTable.Command] {
+                guard let p = state.peering.peers[peer], p.state == .linkReady, let link = p.linkID else { return [] }
+                guard state.nodeModeEnabled, let announce = p.announce else {
+                    state.peering.linkClosed(linkID: link)
+                    return [.closeLink(link)]
+                }
+                let store = state.pn.store
+                let purged = p.unhandled.filter { !store.contains(transientId: $0) }
+                    .sorted { $0.lexicographicallyPrecedes($1) }
+                let selection = store.offerCandidates(
+                    acceptedAt: LXMFPropagation.peerMinimumAcceptedCost(announce),
+                    transferLimitKB: announce.perTransferLimit, syncLimitKB: announce.perSyncLimit,
+                    among: p.unhandled, excluding: p.handled, now: date.now)
+                return state.peering.offerSelected(peer: peer, offer: selection.offer, oversized: selection.oversized,
+                                                   lowValue: selection.lowValue, purged: purged, now: date.now)
+            }
+
+            /// Runs `commands`, then makes the offer when `offerFor` was left link-ready.
+            func run(_ commands: [PNPeerTable.Command], _ state: inout State, offerFor peer: Data? = nil) -> Effect<Action> {
+                var ordered: [Effect<Action>] = [], concurrent: [Effect<Action>] = []
+                interpret(commands, &state, ordered: &ordered, concurrent: &concurrent)
+                if let peer {
+                    interpret(offerIfReady(&state, peer), &state, ordered: &ordered, concurrent: &concurrent)
+                }
+                if ordered.isEmpty, concurrent.isEmpty { return .none }
+                return .merge([.concatenate(ordered)] + concurrent)
+            }
+
+            /// Every configured static peer in the table, and a path request for each one never heard
+            /// (LXMRouter.py:702-704 for a loaded one, :728-737 for a new one): its costs come only
+            /// from an announce or a path response (Handlers.py:76-86).
+            func activateStaticPeers(_ state: inout State) -> [PNPeerTable.Command] {
+                var commands = state.peering.activateStaticPeers(now: date.now)
+                for dest in state.peering.config.staticPeers.sorted(by: { $0.lexicographicallyPrecedes($1) })
+                where state.peering.peers[dest]?.lastHeard == PNPeerTable.never && !commands.contains(.requestPath(dest)) {
+                    commands.append(.requestPath(dest))
+                }
+                return commands
+            }
+
+            /// The 24 s peer-sync job.
+            func peerSyncJob() -> Effect<Action> {
+                .run { send in
+                    for await _ in clock.timer(interval: .seconds(PNPeerTable.peerSyncInterval)) {
+                        await send(.peerSyncTick)
+                    }
+                }.cancellable(id: CancelID.peerSyncJob, cancelInFlight: true)
+            }
+
+            func handle(_ state: inout State, _ action: Action) -> Effect<Action> {
             switch action {
             case let .setNodeMode(enabled):
                 // ENABLE is deliberately NOT idempotence-guarded, and that asymmetry is a judgement
@@ -244,7 +460,15 @@ public struct LXMFServiceNode {
                 // unpaced announces on every interface. Revisit together with a general rate limit
                 // on locally-originated announces, which `Transport` does not have (it paces only
                 // RELAYED announces).
-                if enabled { state.nodeModeEnabled = true; return .send(.registerPropagation) }
+                //
+                // Enabling also starts the peer-sync job (ruling 6b: it runs only in node mode;
+                // `cancelInFlight` keeps a redundant enable to one timer) and activates the static
+                // peers, as reference's `enable_propagation` does (LXMRouter.py:728-737).
+                if enabled {
+                    state.nodeModeEnabled = true
+                    return .merge(.send(.registerPropagation), peerSyncJob(),
+                                  run(activateStaticPeers(&state), &state))
+                }
                 // Disabling is idempotent. Without this guard N calls with the mode already off
                 // produced N unpeer announces on every interface, and `Transport` does not pace
                 // locally-originated announces. Reference's `disable_propagation`
@@ -269,9 +493,38 @@ public struct LXMFServiceNode {
                 // node_state. Peers react in Handlers.py:98-99: unpeer(destination_hash) when
                 // propagation_enabled == False. Guard on propagationDestinationHash: without it there
                 // is no destination to announce on (enable_propagation must have run first).
-                guard let hash = state.client.propagationDestinationHash else { return .none }
-                return .send(.client(.endpoint(.announce(
-                    destinationHash: hash, appData: pnAnnounceAppData(state, nodeState: false)))))
+                //
+                // Peering (ruling 6b, Review Focus 5): the sync job stops, every key search and
+                // path-grace wait is cancelled, and the sync links not yet transferring are closed, so
+                // no further `/offer` or Resource goes out. A transfer already under way finishes; its
+                // conclusion starts nothing new (`interpret` sends only closes in node mode off). Every
+                // peer is idled through the table's own failure calls, and the table itself is kept:
+                // nothing is unpeered. A cancelled search reports nothing (its effect is cancelled), so
+                // the table is told here; a link still establishing stays in `peerLinksOpening`, and
+                // the table closes it if it establishes later.
+                var peering: [Effect<Action>] = [.cancel(id: CancelID.peerSyncJob)]
+                for peer in state.peerPathWaits.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
+                    peering.append(.cancel(id: CancelID.peerPathGrace(peer)))
+                }
+                state.peerPathWaits = []
+                for p in state.peering.persisted {
+                    switch p.state {
+                    case .keyPending:
+                        peering.append(.cancel(id: CancelID.peeringKey(p.destinationHash)))
+                        state.peering.keyFailed(peer: p.destinationHash, now: date.now)
+                    case .linkEstablishing:
+                        state.peering.linkFailed(peer: p.destinationHash, now: date.now)
+                    case .linkReady, .requestSent:
+                        guard let link = p.linkID else { continue }
+                        state.peering.linkClosed(linkID: link)
+                        peering.append(.send(.client(.endpoint(.closeLink(linkID: link)))))
+                    case .idle, .transferring:
+                        break
+                    }
+                }
+                guard let hash = state.client.propagationDestinationHash else { return .merge(peering) }
+                return .merge(peering + [.send(.client(.endpoint(.announce(
+                    destinationHash: hash, appData: pnAnnounceAppData(state, nodeState: false)))))])
 
             case .registerPropagation:
                 guard state.nodeModeEnabled,
@@ -298,14 +551,14 @@ public struct LXMFServiceNode {
                     // Auto-peer via incoming sync (:2682-2714): an unknown sender whose recalled
                     // announce says it is an enabled propagation node, within `autopeerMaxDepth`, is
                     // peered BEFORE the container is judged, so even a refused container peers it.
-                    // `hops_to` is the path's hop count as reference counts it, one more than the
-                    // on-wire count a learned path keeps (see `Transport.receiptTimeoutBase`); with no
-                    // path, reference's `PATHFINDER_M` (128) is over any depth.
+                    // `hops_to` is the path's hop count as reference counts it (`referenceHops`, the
+                    // conversion the announce path uses too); with no path, reference's
+                    // `PATHFINDER_M` (128) is over any depth.
                     if state.peering.peers[remoteHash] == nil, state.peering.config.autopeer,
                        let appData = state.client.endpoint.transport.recallAppData(destinationHash: remoteHash),
                        let announce = PNAnnounce.parse(appData), announce.nodeState,
                        let path = state.client.endpoint.learned[remoteHash],
-                       Int(path.hops) + 1 <= Int(state.peering.config.autopeerMaxDepth) {
+                       LXMFServiceNode.referenceHops(path.hops) <= state.peering.config.autopeerMaxDepth {
                         // A new peer: `peer` returns no commands for one (only an unpeer closes a link).
                         _ = state.peering.peer(remoteHash, announce: announce, now: date.now)
                     }
@@ -558,6 +811,9 @@ public struct LXMFServiceNode {
                     let remaining = queue.filter { $0.linkID != linkID }
                     return remaining.isEmpty ? nil : remaining
                 }
+                // A sync link: idle its peer (`link_closed`, LXMPeer.py:549-551).
+                state.peerTransferBytes[linkID] = nil
+                state.peering.linkClosed(linkID: linkID)
                 return .none
 
             case let .client(.endpoint(.delegate(.requestFailed(linkID, _)))):
@@ -565,11 +821,132 @@ public struct LXMFServiceNode {
                     let remaining = queue.filter { $0.linkID != linkID }
                     return remaining.isEmpty ? nil : remaining
                 }
+                // Our `/offer` failed (`request_failed`, LXMPeer.py:400-403).
+                guard peerOnLink(state, linkID) != nil else { return .none }
+                return run(state.peering.requestFailed(linkID: linkID), &state)
+
+            // --- Peering: the client half ---
+
+            case let .client(.endpoint(.delegate(.announceReceived(dest, hops, isPathResponse, appData)))):
+                // `LXMFPropagationAnnounceHandler` (Handlers.py:56-107): registered for
+                // `lxmf.propagation` only, and peering only while we are a propagation node.
+                guard state.nodeModeEnabled, dest != state.client.propagationDestinationHash,
+                      let appData, let announce = PNAnnounce.parse(appData),
+                      let identity = state.client.endpoint.recall(destinationHash: dest),
+                      propagationHash(of: identity) == dest
+                else { return .none }
+                return run(state.peering.announceHeard(dest, announce: announce,
+                                                       hops: LXMFServiceNode.referenceHops(hops),
+                                                       isPathResponse: isPathResponse, now: date.now), &state)
+
+            case .peerSyncTick:
+                guard state.nodeModeEnabled else { return .none }
+                let now = date.now
+                let table = state.peering
+                let (ticked, commands) = withRandomNumberGenerator { generator in
+                    var copy = table
+                    let commands = copy.syncTick(now: now, random: &generator)
+                    return (copy, commands)
+                }
+                state.peering = ticked
+                return run(commands, &state)
+
+            case let .peeringKeyReady(peer, key, value):
+                return run(state.peering.keyReady(peer: peer, key: key, value: value, now: date.now), &state)
+
+            case let .peeringKeyFailed(peer):
+                state.peering.keyFailed(peer: peer, now: date.now)
                 return .none
+
+            case let .peerPathRequestGraceElapsed(peer):
+                state.peerPathWaits.remove(peer)
+                guard state.peering.peers[peer]?.state == .linkEstablishing else { return .none }
+                if state.nodeModeEnabled, state.client.endpoint.transport.reachableLearned(peer) != nil {
+                    state.peerLinksOpening.insert(peer)
+                    return .send(.client(.endpoint(.openLink(destinationHash: peer))))
+                }
+                state.peering.linkFailed(peer: peer, now: date.now)
+                return .none
+
+            case let .client(.endpoint(.delegate(.linkEstablished(linkID, dest)))):
+                // Only a link we opened to a peer. The table answers a link for a peer no longer
+                // establishing one (unpeered, or idled by node mode off) with `.closeLink`.
+                guard state.peerLinksOpening.remove(dest) != nil else { return .none }
+                return run(state.peering.linkEstablished(peer: dest, linkID: linkID, now: date.now), &state,
+                           offerFor: dest)
+
+            case let .client(.endpoint(.delegate(.linkFailed(dest, _)))):
+                guard state.peerLinksOpening.remove(dest) != nil else { return .none }
+                state.peering.linkFailed(peer: dest, now: date.now)
+                return .none
+
+            case let .client(.endpoint(.delegate(.responseReceived(linkID, _, data)))):
+                guard let dest = peerOnLink(state, linkID), let p = state.peering.peers[dest],
+                      p.state == .requestSent else { return .none }
+                let response = PNPeerTable.OfferResponse.parse(data, offered: p.lastOffer)
+                // `noIdentity` leaves the peer link-ready on the same link: offer again.
+                return run(state.peering.offerResponse(linkID: linkID, response, now: date.now), &state,
+                           offerFor: dest)
+
+            case let .client(.endpoint(.delegate(.resourceProgress(linkID, _, role, _, total, segment, _)))):
+                guard role == .sender, var bytes = state.peerTransferBytes[linkID] else { return .none }
+                bytes[0] = nil
+                bytes[segment] = total
+                state.peerTransferBytes[linkID] = bytes
+                return .none
+
+            case let .client(.endpoint(.delegate(.resourceConcluded(linkID, _)))):
+                guard let dest = peerOnLink(state, linkID), state.peering.peers[dest]?.state == .transferring
+                else { return .none }
+                // `resource.get_transfer_size()` (LXMPeer.py:515): the bytes on the wire, which the
+                // sender's progress reports per segment.
+                let bytes = state.peerTransferBytes.removeValue(forKey: linkID)?.values.reduce(0, +) ?? 0
+                return run(state.peering.transferConcluded(linkID: linkID, bytes: bytes, now: date.now), &state)
+
+            case let .client(.endpoint(.delegate(.resourceFailed(linkID, _, _)))):
+                guard let dest = peerOnLink(state, linkID), state.peering.peers[dest]?.state == .transferring
+                else { return .none }
+                state.peerTransferBytes[linkID] = nil
+                return run(state.peering.transferFailed(linkID: linkID), &state)
+
+            // --- Peering: configuration and persistence ---
+
+            case let .rehydratePeers(peers):
+                state.peering.rehydrate(peers, stored: Set(state.pn.store.transientIds))
+                guard state.nodeModeEnabled else { return .none }
+                return run(activateStaticPeers(&state), &state)
+
+            case let .setStaticPeers(peers):
+                state.peering.config.staticPeers = peers
+                guard state.nodeModeEnabled else { return .none }
+                return run(activateStaticPeers(&state), &state)
+
+            case let .setAutopeer(enabled):
+                state.peering.config.autopeer = enabled
+                return .none
+
+            case let .rehydrateStore(entries):
+                guard !entries.isEmpty else { return .none }
+                // No `distribute`: these entries were in the store before the relaunch, and each
+                // peer's unhandled set comes back with `.rehydratePeers` (Review Focus 3).
+                let container = LXMFPropagation.container(timestamp: date.now.timeIntervalSince1970, entries: entries)
+                let (_, evicted) = state.pn.store.ingest(container: container, now: date.now)
+                guard !evicted.isEmpty else { return .none }
+                return .send(.pn(.delegate(.purged(transientIds: evicted))))
 
             case .client, .pn, .delegate:
                 return .none
             }
+            }
+
+            // `peersChanged`: once per action that changed the persisted table, after it. Comparing
+            // the table first is cheap when nothing touched it (copy-on-write storage compares by
+            // identity); `persisted` then decides, so a config-only change reports nothing.
+            if case .delegate = action { return handle(&state, action) }
+            let before = state.peering
+            let effect = handle(&state, action)
+            guard state.peering != before, state.peering.persisted != before.persisted else { return effect }
+            return .merge(effect, .send(.delegate(.peersChanged(state.peering.persisted))))
         }
     }
 }

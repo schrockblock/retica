@@ -16,12 +16,19 @@ public struct LXMFStampGenerator: Sendable {
     /// with a propagation stamp at `cost`. The container bytes.
     public var propagationPack: @Sendable (_ message: LXMessage, _ recipient: Identity, _ ratchet: Data?,
                                            _ timestamp: Double, _ cost: Double) async -> Data?
+    /// A peering key over `peeringID` (the peer's identity hash ‖ ours) at `cost`, as
+    /// `LXMFServiceNode` mines one for each peer it syncs to. Live: `LXStamper.generatePeeringKey`.
+    public var peeringKey: @Sendable (_ peeringID: Data, _ cost: Double) async -> Data?
 
     public init(deliveryStamp: @escaping @Sendable (_ messageID: Data, _ cost: Double) async -> Data?,
                 propagationPack: @escaping @Sendable (_ message: LXMessage, _ recipient: Identity, _ ratchet: Data?,
-                                                      _ timestamp: Double, _ cost: Double) async -> Data?) {
+                                                      _ timestamp: Double, _ cost: Double) async -> Data?,
+                peeringKey: @escaping @Sendable (_ peeringID: Data, _ cost: Double) async -> Data? = { id, cost in
+                    await LXStamper.generatePeeringKey(peeringId: id, targetCost: cost)
+                }) {
         self.deliveryStamp = deliveryStamp
         self.propagationPack = propagationPack
+        self.peeringKey = peeringKey
     }
 }
 
@@ -33,6 +40,9 @@ extension LXMFStampGenerator: DependencyKey {
         propagationPack: { message, recipient, ratchet, timestamp, cost in
             await LXMFPropagation.pack(message: message, recipientIdentity: recipient, ratchet: ratchet,
                                        timestamp: timestamp, stampCost: cost)?.propagationPacked
+        },
+        peeringKey: { id, cost in
+            await LXStamper.generatePeeringKey(peeringId: id, targetCost: cost)
         })
     /// The real searches: tests that do not care which generator runs get the live behaviour.
     public static let testValue = liveValue

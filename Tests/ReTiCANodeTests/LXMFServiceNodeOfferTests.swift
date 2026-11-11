@@ -391,8 +391,28 @@ func autoPeerViaIncomingSyncMatchesReference(_ c: OfferResponderFixtures.Resourc
     #expect(store.state.validatedOfferLinks.isEmpty)
 }
 
+/// A peer that pushes us an entry we already hold, byte for byte, has it: reference marks every
+/// validated id from a peer handled for it, duplicates included (`queue_handled_message` after each
+/// `lxmf_propagation`, LXMRouter.py:2765-2784), so it is never offered back to that peer.
+@MainActor @Test func peerRepushingAnIdenticalStoredEntryMarksItHandledForThatPeer() async {
+    let syncLink = Data(repeating: 0xC1, count: 16)
+    let log = LockIsolated<[Seen]>([])
+    var state = nodeState(F.node8, peering: .init(peeringCost: 8), held: [F.entry("h1")], links: [syncLink])
+    _ = state.peering.peer(F.peerPropHash, announce: otherAnnounce, now: now)
+    state.peering.distribute([F.tid("h1")], from: nil)
+    #expect(state.peering.peers[F.peerPropHash]!.unhandled == [F.tid("h1")])
+    let store = makeStore(state, log: log)
+    await identify(store, syncLink, F.peer)
+    await push(store, syncLink, LXMFPropagation.container(timestamp: 1700000000, entries: [F.entry("h1")]))
+    let p = store.state.peering.peers[F.peerPropHash]!
+    #expect(p.handled.contains(F.tid("h1")))
+    #expect(p.unhandled.isEmpty)
+    #expect(closes(log).isEmpty)
+}
+
 /// Every store removal prunes the peer table (`PNPeerTable.prune(toStored:)` is mandatory after each):
-/// an id a client confirms delivered leaves every peer's handled and unhandled sets.
+/// an id a client confirms delivered, and an id evicted to make room for a new upload, leave every
+/// peer's handled and unhandled sets.
 @MainActor @Test func storeRemovalPrunesEveryPeer() async {
     let syncLink = Data(repeating: 0xC1, count: 16)
     let log = LockIsolated<[Seen]>([])
@@ -411,6 +431,27 @@ func autoPeerViaIncomingSyncMatchesReference(_ c: OfferResponderFixtures.Resourc
     #expect(!peers[F.peerPropHash]!.handled.contains(F.tid("u1")))
     #expect(!peers[F.otherPropHash]!.unhandled.contains(F.tid("u1")))
     #expect(peers[F.otherPropHash]!.unhandled.contains(F.tid("u2")))
+
+    // Eviction: a store with room for two entries takes a client's upload and evicts the oldest.
+    let (u1, u2, b1) = (F.entry("u1"), F.entry("u2"), F.entry("b1"))
+    let clientLink = Data(repeating: 0xC2, count: 16)
+    var small = nodeState(F.node8, peering: .init(peeringCost: 8), links: [syncLink, clientLink])
+    small.pn.store.storageLimitBytes = max(u1.count + u2.count, u2.count + b1.count)
+    _ = small.peering.peer(F.peerPropHash, announce: otherAnnounce, now: now)
+    _ = small.peering.peer(F.otherPropHash, announce: otherAnnounce, now: now)
+    let evicting = makeStore(small, log: LockIsolated<[Seen]>([]))
+    await identify(evicting, syncLink, F.peer)
+    await offer(evicting, syncLink, F.offers.first { $0.name == "none-held" }!.request)
+    await push(evicting, syncLink, LXMFPropagation.container(timestamp: 1700000000, entries: [u1, u2]))
+    #expect(evicting.state.peering.peers[F.peerPropHash]!.handled.contains(F.tid("u1")))
+    #expect(evicting.state.peering.peers[F.otherPropHash]!.unhandled.contains(F.tid("u1")))
+    await push(evicting, clientLink, LXMFPropagation.container(timestamp: 1700000000, entries: [b1]))
+    #expect(!evicting.state.pn.store.contains(transientId: F.tid("u1")))
+    #expect(evicting.state.pn.store.contains(transientId: F.tid("b1")))
+    let after = evicting.state.peering.peers
+    #expect(!after[F.peerPropHash]!.handled.contains(F.tid("u1")))
+    #expect(!after[F.otherPropHash]!.unhandled.contains(F.tid("u1")))
+    #expect(after[F.otherPropHash]!.unhandled.contains(F.tid("b1")))
 }
 
 // MARK: - Announce
