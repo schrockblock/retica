@@ -76,7 +76,8 @@ public struct LXMFServiceNode {
         /// byte-identical replay of one as it treats a stored entry: already validated, so no
         /// workblock. Without it, a single valid entry addressed to us could be replayed on one link
         /// at two workblocks (~44 ms) per packet, each one proved (final re-review, I3). Bounded, as
-        /// a ring: one evicted costs only a re-validation.
+        /// a ring: one evicted costs only a re-validation. Holds `Crypto.fullHash(entry)`, not the
+        /// entry, so 1024 large messages cost 32 KB, not their bodies.
         public var ownDeliveredEntries = RingSet(capacity: State.ownDeliveredEntriesCapacity)
         public static let ownDeliveredEntriesCapacity = 1024
 
@@ -372,7 +373,7 @@ public struct LXMFServiceNode {
                                                                         targetCost: store.minAcceptedStampCost)
                         else { continue }
                         core = validated.lxmfData
-                        _ = state.ownDeliveredEntries.insert(entry)
+                        _ = state.ownDeliveredEntries.insert(Crypto.fullHash(entry))
                     } else {
                         core = LXMFPropagation.strippedCore(lxmfData: entry)
                         // Reference handles only `len(lxmf_data) >= LXMF_OVERHEAD` (LXMRouter.py:2832);
@@ -757,7 +758,7 @@ public struct LXMFServiceNode {
                         // An entry addressed to us is never stored (`deliverOwn`), so a byte-identical
                         // replay of one we delivered is recognised by `ownDeliveredEntries` instead.
                         !state.pn.store.containsIdenticalStampedEntry($0)
-                            && !state.ownDeliveredEntries.contains($0)
+                            && !state.ownDeliveredEntries.contains(Crypto.fullHash($0))
                             && LXStamper.validatePnStamp(transientData: $0,
                                                          targetCost: state.pn.store.minAcceptedStampCost) == nil
                     }
