@@ -79,6 +79,12 @@ public struct LXMFRouter {
         /// link: `LinkSession` keeps a single split-send slot, and reference's several concurrent
         /// Resources per link is out of scope (spec §4).
         public var resourceQueue: [Data: [DeliveryKey]] = [:]
+        /// linkID → message hashes whose propagated copy went out on that link as a link packet, in the
+        /// order of each copy's first packet there (a resend keeps its place). The PN's
+        /// `ERROR_INVALID_STAMP` signal on the link rejects the first one still awaiting its receipt
+        /// (`.propagationLinkSignal`). Entries for settled copies are pruned on the next append; a
+        /// link's list goes with the link (`clearDirectLink`).
+        public var propagationPacketsOnLink: [Data: [Data]] = [:]
         /// The configured store-and-forward propagation node (all PROPAGATED sends link to it).
         public var outboundPropagationNode: Data? = nil
         /// PN hash → propagated messages queued until a link to the PN becomes active.
@@ -325,6 +331,11 @@ public struct LXMFRouter {
         /// list. `LXMFNode` tears that link down itself. If `linkID` is the active link to the current
         /// propagation node, `noIdentity` / `noAccess` set their (sticky) state; otherwise nothing.
         case syncError(SyncError, linkID: Data)
+        /// The propagation node sent `signal`, the first element of a list, as a link packet on `linkID`
+        /// (reference `propagation_transfer_signalling_packet`, LXMRouter.py:3035-3048). Only
+        /// `ERROR_INVALID_STAMP` does anything: the propagated copy whose packet on `linkID` is the
+        /// oldest still awaiting its receipt is REJECTED. With no such packet, nothing is.
+        case propagationLinkSignal(linkID: Data, signal: UInt64)
         case linkEstablished(destinationHash: Data, linkID: Data)
         case linkClosed(destinationHash: Data)
         case learnedPath(destinationHash: Data)
@@ -542,6 +553,26 @@ public struct LXMFRouter {
                 state.pendingDeliveries[key] = PendingDelivery(resend: resend, attempts: 0)
                 return deliveryRetryTimer(state, key)
             }
+            /// A propagated copy that is a link packet still awaiting its receipt: armed, retrying (a
+            /// Resource copy is `.transferring` or `.queued`), and small enough to go as a packet.
+            func awaitsPacketReceipt(_ state: State, _ hash: Data) -> Bool {
+                guard let pending = state.pendingDeliveries[.propagated(hash)], pending.phase == .retrying,
+                      case let .propagated(_, data) = pending.resend else { return false }
+                return data.count <= Link.mdu
+            }
+            /// `hash`'s propagated copy just went out on `linkID` as a link packet: record it for the
+            /// PN's upload signal. Prunes settled copies and the lists of links no longer active.
+            func notePropagatedPacket(_ state: inout State, linkID: Data, _ hash: Data) {
+                let active = Set(state.directLinks.values.compactMap { status -> Data? in
+                    if case let .active(id) = status { return id } else { return nil }
+                })
+                var lists = state.propagationPacketsOnLink.filter { active.contains($0.key) }
+                for (id, hashes) in lists { lists[id] = hashes.filter { awaitsPacketReceipt(state, $0) } }
+                var list = lists[linkID] ?? []
+                if !list.contains(hash) { list.append(hash) }
+                lists[linkID] = list
+                state.propagationPacketsOnLink = lists.filter { !$0.value.isEmpty }
+            }
             /// The destination whose ACTIVE link is `linkID`, if any.
             func destination(ofLink linkID: Data, _ state: State) -> Data? {
                 state.directLinks.first { $0.value == .active(linkID: linkID) }?.key
@@ -720,6 +751,7 @@ public struct LXMFRouter {
                 var orphaned: Effect<Action> = .none
                 if case let .active(linkID) = state.directLinks[dest] {
                     orphaned = orphanTransfer(&state, linkID: linkID)
+                    state.propagationPacketsOnLink[linkID] = nil
                 }
                 state.directLinks[dest] = nil
                 return orphaned
@@ -785,6 +817,7 @@ public struct LXMFRouter {
                 case let .propagated(destinationHash, data):
                     if case let .active(linkID) = state.directLinks[destinationHash] {
                         if data.count <= Link.mdu {
+                            notePropagatedPacket(&state, linkID: linkID, hash)
                             return .merge(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
                                                                                 propagationPacked: data,
                                                                                 messageHash: hash))),
@@ -1006,6 +1039,7 @@ public struct LXMFRouter {
                     if propagationPacked.count <= Link.mdu {
                         // Small container: send as a proof-requesting link packet. token = message.hash,
                         // and LXMFNode maps its packetDelivered back to THIS copy (leg .propagated).
+                        notePropagatedPacket(&state, linkID: linkID, message.hash)
                         return .merge(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
                                                                             propagationPacked: propagationPacked,
                                                                             messageHash: message.hash))),
@@ -1080,6 +1114,20 @@ public struct LXMFRouter {
                 }
                 return .none
 
+            case let .propagationLinkSignal(linkID, signal):
+                // Reference cancels `link.for_lxmessage`, the message that OPENED the link
+                // (LXMRouter.py:3293), as REJECTED. Plan ruling 2: we reject the copy whose packet on
+                // this link is the oldest still awaiting its receipt. With none (a Resource copy has
+                // its own rejection path), nothing is rejected.
+                guard signal == LXMFPropagation.errorInvalidStamp,
+                      var list = state.propagationPacketsOnLink[linkID],
+                      let index = list.firstIndex(where: { awaitsPacketReceipt(state, $0) })
+                else { return .none }
+                let hash = list.remove(at: index)
+                state.propagationPacketsOnLink[linkID] = list.isEmpty ? nil : list
+                let key = DeliveryKey.propagated(hash)
+                return .merge(.cancel(id: CancelID.retry(key)), fail(&state, key, reason: .rejected))
+
             case let .linkEstablished(dest, linkID):
                 // Defensive (unreachable through `establish` today, which only runs with no active
                 // link): a new link replacing a still-active one would otherwise strand the old
@@ -1116,6 +1164,7 @@ public struct LXMFRouter {
                     let key = DeliveryKey.propagated(item.messageHash)
                     arm(&state, key, .propagated(destinationHash: dest, data: item.propagationPacked))
                     if item.propagationPacked.count <= Link.mdu {
+                        notePropagatedPacket(&state, linkID: linkID, item.messageHash)
                         effects.append(.send(.delegate(.sendPropagatedPacket(linkID: linkID,
                                                                               propagationPacked: item.propagationPacked,
                                                                               messageHash: item.messageHash))))

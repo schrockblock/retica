@@ -503,6 +503,24 @@ public struct LXMFNode {
         }
     }
 
+    /// The signal in a PN's link packet on our outbound propagation link, read as reference
+    /// `propagation_transfer_signalling_packet` does (LXMRouter.py:3035-3040): the first element of a
+    /// msgpack list. `umsgpack.unpackb` ignores trailing bytes, and the `==` against the error code
+    /// also holds for an integral float, so both count. Anything else (not a list, an empty one, a
+    /// non-numeric first element, garbage) is no signal.
+    static func propagationSignal(_ data: Data) -> UInt64? {
+        guard case let .array(items)? = MsgPack.decodeLeadingValue(data), let first = items.first else { return nil }
+        let value: Double
+        switch first {
+        case let .uint(u): return u
+        case let .double(d): value = d
+        case let .float(f): value = Double(f)
+        default: return nil
+        }
+        guard value >= 0, value < 0x1p64, value.rounded() == value else { return nil }
+        return UInt64(value)
+    }
+
     /// A sync answered with `error` on `linkID`: tell the router (which sets the state only if
     /// `linkID` is its current PN link), then tear down THAT link, the one the answer came on.
     static func endSync(_ error: LXMFRouter.SyncError, linkID: Data) -> Effect<Action> {
@@ -694,6 +712,12 @@ public struct LXMFNode {
             func isServedPropagationLink(_ state: LXMFNode.State, _ linkID: Data) -> Bool {
                 guard let served = state.propagationDestinationHash else { return false }
                 return state.linkDestinations[linkID] == served
+            }
+            /// `linkID` is our link to the current outbound propagation node (the one uploads and
+            /// syncs use), by the router's active link or by where the link goes.
+            func isOutboundPropagationLink(_ state: LXMFNode.State, _ linkID: Data) -> Bool {
+                guard let pn = state.router.outboundPropagationNode else { return false }
+                return state.router.directLinks[pn] == .active(linkID: linkID) || state.linkDestinations[linkID] == pn
             }
             /// Report `fraction` for this copy unless it would not move its progress forward.
             func reportProgress(_ state: inout LXMFNode.State, _ key: LXMFRouter.DeliveryKey,
@@ -1582,6 +1606,14 @@ public struct LXMFNode {
                 // `LXMFServiceNode` handles proving for propagation-link packets; return early here so
                 // that proving is never double-counted and delivery is not attempted for propagation data.
                 guard !isServedPropagationLink(state, linkID) else { return .none }
+                // On our outbound link to the propagation node a link packet is the PN's upload signal,
+                // never a message: reference sets `propagation_transfer_signalling_packet` as that
+                // link's packet callback (LXMRouter.py:3292). Sync answers come as link RESPONSES
+                // (`.responseReceived`), so they never reach here.
+                if isOutboundPropagationLink(state, linkID) {
+                    guard let signal = LXMFNode.propagationSignal(data) else { return .none }
+                    return .send(.router(.propagationLinkSignal(linkID: linkID, signal: signal)))
+                }
                 // Reference `LXMRouter.delivery_packet` (LXMRouter.py:1925-1927) calls `packet.prove()`
                 // as its FIRST statement for every inbound delivery-link packet. Without this proof,
                 // a reference client's `LXMessage.__link_packet_timed_out` (LXMessage.py:616-619)

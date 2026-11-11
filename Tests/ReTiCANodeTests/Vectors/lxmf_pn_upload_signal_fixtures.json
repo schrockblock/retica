@@ -1,0 +1,63 @@
+{
+  "constants": {
+    "error_invalid_stamp": 245,
+    "rejected": 253
+  },
+  "pn_reject_data": "91ccf5",
+  "cases": [
+    {
+      "name": "invalid-stamp-list",
+      "data": "91ccf5",
+      "rejected": true
+    },
+    {
+      "name": "no-identity-list",
+      "data": "91ccf0",
+      "rejected": false
+    },
+    {
+      "name": "invalid-stamp-bare",
+      "data": "ccf5",
+      "rejected": false
+    },
+    {
+      "name": "empty-list",
+      "data": "90",
+      "rejected": false
+    },
+    {
+      "name": "garbage",
+      "data": "c1ff0013",
+      "rejected": false
+    },
+    {
+      "name": "invalid-stamp-list-with-more",
+      "data": "92ccf501",
+      "rejected": true
+    },
+    {
+      "name": "invalid-stamp-list-trailing-bytes",
+      "data": "91ccf50102",
+      "rejected": true
+    },
+    {
+      "name": "invalid-stamp-as-float",
+      "data": "91cb406ea00000000000",
+      "rejected": true
+    },
+    {
+      "name": "invalid-stamp-as-string",
+      "data": "91a2c3b5",
+      "rejected": false
+    },
+    {
+      "name": "true-list",
+      "data": "91c3",
+      "rejected": false
+    }
+  ],
+  "versions": {
+    "rns": "1.6.0",
+    "lxmf": "1.3.0"
+  }
+}
