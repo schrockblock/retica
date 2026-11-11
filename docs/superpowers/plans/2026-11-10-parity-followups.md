@@ -34,7 +34,7 @@
 **Interfaces:**
 - `PropagationStore.Entry.receivedAt: Date` — set by `ingest` from its `now` argument; rehydration re-ingests, so a relaunch resets ages (record this in the doc comment; reference persists `lxm_rcvd`).
 - `PropagationStore.offerCandidates(acceptedAt minimum: Double, transferLimitKB: Int?, syncLimitKB: Int?, excluding handled: Set<Data>, now: Date) -> (offer: [Data], oversized: [Data])` — the reference selection loop (Global Constraints values). No prioritised-destination list exists in ReTiCA, so `priority_weight` is always 1.0; say so in a comment.
-- `PNNode.State.handledByPeer: [Data: Set<Data>]` (peer hash → transient ids). An id becomes handled for a peer when it is oversized for that peer, when the peer's offer response says it does not want it (reference `offer_response` adds to handled the ids not in the wanted list, and the wanted ones after they are sent — check LXMPeer.py `offer_response` and `resource_concluded` and match it), or when the peer offered it to us. In memory only; a relaunch costs one redundant offer (ruling — record in Status).
+- `PNNode.State.handledByPeer: [Data: Set<Data>]` (peer hash → transient ids). An id becomes handled for a peer when it is oversized for that peer, when the peer's offer response says it does not want it (reference `offer_response` adds to handled the ids not in the wanted list, and the wanted ones after they are sent — check LXMPeer.py `offer_response` and `resource_concluded` and match it), or when the peer offered it to us (this last clause was dropped by the final review — see Status). In memory only; a relaunch costs one redundant offer (ruling — record in Status).
 
 - [ ] Tests: Review Focus 1 and 2; weight order (an older entry of equal size sorts after a newer one; a smaller entry sorts first); a handled id is not offered again; an id the peer declined is not offered again. Cross-validate the selection against reference by driving `LXMPeer` selection logic from a committed generator in `Tests/Fixtures/` (or, if driving LXMPeer needs a live router, compute the expected subset with reference's own `get_weight` arithmetic in the generator and say so in its header).
 - [ ] Grep ReTiCAMsgr for any persisted `PropagationStore.Entry` before deciding no app change is needed. Commit.
@@ -91,7 +91,33 @@ Added after the 2026-11-10 parity survey (`/tmp/ReTiCA/parity-gap-report.md`): `
 
 ## Status
 
-Not started.
+Done 2026-11-10 (commits 0076d46..f9127a8, plus the final-review fix e3a05ed). Rulings and known limits:
+
+- Task 1 (PN offer limits): done, **library-only**. It changes `PNNode` / `PropagationNode.offerToPeer`.
+  ReTiCAMsgr's production node is `LXMFServiceNode`, which answers no `/offer` and never syncs, so
+  app users see no change (the only part the app runs is `ingest(container:now:)` recording
+  `receivedAt`). The handled set is kept in memory only (a relaunch costs one redundant offer), and
+  `receivedAt` resets on rehydration. Low-value ids (stamp cost below the peer's) count as handled,
+  as reference does. The final review found the handled set gained one permanent key per stranger
+  that offered a held id; the early "offered to us" mark was dropped. PNNode keeps no peer list, so
+  it makes no receipt-side mark either, matching reference for an unpeered sender
+  (LXMRouter.py:2772-2784).
+- Task 3 (tickets mid-stamp): done. The ticket ruling also applies to tickets rehydrated at launch;
+  each job re-checks expiry.
+- Task 4 (destination-stamp queue): done. Divergence: a re-announce of the item being searched
+  replaces it in place (one announce with the newest app data) instead of queuing a second; the
+  stamp covers destination hash, public key and name hash, not app data. Documented one-slot
+  divergence when a path response and a preempted announce are both excluded. Out of scope:
+  re-registration drops pending items but leaves the running search, so a new announce counts as
+  queued.
+- Task 5 (minors): done; the `Task.isCancelled` guard in the path-request race is redundant (TCA
+  drops sends from cancelled effects) and was kept.
+- Task 6: superseded by another session's 3d74fe8 (opportunistic sends capped at
+  `Packet.encryptedMDU` 383); not redone.
+- Known limits of the decrypt budget (later): budgets are keyed by `InterfaceID`, and TCP-server and
+  AutoInterface ids are per connection / per peer, so each new connection gets a fresh burst of 8
+  deep scans; the shallow scan (17 agreements per packet) is not rate-limited, so a junk DATA flood
+  still costs main-actor time (strictly better than the previous 513 per packet).
 
 - Task 2 (inbound ratchet-decrypt budget): done. Deliberate divergence from reference (RNS 1.6.0
   Destination.py:720-752 scans the whole ring): shallow 16 ratchets then the identity key, deep scan
