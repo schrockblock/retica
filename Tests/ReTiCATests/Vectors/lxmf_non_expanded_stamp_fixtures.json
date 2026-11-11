@@ -1,0 +1,33 @@
+{
+  "versions": {
+    "rns": "1.6.0",
+    "lxmf": "1.3.0"
+  },
+  "cost": 12,
+  "message": {
+    "packed": "82097450f615c6bc4db1d7f45a3dc2cef01c85fc9b43b825a88209836d14a618a89c8b6d2c79f2eb90732ac47047f5a2cd06940264d30d06344457879471f22d52eb0752bb4d5d4e1e2e198c46729809d2e4d7154dc37c17d63ee1ddad048c0494cb41d954fc40100000c4057374616d70c40c6e6f6e2d657870616e64656480",
+    "hash": "d5d6f3a7177164149837d9b9755263c3def05bee39a8d90de9d3fdcef3bc7717",
+    "stamp": "dec6961735cdce200451a94d95ea3a89dc532c030a94db4e0fbeac654c22b84b",
+    "non_expanded_value": 13.87109375,
+    "expanded_value": 1.34765625,
+    "reference_validate_stamp": false,
+    "non_expanded_stamp_valid": true
+  },
+  "pn": {
+    "lxm_data": "832d07d5eee3a2aa53f7865890e51cffb606514a1eaa8c644f36afba8bf9210d832d07d5eee3a2aa53f7865890e51cffb606514a1eaa8c644f36afba8bf9210d832d07d5eee3a2aa53f7865890e51cffb606514a1eaa8c644f36afba8bf9210d832d07d5eee3a2aa53f7865890e51cffb606514a1eaa8c644f36afba8bf9210d832d07d5eee3a2aa53f7865890e51cffb606514a1eaa8c644f36afba8bf9210d",
+    "transient_id": "cd0a2bf8564efa7332110aac55b992960e1557dc110525595b32526ace3806b6",
+    "stamp": "93533b4b1cadaa805d9083667656a7406f9994d20ef255a87095cfe22d8e9692",
+    "non_expanded_value": 14.046875,
+    "expanded_value": 1.55859375,
+    "reference_validate_pn_stamp_accepts": false,
+    "non_expanded_stamp_valid": true
+  },
+  "peering": {
+    "peering_id": "63b3ce020e89ee771988c582853f82e44481b5c8a1cbb230549bd20f74aad437",
+    "stamp": "efe66f46c7e846131be1bc89f845442b6c9cacc9ac62ba326fa765b003497d42",
+    "non_expanded_value": 12.3984375,
+    "expanded_value": 0.10546875,
+    "reference_validate_peering_key": false,
+    "non_expanded_stamp_valid": true
+  }
+}
