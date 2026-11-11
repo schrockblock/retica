@@ -130,7 +130,9 @@ import ComposableArchitecture
             #expect(announced.nodeState == true)
             #expect(announced.targetStampCost == 12)
             #expect(announced.stampCostFlexibility == 0)
-            #expect(announced.peeringCost == 0)
+            // 18, not the 0 this node advertised before it answered `/offer`: the announce now
+            // carries the cost its `/offer` validates keys at, lxmd's default (LXMRouter.py:63).
+            #expect(announced.peeringCost == 18)
             #expect(announced.metadata == .map([]))
         }
     }

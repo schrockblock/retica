@@ -11,8 +11,10 @@ import ReTiCATransport
 /// delegates and the propagation node's actions. Every serve behavior is gated on `nodeModeEnabled`, so
 /// with node-mode off this behaves exactly like a bare `LXMFNode`.
 ///
-/// Serve scope is client-facing only (register/announce, ingest offers, two-phase `/get`). PN↔PN mesh
-/// peering and time-based expiry are out of scope — see `PNNode` for the peering path. Inbound proving
+/// Serve scope: register/announce, ingest offers, two-phase `/get`, and the server half of PN↔PN
+/// peering — `/offer` answered as reference does, multi-message containers refused on links without a
+/// validated peering key, inbound syncs accounted in `peering` (a `PNPeerTable`), auto-peering with a
+/// recallable sender. Outbound syncing to peers and time-based expiry are not driven here. Inbound proving
 /// of PACKET-framed propagation offers is in scope and lives at the `.linkDataReceived` handler below
 /// (reference LXMRouter.py:2255); Resource-framed offers are proved by the resource transfer protocol.
 @Reducer
@@ -30,6 +32,15 @@ public struct LXMFServiceNode {
         /// possible. Using a queue per key prevents the second request from silently overwriting the
         /// first (the first's linkID would be lost and its response never sent).
         public var pendingGet: [Data: [PendingGet]] = [:]
+        /// Our propagation-node peers. This task drives only the inbound side: `/offer` validates keys
+        /// at `peering.config.peeringCost` (which the announce advertises), inbound syncs mark ids
+        /// handled for the sending peer and distribute fresh ones to the others, and every store
+        /// removal prunes it. Outbound syncing (`syncTick`, offers, key mining) is not driven here yet.
+        public var peering: PNPeerTable
+        /// Links on which a peer presented a peering key valid at our cost (reference
+        /// `validated_peer_links`, LXMRouter.py:2649). Only such a link may deliver more than one
+        /// message per container (:2716-2724). Cleared when the link closes and on node-mode disable.
+        public var validatedOfferLinks: Set<Data> = []
 
         /// 32 MB — a mobile-appropriate cap for the store-and-forward backlog.
         public static let defaultStorageLimitBytes: Int = 32 * 1024 * 1024
@@ -37,30 +48,34 @@ public struct LXMFServiceNode {
         public init(identity: Identity, endpoint: TransportEndpoint.State,
                     storageLimitBytes: Int? = State.defaultStorageLimitBytes,
                     targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
-                    stampCostFlexibility: Double = 0) {
+                    stampCostFlexibility: Double = 0,
+                    peering: PNPeerTable.Config = .init()) {
             self.client = LXMFNode.State(identity: identity, endpoint: endpoint)
             self.pn = PropagationNode.State(storageLimitBytes: storageLimitBytes, targetStampCost: targetStampCost,
                                             stampCostFlexibility: stampCostFlexibility)
+            self.peering = PNPeerTable(config: peering)
         }
 
         /// Convenience: run this node over TCP.
         public init(identity: Identity, endpoint: TCPEndpoint.State,
                     storageLimitBytes: Int? = State.defaultStorageLimitBytes,
                     targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
-                    stampCostFlexibility: Double = 0) {
+                    stampCostFlexibility: Double = 0,
+                    peering: PNPeerTable.Config = .init()) {
             self.init(identity: identity, endpoint: .tcp(endpoint),
                       storageLimitBytes: storageLimitBytes, targetStampCost: targetStampCost,
-                      stampCostFlexibility: stampCostFlexibility)
+                      stampCostFlexibility: stampCostFlexibility, peering: peering)
         }
 
         /// Convenience: run this node over BLE.
         public init(identity: Identity, endpoint: BLEEndpoint.State,
                     storageLimitBytes: Int? = State.defaultStorageLimitBytes,
                     targetStampCost: Double = LXMFPropagation.defaultPropagationStampCost,
-                    stampCostFlexibility: Double = 0) {
+                    stampCostFlexibility: Double = 0,
+                    peering: PNPeerTable.Config = .init()) {
             self.init(identity: identity, endpoint: .ble(endpoint),
                       storageLimitBytes: storageLimitBytes, targetStampCost: targetStampCost,
-                      stampCostFlexibility: stampCostFlexibility)
+                      stampCostFlexibility: stampCostFlexibility, peering: peering)
         }
     }
 
@@ -168,9 +183,56 @@ public struct LXMFServiceNode {
                            // at max(0, cost - flex).
                            targetStampCost: state.pn.store.targetStampCost,
                            stampCostFlexibility: state.pn.store.stampCostFlexibility,
-                           // This node serves clients only and answers no `/offer`, so there is
-                           // no peering key it checks; 0 is what it has always advertised.
-                           peeringCost: 0).packed
+                           // The cost `/offer` validates peering keys at, read from the same
+                           // config, so advertised == enforced (lxmd's default 18).
+                           peeringCost: state.peering.config.peeringCost).packed
+            }
+
+            /// A remote identity's propagation destination hash: reference's
+            /// `RNS.Destination(remote_identity, OUT, SINGLE, APP_NAME, "propagation").hash`.
+            func propagationHash(of identity: Identity) -> Data {
+                Destination.hash(identityHash: identity.hash, appName: LXMessage.appName, aspects: ["propagation"])
+            }
+
+            /// Ingests a container that arrived on a propagation link and accounts it in the peer
+            /// table. `source` is the sending peer's propagation hash when that peer is in the table.
+            ///
+            /// Reference marks each validated id handled for the sending peer, fresh or duplicate
+            /// (`queue_handled_message` after every `lxmf_propagation`, LXMRouter.py:2765-2784), and
+            /// queues each FRESH id for every other peer (`enqueue_peer_distribution(transient_id,
+            /// from_peer)`, :2882, flushed by :2811-2824). The handled set here is the fresh ids
+            /// plus entries byte-identical to ones already stored: `ingest` skips a stored entry before
+            /// validating it, and a byte-identical one is known valid because it was accepted. An entry
+            /// pairing a stored core with a different stamp is not counted (reference would validate it
+            /// and find it invalid).
+            ///
+            /// Done here rather than through `PropagationNode.ingestContainer` because only this
+            /// reducer knows the source, and the pre-ingest store state is needed for the duplicates.
+            /// The same `PropagationNode` delegates are sent, so the host-facing signals are unchanged.
+            func ingest(_ state: inout State, _ container: Data, from source: Data?) -> Effect<Action> {
+                var duplicates: [Data] = []
+                if source != nil, let (_, entries) = LXMFPropagation.parseContainer(container) {
+                    duplicates = entries.compactMap { entry in
+                        guard state.pn.store.containsIdenticalStampedEntry(entry) else { return nil }
+                        return state.pn.store.preflightTransientId(ofStampedEntry: entry)
+                    }
+                }
+                let (added, evicted) = state.pn.store.ingest(container: container, now: date.now)
+                if let source { state.peering.markHandled(added + duplicates, for: source) }
+                state.peering.distribute(added, from: source)
+                var effects: [Effect<Action>] = [
+                    .send(.pn(.delegate(.stored(transientIds: added)))),
+                    .send(.pn(.delegate(.storedEntries(entries: state.pn.store.entries(forTransientIds: added))))),
+                ]
+                // The `.purged` handler prunes the peer table, as it does for every removal route.
+                if !evicted.isEmpty { effects.append(.send(.pn(.delegate(.purged(transientIds: evicted))))) }
+                return .merge(effects)
+            }
+
+            /// The response body for a request: `umsgpack.packb(value)`.
+            func respond(_ linkID: Data, _ requestID: Data, _ value: MsgPackValue) -> Effect<Action> {
+                .send(.client(.endpoint(.sendResponseOverLink(linkID: linkID, requestID: requestID,
+                                                              data: MsgPack.encode(value)))))
             }
 
             switch action {
@@ -199,6 +261,7 @@ public struct LXMFServiceNode {
                 // bookkeeping is sufficient — all serve behaviour is independently gated on nodeModeEnabled.
                 state.clientIdentities = [:]
                 state.pendingGet = [:]
+                state.validatedOfferLinks = []
                 // Re-announce with nodeState = false so peers unpeer immediately rather than continuing
                 // to sync into a node that now drops everything. Reference: LXMRouter.disable_propagation
                 // (LXMRouter.py:692-694) sets self.propagation_node = False then calls
@@ -226,7 +289,35 @@ public struct LXMFServiceNode {
             // --- Inbound offers (only on the link to the destination we serve) ---
             case let .client(.endpoint(.delegate(.resourceReceived(linkID, data)))):
                 guard state.nodeModeEnabled, isPropagationLink(state, linkID) else { return .none }
-                return .send(.pn(.ingestContainer(data)))
+                // Reference `propagation_resource_concluded` (LXMRouter.py:2669-2805). A container that
+                // does not parse is ignored (:2795-2796).
+                guard let (_, messages) = LXMFPropagation.parseContainer(data) else { return .none }
+                var source: Data? = nil
+                if let remote = state.clientIdentities[linkID] {
+                    let remoteHash = propagationHash(of: remote)
+                    // Auto-peer via incoming sync (:2682-2714): an unknown sender whose recalled
+                    // announce says it is an enabled propagation node, within `autopeerMaxDepth`, is
+                    // peered BEFORE the container is judged, so even a refused container peers it.
+                    // `hops_to` is the path's hop count as reference counts it, one more than the
+                    // on-wire count a learned path keeps (see `Transport.receiptTimeoutBase`); with no
+                    // path, reference's `PATHFINDER_M` (128) is over any depth.
+                    if state.peering.peers[remoteHash] == nil, state.peering.config.autopeer,
+                       let appData = state.client.endpoint.transport.recallAppData(destinationHash: remoteHash),
+                       let announce = PNAnnounce.parse(appData), announce.nodeState,
+                       let path = state.client.endpoint.learned[remoteHash],
+                       Int(path.hops) + 1 <= Int(state.peering.config.autopeerMaxDepth) {
+                        // A new peer: `peer` returns no commands for one (only an unpeer closes a link).
+                        _ = state.peering.peer(remoteHash, announce: announce, now: date.now)
+                    }
+                    if state.peering.peers[remoteHash] != nil { source = remoteHash }
+                }
+                // Only a link with a validated peering key (which requires an identity: `/offer` answers
+                // ERROR_NO_IDENTITY without one) may deliver more than one message per container
+                // (:2716-2724): anything else is torn down and nothing is ingested.
+                if messages.count > 1, !state.validatedOfferLinks.contains(linkID) {
+                    return .send(.client(.endpoint(.closeLink(linkID: linkID))))
+                }
+                return ingest(&state, data, from: source)
 
             case let .client(.endpoint(.delegate(.linkDataReceived(linkID, data, packetHash)))):
                 guard state.nodeModeEnabled, isPropagationLink(state, linkID) else { return .none }
@@ -291,8 +382,10 @@ public struct LXMFServiceNode {
                             .send(.client(.endpoint(.closeLink(linkID: linkID)))))
                     }
                 }
+                // A packet comes from a client, never a peer: reference's `propagation_packet` passes no
+                // `from_peer` (LXMRouter.py:2584), so every fresh id goes to every peer.
                 return .merge(
-                    .send(.pn(.ingestContainer(data))),
+                    ingest(&state, data, from: nil),
                     .send(.client(.endpoint(.provePacketOverLink(linkID: linkID, packetHash: packetHash)))))
 
             case let .client(.endpoint(.delegate(.linkIdentified(linkID, remoteIdentity)))):
@@ -307,10 +400,49 @@ public struct LXMFServiceNode {
                 // Guard on propagation-link classification (Minor-4): the /get handler is registered only
                 // on the propagation destination (reference LXMRouter.py:670), so a /get on the delivery
                 // link must be silently dropped rather than served.
-                guard state.nodeModeEnabled,
-                      isPropagationLink(state, linkID),
-                      pathHash == Crypto.truncatedHash(Data("/get".utf8))
-                else { return .none }
+                guard state.nodeModeEnabled, isPropagationLink(state, linkID) else { return .none }
+                if pathHash == Crypto.truncatedHash(Data("/offer".utf8)) {
+                    // Reference `offer_request` (LXMRouter.py:2601-2667), registered on the
+                    // propagation destination only (LXMF 1.3.0 :764). Admission control (ERROR_THROTTLED,
+                    // sequential validation, max inbound syncs, throttled peers, from_static_only) is
+                    // not implemented: ruling 5a.
+                    guard let remote = state.clientIdentities[linkID] else {
+                        return respond(linkID, requestID, .uint(LXMFPropagation.errorNoIdentity))
+                    }
+                    // Ruling 5b: any body that is not an array of at least two elements with a bin key
+                    // is ERROR_INVALID_DATA. Reference answers that only for a non-list shorter than 2
+                    // and answers None (its `except`) for the rest, which no reference peer sends.
+                    guard case let .array(items)? = MsgPack.decodeValue(data), items.count >= 2,
+                          case let .bin(peeringKey) = items[0]
+                    else { return respond(linkID, requestID, .uint(LXMFPropagation.errorInvalidData)) }
+                    // Synchronous, as reference validates in the handler (ruling 5c): one 25-round
+                    // workblock (6 400 bytes) and one hash.
+                    let peeringID = state.client.identity.hash + remote.hash
+                    guard LXStamper.validatePeeringKey(peeringId: peeringID, peeringKey: peeringKey,
+                                                       targetCost: state.peering.config.peeringCost)
+                    else { return respond(linkID, requestID, .uint(LXMFPropagation.errorInvalidKey)) }
+                    state.validatedOfferLinks.insert(linkID)
+                    // Reference iterates `data[1]` after validating; anything but a list of ids raises
+                    // there and answers None (the link stays validated). Ruling 5b's answer instead.
+                    guard case let .array(idItems) = items[1] else {
+                        return respond(linkID, requestID, .uint(LXMFPropagation.errorInvalidData))
+                    }
+                    var offered: [Data] = []
+                    for item in idItems {
+                        guard case let .bin(id) = item else {
+                            return respond(linkID, requestID, .uint(LXMFPropagation.errorInvalidData))
+                        }
+                        offered.append(id)
+                    }
+                    // Not `PropagationStore.wanted(fromOffered:)`, which de-duplicates: reference
+                    // appends every offered id it lacks, repeats included, and compares that count to
+                    // the offer's (an offer repeating an id we lack is answered `True`).
+                    let wanted = offered.filter { !state.pn.store.contains(transientId: $0) }
+                    if wanted.isEmpty { return respond(linkID, requestID, .bool(false)) }
+                    if wanted.count == offered.count { return respond(linkID, requestID, .bool(true)) }
+                    return respond(linkID, requestID, .array(wanted.map { .bin($0) }))
+                }
+                guard pathHash == Crypto.truncatedHash(Data("/get".utf8)) else { return .none }
                 // Reference LXMRouter.py:1483 — `message_get_request` returns LXMPeer.ERROR_NO_IDENTITY
                 // (0xF0) as the response BODY when the link never IDENTIFY'd. Reference clients branch on
                 // exactly that value (LXMRouter.py:1563 / :1608) to tear the link down and set
@@ -411,11 +543,16 @@ public struct LXMFServiceNode {
 
             case let .pn(.delegate(.purged(ids))):
                 guard !ids.isEmpty else { return .none }
+                // Every removal route reports here (a client's purge or delivery confirmation, and
+                // eviction on ingest), so this is the one place the peer table is pruned, which
+                // `PNPeerTable.prune(toStored:)` requires after every store removal.
+                state.peering.prune(toStored: Set(state.pn.store.transientIds))
                 return .send(.delegate(.messagesPurged(transientIds: ids)))
 
             // --- Link lifecycle cleanup ---
             case let .client(.endpoint(.delegate(.linkClosed(linkID, _)))):
                 state.clientIdentities[linkID] = nil
+                state.validatedOfferLinks.remove(linkID)
                 // Drop all queued requests for this link; responses can never be delivered.
                 state.pendingGet = state.pendingGet.compactMapValues { queue in
                     let remaining = queue.filter { $0.linkID != linkID }
