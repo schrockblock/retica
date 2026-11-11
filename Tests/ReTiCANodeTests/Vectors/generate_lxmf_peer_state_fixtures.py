@@ -260,11 +260,12 @@ def apply(r, s):
         raise ValueError(op)
 
 
-def run_case(index, name, steps, static=(), entries=True):
+def run_case(index, name, steps, static=(), max_peers=20, entries=True):
     LOG.clear()
     CLOCK.now = T0
     r = LXMF.LXMRouter(identity=RNS.Identity(), storagepath=os.path.join(workdir, f"case-{index}"),
-                       autopeer=True, autopeer_maxdepth=6, static_peers=[PEER(i) for i in static])
+                       autopeer=True, autopeer_maxdepth=6, static_peers=[PEER(i) for i in static],
+                       max_peers=max_peers)
     r.request_path = lambda h: LOG.append({"kind": "request_path", "peer": hx(h)})
     r.enable_propagation()
     if entries:
@@ -299,7 +300,7 @@ def run_case(index, name, steps, static=(), entries=True):
         s["peers"] = snapshot(r)
         s["now"] = CLOCK.now
         recorded.append(s)
-    return {"name": name, "static": [hx(PEER(i)) for i in static], "steps": recorded}
+    return {"name": name, "static": [hx(PEER(i)) for i in static], "max_peers": max_peers, "steps": recorded}
 
 
 def announce(*who, **kw): return dict(op="announce", who=list(who), **kw)
@@ -446,6 +447,19 @@ CASES = [
         dict(op="sync_tick", randint=[2]),                  # pool [1, 2, 0, 3]: peer 0
         dict(op="sync_tick", randint=[2]),                  # pool [1, 2, 3]: peer 3
     ], ()),
+    ("selection_unknown_speed", [
+        dict(op="rehydrate", load=[
+            dict(peer=0, rate=0, unhandled=[0]),
+            dict(peer=1, rate=300, unhandled=[0]),
+            dict(peer=2, rate=0, unhandled=[0]),
+        ]),
+        dict(op="sync_tick", randint=[3]),                  # fastest [1, 0] + unknown [0, 2]: pool [1, 0, 0, 2]
+        dict(op="sync_tick", randint=[2]),                  # fastest [1, 0] + unknown [0]: pool [1, 0, 0]
+    ], ()),
+    ("static_counts_toward_max_peers", [
+        announce(0, timebase=100),                          # the static peer fills max_peers 1: refused
+        announce(5, timebase=100),                          # the static peer still updates
+    ], (5,), 1),
     ("no_path", [
         announce(0, timebase=100),
         dict(op="distribute", ids=[0]),
@@ -463,7 +477,7 @@ fixtures = {
     "key": hx(KEY),
     "peers": [hx(PEER(i)) for i in range(21)],
     "tids": [hx(TID(j)) for j in range(10)],
-    "cases": [run_case(i, name, steps, static) for i, (name, steps, static) in enumerate(CASES)],
+    "cases": [run_case(i, *case) for i, case in enumerate(CASES)],
     "versions": {"rns": RNS.__version__, "lxmf": LXMF.__version__},
 }
 
@@ -510,6 +524,11 @@ assert len(cu[-3]["peers"]) == 2 and [p["dest"] for p in cu[-1]["peers"]] == [P[
 se = by_name["selection"]["steps"]
 assert se[1]["pools"] == [4] and se[1]["commands"] == [{"kind": "open_link", "peer": P[0]}]
 assert se[2]["pools"] == [3] and se[2]["commands"] == [{"kind": "open_link", "peer": P[3]}]
+su = by_name["selection_unknown_speed"]["steps"]
+assert su[1]["pools"] == [4] and su[1]["commands"] == [{"kind": "open_link", "peer": P[2]}]
+assert su[2]["pools"] == [3] and su[2]["commands"] == [{"kind": "open_link", "peer": P[0]}]
+sm = by_name["static_counts_toward_max_peers"]["steps"]
+assert [p["dest"] for p in sm[1]["peers"]] == [P[5]] and sm[2]["peers"][0]["timebase"] == 100
 np = by_name["no_path"]["steps"]
 assert np[3]["commands"] == [{"kind": "request_path", "peer": P[0]}]
 assert peer_in(np[3], 0)["sync_backoff"] == 720 and peer_in(np[3], 0)["alive"] is False

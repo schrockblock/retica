@@ -14,19 +14,25 @@ import ReTiCA
 /// - `.openLink(peer)`: open a link to the peer's `lxmf.propagation` destination. With no path,
 ///   request one, wait `pathRequestGrace`, and if there is still none call `linkFailed`, which is
 ///   where reference's `sync()` does the same (LXMPeer.py:297-306). A link that fails to establish
-///   also goes to `linkFailed`. An established one goes to `linkEstablished`.
+///   also goes to `linkFailed` (the endpoint reports it by destination; the table knows a link id only
+///   from `linkEstablished` on). An established one goes to `linkEstablished`.
 /// - After `linkEstablished`, or after `offerResponse(.noIdentity)`, a peer left in `.linkReady`
 ///   wants an offer: the host calls `offerSelected` with
 ///   `store.offerCandidates(acceptedAt: LXMFPropagation.peerMinimumAcceptedCost(peer.announce!), …,
-///   among: peer.unhandled, excluding: peer.handled, now:)`.
+///   among: peer.unhandled, excluding: peer.handled, now:)` and `purged:` = the peer's unhandled ids
+///   the store does not hold.
 /// - `.generatePeeringKey(peer, cost)`: mine a peering key over `peerIdentity.hash + ourIdentity.hash`
-///   and report it with `keyReady`. The table does not ask again while the peer is `.keyPending`.
+///   and report it with `keyReady`, or `keyFailed` if the search fails or is cancelled. The table does
+///   not ask again while the peer is `.keyPending`.
 /// - `.sendOffer` / `.sendResource`: the `/offer` request and the sync container, on that link;
 ///   report the response with `offerResponse` (parsed by `OfferResponse.parse`), a failed request with
 ///   `requestFailed`, the transfer with `transferConcluded` / `transferFailed`, and any close of the
 ///   link with `linkClosed`.
+/// - `.closeLink` is also returned by every path that removes a peer holding a link (`unpeer`,
+///   `peer` / `announceHeard` unpeering, the cull in `syncTick`).
 /// - Run `syncTick` every `peerSyncInterval` seconds. Call `distribute` on every fresh ingest and
-///   `markHandled` for ids a peer sent us. `prune` after the store evicts.
+///   `markHandled` for ids a peer sent us. Call `prune` after EVERY store eviction (see `prune`).
+///   Call `announceHeard` only in node mode.
 ///
 /// **Deliberate divergences from reference**, each where reference strands a peer with its sync link
 /// open and out of selection (`sync_peers` only picks `IDLE` peers) until the link happens to die:
@@ -173,35 +179,42 @@ public struct PNPeerTable: Equatable, Sendable {
     /// ignored (reference raises a KeyError there). Any other node autopeers on a real announce
     /// (never a path response) within `autopeerMaxDepth` hops, is unpeered when it moves beyond it,
     /// and is unpeered when it announces its node disabled.
-    public mutating func announceHeard(_ dest: Data, announce: PNAnnounce, hops: UInt8, isPathResponse: Bool, now: Date) {
+    ///
+    /// The host must call this only while it is itself a propagation node (node mode on): reference
+    /// evaluates peering only `if self.lxmrouter.propagation_node` (Handlers.py:56). Returns
+    /// `.closeLink` when an unpeered peer held a sync link.
+    public mutating func announceHeard(_ dest: Data, announce: PNAnnounce, hops: UInt8, isPathResponse: Bool,
+                                       now: Date) -> [Command] {
         if config.staticPeers.contains(dest) {
-            guard let existing = peers[dest] else { return }
-            if !isPathResponse || existing.lastHeard == Self.never { peer(dest, announce: announce, now: now) }
-            return
+            guard let existing = peers[dest] else { return [] }
+            if !isPathResponse || existing.lastHeard == Self.never { return peer(dest, announce: announce, now: now) }
+            return []
         }
-        guard config.autopeer, !isPathResponse else { return }
+        guard config.autopeer, !isPathResponse else { return [] }
         if announce.nodeState {
             if hops <= config.autopeerMaxDepth {
-                peer(dest, announce: announce, now: now)
+                return peer(dest, announce: announce, now: now)
             } else if peers[dest] != nil {
-                unpeer(dest, timebase: announce.timebase, now: now)
+                return unpeer(dest, timebase: announce.timebase, now: now)
             }
+            return []
         } else {
-            unpeer(dest, timebase: announce.timebase, now: now)
+            return unpeer(dest, timebase: announce.timebase, now: now)
         }
     }
 
     /// `LXMRouter.peer` (LXMRouter.py:2340-2383). A cost over `maxRemotePeeringCost` (or negative, or
     /// NaN) refuses a new peer and unpeers an existing one. An existing peer is updated only by a newer
-    /// timebase. A new peer keeps timebase 0, as reference never sets it there.
-    public mutating func peer(_ dest: Data, announce: PNAnnounce, now: Date) {
+    /// timebase. A new peer keeps timebase 0, as reference never sets it there. Returns `.closeLink`
+    /// when an unpeered peer held a sync link.
+    public mutating func peer(_ dest: Data, announce: PNAnnounce, now: Date) -> [Command] {
         let cost = announce.peeringCost
         guard cost >= 0, cost <= config.maxRemotePeeringCost else {
-            if peers[dest] != nil { unpeer(dest, timebase: announce.timebase, now: now) }
-            return
+            if peers[dest] != nil { return unpeer(dest, timebase: announce.timebase, now: now) }
+            return []
         }
         if var p = peers[dest] {
-            guard announce.timebase > p.peeringTimebase else { return }
+            guard announce.timebase > p.peeringTimebase else { return [] }
             p.alive = true
             p.syncBackoff = 0
             p.nextSyncAttempt = Self.never
@@ -210,18 +223,21 @@ public struct PNPeerTable: Equatable, Sendable {
             p.announce = announce
             peers[dest] = p
         } else {
-            guard peers.count < config.maxPeers else { return }
+            guard peers.count < config.maxPeers else { return [] }
             insert(Peer(destinationHash: dest, alive: true, lastHeard: now, announce: announce))
         }
+        return []
     }
 
     /// `LXMRouter.unpeer` (LXMRouter.py:2385-2394): removed when `timebase` (now, truncated, when nil)
-    /// is not older than the peering.
-    public mutating func unpeer(_ dest: Data, timebase: Int?, now: Date) {
-        guard let p = peers[dest] else { return }
+    /// is not older than the peering. Returns `.closeLink` when the peer held a sync link, so the host
+    /// is not left with a link (and a transfer) no peer owns. A peer removed while still establishing
+    /// has no link id yet: its late `linkEstablished` is answered with `.closeLink`.
+    public mutating func unpeer(_ dest: Data, timebase: Int?, now: Date) -> [Command] {
+        guard let p = peers[dest] else { return [] }
         let stamp = timebase ?? Self.truncatedSeconds(now)
-        guard stamp >= p.peeringTimebase else { return }
-        remove(dest)
+        guard stamp >= p.peeringTimebase else { return [] }
+        return remove(dest)
     }
 
     /// Adds every configured static peer not yet in the table, with its costs unknown, and requests a
@@ -258,6 +274,12 @@ public struct PNPeerTable: Equatable, Sendable {
 
     /// Keeps only ids the store holds, as reference's lists live inside the store entries
     /// (LXMPeer.py:118-128 on load, :579-593 always).
+    ///
+    /// **Mandatory after every store eviction or removal.** Reference needs no such call, because a
+    /// peer's handled and unhandled lists ARE fields of the store entries and leave with them. Here
+    /// they are separate sets, so without `prune`: they grow without bound with every id ever
+    /// distributed, and an evicted id stays in `unhandled`, keeping the peer selectable for a sync
+    /// that can offer nothing (the host should also pass such ids as `purged` to `offerSelected`).
     public mutating func prune(toStored stored: Set<Data>) {
         for dest in order {
             guard var p = peers[dest] else { continue }
@@ -273,6 +295,7 @@ public struct PNPeerTable: Equatable, Sendable {
     /// among idle peers with unhandled ids, pools the `fastestNRandomPool` fastest alive ones plus as
     /// many unknown-speed alive ones (or, with none alive, the dead ones past their backoff), picks one
     /// with `random`, and runs reference's `sync()` on it. The pick is `random.next() % pool.count`.
+    /// A culled peer that held a sync link adds its `.closeLink` after the sync's commands.
     public mutating func syncTick(now: Date, random: inout some RandomNumberGenerator) -> [Command] {
         var culled: [Data] = [], waiting: [Data] = [], unresponsive: [Data] = []
         for dest in order {
@@ -303,8 +326,19 @@ public struct PNPeerTable: Equatable, Sendable {
             let index = Int(random.next() % UInt64(pool.count))
             commands = sync(pool[index], now: now)
         }
-        for dest in culled { remove(dest) }
+        for dest in culled { commands += remove(dest) }
         return commands
+    }
+
+    /// The host's key search for `peer` failed or was cancelled: back to idle, with one backoff step
+    /// before the next attempt, so the peer is neither stranded in `.keyPending` nor retried every tick.
+    /// Reference has no such outcome (its search runs to completion in a thread).
+    public mutating func keyFailed(peer: Data, now: Date) {
+        guard var p = peers[peer], p.state == .keyPending else { return }
+        p.state = .idle
+        p.syncBackoff += Self.syncBackoffStep
+        p.nextSyncAttempt = now + p.syncBackoff
+        peers[peer] = p
     }
 
     /// A peering key the host mined. Kept when it meets the peer's current cost (`generate_peering_key`,
@@ -336,16 +370,25 @@ public struct PNPeerTable: Equatable, Sendable {
     }
 
     /// The offer reference's `sync()` prepares on a ready link (LXMPeer.py:339-395), computed by the host:
-    /// low-value ids leave the unhandled set, oversized ones become handled, and the rest go out with the
-    /// cached key. An empty offer closes the link (a divergence; see the type's documentation).
-    public mutating func offerSelected(peer: Data, offer: [Data], oversized: [Data], lowValue: [Data]) -> [Command] {
+    /// `purged` (unhandled ids the store no longer holds, `peer.unhandled` minus the store) and low-value
+    /// ids leave the unhandled set (LXMPeer.py:353-361), oversized ones become handled (:375-378), and the
+    /// rest go out with the cached key.
+    ///
+    /// An empty offer closes the link (a divergence; see the type's documentation). If unhandled ids
+    /// remain (ones the sync limit skipped this time), the next attempt waits `syncBackoffStep`:
+    /// otherwise the peer, idle again with unhandled ids and no backoff, would get a new link every tick
+    /// for an offer that is empty every time.
+    public mutating func offerSelected(peer: Data, offer: [Data], oversized: [Data], lowValue: [Data],
+                                       purged: [Data], now: Date) -> [Command] {
         guard var p = peers[peer], p.state == .linkReady, let link = p.linkID else { return [] }
+        p.unhandled.subtract(purged)
         p.unhandled.subtract(lowValue)
         p.unhandled.subtract(oversized)
         p.handled.formUnion(oversized)
         guard !offer.isEmpty, let key = p.peeringKey else {
             p.linkID = nil
             p.state = .idle
+            if !p.unhandled.isEmpty { p.nextSyncAttempt = now + Self.syncBackoffStep }
             peers[peer] = p
             return [.closeLink(link)]
         }
@@ -374,8 +417,7 @@ public struct PNPeerTable: Equatable, Sendable {
             peers[dest] = p
             return [.identify(linkID: linkID)] + sync(dest, now: now)
         case .noAccess:
-            unpeer(dest, timebase: nil, now: now)
-            if peers[dest] != nil { idle(dest) }
+            if unpeer(dest, timebase: nil, now: now).isEmpty { idle(dest) }   // refused: still a peer
             return [.closeLink(linkID)]
         case .throttled:
             p.nextSyncAttempt = now + Self.pnStampThrottle
@@ -420,7 +462,9 @@ public struct PNPeerTable: Equatable, Sendable {
 
     /// `LXMPeer.resource_concluded` with a complete resource (LXMPeer.py:497-529): the sent ids become
     /// handled, the link closes, the rate is `bytes * 8 / seconds`, and with unhandled ids left the
-    /// persistent strategy runs `sync()` again, which opens a new link.
+    /// persistent strategy runs `sync()` again, which opens a new link. `bytes` is the resource's
+    /// TRANSFER size (`resource.get_transfer_size()`, LXMPeer.py:515: the bytes on the wire, after
+    /// compression), not the container's data size.
     public mutating func transferConcluded(linkID: Data, bytes: Int, now: Date) -> [Command] {
         guard let dest = peerOnLink(linkID), var p = peers[dest], p.state == .transferring,
               let sent = p.transferring else { return [] }
@@ -429,6 +473,7 @@ public struct PNPeerTable: Equatable, Sendable {
         p.linkID = nil
         p.state = .idle
         if let started = transferStarted.removeValue(forKey: dest) {
+            // Reference: get_transfer_size()*8 / max(elapsed, 1E-6), LXMPeer.py:515.
             p.syncTransferRate = Double(bytes) * 8 / max(now.timeIntervalSince(started), 1e-6)
         }
         p.alive = true
@@ -442,21 +487,28 @@ public struct PNPeerTable: Equatable, Sendable {
         return commands
     }
 
-    /// A failed sync transfer (LXMPeer.py:531-537): idle, nothing marked. The host closes the link.
-    public mutating func transferFailed(linkID: Data) {
-        guard let dest = peerOnLink(linkID) else { return }
+    /// A failed sync transfer (LXMPeer.py:531-537): close the link, idle, nothing marked.
+    public mutating func transferFailed(linkID: Data) -> [Command] {
+        guard let dest = peerOnLink(linkID) else { return [] }
         idle(dest)
+        return [.closeLink(linkID)]
     }
 
     /// The sync link closed (`link_closed`, LXMPeer.py:549-551): idle. A transfer still in flight is
-    /// dropped, as the resource's failure would drop it.
+    /// dropped, as the resource's failure would drop it. Only an ESTABLISHED link has an id here; an id
+    /// no peer holds (a link still establishing, or one a removed peer owned) is ignored, harmlessly.
+    /// A link that ends before it is established must be reported with `linkFailed(peer:now:)`.
     public mutating func linkClosed(linkID: Data) {
         guard let dest = peerOnLink(linkID) else { return }
         idle(dest)
     }
 
-    /// No path after the grace period, or a link that never established: not alive, and no attempt
-    /// before the backoff `syncTick` added (LXMPeer.py:302-306).
+    /// THE call for every outcome of an `.openLink` other than `linkEstablished`: no path after the
+    /// grace period, or a link that never established (the endpoint reports those by destination
+    /// only, `TransportEndpoint.Delegate.linkFailed(destinationHash:reason:)`, since no link id exists
+    /// for the host until establishment). Not alive, and no attempt before the backoff `syncTick`
+    /// added (LXMPeer.py:302-306). A peer left in `.linkEstablishing` without this call is never
+    /// selected again, so the host must make it. Ignored for a peer not establishing.
     public mutating func linkFailed(peer: Data, now: Date) {
         guard var p = peers[peer], p.state == .linkEstablishing else { return }
         p.state = .idle
@@ -582,10 +634,13 @@ public struct PNPeerTable: Equatable, Sendable {
         peers[p.destinationHash] = p
     }
 
-    private mutating func remove(_ dest: Data) {
+    /// Removes a peer; `.closeLink` for the sync link it held, if any.
+    private mutating func remove(_ dest: Data) -> [Command] {
+        let link = peers[dest]?.linkID
         peers[dest] = nil
         order.removeAll { $0 == dest }
         transferStarted[dest] = nil
+        return link.map { [.closeLink($0)] } ?? []
     }
 
     /// Python's `int(time.time())`, without trapping on a non-finite or out-of-range date.

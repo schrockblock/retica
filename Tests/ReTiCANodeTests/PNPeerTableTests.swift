@@ -18,7 +18,6 @@ import ComposableArchitecture
 //   - after `linkEstablished` / a no-identity response leaves a peer in `.linkReady`, the host calls
 //     `offerSelected` with the selection reference computed inside `sync()` (the selection itself is
 //     cross-validated against reference in PNOfferLimitsCrossValidationTests).
-//   - a failed transfer's teardown is the host's (`transferFailed` returns nothing).
 //   - where reference strands a peer with its link open (throttled or no-access responses), the table
 //     closes the link: one extra `.closeLink` (see `PNPeerTable.offerResponse`).
 
@@ -121,7 +120,7 @@ struct PeerTableHost {
         let sel = step["selection"] as! [String: Any]
         func ids(_ k: String) -> [Data] { (sel[k] as! [String]).map { Data(hexString: $0)! } }
         return table.offerSelected(peer: peer, offer: ids("offer"), oversized: ids("oversized"),
-                                   lowValue: ids("low_value"))
+                                   lowValue: ids("low_value"), purged: [], now: now)
     }
 }
 
@@ -139,7 +138,7 @@ private func ids(_ any: Any?) -> [Data] { (any as! [Int]).map { PeerStateFixture
 private func replay(_ name: String) {
     let c = PeerStateFixtures.cases[name]!
     let statics = Set((c["static"] as! [String]).map { Data(hexString: $0)! })
-    var host = PeerTableHost(table: PNPeerTable(config: .init(staticPeers: statics)),
+    var host = PeerTableHost(table: PNPeerTable(config: .init(maxPeers: c["max_peers"] as! Int, staticPeers: statics)),
                              now: Date(timeIntervalSince1970: PeerStateFixtures.t0))
     let P = PeerStateFixtures.peers
     for (index, step) in (c["steps"] as! [[String: Any]]).enumerated() {
@@ -152,8 +151,9 @@ private func replay(_ name: String) {
             commands = host.translate(host.table.activateStaticPeers(now: host.now))
         case "announce":
             for i in step["who"] as! [Int] {
-                host.table.announceHeard(P[i], announce: announce(step), hops: UInt8(step["hops"] as? Int ?? 1),
-                                         isPathResponse: step["path_response"] as? Bool ?? false, now: host.now)
+                commands += host.translate(host.table.announceHeard(
+                    P[i], announce: announce(step), hops: UInt8(step["hops"] as? Int ?? 1),
+                    isPathResponse: step["path_response"] as? Bool ?? false, now: host.now))
             }
         case "advance":
             host.now += (step["seconds"] as! NSNumber).doubleValue
@@ -202,8 +202,7 @@ private func replay(_ name: String) {
                 commands = host.translate(host.table.transferConcluded(linkID: link, bytes: step["transfer_size"] as! Int,
                                                                        now: host.now))
             } else {
-                host.table.transferFailed(linkID: link)
-                expected.removeAll(where: \.isTeardown)       // the host closes the link itself
+                commands = host.translate(host.table.transferFailed(linkID: link))
             }
         case "request_failed":
             commands = host.translate(host.table.requestFailed(linkID: host.currentLink[peer!]!))
@@ -280,7 +279,8 @@ private func comparePeers(_ table: PNPeerTable, _ reference: [[String: Any]], _ 
 
 // MARK: - Fixture groups
 
-@Test(arguments: ["announce_depth", "static_peer", "unpeer_node_state", "peering_cost", "max_peers"])
+@Test(arguments: ["announce_depth", "static_peer", "unpeer_node_state", "peering_cost", "max_peers",
+                  "static_counts_toward_max_peers"])
 func peerTableAnnouncesMatchReference(_ name: String) { replay(name) }
 
 @Test(arguments: ["distribute"])
@@ -295,7 +295,7 @@ func peerTableSyncLifecycleMatchesReference(_ name: String) { replay(name) }
 @Test(arguments: ["cull"])
 func peerTableCullMatchesReference(_ name: String) { replay(name) }
 
-@Test(arguments: ["selection", "no_path"])
+@Test(arguments: ["selection", "selection_unknown_speed", "no_path"])
 func peerTableSelectionMatchesReference(_ name: String) { replay(name) }
 
 // MARK: - Parser and shared pieces
@@ -372,9 +372,107 @@ private func ann(_ tb: Int, cost: Double = 18) -> PNAnnounce {
                targetStampCost: 16, stampCostFlexibility: 3, peeringCost: cost)
 }
 
+private let idX = Data(repeating: 1, count: 32)
+private let key9 = Data(repeating: 9, count: 32)
+
+/// A peer with `idX` unhandled and a ready key.
+private func readyTable() -> PNPeerTable {
+    var table = PNPeerTable(config: .init())
+    _ = table.peer(pA, announce: ann(100), now: t0)
+    table.distribute([idX], from: nil)
+    _ = table.keyReady(peer: pA, key: key9, value: 18, now: t0)
+    return table
+}
+
+/// Opens and establishes `pA`'s sync link from a tick at `now`; returns the link id.
+private func establish(_ table: inout PNPeerTable, now: Date, link: Data = Data(repeating: 0x55, count: 16)) -> Data {
+    var random = ScriptedRandom(values: [0])
+    #expect(table.syncTick(now: now, random: &random) == [.openLink(pA)])
+    #expect(table.linkEstablished(peer: pA, linkID: link, now: now + 1) == [.identify(linkID: link)])
+    return link
+}
+
+/// Fix round 1, ruling 1: an empty offer with unhandled ids left (the sync limit skipped them, or the
+/// store dropped them and nobody pruned) used to reopen a link every tick. Five 24 s ticks now open at
+/// most one link. With `purged` passed, the dropped id leaves `unhandled` at once.
+@Test(arguments: [false, true])
+func emptyOfferProbeOpensAtMostOneLinkInFiveTicks(_ passPurged: Bool) {
+    var table = readyTable()
+    var opened = 0
+    var now = t0
+    for _ in 0..<5 {
+        now += PNPeerTable.peerSyncInterval
+        var random = ScriptedRandom(values: [0])
+        let commands = table.syncTick(now: now, random: &random)
+        guard commands == [.openLink(pA)] else { continue }
+        opened += 1
+        let link = Data(repeating: UInt8(opened), count: 16)
+        _ = table.linkEstablished(peer: pA, linkID: link, now: now)
+        #expect(table.offerSelected(peer: pA, offer: [], oversized: [], lowValue: [],
+                                    purged: passPurged ? [idX] : [], now: now) == [.closeLink(link)])
+    }
+    #expect(opened == 1)
+    #expect(table.peers[pA]!.unhandled == (passPurged ? [] : [idX]))
+}
+
+/// Ruling 2: a link that ends before establishment is reported by destination with `linkFailed`; an
+/// unknown link id in `linkClosed` is harmless. The peer is retried once the backoff passes.
+@Test func establishingThenFailedPeerIsRetriedAfterBackoff() {
+    var table = readyTable()
+    var random = ScriptedRandom(values: [0, 0])
+    #expect(table.syncTick(now: t0 + 24, random: &random) == [.openLink(pA)])
+    let before = table
+    table.linkClosed(linkID: Data(repeating: 0x99, count: 16))
+    #expect(table == before)
+    table.linkFailed(peer: pA, now: t0 + 40)
+    #expect(table.peers[pA]!.state == .idle && !table.peers[pA]!.alive)
+    #expect(table.syncTick(now: t0 + 48, random: &random) == [])                      // in backoff
+    #expect(table.syncTick(now: t0 + 40 + PNPeerTable.syncBackoffStep + 1, random: &random) == [.openLink(pA)])
+    #expect(random.values.isEmpty)
+}
+
+/// Ruling 3: a failed key search returns the peer to idle with a backoff step; it is asked again
+/// only after the backoff.
+@Test func keyFailedReturnsThePeerToIdleWithBackoff() {
+    var table = PNPeerTable(config: .init())
+    _ = table.peer(pA, announce: ann(100), now: t0)
+    table.distribute([idX], from: nil)
+    var random = ScriptedRandom(values: [0, 0, 0])
+    #expect(table.syncTick(now: t0 + 24, random: &random) == [.generatePeeringKey(peer: pA, cost: 18)])
+    table.keyFailed(peer: pA, now: t0 + 30)
+    #expect(table.peers[pA]!.state == .idle)
+    #expect(table.peers[pA]!.nextSyncAttempt == t0 + 30 + PNPeerTable.syncBackoffStep)
+    #expect(table.syncTick(now: t0 + 48, random: &random) == [])
+    #expect(table.syncTick(now: t0 + 30 + PNPeerTable.syncBackoffStep + 1, random: &random)
+            == [.generatePeeringKey(peer: pA, cost: 18)])
+}
+
+/// Ruling 4: unpeering a peer mid-transfer closes its link, and the transfer's later outcome finds
+/// no peer.
+@Test func unpeerMidTransferClosesItsLink() {
+    var table = readyTable()
+    let link = establish(&table, now: t0 + 24)
+    #expect(table.offerSelected(peer: pA, offer: [idX], oversized: [], lowValue: [], purged: [], now: t0 + 25)
+            == [.sendOffer(linkID: link, key: key9, ids: [idX])])
+    #expect(table.offerResponse(linkID: link, .wantsAll, now: t0 + 26) == [.sendResource(linkID: link, ids: [idX])])
+    var off = ann(200); off.nodeState = false
+    #expect(table.announceHeard(pA, announce: off, hops: 1, isPathResponse: false, now: t0 + 27) == [.closeLink(link)])
+    #expect(table.peers.isEmpty)
+    #expect(table.transferConcluded(linkID: link, bytes: 100, now: t0 + 28) == [])
+}
+
+/// Ruling 4: the 14-day cull closes a link the culled peer still held.
+@Test func cullClosesALinkTheCulledPeerHeld() {
+    var table = readyTable()
+    let link = establish(&table, now: t0 + 24)
+    var random = ScriptedRandom(values: [])
+    #expect(table.syncTick(now: t0 + PNPeerTable.maxUnreachable + 100, random: &random) == [.closeLink(link)])
+    #expect(table.peers.isEmpty)
+}
+
 @Test func persistedRoundTripsThroughRehydratePruningToTheStore() {
     var table = PNPeerTable(config: .init())
-    table.peer(pA, announce: ann(100), now: t0)
+    _ = table.peer(pA, announce: ann(100), now: t0)
     let x = Data(repeating: 1, count: 32), y = Data(repeating: 2, count: 32), z = Data(repeating: 3, count: 32)
     table.distribute([x, y], from: nil)
     table.markHandled([z], for: pA)
@@ -389,7 +487,7 @@ private func ann(_ tb: Int, cost: Double = 18) -> PNAnnounce {
 
 @Test func pruneDropsIdsTheStoreNoLongerHolds() {
     var table = PNPeerTable(config: .init())
-    table.peer(pA, announce: ann(100), now: t0)
+    _ = table.peer(pA, announce: ann(100), now: t0)
     let x = Data(repeating: 1, count: 32), y = Data(repeating: 2, count: 32)
     table.distribute([x, y], from: nil)
     table.markHandled([y], for: pA)
@@ -399,14 +497,14 @@ private func ann(_ tb: Int, cost: Double = 18) -> PNAnnounce {
 
 @Test func emptyOfferClosesTheLinkRatherThanStrandingThePeer() {
     var table = PNPeerTable(config: .init())
-    table.peer(pA, announce: ann(100), now: t0)
+    _ = table.peer(pA, announce: ann(100), now: t0)
     table.distribute([Data(repeating: 1, count: 32)], from: nil)
     _ = table.keyReady(peer: pA, key: Data(repeating: 9, count: 32), value: 18, now: t0)
     var random = ScriptedRandom(values: [0])
     #expect(table.syncTick(now: t0 + 1, random: &random) == [.openLink(pA)])
     let link = Data(repeating: 0x55, count: 16)
     #expect(table.linkEstablished(peer: pA, linkID: link, now: t0 + 2) == [.identify(linkID: link)])
-    #expect(table.offerSelected(peer: pA, offer: [], oversized: [], lowValue: [Data(repeating: 1, count: 32)])
+    #expect(table.offerSelected(peer: pA, offer: [], oversized: [], lowValue: [Data(repeating: 1, count: 32)], purged: [], now: t0 + 3)
             == [.closeLink(link)])
     #expect(table.peers[pA]!.state == .idle && table.peers[pA]!.linkID == nil)
     #expect(table.peers[pA]!.unhandled.isEmpty)
@@ -414,7 +512,7 @@ private func ann(_ tb: Int, cost: Double = 18) -> PNAnnounce {
 
 @Test func keyPendingIsNotRequestedTwiceAndAnUnderCostKeyIsRefused() {
     var table = PNPeerTable(config: .init())
-    table.peer(pA, announce: ann(100), now: t0)
+    _ = table.peer(pA, announce: ann(100), now: t0)
     table.distribute([Data(repeating: 1, count: 32)], from: nil)
     var random = ScriptedRandom(values: [0, 0, 0])
     #expect(table.syncTick(now: t0 + 1, random: &random) == [.generatePeeringKey(peer: pA, cost: 18)])

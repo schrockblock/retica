@@ -40,6 +40,7 @@
   {
    "name": "announce_depth",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -347,6 +348,7 @@
    "static": [
     "c20d3545e9ef52d5f8f9104a4cde0d06"
    ],
+   "max_peers": 20,
    "steps": [
     {
      "op": "activate_static",
@@ -601,6 +603,7 @@
   {
    "name": "unpeer_node_state",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -735,6 +738,7 @@
   {
    "name": "peering_cost",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -799,6 +803,7 @@
   {
    "name": "max_peers",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -1806,6 +1811,7 @@
   {
    "name": "distribute",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -2132,6 +2138,7 @@
   {
    "name": "offer_no_identity",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -2782,6 +2789,7 @@
   {
    "name": "offer_no_access",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -3210,6 +3218,7 @@
   {
    "name": "offer_throttled",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -3675,6 +3684,7 @@
   {
    "name": "offer_false",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -4144,6 +4154,7 @@
   {
    "name": "offer_true",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -4724,6 +4735,7 @@
   {
    "name": "offer_partial",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -5298,6 +5310,7 @@
   {
    "name": "offer_empty_list",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -5767,6 +5780,7 @@
   {
    "name": "offer_invalid_key",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -6237,6 +6251,7 @@
   {
    "name": "offer_invalid_data",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -6707,6 +6722,7 @@
   {
    "name": "offer_request_failed",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -7176,6 +7192,7 @@
   {
    "name": "offer_transfer_failed",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -7707,6 +7724,7 @@
   {
    "name": "offer_link_closed",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -8171,6 +8189,7 @@
   {
    "name": "persistent_resync",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -8912,6 +8931,7 @@
   {
    "name": "key_regeneration",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
@@ -9108,6 +9128,7 @@
    "static": [
     "c20d3545e9ef52d5f8f9104a4cde0d06"
    ],
+   "max_peers": 20,
    "steps": [
     {
      "op": "activate_static",
@@ -9468,6 +9489,7 @@
   {
    "name": "selection",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "rehydrate",
@@ -9951,8 +9973,431 @@
    ]
   },
   {
+   "name": "selection_unknown_speed",
+   "static": [],
+   "max_peers": 20,
+   "steps": [
+    {
+     "op": "rehydrate",
+     "load": [
+      {
+       "peer": 0,
+       "rate": 0,
+       "unhandled": [
+        0
+       ]
+      },
+      {
+       "peer": 1,
+       "rate": 300,
+       "unhandled": [
+        0
+       ]
+      },
+      {
+       "peer": 2,
+       "rate": 0,
+       "unhandled": [
+        0
+       ]
+      }
+     ],
+     "commands": [],
+     "peers": [
+      {
+       "dest": "f321a6a8f38bb38a923b2cbe162c916b",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 0,
+       "state": 0,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      },
+      {
+       "dest": "afc0002cd14bb51da2112baa28c762b4",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 300,
+       "state": 0,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      },
+      {
+       "dest": "824efa911a60eaf4caff5b4da755a355",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 0,
+       "state": 0,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      }
+     ],
+     "now": 1700000000.0
+    },
+    {
+     "op": "sync_tick",
+     "randint": [
+      3
+     ],
+     "pools": [
+      4
+     ],
+     "commands": [
+      {
+       "kind": "open_link",
+       "peer": "824efa911a60eaf4caff5b4da755a355"
+      }
+     ],
+     "peers": [
+      {
+       "dest": "f321a6a8f38bb38a923b2cbe162c916b",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 0,
+       "state": 0,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      },
+      {
+       "dest": "afc0002cd14bb51da2112baa28c762b4",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 300,
+       "state": 0,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      },
+      {
+       "dest": "824efa911a60eaf4caff5b4da755a355",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 1700000000.0,
+       "next_sync_attempt": 1700000720.0,
+       "sync_backoff": 720,
+       "rate": 0,
+       "state": 1,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      }
+     ],
+     "now": 1700000000.0
+    },
+    {
+     "op": "sync_tick",
+     "randint": [
+      2
+     ],
+     "pools": [
+      3
+     ],
+     "commands": [
+      {
+       "kind": "open_link",
+       "peer": "f321a6a8f38bb38a923b2cbe162c916b"
+      }
+     ],
+     "peers": [
+      {
+       "dest": "f321a6a8f38bb38a923b2cbe162c916b",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 1700000000.0,
+       "next_sync_attempt": 1700000720.0,
+       "sync_backoff": 720,
+       "rate": 0,
+       "state": 1,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      },
+      {
+       "dest": "afc0002cd14bb51da2112baa28c762b4",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 300,
+       "state": 0,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      },
+      {
+       "dest": "824efa911a60eaf4caff5b4da755a355",
+       "timebase": 0,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 1700000000.0,
+       "next_sync_attempt": 1700000720.0,
+       "sync_backoff": 720,
+       "rate": 0,
+       "state": 1,
+       "handled": [],
+       "unhandled": [
+        "dd3e14c6773694b862bc7c11fe08cde252280593e32b2fbc9c5da0c8fd2ebe6e"
+       ],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256.0,
+       "sync_limit": 10240,
+       "key_value": 18.0
+      }
+     ],
+     "now": 1700000000.0
+    }
+   ]
+  },
+  {
+   "name": "static_counts_toward_max_peers",
+   "static": [
+    "c20d3545e9ef52d5f8f9104a4cde0d06"
+   ],
+   "max_peers": 1,
+   "steps": [
+    {
+     "op": "activate_static",
+     "commands": [
+      {
+       "kind": "request_path",
+       "peer": "c20d3545e9ef52d5f8f9104a4cde0d06"
+      }
+     ],
+     "peers": [
+      {
+       "dest": "c20d3545e9ef52d5f8f9104a4cde0d06",
+       "timebase": 0,
+       "alive": false,
+       "last_heard": 0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 0,
+       "state": 0,
+       "handled": [],
+       "unhandled": [],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": null,
+       "stamp_cost": null,
+       "flexibility": null,
+       "transfer_limit": null,
+       "sync_limit": null,
+       "key_value": null
+      }
+     ],
+     "now": 1700000000.0
+    },
+    {
+     "op": "announce",
+     "who": [
+      0
+     ],
+     "timebase": 100,
+     "commands": [],
+     "peers": [
+      {
+       "dest": "c20d3545e9ef52d5f8f9104a4cde0d06",
+       "timebase": 0,
+       "alive": false,
+       "last_heard": 0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 0,
+       "state": 0,
+       "handled": [],
+       "unhandled": [],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": null,
+       "stamp_cost": null,
+       "flexibility": null,
+       "transfer_limit": null,
+       "sync_limit": null,
+       "key_value": null
+      }
+     ],
+     "now": 1700000000.0
+    },
+    {
+     "op": "announce",
+     "who": [
+      5
+     ],
+     "timebase": 100,
+     "commands": [],
+     "peers": [
+      {
+       "dest": "c20d3545e9ef52d5f8f9104a4cde0d06",
+       "timebase": 100,
+       "alive": true,
+       "last_heard": 1700000000.0,
+       "last_sync_attempt": 0,
+       "next_sync_attempt": 0,
+       "sync_backoff": 0,
+       "rate": 0,
+       "state": 0,
+       "handled": [],
+       "unhandled": [],
+       "last_offer": [],
+       "transferring": null,
+       "offered": 0,
+       "outgoing": 0,
+       "incoming": 0,
+       "peering_cost": 18.0,
+       "stamp_cost": 16.0,
+       "flexibility": 3.0,
+       "transfer_limit": 256,
+       "sync_limit": 10240,
+       "key_value": null
+      }
+     ],
+     "now": 1700000000.0
+    }
+   ]
+  },
+  {
    "name": "no_path",
    "static": [],
+   "max_peers": 20,
    "steps": [
     {
      "op": "announce",
