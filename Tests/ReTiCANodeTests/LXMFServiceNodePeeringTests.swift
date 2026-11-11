@@ -916,6 +916,69 @@ private func peerWithOfferOut(_ h: Harness, unhandled: [UInt8] = [2]) async -> (
     #expect(store.state.client.router.downloadedTransientIds.contains(transientID))
 
     await send(store, .client(.endpoint(.delegate(.resourceReceived(linkID: clientLink, data: container)))))
+    // (The router's message-hash dedup also stops this one; `aDownloadedOwnEntryIsNotDeliveredAgain`
+    // pins `deliverOwn`'s own guard.)
     #expect(h.log.value.filter { $0 == .delivered(content) }.count == 1, "a second copy is not delivered again")
     #expect(!store.state.pn.store.contains(transientId: transientID))
+}
+
+/// A node state whose store enforces PN stamps at `cost`, with our delivery destination registered.
+private func stampedNodeState(_ ours: Identity, cost: Double) -> LXMFServiceNode.State {
+    var s = LXMFServiceNode.State(identity: ours, endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
+                                  targetStampCost: cost, peering: .init(peeringCost: 8))
+    s.nodeModeEnabled = true
+    let served = propagationHash(ours)
+    s.client.propagationDestinationHash = served
+    s.client.linkDestinations[clientLink] = served
+    s.client.deliveryDestinationHash = LXMessage.deliveryHash(identityHash: ours.hash)
+    return s
+}
+
+/// Final re-review, I3 test gap: with the store enforcing PN stamps (cost 8), an entry addressed to us
+/// whose stamp is invalid is neither delivered nor recorded as downloaded (reference delivers only
+/// `validated_messages`, LXMRouter.py:2741); the same message with its valid stamp is (the control).
+@MainActor @Test func anOwnEntryWithAnInvalidStampIsNotDelivered() async throws {
+    let h = Harness()
+    let ours = Identity()
+    let store = await makeStore(stampedNodeState(ours, cost: 8), h)
+    let content = Data("stamped for us".utf8)
+    let message = LXMessage.create(source: Identity(), destinationHash: LXMessage.deliveryHash(identityHash: ours.hash),
+                                   timestamp: 1_700_000_000, title: Data("t".utf8), content: content)
+    let (valid, transientID) = try #require(await LXMFPropagation.pack(message: message, recipientIdentity: ours,
+                                                                       timestamp: 1_700_000_000, stampCost: 8))
+    let entry = try #require(LXMFPropagation.parseContainer(valid)?.entries.first)
+    let core = Data(entry.dropLast(LXStamper.stampSize))
+    let badTail = try #require((0...255).lazy.map { Data(repeating: UInt8($0), count: LXStamper.stampSize) }
+        .first { LXStamper.validatePnStamp(transientData: core + $0, targetCost: 8) == nil })
+    let invalid = LXMFPropagation.container(timestamp: 1_700_000_000, entries: [core + badTail])
+
+    await send(store, .client(.endpoint(.delegate(.resourceReceived(linkID: clientLink, data: invalid)))))
+    #expect(!h.log.value.contains(.delivered(content)), "an invalid stamp is not delivered")
+    #expect(!store.state.client.router.downloadedTransientIds.contains(transientID))
+    #expect(store.state.pn.store.count == 0)
+
+    await send(store, .client(.endpoint(.delegate(.resourceReceived(linkID: clientLink, data: valid)))))
+    #expect(h.log.value.filter { $0 == .delivered(content) }.count == 1, "control: the valid stamp is")
+    #expect(store.state.client.router.downloadedTransientIds.contains(transientID))
+}
+
+/// `deliverOwn`'s own dedup, not the router's: an entry whose transient id we already downloaded (here
+/// restored by `rehydrateDedup`, with an empty message-hash ring, so the router would deliver it) is
+/// not delivered again, at store cost 0 (the post-validation guard) and at cost 8 (the preflight
+/// guard, ahead of the workblock), and is not stored.
+@MainActor @Test func aDownloadedOwnEntryIsNotDeliveredAgain() async throws {
+    for cost in [0.0, 8] {
+        let h = Harness()
+        let ours = Identity()
+        let store = await makeStore(stampedNodeState(ours, cost: cost), h)
+        let content = Data("already downloaded".utf8)
+        let message = LXMessage.create(source: Identity(), destinationHash: LXMessage.deliveryHash(identityHash: ours.hash),
+                                       timestamp: 1_700_000_000, title: Data("t".utf8), content: content)
+        let (container, transientID) = try #require(await LXMFPropagation.pack(message: message, recipientIdentity: ours,
+                                                                               timestamp: 1_700_000_000, stampCost: 8))
+        await send(store, .client(.router(.rehydrateDedup(seenHashes: [], downloadedTransientIds: [transientID]))))
+        await send(store, .client(.endpoint(.delegate(.resourceReceived(linkID: clientLink, data: container)))))
+        #expect(!h.log.value.contains(.delivered(content)), "cost \(cost): already downloaded")
+        #expect(store.state.pn.store.count == 0, "cost \(cost)")
+    }
 }

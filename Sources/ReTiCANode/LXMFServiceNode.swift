@@ -71,6 +71,14 @@ public struct LXMFServiceNode {
         /// The 24 s peer-sync job is running: set when `setNodeMode(true)` starts it, cleared when
         /// `setNodeMode(false)` cancels it. A redundant enable leaves a running job alone.
         public var peerSyncJobRunning: Bool = false
+        /// Stamped propagation entries addressed to us whose PN stamp validated, which `deliverOwn`
+        /// delivered (or tried to) and never stored. The packet path's stamp pre-scan treats a
+        /// byte-identical replay of one as it treats a stored entry: already validated, so no
+        /// workblock. Without it, a single valid entry addressed to us could be replayed on one link
+        /// at two workblocks (~44 ms) per packet, each one proved (final re-review, I3). Bounded, as
+        /// a ring: one evicted costs only a re-validation.
+        public var ownDeliveredEntries = RingSet(capacity: State.ownDeliveredEntriesCapacity)
+        public static let ownDeliveredEntriesCapacity = 1024
 
         /// 32 MB — a mobile-appropriate cap for the store-and-forward backlog.
         public static let defaultStorageLimitBytes: Int = 32 * 1024 * 1024
@@ -353,12 +361,23 @@ public struct LXMFServiceNode {
                     }
                     let core: Data
                     if store.targetStampCost > 0 {
+                        // One we already delivered: the cheap id first, BEFORE the workblock, as the
+                        // store's preflight does for stored entries. It is only marked handled again.
+                        if let known = store.preflightTransientId(ofStampedEntry: entry),
+                           state.client.router.downloadedTransientIds.contains(known) {
+                            handled.append(known)
+                            continue
+                        }
                         guard let validated = LXStamper.validatePnStamp(transientData: entry,
                                                                         targetCost: store.minAcceptedStampCost)
                         else { continue }
                         core = validated.lxmfData
+                        _ = state.ownDeliveredEntries.insert(entry)
                     } else {
                         core = LXMFPropagation.strippedCore(lxmfData: entry)
+                        // Reference handles only `len(lxmf_data) >= LXMF_OVERHEAD` (LXMRouter.py:2832);
+                        // at cost 0 nothing else stops junk from growing `downloadedTransientIds`.
+                        guard core.count >= LXMessage.lxmfOverhead else { continue }
                     }
                     let tid = LXMFPropagation.transientId(lxmfData: core)
                     handled.append(tid)
@@ -734,7 +753,11 @@ public struct LXMFServiceNode {
                         // store a second entry point that trusts its caller's validation, and an
                         // attacker can only reach this path at all by doing the ~2^cost work of a
                         // valid stamp themselves. Filed with the admission-control gap.
+                        //
+                        // An entry addressed to us is never stored (`deliverOwn`), so a byte-identical
+                        // replay of one we delivered is recognised by `ownDeliveredEntries` instead.
                         !state.pn.store.containsIdenticalStampedEntry($0)
+                            && !state.ownDeliveredEntries.contains($0)
                             && LXStamper.validatePnStamp(transientData: $0,
                                                          targetCost: state.pn.store.minAcceptedStampCost) == nil
                     }

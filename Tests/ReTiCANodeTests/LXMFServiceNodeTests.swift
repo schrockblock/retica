@@ -1560,6 +1560,58 @@ import ComposableArchitecture
     #expect(store.state.pn.store.count == 1, "replay must not add a second entry")
 }
 
+/// The same property for an entry addressed to US (final re-review, I3): it is delivered locally and
+/// never stored, so `containsIdenticalStampedEntry` cannot recognise its replay. Each byte-identical
+/// replay must still derive ZERO workblocks (neither in the pre-scan nor in `deliverOwn`), be proved,
+/// and deliver nothing; the first offer derives at least one (seam liveness).
+@MainActor @Test func serviceNodeDoesNotRederiveWorkblockForOwnPacketOfferReplay() async throws {
+    let identity = Identity()
+    var initial = LXMFServiceNode.State(
+        identity: identity,
+        endpoint: tcpDriverEndpoint(host: "h", port: 4242, reconnectOnDrop: false),
+        targetStampCost: 4)
+    initial.nodeModeEnabled = true
+    let ours = LXMessage.deliveryHash(identityHash: identity.hash)
+    initial.client.deliveryDestinationHash = ours
+    let store = makeServiceNodeStore(initial)
+
+    let propDest = Destination(kind: .single, direction: .in, appName: LXMessage.appName,
+                               aspects: ["propagation"], identity: identity)!
+    let linkID = Data(repeating: 0xC2, count: 16)
+    let message = LXMessage.create(source: Identity(), destinationHash: ours, timestamp: 1700000000.5,
+                                   title: Data("t".utf8), content: Data("replayed to us".utf8))
+    let (container, tid) = try #require(await LXMFPropagation.pack(message: message, recipientIdentity: identity,
+                                                                   timestamp: 1700000000.5, stampCost: 4))
+
+    await store.send(.registerPropagation)
+    await store.send(.client(.endpoint(.delegate(.linkEstablished(linkID: linkID,
+                                                                  destinationHash: propDest.hash)))))
+
+    let onFirstOffer = LXStamper.WorkblockCounter()
+    await LXStamper.$workblockCounter.withValue(onFirstOffer) {
+        await store.send(.client(.endpoint(.delegate(.linkDataReceived(
+            linkID: linkID, data: container, packetHash: Data(repeating: 0xE7, count: 32))))))
+        await store.receive { if case .client(.endpoint(.provePacketOverLink)) = $0 { return true }
+                              return false }
+    }
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.pn.store.count == 0, "setup: addressed to us, so not stored")
+    #expect(store.state.client.router.downloadedTransientIds.contains(tid), "setup: delivered")
+    #expect(onFirstOffer.count >= 1, "seam liveness: a novel offer derives at least one workblock")
+
+    for n in 0..<3 {
+        let onReplay = LXStamper.WorkblockCounter()
+        await LXStamper.$workblockCounter.withValue(onReplay) {
+            await store.send(.client(.endpoint(.delegate(.linkDataReceived(
+                linkID: linkID, data: container, packetHash: Data(repeating: 0xE8 + UInt8(n), count: 32))))))
+            await store.receive { if case .client(.endpoint(.provePacketOverLink)) = $0 { return true }
+                                  return false }
+        }
+        #expect(onReplay.count == 0, "replay \(n): an own entry replayed byte-for-byte derives no workblock")
+    }
+    #expect(store.state.pn.store.count == 0)
+}
+
 // MARK: - FIX 4: awaitingList handles ERROR_NO_IDENTITY from reference PN
 
 /// When the phase-1 /get response is `LXMPeer.ERROR_NO_IDENTITY` (0xF0) — sent by a reference PN
