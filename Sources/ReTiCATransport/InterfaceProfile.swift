@@ -46,6 +46,12 @@ public struct InterfaceProfile: Equatable, Sendable {
     public var pathRequestCost: Double? {
         didSet { pathRequestCost = pathRequestCost.map(Self.clampedStampCost) }
     }
+    /// Send a signed tunnel-synthesis packet on this interface each time it connects, so a hub
+    /// restores its paths to our destinations at once (reference `wants_tunnel`, set only by
+    /// connecting TCP/I2P/Backbone client interfaces: TCPInterface.py:179, 299). Only `TCPEndpoint`
+    /// (an outbound TCP client) sets it; accepted server connections, BLE, Auto and radio
+    /// interfaces never do. It needs `Transport.State.tunnelIdentity`.
+    public var wantsTunnel: Bool = false
 
     public init(name: String, bitrate: Int, mode: InterfaceMode = .full,
                 hwMTU: Int? = nil, announceCap: Double = 0.02, ifac: IFAC? = nil,
@@ -70,6 +76,13 @@ public struct InterfaceProfile: Equatable, Sendable {
 
     /// Reference TCPInterface declared values (TCPInterface.py:76, 42).
     public static let tcp = InterfaceProfile(name: "tcp", bitrate: 10_000_000, hwMTU: 262_144)
+    /// `tcp` as an outbound TCP client registers it: wanting a tunnel (`wantsTunnel`). What
+    /// `TCPEndpoint` registers when given the default profile.
+    public static let tcpClient: InterfaceProfile = {
+        var profile = InterfaceProfile.tcp
+        profile.wantsTunnel = true
+        return profile
+    }()
     /// ble-reticulum protocol v2.2 peers: HW_MTU 500 (BLEInterface.HW_MTU in the reference);
     /// 80 kbps is a conservative guess until measured live (spec §2.8).
     public static let ble = InterfaceProfile(name: "ble", bitrate: 80_000, hwMTU: 500)

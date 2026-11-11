@@ -45,7 +45,7 @@ private func makeStore(host: String = "node", port: UInt16 = 4242)
     await store.send(.start)
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
-    #expect(store.state.transport.interfaces[store.state.tcpClients[0].interfaceID] == .tcp)
+    #expect(store.state.transport.interfaces[store.state.tcpClients[0].interfaceID] == .tcpClient)
     #expect(store.state.tcpClients[0].interface.status == .online)
     await store.send(.stop)
     await store.receive(\.tcpClients[id: InterfaceID("tcp")].interface.disconnect)
@@ -1968,7 +1968,7 @@ private func deframeOne(_ hdlcFramed: Data) -> Data {
     events.yield(.connected)
     await store.receive(\.transport.interfaceConnected)
     let id = store.state.tcpClients[0].interfaceID
-    #expect(store.state.transport.interfaces[id] == .tcp)
+    #expect(store.state.transport.interfaces[id] == .tcpClient)
 
     await store.send(.stop)
     await store.receive { if case .transport(.interfaceDisconnected(id)) = $0 { return true }; return false }

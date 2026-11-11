@@ -54,6 +54,15 @@ public struct Transport {
         public var knownDestinations: [Data: KnownDestination] = [:]
         public var interfaces: [InterfaceID: InterfaceProfile] = [:]
         public var transportIdentity: Identity? = nil
+        /// The identity that signs tunnel-synthesis packets (reference signs them with the transport
+        /// identity, Transport.py:3046-3053). A leaf has no `transportIdentity` and setting one turns
+        /// relaying on, so the host keeps a separate persisted identity for this one job (Ruling 9b).
+        /// It changes nothing else: relay mode, path-request sender IDs and proofs ignore it. With it
+        /// set, every `.interfaceConnected` for a profile with `wantsTunnel` sends one synthesis
+        /// packet on that interface. Set it before the interfaces connect: setting it later sends
+        /// nothing for interfaces already up (until they reconnect). One without a private key is
+        /// stored but never signs.
+        public var tunnelIdentity: Identity? = nil
         var seenPacketHashes = RingSet(capacity: Transport.seenPacketRingSize)
         public var linkTable: [Data: LinkTableEntry] = [:]
         /// LinkIDs of links we are an endpoint of (initiator or responder). A link we own is never
@@ -553,6 +562,9 @@ public struct Transport {
         /// announce) until it expires, so traffic may still arrive here for a while — and is dropped.
         case deregisterLocalDestination(destinationHash: Data)
         case setTransportIdentity(Identity?)
+        /// Set `State.tunnelIdentity`, the identity that signs tunnel-synthesis packets. It never
+        /// touches `transportIdentity` or relay state.
+        case setTunnelIdentity(Identity?)
         case setRecursivePathRequests(Bool)
         case registerLocalLink(Data)
         case unregisterLocalLink(Data)
@@ -1068,7 +1080,20 @@ public struct Transport {
                         state.interfaceConnectedAt[id] = date.now
                     }
                 }
-                return .none
+                // Tunnel synthesis (reference `synthesize_tunnel`, Transport.py:3043-3064, called on
+                // every connect of a client interface, TCPInterface.py:179, 299): one signed DATA
+                // packet to the PLAIN control destination, on THIS interface only, never broadcast.
+                guard profile.wantsTunnel, let identity = state.tunnelIdentity, identity.privateKey != nil
+                else { return .none }
+                let payload = Transport.tunnelSynthesisPayload(
+                    identity: identity, interfaceHash: Transport.tunnelInterfaceHash(profileName: profile.name),
+                    randomHash: randomBytes(Crypto.truncatedHashLength))
+                let packet = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                                    destinationType: .plain, context: .none, contextFlag: false, hops: 0,
+                                    destinationHash: Transport.tunnelSynthesizeDestinationHash, transportId: nil,
+                                    payload: payload)
+                guard let raw = try? packet.packed() else { return .none }
+                return .send(.delegate(.transmit(id, raw)))
 
             case let .interfaceDisconnected(id):
                 state.interfaces[id] = nil
@@ -1143,6 +1168,10 @@ public struct Transport {
                 state.linkTable = [:]
                 state.discoveryPathRequests = [:]   // in-flight recursive searches are relay-only state
                 return cancels.isEmpty ? .none : .merge(cancels)
+
+            case let .setTunnelIdentity(identity):
+                state.tunnelIdentity = identity
+                return .none
 
             case let .setRecursivePathRequests(enabled):
                 state.recursivePathRequests = enabled
@@ -1503,18 +1532,6 @@ public struct Transport {
                                                               hops: packet.hops,
                                                               isPathResponse: packet.context == .pathResponse,
                                                               appData: parsed.appData)))))
-                    } else if packet.context == .pathResponse, state.pathRequests[packet.destinationHash] != nil,
-                              let held = state.learned[packet.destinationHash] {
-                        // An answer to OUR path request that does not improve the route we hold:
-                        // typically a hub replaying its cached copy of the very announce the held
-                        // route came from (same emission time, same hops), e.g. after a relaunch
-                        // restored that route. The route stays as it is, but the request has been
-                        // answered: a path exists. Report it, or the asker (LXMFRouter, parked in
-                        // `.awaitingPath`) waits for an announce that may not come for hours and
-                        // spends its establishment budget. No `.announceReceived`: nothing new was
-                        // adopted. Only fresh blobs reach here; a replay was dropped above.
-                        effects.append(.send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
-                                                                    hops: held.hops))))
                     }
                     // Relay mode: instead of re-broadcasting now, HOLD this fresh announce and
                     // re-broadcast it once after a jittered delay in [0, PATHFINDER_RW) — RNS
@@ -2515,6 +2532,33 @@ public struct Transport {
     /// (Transport.py:61,256). Deterministic (no identity). Cross-validated against genuine RNS.
     static let pathRequestDestinationHash: Data =
         Destination.hash(identityHash: nil, appName: "rnstransport", aspects: ["path", "request"])
+
+    /// RNS Transport tunnel-synthesis control destination: PLAIN "rnstransport"/["tunnel","synthesize"]
+    /// (Transport.py:480, 3057). Cross-validated against genuine RNS (tunnel_synthesis_fixtures.json).
+    public static let tunnelSynthesizeDestinationHash: Data =
+        Destination.hash(identityHash: nil, appName: "rnstransport", aspects: ["tunnel", "synthesize"])
+
+    /// The tunnel id a hub files our tunnel under: `full_hash(public_key + interface_hash)`
+    /// (Transport.py:3049-3050, 3073-3074). 32 bytes.
+    public static func tunnelID(publicKey: Data, interfaceHash: Data) -> Data {
+        Crypto.fullHash(publicKey + interfaceHash)
+    }
+
+    /// A tunnel-synthesis payload (Transport.py:3045-3055): `public_key(64) + interface_hash(32) +
+    /// random_hash(16)`, signed, then the 64-byte signature: 176 bytes, the only length the hub's
+    /// handler accepts (Transport.py:3069-3070). `identity` must hold a private key.
+    public static func tunnelSynthesisPayload(identity: Identity, interfaceHash: Data, randomHash: Data) -> Data {
+        let signed = identity.publicKey + interfaceHash + randomHash
+        return signed + identity.sign(signed)
+    }
+
+    /// The interface hash a tunnel is synthesized with (Ruling 9c): `full_hash` of the UTF-8 of
+    /// `"TCPInterface[<profile name>]"`. Reference hashes `str(interface)` (Interface.get_hash); only
+    /// we compute ours, so it need not match reference's string, only stay stable across reconnects
+    /// of one configured interface, because the tunnel id depends on it.
+    public static func tunnelInterfaceHash(profileName: String) -> Data {
+        Crypto.fullHash(Data("TCPInterface[\(profileName)]".utf8))
+    }
 
     /// RNS PR_LEGACY_LENGTH: destination + tag, from a pre-1.6 leaf.
     static let pathRequestLegacyLength = 32

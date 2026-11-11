@@ -32,6 +32,11 @@ public struct TCPEndpoint {
             self.interface = TCPClientInterface.State(host: host, port: port,
                                                       reconnectOnDrop: reconnectOnDrop)
             self.interfaceID = interfaceID
+            // An outbound TCP client synthesizes a tunnel on each connect, as reference's
+            // TCPClientInterface does (TCPInterface.py:179, 299). Accepted server connections use
+            // `TCPServerEndpoint.State.profile`, which leaves it off.
+            var profile = profile
+            profile.wantsTunnel = true
             self.profile = profile
         }
     }

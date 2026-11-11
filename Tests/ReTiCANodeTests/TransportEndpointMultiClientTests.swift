@@ -164,8 +164,8 @@ private func activeLink(id: UUID, on interfaceID: InterfaceID, linkID: Data) -> 
 @Test @MainActor func multiClientBothConnectAndRegisterAndStopDisconnectsBoth() async {
     let (store, keyed) = makeTwoClients()
     await connectBoth(store, keyed)
-    #expect(store.state.interfaces[idA] == .tcp)
-    #expect(store.state.interfaces[idB] == .tcp)
+    #expect(store.state.interfaces[idA] == .tcpClient)
+    #expect(store.state.interfaces[idB] == .tcpClient)
 
     await store.send(.stop)
     for _ in 0..<2 {
@@ -213,7 +213,7 @@ private func activeLink(id: UUID, on interfaceID: InterfaceID, linkID: Data) -> 
     await store.receive { if case .linkPlane(.interfaceDisconnected(idA)) = $0 { return true }; return false }
     await store.skipReceivedActions(strict: false)
     #expect(store.state.interfaces[idA] == nil)
-    #expect(store.state.interfaces[idB] == .tcp, "B's interface must survive A's disconnect")
+    #expect(store.state.interfaces[idB] == .tcpClient, "B's interface must survive A's disconnect")
     #expect(store.state.links[id: UUID(0)]?.rehomePermitted == true, "A's link learned its interface is gone")
     #expect(store.state.links[id: UUID(1)]?.rehomePermitted == false, "B's link must be untouched")
     await store.send(.stop)
@@ -254,7 +254,7 @@ private func activeLink(id: UUID, on interfaceID: InterfaceID, linkID: Data) -> 
     #expect(store.state.tcpClients[id: idA] == nil, "the removed client's slot is gone")
     #expect(store.state.tcpClients[id: idB] != nil, "the other client's slot stays")
     #expect(store.state.interfaces[idA] == nil)
-    #expect(store.state.interfaces[idB] == .tcp)
+    #expect(store.state.interfaces[idB] == .tcpClient)
     await store.send(.stop)
     await store.skipReceivedActions(strict: false)
 }

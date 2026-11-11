@@ -247,7 +247,7 @@ private func makeAnnounce(hops: UInt8 = 0, emitted: UInt64 = 1000) -> (raw: Data
         let h = makeMeshEndpoint(withTCPClient: true)
         await h.store.send(.start)
         h.tcp.yield(.connected)
-        await h.store.receive { $0 == .transport(.interfaceConnected(tcpID, .tcp)) }
+        await h.store.receive { $0 == .transport(.interfaceConnected(tcpID, .tcpClient)) }
         await bringRadioOnline(h, start: false)
         let (raw, dest) = makeAnnounce(hops: 3)
         h.tcp.yield(.data(HDLC.frame(raw)))
@@ -270,7 +270,7 @@ private func makeAnnounce(hops: UInt8 = 0, emitted: UInt64 = 1000) -> (raw: Data
         let h = makeMeshEndpoint(withTCPClient: true)
         await h.store.send(.start)
         h.tcp.yield(.connected)
-        await h.store.receive { $0 == .transport(.interfaceConnected(tcpID, .tcp)) }
+        await h.store.receive { $0 == .transport(.interfaceConnected(tcpID, .tcpClient)) }
         await bringRadioOnline(h, start: false)
         let (raw, dest) = makeAnnounce(hops: 3)
         h.tcp.yield(.data(HDLC.frame(raw)))
@@ -294,7 +294,7 @@ private func makeAnnounce(hops: UInt8 = 0, emitted: UInt64 = 1000) -> (raw: Data
         let h = makeMeshEndpoint(withTCPClient: true)
         await h.store.send(.start)
         h.tcp.yield(.connected)
-        await h.store.receive { $0 == .transport(.interfaceConnected(tcpID, .tcp)) }
+        await h.store.receive { $0 == .transport(.interfaceConnected(tcpID, .tcpClient)) }
         await bringRadioOnline(h, preset: 8, start: false)
         await bringRadioOnline(h, preset: 4, start: false)     // preset change, no drop
         h.radio.yield(.disconnected(reason: nil))

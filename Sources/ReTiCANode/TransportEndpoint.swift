@@ -195,6 +195,10 @@ public struct TransportEndpoint {
         case announceOn(interface: InterfaceID, destinationHash: Data, appData: Data?)
         case send(destinationHash: Data, plaintext: Data, receiptToken: Data? = nil)
         case enableRelay(Identity)
+        /// Hand Transport the identity that signs tunnel-synthesis packets on each TCP client
+        /// connect (`Transport.Action.setTunnelIdentity`). Not a transport identity: relay mode is
+        /// unchanged. Send it before `.start`.
+        case setTunnelIdentity(Identity?)
         case requestPath(destinationHash: Data)
         case openLink(destinationHash: Data)
         /// `.openLink` on behalf of `owner`: its establishment and every failure before it come back
@@ -335,6 +339,7 @@ public struct TransportEndpoint {
             case let .send(h, p, token):            return .send(.transport(.send(destinationHash: h, plaintext: p,
                                                                                   receiptToken: token)))
             case let .enableRelay(identity):        return .send(.transport(.setTransportIdentity(identity)))
+            case let .setTunnelIdentity(identity):  return .send(.transport(.setTunnelIdentity(identity)))
             case let .requestPath(h):               return .send(.transport(.requestPath(destinationHash: h)))
             case let .proveSinglePacket(h, id, identity):
                 return .send(.transport(.proveSingle(packetHash: h, interfaceID: id, identity: identity)))
