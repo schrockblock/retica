@@ -418,7 +418,15 @@ struct AutoInterfaceDriverLiveTests {
         _ = await poll(timeout: .seconds(1)) { await gate.peak > 1 }
         let peak = await gate.peak
         #expect(peak == 1, "\(peak) delivery Tasks pending for one socket")
+        let callsAtOpen = await gate.calls
         await gate.open()
+        // The mailbox is FULL here, and stays full until the released Task has delivered its held
+        // batch and taken the mailbox. A datagram read before that take finds no room and is dropped
+        // (the cap working as designed), so sending `after` straight after `open()` raced the take:
+        // it failed whenever the read handler won. The Task calls the gate again right AFTER each
+        // take, so the next call means the mailbox has room. A driver that goes deaf once the
+        // mailbox has been full still fails below: the room is there, the delivery never comes.
+        #expect(await poll { await gate.calls > callsAtOpen }, "the released Task never took the full mailbox")
         let after = Data("after-hold".utf8)
         #expect(await driver.sendUnicast(Self.loopbackAddress, Self.loopbackIndex, b.dataPort, after) == .sent)
         #expect(await log.waitFor { $0.contains(datagram(.data, after)) }, "delivery blocked after the hold")
@@ -575,9 +583,12 @@ private actor HoldAll {
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     private(set) var peak = 0
+    /// Every `pass()` call, held or not.
+    private(set) var calls = 0
     var waiting: Int { waiters.count }
 
     func pass() async {
+        calls += 1
         guard !isOpen else { return }
         await withCheckedContinuation { waiters.append($0); peak = max(peak, waiters.count) }
     }
