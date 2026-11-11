@@ -181,7 +181,7 @@ private let longText = String(repeating: "The quick brown fox jumps over the laz
         #expect(bob.inbox.isEmpty)
 
         // The direct copy runs out of attempts. That is not a failure: the node has the message.
-        await world.advance(seconds: 300)
+        await world.advance(seconds: 300, step: 10)
         #expect(alice.outcomes(of: sent) == [.acceptedByPropagationNode(sent)])
 
         world.plug(bob.port)
