@@ -671,6 +671,15 @@ public struct Transport {
             /// a proof must go back out).
             case received(destinationHash: Data, plaintext: Data, packetHash: Data, interfaceID: InterfaceID)
             case pathLearned(destinationHash: Data, hops: UInt8)
+            /// A valid announce for `destinationHash` was taken into the path table: reference calls
+            /// its announce handlers inside the same path-update branch (RNS 1.6.0
+            /// Transport.py:2756-2806), so this is emitted exactly where `.pathLearned` is, right
+            /// after it. `hops` is the ON-WIRE count, as `.pathLearned` carries it (reference has
+            /// already added one on receipt, Transport.py:2028). `isPathResponse` is the packet's
+            /// `PATH_RESPONSE` context (reference passes `is_path_response` to handlers that ask for
+            /// it). `appData` is this announce's app data, carried so a consumer does not read a store
+            /// a later announce may have overwritten.
+            case announceReceived(destinationHash: Data, hops: UInt8, isPathResponse: Bool, appData: Data?)
             case sendFailed(destinationHash: Data, reason: SendFailure)
             case linkPacket(linkID: Data, arrivalInterface: InterfaceID, data: Data)
             case linkRequest(destinationHash: Data, arrivalInterface: InterfaceID, data: Data)
@@ -1426,8 +1435,13 @@ public struct Transport {
                             state.learned[packet.destinationHash] = candidate
                             state.announceCache[packet.destinationHash] = State.CachedAnnounce(
                                 payload: packet.payload, contextFlag: packet.contextFlag)
-                            return .send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
-                                                                hops: packet.hops)))
+                            return .concatenate(
+                                .send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
+                                                             hops: packet.hops))),
+                                .send(.delegate(.announceReceived(destinationHash: packet.destinationHash,
+                                                                  hops: packet.hops,
+                                                                  isPathResponse: packet.context == .pathResponse,
+                                                                  appData: parsed.appData))))
                         }
                         // REPLAY. A peer/downstream re-broadcast of an announce we are holding is a
                         // same-blob replay. Collaborative suppression: cancel our pending RETRY once
@@ -1482,8 +1496,13 @@ public struct Transport {
                         state.learned[packet.destinationHash] = candidate
                         state.announceCache[packet.destinationHash] = State.CachedAnnounce(
                             payload: packet.payload, contextFlag: packet.contextFlag)
-                        effects.append(.send(.delegate(.pathLearned(
-                            destinationHash: packet.destinationHash, hops: packet.hops))))
+                        effects.append(.concatenate(
+                            .send(.delegate(.pathLearned(destinationHash: packet.destinationHash,
+                                                         hops: packet.hops))),
+                            .send(.delegate(.announceReceived(destinationHash: packet.destinationHash,
+                                                              hops: packet.hops,
+                                                              isPathResponse: packet.context == .pathResponse,
+                                                              appData: parsed.appData)))))
                     }
                     // Relay mode: instead of re-broadcasting now, HOLD this fresh announce and
                     // re-broadcast it once after a jittered delay in [0, PATHFINDER_RW) — RNS

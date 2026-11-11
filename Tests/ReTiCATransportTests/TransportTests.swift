@@ -594,9 +594,10 @@ private func makeAnnouncePacket(hops: UInt8, emitted: UInt64 = 1000,
     let (announceRaw, destHash) = makeAnnouncePacket(hops: 2)
 
     await store.send(.received(InterfaceID("i0"), announceRaw))
-    // Drain the only expected effect (pathLearned); switch exhaustive ON afterward so any
-    // spurious transmit left in the queue would cause teardown to fail.
+    // Drain the only expected effects (pathLearned and the announceReceived beside it); switch
+    // exhaustive ON afterward so any spurious transmit left in the queue would cause teardown to fail.
     await store.receive(.delegate(.pathLearned(destinationHash: destHash, hops: 2)))
+    await store.receive { if case .delegate(.announceReceived(destHash, 2, false, _)) = $0 { return true }; return false }
     store.exhaustivity = .on
     // No transmit pending → exhaustive teardown passes.
     #expect(store.state.learned[destHash]?.nextHop == destHash)  // fallback still applied
@@ -994,6 +995,7 @@ private func sentPacket(_ store: TestStore<Transport.State, Transport.Action>, _
     // transportIdentity stays nil → leaf mode
     await storeB.send(.received(ifB, announceRawB))
     await storeB.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    await storeB.receive { if case .delegate(.announceReceived) = $0 { return true }; return false }
     // With a learned path: leaf would forward if transportIdentity guard is removed.
     let inboundB = makeHeader2DataPacket(transportId: Data(repeating: 0xDE, count: 16),
                                           destHash: destHashB, hops: 1, payload: Data([0xBB]))
@@ -1013,6 +1015,7 @@ private func sentPacket(_ store: TestStore<Transport.State, Transport.Action>, _
     await storeC.send(.setTransportIdentity(relay2))
     await storeC.send(.received(outIf, announceRaw))
     await storeC.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    await storeC.receive { if case .delegate(.announceReceived) = $0 { return true }; return false }
     let maxHops = UInt8(Packet.maxHops) - 1  // 127; +1 == 128 == maxHops → blocked
     let inboundC = makeHeader2DataPacket(transportId: relay2.hash, destHash: destHashC, hops: maxHops,
                                           payload: Data([0xCC]))
@@ -3337,6 +3340,9 @@ private func makeRelayedAnnounce(via upstream: Identity) -> (raw: Data, destHash
     await store.send(.received(InterfaceID("a"), responseRaw))
     // Drain the pathLearned delegate (adoption still happens).
     await store.receive { if case .delegate(.pathLearned) = $0 { return true }; return false }
+    // Announce handlers see it as a path response, with its app data and on-wire hop count.
+    await store.receive(.delegate(.announceReceived(destinationHash: destHash, hops: 1, isPathResponse: true,
+                                                     appData: Data([0xAB]))))
     // Flip exhaustive ON last — any stray transmit (the re-broadcast bug) is an un-received
     // delegate action that fails teardown.
     store.exhaustivity = .on

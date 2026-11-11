@@ -216,6 +216,9 @@ public struct TransportEndpoint {
         public enum Delegate: Equatable {
             case messageReceived(destinationHash: Data, plaintext: Data, packetHash: Data, interfaceID: InterfaceID)
             case pathLearned(destinationHash: Data, hops: UInt8)
+            /// Forwarded from `Transport.Action.Delegate.announceReceived`, right after the
+            /// `.pathLearned` it accompanies; see there.
+            case announceReceived(destinationHash: Data, hops: UInt8, isPathResponse: Bool, appData: Data?)
             case sendFailed(destinationHash: Data, reason: Transport.SendFailure)
             case linkEstablished(linkID: Data, destinationHash: Data)
             case linkDataReceived(linkID: Data, data: Data, packetHash: Data)
@@ -610,6 +613,9 @@ public struct TransportEndpoint {
                 return .send(.delegate(.ratchetsChanged(destinationHash: h, ring: ring)))
             case let .transport(.delegate(.pathLearned(h, hops))):
                 return .send(.delegate(.pathLearned(destinationHash: h, hops: hops)))
+            case let .transport(.delegate(.announceReceived(h, hops, isPathResponse, appData))):
+                return .send(.delegate(.announceReceived(destinationHash: h, hops: hops,
+                                                         isPathResponse: isPathResponse, appData: appData)))
             case let .transport(.delegate(.sendFailed(h, r))):
                 return .send(.delegate(.sendFailed(destinationHash: h, reason: r)))
 
