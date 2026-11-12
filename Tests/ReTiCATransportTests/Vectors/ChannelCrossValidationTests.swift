@@ -26,8 +26,42 @@ private struct ChannelFixtures: Decodable {
         let ring_after: [UInt16]
     }
 
+    /// The six window fields of a real `RNS.Channel.Channel`.
+    struct WindowState: Decodable, Equatable {
+        let window: Int
+        let window_max: Int
+        let window_min: Int
+        let window_flexibility: Int
+        let fast_rate_rounds: Int
+        let medium_rate_rounds: Int
+    }
+
+    /// A real Channel built at `init_rtt`, then driven through `D` (`_packet_delivered`) and `T`
+    /// (`_packet_timeout`) events, each at its own rtt; `states` is the state after each event.
+    struct WindowScenario: Decodable {
+        struct Event: Decodable {
+            let op: String
+            let rtt: Double
+        }
+        let name: String
+        let init_rtt: Double
+        let events: [Event]
+        let initial: WindowState
+        let states: [WindowState]
+    }
+
+    /// `_get_packet_timeout_time(tries)` with `ring` envelopes in the tx ring.
+    struct Timeout: Decodable {
+        let tries: Int
+        let rtt: Double
+        let ring: Int
+        let timeout: Double
+    }
+
     let envelopes: [Envelope]
     let receive_scenarios: [ReceiveScenario]
+    let window_scenarios: [WindowScenario]
+    let timeouts: [Timeout]
 
     static func load() throws -> ChannelFixtures {
         let url = try #require(Bundle.module.url(forResource: "channel_fixtures", withExtension: "json"))
@@ -113,6 +147,44 @@ struct ChannelCrossValidationTests {
             #expect(deliveredBySend == scenario.delivered_by_send, "\(scenario.name)")
             #expect(ring.nextSequence == scenario.next_after, "\(scenario.name)")
             #expect(ring.pending.map(\.sequence) == scenario.ring_after, "\(scenario.name)")
+        }
+    }
+
+    @Test func windowScenariosMatchTheReference() throws {
+        let scenarios = try ChannelFixtures.load().window_scenarios
+        #expect(scenarios.map(\.name) == [
+            "slow_link_init", "grow_to_slow_max", "promote_medium", "promote_fast", "fast_then_slow_resets",
+            "shrink", "shrink_after_medium", "shrink_after_fast", "shrink_max_floor", "slow_link_traffic",
+            "rtt_zero_skips_rate_tracking", "rtt_boundaries",
+        ])
+        for scenario in scenarios {
+            var window = ChannelSendWindow(linkRTT: scenario.init_rtt)
+            #expect(Self.state(window) == scenario.initial, "\(scenario.name) initial")
+            #expect(scenario.events.count == scenario.states.count, "\(scenario.name)")
+            for (index, (event, expected)) in zip(scenario.events, scenario.states).enumerated() {
+                switch event.op {
+                case "D": window.delivered(linkRTT: event.rtt)
+                case "T": window.timedOut()
+                default: Issue.record("\(scenario.name): unknown op \(event.op)")
+                }
+                #expect(Self.state(window) == expected, "\(scenario.name) event \(index) \(event.op)")
+            }
+        }
+    }
+
+    private static func state(_ w: ChannelSendWindow) -> ChannelFixtures.WindowState {
+        ChannelFixtures.WindowState(
+            window: w.window, window_max: w.windowMax, window_min: w.windowMin,
+            window_flexibility: w.windowFlexibility, fast_rate_rounds: w.fastRateRounds,
+            medium_rate_rounds: w.mediumRateRounds)
+    }
+
+    @Test func timeoutsMatchTheReference() throws {
+        let cases = try ChannelFixtures.load().timeouts
+        #expect(cases.count == 30)
+        for c in cases {
+            let ours = ChannelSendWindow.timeout(tries: c.tries, linkRTT: c.rtt, txRingCount: c.ring)
+            #expect(abs(ours - c.timeout) < 1e-9, "tries \(c.tries) rtt \(c.rtt) ring \(c.ring): \(ours) vs \(c.timeout)")
         }
     }
 
