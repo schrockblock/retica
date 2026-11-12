@@ -230,6 +230,50 @@ private func token(_ n: UInt8) -> Data { Data(repeating: n, count: 16) }
     if let proofIndex, let deliveryIndex { #expect(proofIndex < deliveryIndex) }
 }
 
+/// The interfaces every transmit in `events` went out on.
+private func transmitInterfaces(_ events: [Delegate]) -> [InterfaceID] {
+    events.compactMap { if case let .transmit(id, _) = $0 { return id }; return nil }
+}
+
+/// A CHANNEL packet that re-homes the link is proven on the interface it moved TO. The proof is
+/// built while the packet is handled, before the re-home was applied, so it used to go out on the
+/// interface the peer had left.
+@Test @MainActor func aReHomingChannelPacketIsProvenOnTheNewInterface() async throws {
+    let env = Env()
+    let (_, r, owner) = try await activePair(env)
+    await openWithType(r)
+    #expect(r.state.session.interfaceID == InterfaceID("b"))
+    let raw = channelPacket(r.state.session, envelope(msgType.rawValue, 0, "moved"))
+
+    let events = await act(r, .received(raw, arrivalInterface: InterfaceID("c")))
+    #expect(r.state.session.interfaceID == InterfaceID("c"))
+    #expect(events.contains(.rehomed(InterfaceID("c"))))
+    expectProof(of: raw, in: events, signedBy: owner)
+    #expect(transmitInterfaces(events) == [InterfaceID("c")])
+    #expect(received(events).map(\.payload) == [Data("moved".utf8)])
+}
+
+/// Same on the local-disconnect grant: a plaintext keepalive that spends the grant is answered on
+/// the interface the link moved to.
+@Test @MainActor func aReHomingKeepaliveIsAnsweredOnTheNewInterface() async throws {
+    let env = Env()
+    let (_, active, _) = try await activePair(env)
+    var granted = active.state.session
+    granted.rehomePermitted = true
+    let r = env.store(granted)
+    let keepalive = try Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
+                               destinationType: .link, context: .keepalive, contextFlag: false, hops: 0,
+                               destinationHash: granted.linkID, transportId: nil,
+                               payload: Data([LinkSession.keepaliveByte])).packed()
+
+    let events = await act(r, .received(keepalive, arrivalInterface: InterfaceID("c")))
+    #expect(r.state.session.interfaceID == InterfaceID("c"))
+    #expect(r.state.session.rehomePermitted == false)
+    #expect(events.contains(.rehomed(InterfaceID("c"))))
+    #expect(packets(events, .data, .keepalive).map(\.payload) == [Data([LinkSession.keepaliveReplyByte])])
+    #expect(transmitInterfaces(events) == [InterfaceID("c")])
+}
+
 // MARK: - Send
 
 @Test @MainActor func aSendIsRejectedWhenTheWindowIsFull() async throws {

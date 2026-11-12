@@ -887,7 +887,7 @@ public struct LinkSession {
                     return .none
                 }
                 }
-                let effect = dispatch(&state)
+                var effect = dispatch(&state)
                 // Re-arm only when the link is still active after dispatch: the LINKCLOSE branch
                 // sets .closed and must not have an inactivity timer re-armed behind it.
                 guard state.status == .active else { return effect }
@@ -966,8 +966,19 @@ public struct LinkSession {
                 // before the reconnecting peer could use it.
                 if let arrival = arrivalInterface, arrival != state.interfaceID,
                    sawAuthenticatedData || state.rehomePermitted {
+                    let departed = state.interfaceID
                     state.rehomePermitted = false          // one-shot
                     state.interfaceID = arrival
+                    // Replies to THIS packet (the channel proof, the keepalive answer) were built
+                    // inside `dispatch`, which had to run first: only it knows whether the packet
+                    // authenticated. They addressed the interface the peer just left, so point
+                    // them at the one it arrived on. Every transmit `dispatch` builds reads
+                    // `state.interfaceID`, so `departed` matches exactly those.
+                    effect = effect.map { action in
+                        guard case let .delegate(.transmit(id, raw)) = action, id == departed
+                        else { return action }
+                        return .delegate(.transmit(arrival, raw))
+                    }
                     extra.append(.send(.delegate(.rehomed(arrival))))
                 }
                 return .merge([effect, inactivityTimer(state.staleTime)] + extra)
