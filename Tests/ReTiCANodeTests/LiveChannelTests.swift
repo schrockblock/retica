@@ -29,7 +29,9 @@ private let echoType = ChannelMessageType(0x0101)!
 @MainActor
 private func poll<T>(seconds: Double, _ value: () -> T?) async -> T? {
     let end = Date().addingTimeInterval(seconds)
-    while Date() < end {
+    // Once the task is cancelled (the suite's time limit), `Task.sleep` throws at once: stop rather
+    // than spin until this poll's own deadline.
+    while Date() < end, !Task.isCancelled {
         if let found = value() { return found }
         try? await Task.sleep(for: .milliseconds(10))
     }
@@ -172,7 +174,11 @@ private final class ReferencePeer {
         let lines = self.lines, partial = self.partial
         stdout.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
-            guard !chunk.isEmpty else { return }
+            // Empty is EOF (the peer exited): unhook, or the handler keeps being called.
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
             partial.withValue { buffer in
                 buffer += String(decoding: chunk, as: UTF8.self)
                 while let newline = buffer.firstIndex(of: "\n") {
@@ -223,7 +229,9 @@ private final class ReferencePeer {
     }
 }
 
-@Suite(.serialized, .enabled(if: pythonPath != nil), .timeLimit(.minutes(3)))
+// The limit covers the sum of each test's step timeouts (about 6.5 minutes in the responder test);
+// a green run takes seconds.
+@Suite(.serialized, .enabled(if: pythonPath != nil), .timeLimit(.minutes(8)))
 @MainActor struct LiveChannelTests {
     private func makeStore(_ events: LockIsolated<[Event]>) -> StoreOf<ChannelHarness> {
         // `.live`: in a test context several ReTiCA dependencies (clocks, \.transportDate) are
@@ -296,6 +304,65 @@ private final class ReferencePeer {
         return outcome == true
     }
 
+    /// Write `data` on stream 1, looping on `streamWritten.consumed` (0 = window full, retry), then
+    /// close it (EOF) once every chunk is proven, so the close finds the channel ready and its EOF is
+    /// not lost. False (with an issue recorded) if the writes stall or the link closes.
+    private func writeStreamAndClose(_ store: StoreOf<ChannelHarness>, _ events: LockIsolated<[Event]>,
+                                     linkID: Data, data: Data, peer: ReferencePeer) async -> Bool {
+        var offset = 0
+        var write = 0
+        var writeTokens: [Data] = []
+        let writeDeadline = Date().addingTimeInterval(90)
+        while offset < data.count {
+            guard Date() < writeDeadline, !Task.isCancelled, !linkClosed(events) else {
+                Issue.record("stream write stalled at \(offset) of \(data.count); \(peer.report)")
+                return false
+            }
+            let token = Data("write-\(write)".utf8)
+            write += 1
+            store.send(.endpoint(.writeStreamOverLink(linkID: linkID, streamID: 1,
+                                                      data: data.subdata(in: offset..<data.count), token: token)))
+            let consumed = await poll(seconds: 5) { () -> Int? in
+                for event in events.value { if case let .written(t, c) = event, t == token { return c } }
+                return nil
+            }
+            guard let consumed else {
+                Issue.record("no streamWritten for \(token); \(peer.report)")
+                return false
+            }
+            if consumed > 0 {
+                offset += consumed
+                writeTokens.append(token)
+            } else {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        let allDelivered = await poll(seconds: 30) { () -> Bool? in
+            let delivered = Set(events.value.compactMap { if case let .delivered(t) = $0 { return t }; return nil })
+            return writeTokens.allSatisfy(delivered.contains) ? true : nil
+        }
+        #expect(allDelivered == true, "not every stream chunk was proven; \(peer.report)")
+        store.send(.endpoint(.closeStreamWriterOverLink(linkID: linkID, streamID: 1, token: Data("eof".utf8))))
+        return true
+    }
+
+    /// What arrived on `streamID`, split at each EOF: one entry per EOF-terminated run, plus the
+    /// unterminated tail (with `eof` false) if there is one.
+    private func streamRuns(_ events: LockIsolated<[Event]>, _ streamID: UInt16) -> [(data: Data, eof: Bool)] {
+        var runs: [(data: Data, eof: Bool)] = []
+        var current = Data()
+        for event in events.value {
+            guard case let .stream(s, data, eof) = event, s == streamID else { continue }
+            current += data
+            if eof {
+                runs.append((current, true))
+                current = Data()
+            }
+        }
+        if !current.isEmpty { runs.append((current, false)) }
+        return runs
+    }
+
     // MARK: ReTiCA initiates
 
     @Test func retiCAInitiatesAndExchangesChannelMessagesAndStreams() async throws {
@@ -348,42 +415,7 @@ private final class ReferencePeer {
 
         // 3. 40 000 bytes on stream 1, then EOF; the same bytes and EOF back on stream 2.
         let sent = mixedStream(count: 40_000, linePrefix: "retica")
-        var offset = 0
-        var write = 0
-        var writeTokens: [Data] = []
-        let writeDeadline = Date().addingTimeInterval(90)
-        while offset < sent.count {
-            guard Date() < writeDeadline, !linkClosed(events) else {
-                Issue.record("stream write stalled at \(offset) of \(sent.count); \(peer.report)")
-                return
-            }
-            let token = Data("write-\(write)".utf8)
-            write += 1
-            store.send(.endpoint(.writeStreamOverLink(linkID: linkID, streamID: 1, data: sent.subdata(in: offset..<sent.count),
-                                                      token: token)))
-            let consumed = await poll(seconds: 5) { () -> Int? in
-                for event in events.value { if case let .written(t, c) = event, t == token { return c } }
-                return nil
-            }
-            guard let consumed else {
-                Issue.record("no streamWritten for \(token); \(peer.report)")
-                return
-            }
-            if consumed > 0 {
-                offset += consumed
-                writeTokens.append(token)
-            } else {
-                // Not ready: the window is full until a delivery frees a slot.
-                try? await Task.sleep(for: .milliseconds(10))
-            }
-        }
-        // EOF only once every chunk is proven, so the close finds the channel ready and is not lost.
-        let allDelivered = await poll(seconds: 30) { () -> Bool? in
-            let delivered = Set(events.value.compactMap { if case let .delivered(t) = $0 { return t }; return nil })
-            return writeTokens.allSatisfy(delivered.contains) ? true : nil
-        }
-        #expect(allDelivered == true, "not every stream chunk was proven; \(peer.report)")
-        store.send(.endpoint(.closeStreamWriterOverLink(linkID: linkID, streamID: 1, token: Data("eof".utf8))))
+        guard await writeStreamAndClose(store, events, linkID: linkID, data: sent, peer: peer) else { return }
 
         let back = await poll(seconds: 60) { stream(events, 2).eof ? stream(events, 2) : nil }
         #expect(back?.eof == true, "no EOF on stream 2; got \(stream(events, 2).data.count) bytes; \(peer.report)")
@@ -472,7 +504,24 @@ private final class ReferencePeer {
         print("LIVE-CHANNEL responder: sequence 0 went out \(firstSends) times")
         #expect(firstSends >= 2, "sequence 0 was not resent after the peer left it unproven")
 
-        // 4.
+        // 4. Stream data the other way: 8000 bytes from us on stream 1, then EOF. The peer counts
+        // them (STREAM_EOF) and, serving the link as in accept mode, echoes them onto stream 2 with
+        // an EOF, after the EOF that ended its own 5000 bytes.
+        let sent = mixedStream(count: 8000, linePrefix: "retica-responder")
+        guard await writeStreamAndClose(store, events, linkID: linkID, data: sent, peer: peer) else { return }
+        let peerCount = await poll(seconds: 30) { peer.value(after: "STREAM_EOF") }
+        #expect(peerCount == "\(sent.count)", "the peer's STREAM_EOF; \(peer.report)")
+        let echoRun = await poll(seconds: 30) { () -> (data: Data, eof: Bool)? in
+            let runs = streamRuns(events, 2)
+            return runs.count >= 2 && runs[1].eof ? runs[1] : nil
+        }
+        #expect(echoRun?.data == sent,
+                "stream 2 after the peer's own EOF: \(streamRuns(events, 2).map { ($0.data.count, $0.eof) }); \(peer.report)")
+        let ours = chunks(events, outbound: true, streamID: 1)
+        print("LIVE-CHANNEL responder: stream 1 out \(ours) (compressed, raw)")
+        #expect(ours.compressed > 0 && ours.raw > 0, "stream 1 chunks out: \(ours)")
+
+        // 5.
         #expect(!exhaustedClose(events), "a link closed with .channelRetriesExhausted; \(peer.report)")
         #expect(!linkClosed(events), "the link closed during the exchange; events: \(events.value.filter { if case .closed = $0 { return true }; return false })")
     }
