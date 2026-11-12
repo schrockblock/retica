@@ -78,7 +78,9 @@ private struct ChannelFixtures: Decodable {
             let hex: String?
             let repeat_hex: String?
             let times: Int?
+            let parts: [Input]?
             var bytes: Data {
+                if let parts { return Data(parts.map(\.bytes).joined()) }
                 if let hex { return Data(hexString: hex)! }
                 return Data((0..<times!).map { _ in Data(hexString: repeat_hex!)! }.joined())
             }
@@ -88,6 +90,8 @@ private struct ChannelFixtures: Decodable {
             let input: Input
             let processed_length: Int
             let compressed: Bool
+            /// 1-3, recovered by the generator from `processed_length`; nil when uncompressed.
+            let compression_try: Int?
             let eof: Bool
             let payload_hex: String
             let header_hex: String
@@ -262,7 +266,11 @@ struct ChannelCrossValidationTests {
         // Ruling R2: the reference writer's _mdu is the channel MDU (425) less the header.
         #expect(stream.writer_mdu == 423)
         #expect(ChannelState(window: ChannelSendWindow(linkRTT: nil)).mdu - StreamDataHeader.length == stream.writer_mdu)
-        #expect(stream.writes.map(\.name) == ["empty", "a_x32", "a_x33", "a_x1000", "random_1000_seed_1234", "ab_x20000"])
+        #expect(stream.writes.map(\.name) == ["empty", "a_x32", "a_x33", "a_x1000", "random_1000_seed_1234", "ab_x20000",
+                                              "x_8192_then_random_8192_seed_77", "x_5462_then_random_10922_seed_78"])
+        // Every branch of the try loop is covered: tries 1, 2 and 3, and all tries failing.
+        #expect(Set(stream.writes.compactMap(\.compression_try)) == [1, 2, 3])
+        #expect(stream.writes.contains { $0.processed_length > 32 && !$0.compressed })
         #expect(stream.writes.contains { $0.compressed } && stream.writes.contains { !$0.compressed && $0.processed_length > 0 })
         for w in stream.writes {
             let input = w.input.bytes
@@ -270,6 +278,9 @@ struct ChannelCrossValidationTests {
             let ours = StreamChunker.chunk(input, writerMDU: stream.writer_mdu)
             #expect(ours.compressed == w.compressed, "\(w.name)")
             #expect(ours.consumed == w.processed_length, "\(w.name)")
+            if let t = w.compression_try {
+                #expect(ours.consumed == min(input.count, StreamChunker.maxChunkLen) / t, "\(w.name): try \(t)")
+            }
             let expected = Data(input.prefix(w.processed_length))
             let header = StreamDataHeader(streamID: 5, eof: false, compressed: w.compressed)
             #expect(header.packed() == Data(hexString: w.header_hex)!, "\(w.name)")

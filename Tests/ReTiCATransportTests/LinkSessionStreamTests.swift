@@ -241,6 +241,97 @@ private final class Wire {
     #expect(i.state.streamEOFDeadlinesFired == 0)
 }
 
+/// A delivery that frees two slots (one envelope leaves, the window grows 2 -> 3) releases both waiting
+/// EOFs at once, in order, the second not held behind the first's retry timer.
+@Test @MainActor func twoFreedSlotsReleaseBothWaitingEOFsAtOnce() async throws {
+    let env = Env()
+    let (i, r, _) = try await activePair(env)
+    await act(i, .openChannel)
+    await act(r, .openChannel)
+    let key = i.state.session.sessionKey
+    var sent: [Packet] = []
+    for n: UInt8 in 1...2 {
+        sent += packets(await act(i, .writeStream(streamID: 9, data: Data([n]), token: token(n))), .data, .channel)
+    }
+    try #require(sent.count == 2)
+    await act(i, .closeStreamWriter(streamID: 1, token: token(0xA)))
+    await act(i, .closeStreamWriter(streamID: 2, token: token(0xB)))
+    #expect(i.state.session.channel?.pendingStreamEOFs.count == 2)
+
+    let before = i.state.events.count
+    let proof = try #require(packets(await act(r, .received(try sent[0].packed())), .proof, .none).first)
+    await act(i, .received(try proof.packed()))
+    await i.skipReceivedActions(strict: false)
+    let events = Array(i.state.events[before...])
+    #expect(sentStreamMessages(events, key: key).map(\.0) == [StreamDataHeader(streamID: 1, eof: true, compressed: false),
+                                                             StreamDataHeader(streamID: 2, eof: true, compressed: false)])
+    #expect(written(events).map(\.token) == [token(0xA), token(0xB)])
+    #expect(i.state.session.channel?.pendingStreamEOFs.isEmpty == true)
+}
+
+/// Two closes wait on a full window. One freed slot releases ONE EOF; the other keeps waiting, with
+/// its deadline still armed, as each reference `close` polls readiness on its own (Buffer.py:276-277).
+@Test @MainActor func oneFreedSlotReleasesOnlyTheOldestWaitingEOF() async throws {
+    enum Then { case secondDelivery, deadline }
+    for then in [Then.secondDelivery, .deadline] {
+        let env = Env()
+        let (i, r, _) = try await activePair(env)
+        await act(i, .openChannel)
+        await act(r, .openChannel)   // the peer proves CHANNEL packets only with a channel open
+        let key = i.state.session.sessionKey
+        // Grow the window to its slow-link max (2 -> 5), so a delivery frees exactly one slot.
+        let wire = Wire(i, r)
+        for n: UInt8 in 1...3 {
+            await act(i, .writeStream(streamID: 9, data: Data([n]), token: token(n)))
+            await wire.pump()
+        }
+        #expect(i.state.session.channel?.window.window == 5, "\(then)")
+        #expect(i.state.session.channel?.window.windowMax == 5, "\(then)")
+
+        var sent: [Packet] = []
+        for n: UInt8 in 10...14 {
+            sent += packets(await act(i, .writeStream(streamID: 9, data: Data([n]), token: token(n))), .data, .channel)
+        }
+        try #require(sent.count == 5)
+        #expect(i.state.session.channel?.isReadyToSend == false, "\(then)")
+        #expect(await act(i, .closeStreamWriter(streamID: 1, token: token(0xA))).isEmpty, "\(then)")
+        #expect(await act(i, .closeStreamWriter(streamID: 2, token: token(0xB))).isEmpty, "\(then)")
+
+        func deliver(_ p: Packet) async throws -> [Delegate] {
+            let proof = try #require(packets(await act(r, .received(try p.packed())), .proof, .none).first)
+            return await act(i, .received(try proof.packed()))
+        }
+        let beforeFirst = i.state.events.count
+        _ = try await deliver(sent[0])
+        await i.skipReceivedActions(strict: false)   // a concatenated tail may land after act's drain
+        let first = Array(i.state.events[beforeFirst...])
+        #expect(sentStreamMessages(first, key: key).map(\.0) == [StreamDataHeader(streamID: 1, eof: true, compressed: false)],
+                "\(then): only A's EOF")
+        #expect(written(first).map(\.token) == [token(0xA)], "\(then): B neither sent nor answered yet")
+        #expect(i.state.session.channel?.pendingStreamEOFs == [PendingStreamEOF(streamID: 2, token: token(0xB))], "\(then)")
+
+        switch then {
+        case .secondDelivery:
+            let second = try await deliver(sent[1])
+            #expect(sentStreamMessages(second, key: key).map(\.0) == [StreamDataHeader(streamID: 2, eof: true, compressed: false)])
+            #expect(written(second).map(\.token) == [token(0xB)])
+            #expect(i.state.session.channel?.pendingStreamEOFs.isEmpty == true)
+            let mark = i.state.events.count
+            await env.advance(1.0, i)   // past both waits (0.125 x 5), short of any retry (~2 s)
+            #expect(written(Array(i.state.events[mark...])).isEmpty)
+            #expect(i.state.streamEOFDeadlinesFired == 0)
+        case .deadline:
+            // B's wait is 0.125 x 5 from its close; still full, so its one try is refused.
+            let mark = i.state.events.count
+            await env.advance(1.0, i)
+            let fired = Array(i.state.events[mark...])
+            #expect(i.state.streamEOFDeadlinesFired == 1, "B's wait was left armed; A's was cancelled")
+            #expect(fired == [.streamWritten(token: token(0xB), consumed: 0)])
+            #expect(i.state.session.channel?.pendingStreamEOFs.isEmpty == true)
+        }
+    }
+}
+
 @Test @MainActor func aWriterClosedWithTheWindowFullTriesOnceAtTheDeadline() async throws {
     // RTT known: the wait is rtt × tx ring length (Buffer.py:271-272), 0.125 × 2.
     do {

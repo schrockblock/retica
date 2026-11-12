@@ -290,10 +290,35 @@ def _stream_inputs():
         ("a_x1000", {"repeat_hex": b"a".hex(), "times": 1000}),
         ("random_1000_seed_1234", {"hex": random.Random(1234).randbytes(1000).hex()}),
         ("ab_x20000", {"repeat_hex": b"ab".hex(), "times": 20000}),
+        # The whole 16 KiB chunk fails (its random half will not fit the MDU), its first half (all
+        # "x") succeeds: compression try 2. section_stream asserts the reference really took try 2.
+        ("x_8192_then_random_8192_seed_77", {"parts": [
+            {"repeat_hex": b"x".hex(), "times": 8192},
+            {"hex": random.Random(77).randbytes(8192).hex()},
+        ]}),
+        # The halves fail too (the first holds 2730 random bytes), the first third (all "x")
+        # succeeds: compression try 3.
+        ("x_5462_then_random_10922_seed_78", {"parts": [
+            {"repeat_hex": b"x".hex(), "times": 5462},
+            {"hex": random.Random(78).randbytes(10922).hex()},
+        ]}),
     ]
 
 
+# Which compression try (1-3) RawChannelWriter.write took, recovered from its processed_length
+# (int(chunk_len/comp_try), Buffer.py:243); None when it sent uncompressed.
+def _compression_try(input_length, processed, compressed):
+    if not compressed:
+        return None
+    chunk_len = min(input_length, RawChannelWriter.MAX_CHUNK_LEN)
+    tries = [t for t in range(1, RawChannelWriter.COMPRESSION_TRIES) if int(chunk_len / t) == processed]
+    assert len(tries) == 1, tries
+    return tries[0]
+
+
 def _input_bytes(spec):
+    if "parts" in spec:
+        return b"".join(_input_bytes(part) for part in spec["parts"])
     if "hex" in spec:
         return bytes.fromhex(spec["hex"])
     return bytes.fromhex(spec["repeat_hex"]) * spec["times"]
@@ -306,7 +331,9 @@ def section_stream():
     #   the inflated bytes. `stream_id_set` 0x7FFF is assigned AFTER construction (the constructor
     #   refuses ids above 0x3FFF, Buffer.py:74-75) to pin pack's `0x3fff &` mask.
     # writes: RawChannelWriter(stream_id 5, _StreamChannel).write(input) for each input. Each case:
-    #   {name, input, processed_length, compressed, eof, payload_hex (the message data as sent: bz2
+    #   {name, input (hex | repeat_hex+times | parts: a list of those, concatenated),
+    #   processed_length, compressed, compression_try (1-3, recovered from processed_length; null
+    #   when uncompressed), eof, payload_hex (the message data as sent: bz2
     #   bytes when compressed), header_hex}. Then close() and one write after close, on a fresh
     #   writer: {close_header_hex, close_data_hex, after_close_header_hex, after_close_processed}.
     headers = []
@@ -336,12 +363,18 @@ def section_stream():
     for name, spec in _stream_inputs():
         channel = _StreamChannel()
         writer = RawChannelWriter(5, channel)
-        processed = writer.write(_input_bytes(spec))
+        data = _input_bytes(spec)
+        processed = writer.write(data)
         assert len(channel.sent) == 1
         message = channel.sent[0]
+        compression_try = _compression_try(len(data), processed, bool(message.compressed))
+        if name.startswith("x_8192"):
+            assert compression_try == 2, compression_try
+        if name.startswith("x_5462"):
+            assert compression_try == 3, compression_try
         writes.append({
             "name": name, "input": spec, "processed_length": processed,
-            "compressed": bool(message.compressed), "eof": message.eof,
+            "compressed": bool(message.compressed), "compression_try": compression_try, "eof": message.eof,
             "payload_hex": message.data.hex(), "header_hex": message.pack()[:2].hex(),
         })
 

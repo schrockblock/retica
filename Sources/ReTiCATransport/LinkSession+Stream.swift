@@ -28,7 +28,17 @@ extension LinkSession {
 
     /// `RawChannelWriter.write` (Buffer.py:232-267): one chunk, answered by `streamWritten`.
     func writeStream(_ state: inout State, streamID: UInt16, data: Data, token: Data) -> Effect<Action> {
-        let nothing = Effect<Action>.send(.delegate(.streamWritten(token: token, consumed: 0)))
+        let parts = writeStreamParts(&state, streamID: streamID, data: data, token: token)
+        return .merge(parts.ordered, parts.timers)
+    }
+
+    /// `writeStream`'s effects in two parts: `ordered` (the transmit, then `streamWritten`), quick
+    /// sends that a caller may concatenate with others; and `timers`, the long-running retry timers,
+    /// which must be MERGED, never concatenated before anything, or what follows waits for them.
+    func writeStreamParts(_ state: inout State, streamID: UInt16, data: Data,
+                          token: Data) -> (ordered: Effect<Action>, timers: Effect<Action>) {
+        let nothing = (ordered: Effect<Action>.send(.delegate(.streamWritten(token: token, consumed: 0))),
+                       timers: Effect<Action>.none)
         // An id above 14 bits: the reference's StreamDataMessage refuses it (Buffer.py:74-75) where
         // pack would otherwise mask it onto another stream. Not ready, inactive or no channel: the
         // ME_LINK_NOT_READY path, 0 (Buffer.py:264-267). Checked before chunking only to spare the
@@ -43,9 +53,9 @@ extension LinkSession {
         case .failure:
             return nothing   // .tooBig cannot happen: the chunk respects the writer MDU
         case let .success(sent):
-            return .merge(.concatenate(sent.transmit,
-                                       .send(.delegate(.streamWritten(token: token, consumed: chunk.consumed)))),
-                          sent.timers)
+            return (ordered: .concatenate(sent.transmit,
+                                          .send(.delegate(.streamWritten(token: token, consumed: chunk.consumed)))),
+                    timers: sent.timers)
         }
     }
 
@@ -59,7 +69,7 @@ extension LinkSession {
         guard streamID <= StreamDataHeader.streamIDMax, let channel = state.channel else {
             return .send(.delegate(.streamWritten(token: token, consumed: 0)))
         }
-        guard !channel.isReadyToSend else { return sendStreamEOF(&state, streamID: streamID, token: token) }
+        guard !channel.isReadyToSend else { return sendStreamEOF(&state, streamID: streamID, token: token).merged }
         state.channel?.pendingStreamEOFs.append(PendingStreamEOF(streamID: streamID, token: token))
         let wait = Self.streamEOFWait(linkRTT: state.rtt, txRingCount: channel.tx.count)
         let clock = self.clock
@@ -82,27 +92,34 @@ extension LinkSession {
         guard let index = state.channel?.pendingStreamEOFs.firstIndex(of: PendingStreamEOF(streamID: streamID, token: token))
         else { return .none }
         state.channel?.pendingStreamEOFs.remove(at: index)
-        return sendStreamEOF(&state, streamID: streamID, token: token)
+        return sendStreamEOF(&state, streamID: streamID, token: token).merged
     }
 
-    /// Run on every delivery: once the channel is ready, every waiting close tries its EOF once, in
-    /// the order they were asked for, as each blocked `close` would wake and write. Eager cancels:
-    /// call it only where the waits are being ended.
+    /// Run on every delivery: while the channel is ready, the oldest waiting close sends its EOF and
+    /// stops waiting. A close that finds the window full again keeps waiting, with its own deadline
+    /// still armed, for a later delivery: each reference `close` polls `is_ready_to_send` on its own
+    /// (Buffer.py:276-277), so one freed slot releases one EOF, and the rest stay blocked. Eager
+    /// cancels: each cancels only the wait it ends. The EOFs' transmits and `streamWritten`s go out in
+    /// order; their retry timers are merged alongside, so no EOF waits on an earlier one's timer.
     func flushStreamEOFsIfReady(_ state: inout State) -> Effect<Action> {
-        guard let channel = state.channel, channel.isReadyToSend, !channel.pendingStreamEOFs.isEmpty else { return .none }
-        state.channel?.pendingStreamEOFs.removeAll()
-        var effects: [Effect<Action>] = []
-        for pending in channel.pendingStreamEOFs {
-            effects.append(.cancel(id: CancelID.streamEOF(streamID: pending.streamID, token: pending.token)))
-            effects.append(sendStreamEOF(&state, streamID: pending.streamID, token: pending.token))
+        var ordered: [Effect<Action>] = []
+        var timers: [Effect<Action>] = []
+        while let channel = state.channel, channel.isReadyToSend, let pending = channel.pendingStreamEOFs.first {
+            state.channel?.pendingStreamEOFs.removeFirst()
+            timers.append(.cancel(id: CancelID.streamEOF(streamID: pending.streamID, token: pending.token)))
+            let parts = sendStreamEOF(&state, streamID: pending.streamID, token: pending.token)
+            ordered.append(parts.ordered)
+            timers.append(parts.timers)
         }
-        return .concatenate(effects)
+        return .merge(.concatenate(ordered), .merge(timers))
     }
 
     /// `self._eof = True; self.write(bytes())` (Buffer.py:279-280). An empty write consumes 0, so its
     /// `streamWritten` reads 0 whether or not it was sent.
-    private func sendStreamEOF(_ state: inout State, streamID: UInt16, token: Data) -> Effect<Action> {
+    private func sendStreamEOF(_ state: inout State, streamID: UInt16,
+                               token: Data) -> (ordered: Effect<Action>, timers: Effect<Action>, merged: Effect<Action>) {
         state.channel?.closedStreamWriters.insert(streamID)
-        return writeStream(&state, streamID: streamID, data: Data(), token: token)
+        let parts = writeStreamParts(&state, streamID: streamID, data: Data(), token: token)
+        return (parts.ordered, parts.timers, .merge(parts.ordered, parts.timers))
     }
 }
