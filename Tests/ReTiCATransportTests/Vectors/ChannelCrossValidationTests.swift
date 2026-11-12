@@ -15,7 +15,19 @@ private struct ChannelFixtures: Decodable {
         var raw: Data { Data(hexString: raw_hex)! }
     }
 
+    /// A real `RNS.Channel.Channel` fed `sends` through `_receive` from `_next_rx_sequence == start`.
+    struct ReceiveScenario: Decodable {
+        let name: String
+        let start: UInt16
+        let sends: [UInt16]
+        let delivered: [UInt16]
+        let delivered_by_send: [[UInt16]]
+        let next_after: UInt16
+        let ring_after: [UInt16]
+    }
+
     let envelopes: [Envelope]
+    let receive_scenarios: [ReceiveScenario]
 
     static func load() throws -> ChannelFixtures {
         let url = try #require(Bundle.module.url(forResource: "channel_fixtures", withExtension: "json"))
@@ -82,6 +94,26 @@ struct ChannelCrossValidationTests {
         #expect(ChannelMessageType(0xF000) == nil)
         #expect(ChannelMessageType(0xFF00) == nil)
         #expect(ChannelMessageType.streamData.rawValue == 0xFF00)
+    }
+
+    @Test func receiveScenariosMatchTheReference() throws {
+        let scenarios = try ChannelFixtures.load().receive_scenarios
+        #expect(scenarios.count == 12)
+        for scenario in scenarios {
+            var ring = ChannelReceiveRing(nextSequence: scenario.start)
+            var delivered: [UInt16] = []
+            var deliveredBySend: [[UInt16]] = []
+            for s in scenario.sends {
+                let envelope = ChannelEnvelope(msgType: 0x0101, sequence: s, payload: Data([UInt8(s & 0xFF)]))
+                let now = ring.accept(envelope).map(\.sequence)
+                deliveredBySend.append(now)
+                delivered += now
+            }
+            #expect(delivered == scenario.delivered, "\(scenario.name)")
+            #expect(deliveredBySend == scenario.delivered_by_send, "\(scenario.name)")
+            #expect(ring.nextSequence == scenario.next_after, "\(scenario.name)")
+            #expect(ring.pending.map(\.sequence) == scenario.ring_after, "\(scenario.name)")
+        }
     }
 
     @Test func theConstantsMatchTheReference() {

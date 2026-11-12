@@ -66,5 +66,291 @@
       "payload_hex": "bfff73747265616d2d64617461",
       "raw_hex": "ff000007000dbfff73747265616d2d64617461"
     }
+  ],
+  "receive_scenarios": [
+    {
+      "name": "in_order",
+      "start": 0,
+      "sends": [
+        0,
+        1,
+        2
+      ],
+      "delivered": [
+        0,
+        1,
+        2
+      ],
+      "delivered_by_send": [
+        [
+          0
+        ],
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "next_after": 3,
+      "ring_after": []
+    },
+    {
+      "name": "gap_then_fill",
+      "start": 0,
+      "sends": [
+        1,
+        2,
+        0
+      ],
+      "delivered": [
+        0,
+        1,
+        2
+      ],
+      "delivered_by_send": [
+        [],
+        [],
+        [
+          0,
+          1,
+          2
+        ]
+      ],
+      "next_after": 3,
+      "ring_after": []
+    },
+    {
+      "name": "duplicate",
+      "start": 0,
+      "sends": [
+        0,
+        0,
+        1
+      ],
+      "delivered": [
+        0,
+        1
+      ],
+      "delivered_by_send": [
+        [
+          0
+        ],
+        [],
+        [
+          1
+        ]
+      ],
+      "next_after": 2,
+      "ring_after": []
+    },
+    {
+      "name": "out_of_window_ahead",
+      "start": 0,
+      "sends": [
+        49
+      ],
+      "delivered": [],
+      "delivered_by_send": [
+        []
+      ],
+      "next_after": 0,
+      "ring_after": []
+    },
+    {
+      "name": "boundary_ahead",
+      "start": 0,
+      "sends": [
+        48
+      ],
+      "delivered": [],
+      "delivered_by_send": [
+        []
+      ],
+      "next_after": 0,
+      "ring_after": [
+        48
+      ]
+    },
+    {
+      "name": "behind",
+      "start": 10,
+      "sends": [
+        5
+      ],
+      "delivered": [],
+      "delivered_by_send": [
+        []
+      ],
+      "next_after": 10,
+      "ring_after": []
+    },
+    {
+      "name": "wrap",
+      "start": 65534,
+      "sends": [
+        65534,
+        65535,
+        0,
+        1
+      ],
+      "delivered": [
+        65534,
+        65535,
+        0,
+        1
+      ],
+      "delivered_by_send": [
+        [
+          65534
+        ],
+        [
+          65535
+        ],
+        [
+          0
+        ],
+        [
+          1
+        ]
+      ],
+      "next_after": 2,
+      "ring_after": []
+    },
+    {
+      "name": "wrap_out_of_order",
+      "start": 65534,
+      "sends": [
+        0,
+        65535,
+        65534,
+        1
+      ],
+      "delivered": [
+        65534,
+        65535,
+        0,
+        1
+      ],
+      "delivered_by_send": [
+        [],
+        [],
+        [
+          65534,
+          65535,
+          0
+        ],
+        [
+          1
+        ]
+      ],
+      "next_after": 2,
+      "ring_after": []
+    },
+    {
+      "name": "behind_near_wrap",
+      "start": 2,
+      "sends": [
+        65520,
+        65535
+      ],
+      "delivered": [],
+      "delivered_by_send": [
+        [],
+        []
+      ],
+      "next_after": 2,
+      "ring_after": []
+    },
+    {
+      "name": "duplicate_pending",
+      "start": 0,
+      "sends": [
+        2,
+        2,
+        0,
+        1
+      ],
+      "delivered": [
+        0,
+        1,
+        2
+      ],
+      "delivered_by_send": [
+        [],
+        [],
+        [
+          0
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "next_after": 3,
+      "ring_after": []
+    },
+    {
+      "name": "wrap_restart",
+      "start": 65534,
+      "sends": [
+        0,
+        65535,
+        65534
+      ],
+      "delivered": [
+        65534,
+        65535,
+        0
+      ],
+      "delivered_by_send": [
+        [],
+        [],
+        [
+          65534,
+          65535,
+          0
+        ]
+      ],
+      "next_after": 1,
+      "ring_after": []
+    },
+    {
+      "name": "wrap_reversed_tail",
+      "start": 65534,
+      "sends": [
+        2,
+        1,
+        0,
+        65535,
+        65534,
+        3
+      ],
+      "delivered": [
+        65534,
+        65535,
+        0,
+        1
+      ],
+      "delivered_by_send": [
+        [],
+        [],
+        [],
+        [],
+        [
+          65534,
+          65535,
+          0
+        ],
+        [
+          1
+        ]
+      ],
+      "next_after": 2,
+      "ring_after": [
+        2,
+        3
+      ]
+    }
   ]
 }
