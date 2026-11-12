@@ -22,6 +22,8 @@ public enum ChannelConstants {
     public static let windowFlexibility = 4
     public static let seqMax = 0xFFFF
     public static let seqModulus = seqMax + 1
+    /// Mirrors the instance field `self._max_tries = 5` (Channel.py:232), not a class constant: the
+    /// reference never changes it either, so one value serves every channel.
     public static let maxTries = 5
     /// `>HHH` header: msgtype, sequence, length.
     public static let envelopeOverhead = 6

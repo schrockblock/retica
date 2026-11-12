@@ -16,7 +16,8 @@ import Foundation
 /// Reference behaviour kept as is: near the wrap, `_emplace_envelope` appends small wrapped sequences
 /// instead of inserting them in order (Channel.py:331's `(next - seq) > SEQ_MAX//2` clause), and the
 /// sweep is a single pass in ring order. A ring like `[2, 1, 0, 0xFFFE, 0xFFFF]` therefore delivers
-/// 0xFFFE, 0xFFFF, 0 and leaves 1 and 2 waiting for the next `accept` to sweep again.
+/// 0xFFFE, 0xFFFF, 0 and leaves 1 and 2 waiting for the next accept of a NEW, non-duplicate in-window
+/// envelope to sweep again (a duplicate is refused before the sweep, Channel.py:373-375).
 public struct ChannelReceiveRing: Equatable, Sendable {
     /// `Channel._next_rx_sequence`.
     public private(set) var nextSequence: UInt16
