@@ -103,6 +103,13 @@ private func linkPacket(_ s: LinkSession.State, _ type: PacketType, _ context: P
     await store.send(.writeStreamOverLink(linkID: b.linkID, streamID: 2, data: Data("out".utf8), token: token))
     await store.receive(.delegate(.streamWritten(linkID: b.linkID, token: token, consumed: 3)))
 
+    // An id above 14 bits is refused under the link's id, distinctly from "consumed nothing".
+    await store.send(.writeStreamOverLink(linkID: b.linkID, streamID: 0x4000, data: Data("x".utf8), token: token))
+    await store.receive(.delegate(.streamIDRejected(linkID: b.linkID, streamID: 0x4000, token: token)))
+    await store.send(.openStreamReaderOverLink(linkID: a.linkID, streamID: 0x4000))
+    await store.receive(.delegate(.streamIDRejected(linkID: a.linkID, streamID: 0x4000, token: nil)))
+    #expect(store.state.links[id: a.id]?.channel == nil)
+
     let inbound = linkPacket(b, .data, .channel, Link.encrypt(
         ChannelEnvelope(msgType: 0xFF00, sequence: 0,
                         payload: StreamDataHeader(streamID: 6, eof: true, compressed: false).packed() + Data("in".utf8)).packed(),

@@ -144,17 +144,26 @@ private final class Wire {
 
 // MARK: - Writer
 
+/// A stream id above 14 bits is refused with `streamIDRejected`, never with `streamWritten(0)`,
+/// which means "window full, retry" and would spin a write loop forever. The reference raises
+/// ValueError (Buffer.py:74-75).
 @Test @MainActor func streamIDsAboveFourteenBitsCannotBeWritten() async throws {
     let env = Env()
     let (i, _, _) = try await activePair(env)
+    // The id is checked first, as the reference builds the message before it tries to send: no
+    // channel is no excuse for an answer that reads "retry".
+    #expect(await act(i, .writeStream(streamID: 0x4000, data: Data("x".utf8), token: token(1)))
+            == [.streamIDRejected(streamID: 0x4000, token: token(1))])
     await act(i, .openChannel)
     for id: UInt16 in [0x4000, 0x8000, 0xFFFF] {
         let events = await act(i, .writeStream(streamID: id, data: Data("x".utf8), token: token(1)))
-        #expect(events == [.streamWritten(token: token(1), consumed: 0)], "\(id)")
+        #expect(events == [.streamIDRejected(streamID: id, token: token(1))], "\(id)")
         let close = await act(i, .closeStreamWriter(streamID: id, token: token(2)))
-        #expect(close == [.streamWritten(token: token(2), consumed: 0)], "\(id)")
+        #expect(close == [.streamIDRejected(streamID: id, token: token(2))], "\(id)")
     }
     #expect(i.state.session.channel?.nextSequence == 0)
+    #expect(i.state.session.channel?.closedStreamWriters.isEmpty == true)
+    #expect(i.state.session.channel?.pendingStreamEOFs.isEmpty == true)
     // The top 14-bit id is writable: the guard is the boundary.
     let top = await act(i, .writeStream(streamID: 0x3FFF, data: Data("x".utf8), token: token(3)))
     #expect(written(top).map(\.consumed) == [1])
@@ -298,7 +307,12 @@ private final class Wire {
         #expect(await act(i, .closeStreamWriter(streamID: 2, token: token(0xB))).isEmpty, "\(then)")
 
         func deliver(_ p: Packet) async throws -> [Delegate] {
-            let proof = try #require(packets(await act(r, .received(try p.packed())), .proof, .none).first)
+            // Not `try #require`: inside this local function the compiler both warns that its `try`
+            // covers nothing and errors without it.
+            guard let proof = packets(await act(r, .received(try p.packed())), .proof, .none).first else {
+                Issue.record("the peer did not prove the packet")
+                return []
+            }
             return await act(i, .received(try proof.packed()))
         }
         let beforeFirst = i.state.events.count
@@ -400,6 +414,25 @@ private final class Wire {
     let closed = await act(r, .received(streamPacket(r.state.session, 2, plain(1, "late"))))
     #expect(chunks(closed).isEmpty)
     #expect(r.state.session.channel?.rx.nextSequence == 3)
+}
+
+/// A reader for an id above 14 bits could never match: unpack masks every inbound id to 14 bits
+/// (Buffer.py:92). It is refused and registers nothing, not even the channel.
+@Test @MainActor func aReaderForAnIDAboveFourteenBitsIsRefused() async throws {
+    let env = Env()
+    let (_, r, _) = try await activePair(env)
+    for id: UInt16 in [0x4000, 0xFFFF] {
+        #expect(await act(r, .openStreamReader(streamID: id)) == [.streamIDRejected(streamID: id, token: nil)], "\(id)")
+    }
+    #expect(r.state.session.channel == nil)
+
+    await act(r, .openChannel)
+    #expect(await act(r, .openStreamReader(streamID: 0x4001)) == [.streamIDRejected(streamID: 0x4001, token: nil)])
+    #expect(r.state.session.channel?.registered.isEmpty == true)
+    #expect(r.state.session.channel?.streamReaders.isEmpty == true)
+    // The top 14-bit id opens: the guard is the boundary.
+    #expect(await act(r, .openStreamReader(streamID: 0x3FFF)).isEmpty)
+    #expect(r.state.session.channel?.streamReaders == [0x3FFF])
 }
 
 @Test @MainActor func streamDataBeforeAnyReaderIsOpenStallsTheRing() async throws {

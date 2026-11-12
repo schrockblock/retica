@@ -383,7 +383,7 @@ The spec's prerequisite. Today `.provePacket` only works on a responder, and pro
     - It sends an empty EOF message, header `eof = true`. Like the reference writer, the EOF bit is also set on any later write.
     - If the channel is not ready, it waits for the next `.channelMessageDelivered` that frees the window, or for a deadline of `max(rtt × tx.count, 0)` seconds (15 s if RTT is unknown), whichever comes first. Then it tries once.
     - It reports `.streamWritten(token, consumed: 0)` whether the EOF went out or not. A failed EOF is lost silently, as in the reference. Note this in a comment with `Buffer.py:269-280`.
-  - Routing on `LinkPlane` / `TransportEndpoint`: `openStreamReaderOverLink`, `closeStreamReaderOverLink`, `writeStreamOverLink`, `closeStreamWriterOverLink` (each with `linkID:` first), and the delegates `streamDataReceived(linkID:streamID:data:eof:)` and `streamWritten(linkID:token:consumed:)`.
+  - Routing on `LinkPlane` / `TransportEndpoint`: `openStreamReaderOverLink`, `closeStreamReaderOverLink`, `writeStreamOverLink`, `closeStreamWriterOverLink` (each with `linkID:` first), and the delegates `streamDataReceived(linkID:streamID:data:eof:)`, `streamWritten(linkID:token:consumed:)` and (added in the final review) `streamIDRejected(linkID:streamID:token:)`.
   - **Receive.** A delivered `0xFF00` envelope whose stream id is in `streamReaders` is decoded and emitted. Other ids are dropped after delivery, which still advances the ring. A decode failure is proven, never enters the ring, and stalls the channel, as the reference (Channel.py:355, 371, 396; Review Focus 4). The session does not buffer stream bytes; consumers own buffering. A `0xFF00` envelope that arrives before any reader is open is unregistered and stalls the ring, exactly as the reference.
 
 - [ ] **Step 1: Extend the generator** with a `stream` section:
@@ -397,7 +397,7 @@ The spec's prerequisite. Today `.provePacket` only works on a responder, and pro
   - `chunkingChoicesMatchTheReference`: `compressed` and `consumed` equal the fixture. A compressed payload round-trips. An uncompressed one is byte-equal.
   - `aChunkThatInflatesPastSixteenKiBIsRejected`: a bz2 of 17 000 zero bytes gives nil.
   - `aTruncatedCompressedChunkIsRejected`
-  - `streamIDsAboveFourteenBitsCannotBeWritten`: `.writeStream(streamID: 0x4000…)` gives `.streamWritten(consumed: 0)`, and nothing is transmitted.
+  - `streamIDsAboveFourteenBitsCannotBeWritten`: `.writeStream(streamID: 0x4000…)` gives `.streamIDRejected(streamID:token:)`, not `.streamWritten(consumed: 0)` (which means retry; final review), and nothing is transmitted.
   - `aStreamRoundTripsBetweenTwoSessions`: 40 KB each way through in-memory sessions, including compressed and uncompressed chunks, then EOF.
   - `streamDataForAnUnopenedStreamIsDroppedButAdvances`
   - `aBadChunkStallsTheRingAsTheReferenceDoes` (Review Focus 4)

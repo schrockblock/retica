@@ -266,6 +266,7 @@ public struct TransportEndpoint {
             /// Forwarded from `LinkPlane`: a link's stream delegates, keyed by the link.
             case streamDataReceived(linkID: Data, streamID: UInt16, data: Data, eof: Bool)
             case streamWritten(linkID: Data, token: Data, consumed: Int)
+            case streamIDRejected(linkID: Data, streamID: UInt16, token: Data?)
             /// A single (non-link) packet sent with a receipt token was proved. Distinct from
             /// `packetDelivered(token:)`, which stays link-only.
             case singlePacketDelivered(token: Data)
@@ -752,6 +753,8 @@ public struct TransportEndpoint {
                 return .send(.delegate(.streamDataReceived(linkID: linkID, streamID: streamID, data: data, eof: eof)))
             case let .linkPlane(.delegate(.streamWritten(linkID, token, consumed))):
                 return .send(.delegate(.streamWritten(linkID: linkID, token: token, consumed: consumed)))
+            case let .linkPlane(.delegate(.streamIDRejected(linkID, streamID, token))):
+                return .send(.delegate(.streamIDRejected(linkID: linkID, streamID: streamID, token: token)))
             case let .linkPlane(.delegate(.localLinkOpened(linkID))):
                 return .send(.transport(.registerLocalLink(linkID)))
             case let .linkPlane(.delegate(.localLinkClosed(linkID))):

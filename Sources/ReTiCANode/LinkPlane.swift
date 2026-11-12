@@ -259,6 +259,7 @@ public struct LinkPlane {
             /// `LinkSession`'s stream delegates, keyed by the link they happened on.
             case streamDataReceived(linkID: Data, streamID: UInt16, data: Data, eof: Bool)
             case streamWritten(linkID: Data, token: Data, consumed: Int)
+            case streamIDRejected(linkID: Data, streamID: UInt16, token: Data?)
             /// A local link's linkID was assigned / released — Transport tracks these to avoid
             /// relaying or shadowing links we are an endpoint of.
             case localLinkOpened(linkID: Data)
@@ -818,6 +819,10 @@ public struct LinkPlane {
             case let .link(.element(elementID, .delegate(.streamWritten(token, consumed)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
                 return .send(.delegate(.streamWritten(linkID: linkID, token: token, consumed: consumed)))
+
+            case let .link(.element(elementID, .delegate(.streamIDRejected(streamID, token)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.streamIDRejected(linkID: linkID, streamID: streamID, token: token)))
 
             case let .link(.element(elementID, .delegate(.rehomed(interfaceID)))):
                 // ResourceTransfer.State.interfaceID is a snapshot taken at creation and every

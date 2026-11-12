@@ -8,10 +8,16 @@ import ComposableArchitecture
 extension LinkSession {
     /// `RawChannelReader.__init__` (Buffer.py:123-129): register `0xFF00` on the channel (opening it
     /// if needed) and start delivering `streamID`. Nothing on a closed link, which has no channel.
-    func openStreamReader(_ state: inout State, streamID: UInt16) {
+    /// An id above 0x3FFF could never match, since unpack masks inbound ids to 14 bits (Buffer.py:92):
+    /// the reference accepts it and stays silent forever; this refuses it and registers nothing.
+    func openStreamReader(_ state: inout State, streamID: UInt16) -> Effect<Action> {
+        guard streamID <= StreamDataHeader.streamIDMax else {
+            return .send(.delegate(.streamIDRejected(streamID: streamID, token: nil)))
+        }
         openChannel(&state)
         state.channel?.registered.insert(ChannelMessageType.streamData.rawValue)
         state.channel?.streamReaders.insert(streamID)
+        return .none
     }
 
     /// A received `0xFF00` envelope as `StreamDataMessage.unpack` leaves it (Buffer.py:88-98): nil
@@ -37,14 +43,17 @@ extension LinkSession {
     /// which must be MERGED, never concatenated before anything, or what follows waits for them.
     func writeStreamParts(_ state: inout State, streamID: UInt16, data: Data,
                           token: Data) -> (ordered: Effect<Action>, timers: Effect<Action>) {
+        // An id above 14 bits: the reference's StreamDataMessage raises ValueError (Buffer.py:74-75)
+        // where pack would otherwise mask it onto another stream. It raises whatever the channel's
+        // state, so this is checked first, and answered distinctly: `streamWritten(0)` means retry.
+        guard streamID <= StreamDataHeader.streamIDMax else {
+            return (ordered: .send(.delegate(.streamIDRejected(streamID: streamID, token: token))), timers: .none)
+        }
         let nothing = (ordered: Effect<Action>.send(.delegate(.streamWritten(token: token, consumed: 0))),
                        timers: Effect<Action>.none)
-        // An id above 14 bits: the reference's StreamDataMessage refuses it (Buffer.py:74-75) where
-        // pack would otherwise mask it onto another stream. Not ready, inactive or no channel: the
-        // ME_LINK_NOT_READY path, 0 (Buffer.py:264-267). Checked before chunking only to spare the
-        // bz2 work; `enqueueChannelEnvelope` refuses the same.
-        guard streamID <= StreamDataHeader.streamIDMax, let channel = state.channel,
-              state.status == .active, channel.isReadyToSend else { return nothing }
+        // Not ready, inactive or no channel: the ME_LINK_NOT_READY path, 0 (Buffer.py:264-267).
+        // Checked before chunking only to spare the bz2 work; `enqueueChannelEnvelope` refuses the same.
+        guard let channel = state.channel, state.status == .active, channel.isReadyToSend else { return nothing }
         let chunk = StreamChunker.chunk(data, writerMDU: channel.mdu - StreamDataHeader.length)   // Buffer.py:230
         let header = StreamDataHeader(streamID: streamID, eof: channel.closedStreamWriters.contains(streamID),
                                       compressed: chunk.compressed)                             // Buffer.py:259
@@ -65,8 +74,14 @@ extension LinkSession {
     /// `write` returns 0 on ME_LINK_NOT_READY and whose `close` ignores the result, a failed EOF is
     /// lost silently. A wait is ended early by the delivery that makes the channel ready
     /// (`flushStreamEOFsIfReady`), and abandoned with no delegate if the link closes first.
+    ///
+    /// An id above 0x3FFF is refused at once with nothing marked: the reference would wait out the
+    /// same delay and then raise ValueError from the EOF write (Buffer.py:74-75, 279-280).
     func closeStreamWriter(_ state: inout State, streamID: UInt16, token: Data) -> Effect<Action> {
-        guard streamID <= StreamDataHeader.streamIDMax, let channel = state.channel else {
+        guard streamID <= StreamDataHeader.streamIDMax else {
+            return .send(.delegate(.streamIDRejected(streamID: streamID, token: token)))
+        }
+        guard let channel = state.channel else {
             return .send(.delegate(.streamWritten(token: token, consumed: 0)))
         }
         guard !channel.isReadyToSend else { return sendStreamEOF(&state, streamID: streamID, token: token).merged }
