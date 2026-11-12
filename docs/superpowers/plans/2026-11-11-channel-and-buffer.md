@@ -459,4 +459,60 @@ ReTiCA's side runs a `TransportEndpoint` with a TCP client to 127.0.0.1:49741, a
 
 ## Status
 
-(Filled in when the plan completes: commits, rulings, live results, parked minors.)
+**DONE 2026-11-11** on branch `feat/channel` (worktree `ReTiCA-worktrees/channel`). Not merged, nothing pushed.
+
+**Commits:**
+- T1 4145cc0
+- T2 7fec6de
+- T3 2f8218d
+- T4 46752f3
+- T5 d7a890b
+- T6 ac62480, 0d2392d (fix: one freed slot releases one waiting EOF)
+- T7 fb5d825, 615fdd7 (responder-role stream added)
+- Final-review fixes: 207fa3c (R7 docs), e2108fb (replies to a re-homing packet go out on the new interface; also fixes the keepalive reply), 2fb8f02 (`streamIDRejected` for ids > 0x3FFF), 42eb641 (comments)
+
+**Live results:** `LiveChannelTests` pass against RNS 1.6.0 in both link roles. Each role runs messages both ways, a forced ReTiCA resend, and streams both ways with both compressed and raw chunks.
+
+**Live mutations:**
+- Reverting the initiator signer fails only `retiCAInitiates…`: the peer logs "Retry count exceeded" and tears the link down.
+- Loading `peerSigningPub` from the wrong half of the key fails only `referenceInitiates…`, with `.channelRetriesExhausted`.
+
+**Rulings that changed the plan or spec:**
+- **R1 (timeout order):** a new envelope's timeout counts the tx ring after it is appended, as the reference does.
+- **R3 (wire-narrowing check):** the check already failed at base, so the rule became "add no new entries".
+- **R5 (send on a closed link):** a send on a closed link still answers `.channelSendRejected(.noChannel)`.
+- **R6 (proof during the handshake):** a CHANNEL packet that arrives during the handshake is backlogged and proven at activation. The reference proves it at once.
+- **R7 (bad stream chunks):** a bad stream chunk stalls the channel, as RNS 1.6.0 does (Channel.py:355). The spec and plan text are corrected.
+- **R8 (responder-role stream):** the responder-role live test also streams from ReTiCA to the reference.
+- **R9 (`.channelRetriesExhausted`):** the new close reason is kept. It breaks QwenRemoticulum's exhaustive `mapCloseReason` and has to be handled at merge.
+- **R10 (window after activation):** the channel window is not rebuilt at activation. That case is unreachable through the public route.
+
+**Plan defects found during execution:**
+- T4's `shrink` scenario never entered the reference's shrink branch. Six scenarios were added.
+- T3 and T6 needed extra scenarios before the named mutations would turn any test red.
+
+**Reference quirks we match:**
+- Near the sequence wrap, small wrapped sequences go to the end of the ring. They wait for a NEW in-window envelope.
+- An unregistered message type, or a bad stream chunk, is proven and then stalls the channel.
+- A responder that opens its channel late loses the initiator's first packets.
+
+**Parked minors:**
+- The window is not rebuilt at activation (only a direct LinkSession composer can reach this).
+- An undecryptable CHANNEL packet that arrives during the handshake is never proven.
+- Proof-validation and packet-construction code is duplicated.
+- Two closes with the same (streamID, token) share one EOF timer.
+- `peer.py` reads private RNS fields.
+- Reference→ReTiCA retry is exercised only by reducer tests.
+- The ring cross-validation test uses 1-byte payloads.
+- There is no reference vector at the 0.025 RTT floor crossover.
+- B (re-home) uses TCA's soft-deprecated `Effect.map`.
+- When the re-homing packet is a resource packet, the child transfer's first reply may still go out on the old interface (this predates the plan).
+
+**Load flakes seen (all pass alone):**
+- `aHeldDeliveryKeepsOnePendingTaskPerSocketAndCoalescesUpToTheLimit`
+- photo-fallback stamp tests
+- `aLinkToADestinationWithACostUsesAKeyMeetingIt`
+
+**Not done:**
+- The LXMF initiator-link proving gap is still open. `LXMFNode` only proves on links addressed to our own delivery destination.
+- No device testing.
