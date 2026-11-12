@@ -61,6 +61,9 @@ public struct LinkSession {
         public var destinationIdentity: Identity?   // initiator: peer identity that signs the proof
         public var owningIdentity: Identity?         // responder: local identity owning the destination
         public var peerX25519Pub: Data?
+        /// Responder only: the initiator's per-link Ed25519 public key, link-request bytes 32..<64.
+        /// RNS loads it as `peer_sig_pub` (Link.py:411-416) to validate the initiator's packet proofs.
+        public var peerSigningPub: Data? = nil
         public var sessionKey: Data
         public var requestedAt: Double?
         public var rtt: Double?
@@ -207,7 +210,7 @@ public struct LinkSession {
         case dataProofDeadline(packetHash: Data)
         /// Prove ONE inbound link data packet, by its `packetHash` (as surfaced with
         /// `delegate(.dataReceived)`). Mirrors reference `RNS.Packet.prove()` →
-        /// `RNS.Link.prove_packet` (RNS/Link.py:378-388). Deliberately an explicit command, not a
+        /// `RNS.Link.prove_packet` (RNS 1.6.0 Link.py:463-474), in either link role. Deliberately an explicit command, not a
         /// policy flag: RNS proves per-destination (`proof_strategy`, default `PROVE_NONE`), so the
         /// decision belongs to whichever composition classified the packet — see `LXMFServiceNode`.
         case provePacket(packetHash: Data)
@@ -266,6 +269,20 @@ public struct LinkSession {
     private enum CancelID: Hashable { case establishment, keepalive, inactivity, request(Data), receipt(Data) }
 
     public init() {}
+
+    /// The identity whose signature proves a packet WE sent on this link, i.e. RNS's
+    /// `peer_sig_pub` (Link.py:1279-1283). An initiator loads it from the destination identity
+    /// (Link.py:492); a responder from the link request's Ed25519 half (Link.py:411-416), paired
+    /// here with the request's X25519 half only so `Identity` can hold it.
+    func proofValidator(_ state: State) -> Identity? {
+        switch state.role {
+        case .initiator:
+            return state.destinationIdentity
+        case .responder:
+            guard let x = state.peerX25519Pub, let ed = state.peerSigningPub else { return nil }
+            return Identity(publicKey: x + ed)
+        }
+    }
 
     public var body: some ReducerOf<Self> {
         // LATE CHILD ACTIONS. A transfer can be removed (GC on `.received`/`.concluded`/`.failed`,
@@ -435,6 +452,10 @@ public struct LinkSession {
                 guard !key.isEmpty else { return .send(.delegate(.establishmentFailed(.handshakeRejected))) }
                 state.linkID = linkID
                 state.peerX25519Pub = peerPub
+                // RNS `load_peer(peer_pub_bytes, peer_sig_pub_bytes)` takes both halves of the
+                // request's key (Link.py:411-416); the Ed25519 half validates the initiator's
+                // packet proofs.
+                state.peerSigningPub = Data(packet.payload[(packet.payload.startIndex + 32)..<(packet.payload.startIndex + 64)])
                 state.sessionKey = key
                 state.status = .handshake
                 let proof = Link.buildProof(linkID: linkID, responderEphemeral: state.ephemeral,
@@ -749,7 +770,7 @@ public struct LinkSession {
                     let proofHash = Data(packet.payload.prefix(32))
                     let signature = Data(packet.payload.suffix(64))
                     guard let token = state.pendingDataReceipts[proofHash],
-                          let peer = state.destinationIdentity,
+                          let peer = proofValidator(state),
                           peer.validate(signature: signature, message: proofHash)
                     else { return .none }
                     state.pendingDataReceipts[proofHash] = nil
@@ -1044,24 +1065,23 @@ public struct LinkSession {
                     }.cancellable(id: CancelID.receipt(packetHash), cancelInFlight: true))
 
             case let .provePacket(packetHash):
-                // Reference RNS/Link.py:378-388 `prove_packet`:
+                // Reference RNS 1.6.0 Link.py:463-474 `prove_packet`:
                 //   signature  = self.sign(packet.packet_hash)
                 //   proof_data = packet.packet_hash + signature
                 //   RNS.Packet(self, proof_data, RNS.Packet.PROOF).send()   # context NONE, unencrypted
-                // The signing key is the link's `sig_prv`, which for a RESPONDER link is the owning
-                // destination's long-term identity key (RNS/Link.py:277) — the key the initiator
-                // validates against (`load_peer` with `destination.identity`, RNS/Link.py:407-408).
-                // Requiring `owningIdentity` therefore also structurally restricts proving to the
-                // responder role, matching RNS: an initiator link signs with an ephemeral key the
-                // peer never learns, so an initiator-side packet proof could never validate.
-                // `owner.privateKey != nil` completes the F4 guard set: `owner.sign` below
-                // `preconditionFailure`s without a private key. The owner is read from session state
-                // (not an action parameter), so `LinkPlane.acceptLinkRequest`'s guard cannot cover a
-                // link whose keyless owner was seeded by a direct-composition caller — guard the
-                // crash site itself, which also defends every other caller of `provePacket`.
-                guard state.status == .active, let owner = state.owningIdentity,
-                      owner.privateKey != nil else { return .none }
-                let proofData = packetHash + owner.sign(packetHash)
+                // `self.sign` uses the link's `sig_prv` (Link.py:1276-1277): on a RESPONDER the
+                // owning destination's identity key (Link.py:303), on an INITIATOR the per-link
+                // Ed25519 key (Link.py:316) whose public half went out in the LINKREQUEST — which is
+                // `state.ephemeral`, sent whole by `.establish`. The peer validates against whichever
+                // it loaded (`proofValidator`).
+                // F4 guard set: the signer is read from session state, never from an action
+                // argument; the link must be `.active`; and the signer must hold a private key,
+                // because `Identity.sign` `preconditionFailure`s without one. A keyless signer can be
+                // seeded by a direct-composition caller, so guard the crash site itself, which also
+                // defends every other caller of `provePacket`.
+                let signer: Identity? = state.role == .initiator ? state.ephemeral : state.owningIdentity
+                guard state.status == .active, let signer, signer.privateKey != nil else { return .none }
+                let proofData = packetHash + signer.sign(packetHash)
                 let proofPacket = Packet(headerType: .header1, packetType: .proof,
                                          transportType: .broadcast, destinationType: .link,
                                          context: .none, contextFlag: false, hops: 0,

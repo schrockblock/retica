@@ -113,17 +113,6 @@ private func responderStore(owner: Identity, _ clock: TestClock<Duration>)
     #expect(sender.state.pendingDataReceipts[sentHash] == nil)
 }
 
-// An INITIATOR link must never emit a packet proof: RNS signs link packet proofs with the link's
-// `sig_prv`, which is the destination OWNER's identity on a responder link (RNS/Link.py:277) but an
-// ephemeral key the peer never learns on an initiator link (RNS/Link.py:285). Requiring
-// `owningIdentity` keeps us structurally on the responder side; this pins that.
-@Test @MainActor func provePacketDoesNothingOnInitiatorLink() async {
-    let clock = TestClock<Duration>()
-    let store = initiatorStore(pn: Identity(), clock)
-    store.exhaustivity = .on          // any transmit at all now fails teardown
-    await store.send(.provePacket(packetHash: Data(repeating: 0x44, count: 32)))
-}
-
 // Sender records a receipt and transmits; a valid proof fires packetDelivered(token).
 @Test @MainActor func sendWithReceiptDeliveredOnValidProof() async {
     let clock = TestClock<Duration>()
