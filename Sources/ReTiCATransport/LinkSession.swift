@@ -240,6 +240,22 @@ public struct LinkSession {
         case sendChannelMessage(type: ChannelMessageType, payload: Data, token: Data)
         /// Internal: the retry timer of the outbound envelope `sequence` ran out.
         case channelDeadline(sequence: UInt16)
+        /// Buffer (RNS `RawChannelReader`, Buffer.py:116-165): deliver stream data for `streamID` as
+        /// `streamDataReceived`. Opens the channel and registers the stream message type `0xFF00`.
+        case openStreamReader(streamID: UInt16)
+        /// Stop delivering `streamID`. Its data is then dropped, still advancing the ring; `0xFF00`
+        /// stays registered (`RawChannelReader.close`, Buffer.py:188-191).
+        case closeStreamReader(streamID: UInt16)
+        /// Buffer (RNS `RawChannelWriter.write`, Buffer.py:232-267): send ONE chunk of `data` on
+        /// `streamID`, answered by `streamWritten(token, consumed)`. Call again with the rest. A
+        /// chunk that went out is also reported by `channelMessageDelivered(token)` once proven.
+        case writeStream(streamID: UInt16, data: Data, token: Data)
+        /// Buffer (RNS `RawChannelWriter.close`, Buffer.py:269-280): send an empty EOF chunk, once the
+        /// channel is ready or after a wait, and mark every later write to `streamID` EOF. Answered
+        /// by `streamWritten(token, consumed: 0)` whether or not the EOF went out.
+        case closeStreamWriter(streamID: UInt16, token: Data)
+        /// Internal: the wait of the pending EOF for `streamID` / `token` ran out.
+        case streamEOFDeadline(streamID: UInt16, token: Data)
         case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
 
@@ -286,6 +302,13 @@ public struct LinkSession {
             case channelMessageDelivered(token: Data)
             /// `sendChannelMessage` sent nothing.
             case channelSendRejected(token: Data, reason: ChannelSendRejection)
+            /// A chunk of stream `streamID`, in order, for an open reader: inflated if it came
+            /// compressed. `eof` is the chunk's own bit; the reference reader makes it sticky.
+            case streamDataReceived(streamID: UInt16, data: Data, eof: Bool)
+            /// What `writeStream` / `closeStreamWriter` did: `consumed` input bytes went out. 0 when
+            /// nothing did (no channel, link not active, window full, stream id above 0x3FFF),
+            /// as `RawChannelWriter.write` returns 0 on ME_LINK_NOT_READY (Buffer.py:264-267).
+            case streamWritten(token: Data, consumed: Int)
         }
     }
 
@@ -298,6 +321,8 @@ public struct LinkSession {
         case establishment, keepalive, inactivity, request(Data), receipt(Data)
         /// The retry timer of outbound channel envelope `sequence` (`LinkSession+Channel.swift`).
         case channel(UInt16)
+        /// The wait of a pending stream EOF (`LinkSession+Stream.swift`).
+        case streamEOF(streamID: UInt16, token: Data)
     }
 
     public init() {}
@@ -1152,6 +1177,23 @@ public struct LinkSession {
                 case let .resent(effect): return effect
                 case .exhausted: return closeActive(&state, .channelRetriesExhausted)
                 }
+
+            case let .openStreamReader(streamID):
+                openStreamReader(&state, streamID: streamID)
+                return .none
+
+            case let .closeStreamReader(streamID):
+                state.channel?.streamReaders.remove(streamID)
+                return .none
+
+            case let .writeStream(streamID, data, token):
+                return writeStream(&state, streamID: streamID, data: data, token: token)
+
+            case let .closeStreamWriter(streamID, token):
+                return closeStreamWriter(&state, streamID: streamID, token: token)
+
+            case let .streamEOFDeadline(streamID, token):
+                return streamEOFDeadline(&state, streamID: streamID, token: token)
 
             case let .dataProofDeadline(packetHash):
                 guard let token = state.pendingDataReceipts[packetHash] else { return .none }

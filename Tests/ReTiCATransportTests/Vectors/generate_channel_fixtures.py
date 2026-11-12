@@ -15,13 +15,17 @@
 #   window_scenarios: a real Channel (stub outlet, settable rtt) driven through D (delivered) and T
 #              (timed out) events; the six window fields after __init__ and after every event.
 #   timeouts:  _get_packet_timeout_time for tries 1..5 x rtt {0, 0.01, 0.5} x tx ring length {0, 3}.
+#   stream:    RNS.Buffer: StreamDataMessage pack/unpack header vectors, RawChannelWriter.write's
+#              chunking choice per input (stub channel, mdu 425), and the EOF written by close().
+#              See section_stream. Do not byte-compare its bz2 bytes; decompress them.
 
+import bz2
 import json
 import os
 
 import RNS
 from RNS.Channel import Envelope, MessageBase
-from RNS.Buffer import StreamDataMessage
+from RNS.Buffer import RawChannelWriter, StreamDataMessage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -259,12 +263,109 @@ def section_timeouts():
     return cases
 
 
+class _StreamChannel:
+    """The channel surface RawChannelWriter (Buffer.py:217-280) touches. mdu is the channel MDU (link
+    MDU 431 - 6 = 425), so the writer's _mdu is 423 (Buffer.py:230). send records each message.
+    is_ready_to_send is always True; there is no _outlet, so close() takes its 15 s fallback
+    (Buffer.py:273-274) and, being ready, does not wait."""
+    mdu = 425
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, message):
+        self.sent.append(message)
+
+    def is_ready_to_send(self):
+        return True
+
+
+# Writer inputs: (name, input spec). A spec is {"hex": ...} or {"repeat_hex": ..., "times": n}.
+def _stream_inputs():
+    import random
+    return [
+        ("empty", {"hex": ""}),
+        ("a_x32", {"repeat_hex": b"a".hex(), "times": 32}),
+        ("a_x33", {"repeat_hex": b"a".hex(), "times": 33}),
+        ("a_x1000", {"repeat_hex": b"a".hex(), "times": 1000}),
+        ("random_1000_seed_1234", {"hex": random.Random(1234).randbytes(1000).hex()}),
+        ("ab_x20000", {"repeat_hex": b"ab".hex(), "times": 20000}),
+    ]
+
+
+def _input_bytes(spec):
+    if "hex" in spec:
+        return bytes.fromhex(spec["hex"])
+    return bytes.fromhex(spec["repeat_hex"]) * spec["times"]
+
+
+def section_stream():
+    # headers: genuine StreamDataMessage.pack() (Buffer.py:81-86) and unpack() (88-98). Each case:
+    #   {stream_id_set, eof, compressed, data_hex, raw_hex, unpacked: {stream_id, eof, compressed,
+    #   data_hex}}. A compressed case carries bz2 data so unpack can inflate it; its unpacked data is
+    #   the inflated bytes. `stream_id_set` 0x7FFF is assigned AFTER construction (the constructor
+    #   refuses ids above 0x3FFF, Buffer.py:74-75) to pin pack's `0x3fff &` mask.
+    # writes: RawChannelWriter(stream_id 5, _StreamChannel).write(input) for each input. Each case:
+    #   {name, input, processed_length, compressed, eof, payload_hex (the message data as sent: bz2
+    #   bytes when compressed), header_hex}. Then close() and one write after close, on a fresh
+    #   writer: {close_header_hex, close_data_hex, after_close_header_hex, after_close_processed}.
+    headers = []
+    for stream_id, eof, compressed, data in [
+        (0, False, False, b""),
+        (0, True, False, b""),
+        (1, False, False, b"hello"),
+        (0x3FFF, False, False, b"top id"),
+        (0x3FFF, True, False, b"top id, eof"),
+        (0x1234, False, True, bz2.compress(b"inflate me " * 8)),
+        (0x3FFF, True, True, bz2.compress(b"both bits")),
+        (0x7FFF, False, False, b"masked"),
+    ]:
+        message = StreamDataMessage(0, data, eof, compressed)
+        message.stream_id = stream_id
+        raw = message.pack()
+        back = StreamDataMessage()
+        back.unpack(raw)
+        headers.append({
+            "stream_id_set": stream_id, "eof": eof, "compressed": compressed,
+            "data_hex": data.hex(), "raw_hex": raw.hex(),
+            "unpacked": {"stream_id": back.stream_id, "eof": back.eof, "compressed": back.compressed,
+                         "data_hex": back.data.hex()},
+        })
+
+    writes = []
+    for name, spec in _stream_inputs():
+        channel = _StreamChannel()
+        writer = RawChannelWriter(5, channel)
+        processed = writer.write(_input_bytes(spec))
+        assert len(channel.sent) == 1
+        message = channel.sent[0]
+        writes.append({
+            "name": name, "input": spec, "processed_length": processed,
+            "compressed": bool(message.compressed), "eof": message.eof,
+            "payload_hex": message.data.hex(), "header_hex": message.pack()[:2].hex(),
+        })
+
+    channel = _StreamChannel()
+    writer = RawChannelWriter(5, channel)
+    writer.close()
+    after = writer.write(b"after close")
+    assert len(channel.sent) == 2
+    close = {
+        "close_header_hex": channel.sent[0].pack()[:2].hex(),
+        "close_data_hex": channel.sent[0].data.hex(),
+        "after_close_header_hex": channel.sent[1].pack()[:2].hex(),
+        "after_close_processed": after,
+    }
+    return {"writer_mdu": writer._mdu, "headers": headers, "writes": writes, "close": close}
+
+
 def main():
     fixtures = {
         "envelopes": section_envelopes(),
         "receive_scenarios": section_receive_scenarios(),
         "window_scenarios": section_window_scenarios(),
         "timeouts": section_timeouts(),
+        "stream": section_stream(),
     }
     path = os.path.join(HERE, "channel_fixtures.json")
     with open(path, "w") as f:

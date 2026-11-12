@@ -215,6 +215,11 @@ public struct LinkPlane {
         case openChannelOverLink(linkID: Data)
         case registerChannelMessageTypeOverLink(linkID: Data, type: ChannelMessageType)
         case sendChannelMessageOverLink(linkID: Data, type: ChannelMessageType, payload: Data, token: Data)
+        /// Buffer streams on `linkID` (see `LinkSession.Action.openStreamReader` and its siblings).
+        case openStreamReaderOverLink(linkID: Data, streamID: UInt16)
+        case closeStreamReaderOverLink(linkID: Data, streamID: UInt16)
+        case writeStreamOverLink(linkID: Data, streamID: UInt16, data: Data, token: Data)
+        case closeStreamWriterOverLink(linkID: Data, streamID: UInt16, token: Data)
         case closeLink(linkID: Data)
         case registerRequestHandler(path: String, policy: RequestPolicy)
         case deregisterRequestHandler(path: String)
@@ -251,6 +256,9 @@ public struct LinkPlane {
             case channelMessageSent(linkID: Data, token: Data, sequence: UInt16)
             case channelMessageDelivered(linkID: Data, token: Data)
             case channelSendRejected(linkID: Data, token: Data, reason: ChannelSendRejection)
+            /// `LinkSession`'s stream delegates, keyed by the link they happened on.
+            case streamDataReceived(linkID: Data, streamID: UInt16, data: Data, eof: Bool)
+            case streamWritten(linkID: Data, token: Data, consumed: Int)
             /// A local link's linkID was assigned / released — Transport tracks these to avoid
             /// relaying or shadowing links we are an endpoint of.
             case localLinkOpened(linkID: Data)
@@ -601,6 +609,24 @@ public struct LinkPlane {
                 return .send(.link(.element(id: element.id,
                                             action: .sendChannelMessage(type: type, payload: payload, token: token))))
 
+            case let .openStreamReaderOverLink(linkID, streamID):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .openStreamReader(streamID: streamID))))
+
+            case let .closeStreamReaderOverLink(linkID, streamID):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .closeStreamReader(streamID: streamID))))
+
+            case let .writeStreamOverLink(linkID, streamID, data, token):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id,
+                                            action: .writeStream(streamID: streamID, data: data, token: token))))
+
+            case let .closeStreamWriterOverLink(linkID, streamID, token):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id,
+                                            action: .closeStreamWriter(streamID: streamID, token: token))))
+
             case let .closeLink(linkID):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .close)))
@@ -784,6 +810,14 @@ public struct LinkPlane {
             case let .link(.element(elementID, .delegate(.channelSendRejected(token, reason)))):
                 guard let linkID = state.links[id: elementID]?.linkID else { return .none }
                 return .send(.delegate(.channelSendRejected(linkID: linkID, token: token, reason: reason)))
+
+            case let .link(.element(elementID, .delegate(.streamDataReceived(streamID, data, eof)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.streamDataReceived(linkID: linkID, streamID: streamID, data: data, eof: eof)))
+
+            case let .link(.element(elementID, .delegate(.streamWritten(token, consumed)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.streamWritten(linkID: linkID, token: token, consumed: consumed)))
 
             case let .link(.element(elementID, .delegate(.rehomed(interfaceID)))):
                 // ResourceTransfer.State.interfaceID is a snapshot taken at creation and every

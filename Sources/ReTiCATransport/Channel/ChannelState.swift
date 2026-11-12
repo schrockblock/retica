@@ -44,6 +44,17 @@ public enum ChannelSendRejection: Equatable, Sendable {
     case tooBig
 }
 
+/// A `closeStreamWriter` waiting for the channel to be ready, so its EOF can go out.
+public struct PendingStreamEOF: Equatable, Sendable {
+    public var streamID: UInt16
+    public var token: Data
+
+    public init(streamID: UInt16, token: Data) {
+        self.streamID = streamID
+        self.token = token
+    }
+}
+
 /// A link's RNS 1.6.0 `Channel`: what `Link.get_channel()` creates (Link.py:1007-1014). Lives in
 /// `LinkSession.State.channel`, nil until opened and again after the link closes.
 public struct ChannelState: Equatable, Sendable {
@@ -57,6 +68,14 @@ public struct ChannelState: Equatable, Sendable {
     /// Envelopes sent and not yet proven, in send order. A delivered envelope leaves it, so its
     /// count is the reference's "outstanding".
     public var tx: [ChannelOutbound] = []
+    /// Buffer: the stream ids a reader is open for (each `RawChannelReader`'s `_stream_id`). Stream
+    /// data for any other id is delivered to nobody, which still advances the ring.
+    public var streamReaders: Set<UInt16> = []
+    /// Buffer: the stream ids whose writer has closed. Every later write to one carries EOF, as the
+    /// reference writer's `_eof` stays set (Buffer.py:259, 279).
+    public var closedStreamWriters: Set<UInt16> = []
+    /// Buffer: writer closes waiting for the window to free (Buffer.py:276-277), in request order.
+    public var pendingStreamEOFs: [PendingStreamEOF] = []
 
     public init(window: ChannelSendWindow) {
         self.window = window

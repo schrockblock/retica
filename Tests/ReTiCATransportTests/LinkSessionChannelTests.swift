@@ -23,6 +23,8 @@ struct ChannelHarness {
         var session: LinkSession.State
         var events: [LinkSession.Action.Delegate] = []
         var deadlinesFired = 0
+        /// `.streamEOFDeadline` actions that reached the session (LinkSessionStreamTests).
+        var streamEOFDeadlinesFired = 0
     }
     enum Action: Equatable { case session(LinkSession.Action) }
     var body: some ReducerOf<Self> {
@@ -31,6 +33,7 @@ struct ChannelHarness {
             switch action {
             case let .session(.delegate(event)): state.events.append(event)
             case .session(.channelDeadline): state.deadlinesFired += 1
+            case .session(.streamEOFDeadline): state.streamEOFDeadlinesFired += 1
             default: break
             }
             return .none

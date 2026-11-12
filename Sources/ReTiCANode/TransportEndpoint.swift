@@ -217,6 +217,11 @@ public struct TransportEndpoint {
         case openChannelOverLink(linkID: Data)
         case registerChannelMessageTypeOverLink(linkID: Data, type: ChannelMessageType)
         case sendChannelMessageOverLink(linkID: Data, type: ChannelMessageType, payload: Data, token: Data)
+        /// Buffer streams on `linkID` (see `LinkSession.Action.openStreamReader` and its siblings).
+        case openStreamReaderOverLink(linkID: Data, streamID: UInt16)
+        case closeStreamReaderOverLink(linkID: Data, streamID: UInt16)
+        case writeStreamOverLink(linkID: Data, streamID: UInt16, data: Data, token: Data)
+        case closeStreamWriterOverLink(linkID: Data, streamID: UInt16, token: Data)
         /// Prove a single (non-link) packet we received — see `Transport.Action.proveSingle`.
         case proveSinglePacket(packetHash: Data, interfaceID: InterfaceID, identity: Identity)
         case closeLink(linkID: Data)
@@ -258,6 +263,9 @@ public struct TransportEndpoint {
             case channelMessageSent(linkID: Data, token: Data, sequence: UInt16)
             case channelMessageDelivered(linkID: Data, token: Data)
             case channelSendRejected(linkID: Data, token: Data, reason: ChannelSendRejection)
+            /// Forwarded from `LinkPlane`: a link's stream delegates, keyed by the link.
+            case streamDataReceived(linkID: Data, streamID: UInt16, data: Data, eof: Bool)
+            case streamWritten(linkID: Data, token: Data, consumed: Int)
             /// A single (non-link) packet sent with a receipt token was proved. Distinct from
             /// `packetDelivered(token:)`, which stays link-only.
             case singlePacketDelivered(token: Data)
@@ -740,6 +748,10 @@ public struct TransportEndpoint {
                 return .send(.delegate(.channelMessageDelivered(linkID: linkID, token: token)))
             case let .linkPlane(.delegate(.channelSendRejected(linkID, token, reason))):
                 return .send(.delegate(.channelSendRejected(linkID: linkID, token: token, reason: reason)))
+            case let .linkPlane(.delegate(.streamDataReceived(linkID, streamID, data, eof))):
+                return .send(.delegate(.streamDataReceived(linkID: linkID, streamID: streamID, data: data, eof: eof)))
+            case let .linkPlane(.delegate(.streamWritten(linkID, token, consumed))):
+                return .send(.delegate(.streamWritten(linkID: linkID, token: token, consumed: consumed)))
             case let .linkPlane(.delegate(.localLinkOpened(linkID))):
                 return .send(.transport(.registerLocalLink(linkID)))
             case let .linkPlane(.delegate(.localLinkClosed(linkID))):
@@ -989,6 +1001,14 @@ extension TransportEndpoint.Action.AllCasePaths {
                     return .registerChannelMessageTypeOverLink(linkID: linkID, type: type)
                 case let .sendChannelMessageOverLink(linkID, type, payload, token):
                     return .sendChannelMessageOverLink(linkID: linkID, type: type, payload: payload, token: token)
+                case let .openStreamReaderOverLink(linkID, streamID):
+                    return .openStreamReaderOverLink(linkID: linkID, streamID: streamID)
+                case let .closeStreamReaderOverLink(linkID, streamID):
+                    return .closeStreamReaderOverLink(linkID: linkID, streamID: streamID)
+                case let .writeStreamOverLink(linkID, streamID, data, token):
+                    return .writeStreamOverLink(linkID: linkID, streamID: streamID, data: data, token: token)
+                case let .closeStreamWriterOverLink(linkID, streamID, token):
+                    return .closeStreamWriterOverLink(linkID: linkID, streamID: streamID, token: token)
                 case let .closeLink(linkID):
                     return .closeLink(linkID: linkID)
                 case let .registerRequestHandler(path, policy):
@@ -1026,6 +1046,14 @@ extension TransportEndpoint.Action.AllCasePaths {
                     return .registerChannelMessageTypeOverLink(linkID: linkID, type: type)
                 case let .sendChannelMessageOverLink(linkID, type, payload, token):
                     return .sendChannelMessageOverLink(linkID: linkID, type: type, payload: payload, token: token)
+                case let .openStreamReaderOverLink(linkID, streamID):
+                    return .openStreamReaderOverLink(linkID: linkID, streamID: streamID)
+                case let .closeStreamReaderOverLink(linkID, streamID):
+                    return .closeStreamReaderOverLink(linkID: linkID, streamID: streamID)
+                case let .writeStreamOverLink(linkID, streamID, data, token):
+                    return .writeStreamOverLink(linkID: linkID, streamID: streamID, data: data, token: token)
+                case let .closeStreamWriterOverLink(linkID, streamID, token):
+                    return .closeStreamWriterOverLink(linkID: linkID, streamID: streamID, token: token)
                 case let .closeLink(linkID):
                     return .closeLink(linkID: linkID)
                 case let .registerRequestHandler(path, policy):

@@ -76,3 +76,48 @@ private func linkPacket(_ s: LinkSession.State, _ type: PacketType, _ context: P
     await store.send(.closeLink(linkID: a.linkID))
     await store.send(.closeLink(linkID: b.linkID))
 }
+
+@Test @MainActor func streamActionsAndDelegatesRouteByLinkID() async throws {
+    let peer = Identity()
+    let a = activeResponder(linkID: Data(repeating: 0xA3, count: 16), interface: InterfaceID("a"), peer: peer)
+    let b = activeResponder(linkID: Data(repeating: 0xB4, count: 16), interface: InterfaceID("b"), peer: peer)
+    let store = TestStore(initialState: TransportEndpoint.State(linkPlane: LinkPlane.State(links: [a, b]))) {
+        TransportEndpoint()
+    } withDependencies: {
+        $0.uuid = .incrementing
+        $0.continuousClock = TestClock()
+        $0.date = .constant(Date(timeIntervalSince1970: 0))
+    }
+    store.exhaustivity = .off
+    let token = Data(repeating: 0x71, count: 16)
+
+    await store.send(.openStreamReaderOverLink(linkID: b.linkID, streamID: 6))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.links[id: b.id]?.channel?.streamReaders == [6])
+    #expect(store.state.links[id: a.id]?.channel == nil)
+
+    // A write on the link without a channel consumes nothing, reported under ITS id.
+    await store.send(.writeStreamOverLink(linkID: a.linkID, streamID: 6, data: Data("x".utf8), token: token))
+    await store.receive(.delegate(.streamWritten(linkID: a.linkID, token: token, consumed: 0)))
+
+    await store.send(.writeStreamOverLink(linkID: b.linkID, streamID: 2, data: Data("out".utf8), token: token))
+    await store.receive(.delegate(.streamWritten(linkID: b.linkID, token: token, consumed: 3)))
+
+    let inbound = linkPacket(b, .data, .channel, Link.encrypt(
+        ChannelEnvelope(msgType: 0xFF00, sequence: 0,
+                        payload: StreamDataHeader(streamID: 6, eof: true, compressed: false).packed() + Data("in".utf8)).packed(),
+        sessionKey: b.sessionKey))
+    await store.send(.linkPlane(.routeLinkPacket(linkID: b.linkID, arrivalInterface: InterfaceID("b"), data: inbound)))
+    await store.receive(.delegate(.streamDataReceived(linkID: b.linkID, streamID: 6, data: Data("in".utf8), eof: true)))
+
+    await store.send(.closeStreamWriterOverLink(linkID: b.linkID, streamID: 2, token: token))
+    await store.receive(.delegate(.streamWritten(linkID: b.linkID, token: token, consumed: 0)))
+    #expect(store.state.links[id: b.id]?.channel?.closedStreamWriters == [2])
+
+    await store.send(.closeStreamReaderOverLink(linkID: b.linkID, streamID: 6))
+    await store.skipReceivedActions(strict: false)
+    #expect(store.state.links[id: b.id]?.channel?.streamReaders.isEmpty == true)
+
+    await store.send(.closeLink(linkID: a.linkID))
+    await store.send(.closeLink(linkID: b.linkID))
+}

@@ -28,7 +28,11 @@ extension LinkSession {
     func closeChannel(_ state: inout State) -> Effect<Action> {
         guard let channel = state.channel else { return .none }
         state.channel = nil
-        return .merge(channel.tx.map { Effect<Action>.cancel(id: CancelID.channel($0.sequence)) })
+        // Pending stream EOFs die with it, silently: no `streamWritten` may follow `.closed`.
+        return .merge(channel.tx.map { Effect<Action>.cancel(id: CancelID.channel($0.sequence)) }
+                      + channel.pendingStreamEOFs.map {
+                          Effect<Action>.cancel(id: CancelID.streamEOF(streamID: $0.streamID, token: $0.token))
+                      })
     }
 
     /// A CHANNEL-context link packet on an active link (Link.py:1234-1242). Without an open channel it
@@ -40,31 +44,72 @@ extension LinkSession {
         guard state.channel != nil else { return .none }                       // Link.py:1235-1236
         let proof = proofTransmit(state, packetHash: packet.packetHash)        // Link.py:1238
         guard let plain = decrypt(packet.payload, state.sessionKey),           // Link.py:1239-1240
-              let envelope = ChannelEnvelope.parse(plain),                      // Channel.py:353
+              var envelope = ChannelEnvelope.parse(plain),                      // Channel.py:353
               state.channel?.registered.contains(envelope.msgType) == true     // Channel.py:355 raises
         else { return proof }
+        if envelope.msgType == ChannelMessageType.streamData.rawValue {
+            // Stream data is unpacked (and inflated) at Channel.py:355 too, so a bad chunk raises
+            // before the ring, exactly like an unregistered type: proven, dropped, ring not advanced.
+            guard let decoded = Self.inflatedStreamEnvelope(envelope) else { return proof }
+            envelope = decoded
+        }
         let ready = state.channel?.rx.accept(envelope) ?? []                   // Channel.py:357-394
-        return .concatenate([proof] + ready.map {
-            .send(.delegate(.channelMessageReceived(msgType: $0.msgType, payload: $0.payload)))
-        })
+        let readers = state.channel?.streamReaders ?? []
+        return .concatenate([proof] + ready.compactMap { delivery(of: $0, streamReaders: readers) })
+    }
+
+    /// What a delivered envelope becomes: a registered user type is surfaced as is; stream data goes
+    /// to its reader, or to nobody (`_run_callbacks`, Channel.py:343-349, with no handler claiming it).
+    func delivery(of envelope: ChannelEnvelope, streamReaders: Set<UInt16>) -> Effect<Action>? {
+        guard envelope.msgType == ChannelMessageType.streamData.rawValue else {
+            return .send(.delegate(.channelMessageReceived(msgType: envelope.msgType, payload: envelope.payload)))
+        }
+        guard let (header, data) = StreamDataHeader.parse(envelope.payload),
+              streamReaders.contains(header.streamID) else { return nil }      // Buffer.py:152-153
+        return .send(.delegate(.streamDataReceived(streamID: header.streamID, data: data, eof: header.eof)))
     }
 
     /// `Channel.send` (Channel.py:495-530). The sequence is taken only once the send is certain to go
     /// out, which is the reference's reserve-then-roll-back with nothing in between to observe.
     func sendChannelMessage(_ state: inout State, type: ChannelMessageType, payload: Data,
                             token: Data) -> Effect<Action> {
-        func reject(_ reason: ChannelSendRejection) -> Effect<Action> {
-            .send(.delegate(.channelSendRejected(token: token, reason: reason)))
+        switch enqueueChannelEnvelope(&state, msgType: type.rawValue, payload: payload, token: token) {
+        case let .failure(reason):
+            return .send(.delegate(.channelSendRejected(token: token, reason: reason)))
+        case let .success(sent):
+            return .merge(.concatenate(sent.transmit,
+                                       .send(.delegate(.channelMessageSent(token: token, sequence: sent.sequence)))),
+                          sent.timers)
         }
-        guard var channel = state.channel else { return reject(.noChannel) }
-        guard state.status == .active else { return reject(.linkNotActive) }
-        guard channel.isReadyToSend else { return reject(.notReady) }          // Channel.py:504
+    }
+
+    /// One envelope out on the channel, as `sendChannelMessage` and the Buffer writer send it.
+    struct ChannelEnqueued {
+        var sequence: UInt16
+        /// The packet's transmit.
+        var transmit: Effect<Action>
+        /// Its retry timer and the extended timers of the envelopes already outstanding.
+        var timers: Effect<Action>
+    }
+
+    /// `Result` shaped, without making `ChannelSendRejection` an `Error`.
+    enum ChannelEnqueueResult {
+        case success(ChannelEnqueued)
+        case failure(ChannelSendRejection)
+    }
+
+    /// The body of `Channel.send` (Channel.py:495-530) for any msgtype, system types included.
+    func enqueueChannelEnvelope(_ state: inout State, msgType: UInt16, payload: Data,
+                                token: Data) -> ChannelEnqueueResult {
+        guard var channel = state.channel else { return .failure(.noChannel) }
+        guard state.status == .active else { return .failure(.linkNotActive) }
+        guard channel.isReadyToSend else { return .failure(.notReady) }        // Channel.py:504
         let sequence = channel.nextSequence
-        let raw = ChannelEnvelope(msgType: type.rawValue, sequence: sequence, payload: payload).packed()
-        guard raw.count <= Link.mdu else { return reject(.tooBig) }            // Channel.py:509-510
+        let raw = ChannelEnvelope(msgType: msgType, sequence: sequence, payload: payload).packed()
+        guard raw.count <= Link.mdu else { return .failure(.tooBig) }          // Channel.py:509-510
         // Unreachable with an envelope inside the MDU; the reference answers an outlet that did not
         // transmit with ME_LINK_NOT_READY and rolls the sequence back (Channel.py:515-517).
-        guard let (packetHash, wire) = channelPacket(state, raw) else { return reject(.linkNotActive) }
+        guard let (packetHash, wire) = channelPacket(state, raw) else { return .failure(.linkNotActive) }
         let now = date.now
         channel.nextSequence = sequence &+ 1                                    // Channel.py:511, % SEQ_MODULUS
         // Emplace, then compute the timeout with the envelope counted (Channel.py:519-523).
@@ -74,11 +119,9 @@ extension LinkSession {
         channel.tx[channel.tx.count - 1].timeout = timeout
         let extend = extendChannelTimeouts(&channel, linkRTT: state.rtt, now: now)  // Channel.py:524
         state.channel = channel
-        return .merge(
-            .concatenate(.send(.delegate(.transmit(state.interfaceID, wire))),
-                         .send(.delegate(.channelMessageSent(token: token, sequence: sequence)))),
-            channelTimer(sequence, after: timeout),
-            extend)
+        return .success(ChannelEnqueued(sequence: sequence,
+                                        transmit: .send(.delegate(.transmit(state.interfaceID, wire))),
+                                        timers: .merge(channelTimer(sequence, after: timeout), extend)))
     }
 
     /// A link proof that matched no `sendWithReceipt` receipt: does it deliver a channel envelope?
@@ -95,7 +138,8 @@ extension LinkSession {
         channel.window.delivered(linkRTT: state.rtt)
         state.channel = channel
         return .merge(.cancel(id: CancelID.channel(outbound.sequence)),
-                      .send(.delegate(.channelMessageDelivered(token: outbound.token))))
+                      .concatenate(.send(.delegate(.channelMessageDelivered(token: outbound.token))),
+                                   flushStreamEOFsIfReady(&state)))
     }
 
     /// `_packet_timeout` (Channel.py:459-493). A resend re-encrypts the same envelope bytes into a

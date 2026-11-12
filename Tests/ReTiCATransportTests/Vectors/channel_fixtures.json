@@ -2790,5 +2790,192 @@
       "ring": 3,
       "timeout": 28.4765625
     }
-  ]
+  ],
+  "stream": {
+    "writer_mdu": 423,
+    "headers": [
+      {
+        "stream_id_set": 0,
+        "eof": false,
+        "compressed": false,
+        "data_hex": "",
+        "raw_hex": "0000",
+        "unpacked": {
+          "stream_id": 0,
+          "eof": false,
+          "compressed": false,
+          "data_hex": ""
+        }
+      },
+      {
+        "stream_id_set": 0,
+        "eof": true,
+        "compressed": false,
+        "data_hex": "",
+        "raw_hex": "8000",
+        "unpacked": {
+          "stream_id": 0,
+          "eof": true,
+          "compressed": false,
+          "data_hex": ""
+        }
+      },
+      {
+        "stream_id_set": 1,
+        "eof": false,
+        "compressed": false,
+        "data_hex": "68656c6c6f",
+        "raw_hex": "000168656c6c6f",
+        "unpacked": {
+          "stream_id": 1,
+          "eof": false,
+          "compressed": false,
+          "data_hex": "68656c6c6f"
+        }
+      },
+      {
+        "stream_id_set": 16383,
+        "eof": false,
+        "compressed": false,
+        "data_hex": "746f70206964",
+        "raw_hex": "3fff746f70206964",
+        "unpacked": {
+          "stream_id": 16383,
+          "eof": false,
+          "compressed": false,
+          "data_hex": "746f70206964"
+        }
+      },
+      {
+        "stream_id_set": 16383,
+        "eof": true,
+        "compressed": false,
+        "data_hex": "746f702069642c20656f66",
+        "raw_hex": "bfff746f702069642c20656f66",
+        "unpacked": {
+          "stream_id": 16383,
+          "eof": true,
+          "compressed": false,
+          "data_hex": "746f702069642c20656f66"
+        }
+      },
+      {
+        "stream_id_set": 4660,
+        "eof": false,
+        "compressed": true,
+        "data_hex": "425a68393141592653593d01581400001b9180400023270400200031064c4055434d1e9c0b1e104163e36208305dc914e14240f4056050",
+        "raw_hex": "5234425a68393141592653593d01581400001b9180400023270400200031064c4055434d1e9c0b1e104163e36208305dc914e14240f4056050",
+        "unpacked": {
+          "stream_id": 4660,
+          "eof": false,
+          "compressed": true,
+          "data_hex": "696e666c617465206d6520696e666c617465206d6520696e666c617465206d6520696e666c617465206d6520696e666c617465206d6520696e666c617465206d6520696e666c617465206d6520696e666c617465206d6520"
+        }
+      },
+      {
+        "stream_id_set": 16383,
+        "eof": true,
+        "compressed": true,
+        "data_hex": "425a68393141592653598aca4cbf0000011180400010608c002000221a63508603952620f1772453850908aca4cbf0",
+        "raw_hex": "ffff425a68393141592653598aca4cbf0000011180400010608c002000221a63508603952620f1772453850908aca4cbf0",
+        "unpacked": {
+          "stream_id": 16383,
+          "eof": true,
+          "compressed": true,
+          "data_hex": "626f74682062697473"
+        }
+      },
+      {
+        "stream_id_set": 32767,
+        "eof": false,
+        "compressed": false,
+        "data_hex": "6d61736b6564",
+        "raw_hex": "3fff6d61736b6564",
+        "unpacked": {
+          "stream_id": 16383,
+          "eof": false,
+          "compressed": false,
+          "data_hex": "6d61736b6564"
+        }
+      }
+    ],
+    "writes": [
+      {
+        "name": "empty",
+        "input": {
+          "hex": ""
+        },
+        "processed_length": 0,
+        "compressed": false,
+        "eof": false,
+        "payload_hex": "",
+        "header_hex": "0005"
+      },
+      {
+        "name": "a_x32",
+        "input": {
+          "repeat_hex": "61",
+          "times": 32
+        },
+        "processed_length": 32,
+        "compressed": false,
+        "eof": false,
+        "payload_hex": "6161616161616161616161616161616161616161616161616161616161616161",
+        "header_hex": "0005"
+      },
+      {
+        "name": "a_x33",
+        "input": {
+          "repeat_hex": "61",
+          "times": 33
+        },
+        "processed_length": 33,
+        "compressed": false,
+        "eof": false,
+        "payload_hex": "616161616161616161616161616161616161616161616161616161616161616161",
+        "header_hex": "0005"
+      },
+      {
+        "name": "a_x1000",
+        "input": {
+          "repeat_hex": "61",
+          "times": 1000
+        },
+        "processed_length": 1000,
+        "compressed": true,
+        "eof": false,
+        "payload_hex": "425a683931415926535949dc4f630000018101a00000800008200020aa6d4198ba83c5dc914e1424127713d8c0",
+        "header_hex": "4005"
+      },
+      {
+        "name": "random_1000_seed_1234",
+        "input": {
+          "hex": "b97f69f75edf35c71fdad37066eae91d14f6ea01456b341770b835e942f549f1d1ee73f0bdb597ced9dd0c95d4ebf0089295ebab5c2d6eb1c6f97c15ed2f3219361838c42866c95ac9909f3c222a7604606de307a79997fc4802edc9301e0e04534999580a0af8a5fb5f8f9f4d8af77bfd18a69d7514ab765fad072641995e174307df2eb00ba2b6122b4a1dcfc268d8660ebe03b717ca80aebf9b7c718266e1ffc903f78cbbf43f562787106842d1aa5cc1848a357c8de9d72045770ec18d113c82f999661ed5ac330ac416a7fcd983208539941b62c40b228e03454bad0ad3575d728ee5db2510c5bf06a58ffd6b4d1f33257b0d4aa5d9e0f3f05a62583644e66ec83fc2a6cda723dffaeec74f3533b03c1174ebe365e018a5b887516958aaf2d0f004a68a04f1c6f71282ca13121251d07a01baea6055e101ce24c16ec3b57c2f0b79616248a895d79960dae1c72a086dde0deb118413aa446896fef91f7f9d1dfc2961484813c831ad8e206d1037b149ed2471e7f106615bf3efd495a25886f15ec53a37631ca891f9f4ff519987aa802724ca01a6ab61372e4e24a14274a88b220a26698f6ac44bdb46f42692a9939a77ce41db4a0a7b5a662ddb3c8c45f8ee91272eadde4c017168f455a3fbd82cae90274bb577c7c9c479d5fd9ae9768817830aadb9279066ecdc62c471a6c38be17e59e077f07e6e297a57685d36951fb903d130a8d677dbded67966b39a0b7f7f6bc85a6ad6ee7afa887846acc4def3743dd1f86d4c98006aaee1283e832bbb638970e0a6c9bba0c8f3c7731eeb847fe092d0c0611870029db14b5f166946b461b61f274f15c70fea842f7d42946a469da16f8945e1c47d6a951ee19a68f0bfeaa087924d641ae8f154d4cd9e2fd79124367c86417760e00357d1a47617d1054809a8fbc366417a651ba4427300319bc96858fa39b01beb74e1b331fa3bb30c4458cf921ba1f612443c28b3069694b01272e85f9e68f1a4d5f244a07ed0f80205a427dcb011d960a429d7317bd6fbab4e5ab8e437d052a5e726cb582a78c93b025972d1c07eb8c43c1e12e80e181413a62e65d488d2364461380cd80800e5810b4049eac3abcd9a03ba092d0c2a384010b881c41d62d483657116a1a2f4ca47a9cdee174560f0980b0bb3257197ff0fff255167693d4eeeddeef15f3af975c04af410793ac19509dce6412d0644dbd01ab012b75e57b09d46226d34c912f3d981af33c450ee195da28a657671d131e6b271b49a22eee2b49629e31a6ca67532ef21801ff77f3c94488bd176602cccec2c7b5c86a957ee62dbd2db1a2580349c47d983cebbc1e32280d1b31109d26b7a7ab82c9fffd9f3e390a2957fd60834f842414d5787700f780717d004823c5a3c8eca88a5f82e27"
+        },
+        "processed_length": 423,
+        "compressed": false,
+        "eof": false,
+        "payload_hex": "b97f69f75edf35c71fdad37066eae91d14f6ea01456b341770b835e942f549f1d1ee73f0bdb597ced9dd0c95d4ebf0089295ebab5c2d6eb1c6f97c15ed2f3219361838c42866c95ac9909f3c222a7604606de307a79997fc4802edc9301e0e04534999580a0af8a5fb5f8f9f4d8af77bfd18a69d7514ab765fad072641995e174307df2eb00ba2b6122b4a1dcfc268d8660ebe03b717ca80aebf9b7c718266e1ffc903f78cbbf43f562787106842d1aa5cc1848a357c8de9d72045770ec18d113c82f999661ed5ac330ac416a7fcd983208539941b62c40b228e03454bad0ad3575d728ee5db2510c5bf06a58ffd6b4d1f33257b0d4aa5d9e0f3f05a62583644e66ec83fc2a6cda723dffaeec74f3533b03c1174ebe365e018a5b887516958aaf2d0f004a68a04f1c6f71282ca13121251d07a01baea6055e101ce24c16ec3b57c2f0b79616248a895d79960dae1c72a086dde0deb118413aa446896fef91f7f9d1dfc2961484813c831ad8e206d1037b149ed2471e7f106615bf3efd495a25886f15ec53a37631ca891f9f4ff519987aa802724ca01a6ab61372e4e24a14274a88b220a26698f",
+        "header_hex": "0005"
+      },
+      {
+        "name": "ab_x20000",
+        "input": {
+          "repeat_hex": "6162",
+          "times": 20000
+        },
+        "processed_length": 16384,
+        "compressed": true,
+        "eof": false,
+        "payload_hex": "425a6839314159265359f3f00bab000fff81003000200030802a6900020007177245385090f3f00bab",
+        "header_hex": "4005"
+      }
+    ],
+    "close": {
+      "close_header_hex": "8005",
+      "close_data_hex": "",
+      "after_close_header_hex": "8005",
+      "after_close_processed": 11
+    }
+  }
 }

@@ -58,10 +58,57 @@ private struct ChannelFixtures: Decodable {
         let timeout: Double
     }
 
+    /// RNS.Buffer: `StreamDataMessage` pack/unpack and `RawChannelWriter.write`'s choices.
+    struct Stream: Decodable {
+        struct Header: Decodable {
+            struct Unpacked: Decodable {
+                let stream_id: UInt16
+                let eof: Bool
+                let compressed: Bool
+                let data_hex: String
+            }
+            let stream_id_set: UInt16
+            let eof: Bool
+            let compressed: Bool
+            let data_hex: String
+            let raw_hex: String
+            let unpacked: Unpacked
+        }
+        struct Input: Decodable {
+            let hex: String?
+            let repeat_hex: String?
+            let times: Int?
+            var bytes: Data {
+                if let hex { return Data(hexString: hex)! }
+                return Data((0..<times!).map { _ in Data(hexString: repeat_hex!)! }.joined())
+            }
+        }
+        struct Write: Decodable {
+            let name: String
+            let input: Input
+            let processed_length: Int
+            let compressed: Bool
+            let eof: Bool
+            let payload_hex: String
+            let header_hex: String
+        }
+        struct Close: Decodable {
+            let close_header_hex: String
+            let close_data_hex: String
+            let after_close_header_hex: String
+            let after_close_processed: Int
+        }
+        let writer_mdu: Int
+        let headers: [Header]
+        let writes: [Write]
+        let close: Close
+    }
+
     let envelopes: [Envelope]
     let receive_scenarios: [ReceiveScenario]
     let window_scenarios: [WindowScenario]
     let timeouts: [Timeout]
+    let stream: Stream
 
     static func load() throws -> ChannelFixtures {
         let url = try #require(Bundle.module.url(forResource: "channel_fixtures", withExtension: "json"))
@@ -186,6 +233,64 @@ struct ChannelCrossValidationTests {
             let ours = ChannelSendWindow.timeout(tries: c.tries, linkRTT: c.rtt, txRingCount: c.ring)
             #expect(abs(ours - c.timeout) < 1e-9, "tries \(c.tries) rtt \(c.rtt) ring \(c.ring): \(ours) vs \(c.timeout)")
         }
+    }
+
+    // MARK: - Buffer
+
+    @Test func streamHeadersMatchTheReference() throws {
+        let headers = try ChannelFixtures.load().stream.headers
+        #expect(headers.count == 8)
+        #expect(headers.contains { $0.compressed && $0.eof })
+        #expect(headers.contains { $0.stream_id_set > StreamDataHeader.streamIDMax })
+        for h in headers {
+            let label = "id \(h.stream_id_set) eof \(h.eof) compressed \(h.compressed)"
+            let raw = Data(hexString: h.raw_hex)!
+            let data = Data(hexString: h.data_hex)!
+            let ours = StreamDataHeader(streamID: h.stream_id_set, eof: h.eof, compressed: h.compressed)
+            #expect(ours.packed() + data == raw, "\(label)")
+
+            let (parsed, rest) = try #require(StreamDataHeader.parse(raw), "\(label)")
+            #expect(parsed == StreamDataHeader(streamID: h.unpacked.stream_id, eof: h.unpacked.eof,
+                                               compressed: h.unpacked.compressed), "\(label)")
+            #expect(rest == data, "\(label)")
+            #expect(StreamChunker.decodeStreamPayload(parsed, rest) == Data(hexString: h.unpacked.data_hex)!, "\(label)")
+        }
+    }
+
+    @Test func chunkingChoicesMatchTheReference() throws {
+        let stream = try ChannelFixtures.load().stream
+        // Ruling R2: the reference writer's _mdu is the channel MDU (425) less the header.
+        #expect(stream.writer_mdu == 423)
+        #expect(ChannelState(window: ChannelSendWindow(linkRTT: nil)).mdu - StreamDataHeader.length == stream.writer_mdu)
+        #expect(stream.writes.map(\.name) == ["empty", "a_x32", "a_x33", "a_x1000", "random_1000_seed_1234", "ab_x20000"])
+        #expect(stream.writes.contains { $0.compressed } && stream.writes.contains { !$0.compressed && $0.processed_length > 0 })
+        for w in stream.writes {
+            let input = w.input.bytes
+            let theirs = Data(hexString: w.payload_hex)!
+            let ours = StreamChunker.chunk(input, writerMDU: stream.writer_mdu)
+            #expect(ours.compressed == w.compressed, "\(w.name)")
+            #expect(ours.consumed == w.processed_length, "\(w.name)")
+            let expected = Data(input.prefix(w.processed_length))
+            let header = StreamDataHeader(streamID: 5, eof: false, compressed: w.compressed)
+            #expect(header.packed() == Data(hexString: w.header_hex)!, "\(w.name)")
+            if w.compressed {
+                // Compressor bytes are not compared: both must inflate to the consumed input.
+                #expect(StreamChunker.decodeStreamPayload(header, ours.payload) == expected, "\(w.name)")
+                #expect(StreamChunker.decodeStreamPayload(header, theirs) == expected, "\(w.name)")
+                #expect(ours.payload.count < stream.writer_mdu, "\(w.name)")
+            } else {
+                #expect(ours.payload == theirs, "\(w.name)")
+                #expect(ours.payload == expected, "\(w.name)")
+            }
+        }
+    }
+
+    @Test func theReferenceWriterSetsEOFOnCloseAndAfter() throws {
+        let close = try ChannelFixtures.load().stream.close
+        #expect(StreamDataHeader(streamID: 5, eof: true, compressed: false).packed() == Data(hexString: close.close_header_hex)!)
+        #expect(close.close_data_hex.isEmpty)
+        #expect(StreamDataHeader(streamID: 5, eof: true, compressed: false).packed() == Data(hexString: close.after_close_header_hex)!)
+        #expect(close.after_close_processed == 11)
     }
 
     @Test func theConstantsMatchTheReference() {
