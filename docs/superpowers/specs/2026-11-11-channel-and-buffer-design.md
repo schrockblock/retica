@@ -98,7 +98,7 @@ Without this, ReTiCA as initiator can't prove a reference peer's channel message
   - A write returns the number of input bytes consumed. On "not ready" it returns 0 rather than failing.
 - **Writer close:** waits (bounded) for the channel to be ready, then sends an empty EOF message.
 - **Reader:** handles only stream data for its own stream id and appends it to its buffer. EOF is sticky.
-  - **Decompression** is bounded at 16 KiB. If the bz2 stream doesn't finish within that, the message is invalid. The reference raises inside the handler, and the handler's exception is caught and logged.
+  - **Decompression** is bounded at 16 KiB. If the bz2 stream doesn't finish within that, the message is invalid. The reference raises inside `Envelope.unpack` (`StreamDataMessage.unpack`, bz2 included, runs at Channel.py:355), before `_emplace_envelope` (Channel.py:371); the exception is caught and logged at Channel.py:396. The packet is still proven, the envelope never enters the receive ring, and the channel stalls at that sequence.
   - **Stream ids are per direction.** A bidirectional buffer has a receive id and a send id.
 
 ## Deliberate divergences

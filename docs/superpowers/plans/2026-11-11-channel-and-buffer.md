@@ -34,7 +34,7 @@
 1. **A late proof for a superseded packet hash.** After a channel resend, the envelope's packet hash changes. A proof for the old hash arrives late. Expected, as in the reference: it is ignored, and only the current hash completes the envelope. Pinned in Task 5.
 2. **The link closes with sends outstanding.** Every channel timer is cancelled, no delivered or failed delegate fires after `closed`, and no second LINKCLOSE goes out. Pinned in Task 5.
 3. **A peer floods duplicate and out-of-window sequences.** The receive ring never holds more than `WINDOW_MAX + 1` envelopes, nothing else grows, and every packet is still proven. Pinned in Task 3 (ring) and Task 5 (proof).
-4. **A compressed stream chunk that inflates past 16 KiB, or a truncated bz2 chunk.** It is dropped with no crash and no allocation beyond the cap. The channel packet was still proven and the sequence still advances, because it is a parse failure inside the handler, after delivery. Pinned in Task 6.
+4. **A compressed stream chunk that inflates past 16 KiB, or a truncated bz2 chunk.** It is dropped with no crash and no allocation beyond the cap. The channel packet was still proven, but the envelope never enters the receive ring and the channel stalls at that sequence, because the parse failure happens inside `Envelope.unpack` (Channel.py:355), before `_emplace_envelope` (Channel.py:371), and is caught at Channel.py:396. Pinned in Task 6.
 5. **A CHANNEL packet arrives on a responder before the LRRTT activates the link.** It joins the handshake backlog like DATA/NONE does and is processed after activation. It is not dropped. Pinned in Task 5.
 
 ---
@@ -384,7 +384,7 @@ The spec's prerequisite. Today `.provePacket` only works on a responder, and pro
     - If the channel is not ready, it waits for the next `.channelMessageDelivered` that frees the window, or for a deadline of `max(rtt × tx.count, 0)` seconds (15 s if RTT is unknown), whichever comes first. Then it tries once.
     - It reports `.streamWritten(token, consumed: 0)` whether the EOF went out or not. A failed EOF is lost silently, as in the reference. Note this in a comment with `Buffer.py:269-280`.
   - Routing on `LinkPlane` / `TransportEndpoint`: `openStreamReaderOverLink`, `closeStreamReaderOverLink`, `writeStreamOverLink`, `closeStreamWriterOverLink` (each with `linkID:` first), and the delegates `streamDataReceived(linkID:streamID:data:eof:)` and `streamWritten(linkID:token:consumed:)`.
-  - **Receive.** A delivered `0xFF00` envelope whose stream id is in `streamReaders` is decoded and emitted. Other ids are dropped after delivery, which still advances the ring. A decode failure drops that chunk only (Review Focus 4). The session does not buffer stream bytes; consumers own buffering. A `0xFF00` envelope that arrives before any reader is open is unregistered and stalls the ring, exactly as the reference.
+  - **Receive.** A delivered `0xFF00` envelope whose stream id is in `streamReaders` is decoded and emitted. Other ids are dropped after delivery, which still advances the ring. A decode failure is proven, never enters the ring, and stalls the channel, as the reference (Channel.py:355, 371, 396; Review Focus 4). The session does not buffer stream bytes; consumers own buffering. A `0xFF00` envelope that arrives before any reader is open is unregistered and stalls the ring, exactly as the reference.
 
 - [ ] **Step 1: Extend the generator** with a `stream` section:
   - real `StreamDataMessage.pack()` outputs (header vectors);
@@ -400,7 +400,7 @@ The spec's prerequisite. Today `.provePacket` only works on a responder, and pro
   - `streamIDsAboveFourteenBitsCannotBeWritten`: `.writeStream(streamID: 0x4000…)` gives `.streamWritten(consumed: 0)`, and nothing is transmitted.
   - `aStreamRoundTripsBetweenTwoSessions`: 40 KB each way through in-memory sessions, including compressed and uncompressed chunks, then EOF.
   - `streamDataForAnUnopenedStreamIsDroppedButAdvances`
-  - `aBadChunkDoesNotStallTheStream` (Review Focus 4)
+  - `aBadChunkStallsTheRingAsTheReferenceDoes` (Review Focus 4)
 
 - [ ] **Step 3: Run, fail, implement, pass:** `swift test --filter Stream`, `swift test --filter Channel`.
 
