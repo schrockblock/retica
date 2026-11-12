@@ -213,6 +213,10 @@ public struct TransportEndpoint {
         case sendResponseOverLink(linkID: Data, requestID: Data, data: Data)
         case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
         case provePacketOverLink(linkID: Data, packetHash: Data)
+        /// Channel on `linkID` (see `LinkSession.Action.openChannel` and its siblings).
+        case openChannelOverLink(linkID: Data)
+        case registerChannelMessageTypeOverLink(linkID: Data, type: ChannelMessageType)
+        case sendChannelMessageOverLink(linkID: Data, type: ChannelMessageType, payload: Data, token: Data)
         /// Prove a single (non-link) packet we received — see `Transport.Action.proveSingle`.
         case proveSinglePacket(packetHash: Data, interfaceID: InterfaceID, identity: Identity)
         case closeLink(linkID: Data)
@@ -249,6 +253,11 @@ public struct TransportEndpoint {
             case requestFailed(linkID: Data, requestID: Data)
             case packetDelivered(token: Data)
             case packetDeliveryFailed(token: Data)
+            /// Forwarded from `LinkPlane`: a link's channel delegates, keyed by the link.
+            case channelMessageReceived(linkID: Data, msgType: UInt16, payload: Data)
+            case channelMessageSent(linkID: Data, token: Data, sequence: UInt16)
+            case channelMessageDelivered(linkID: Data, token: Data)
+            case channelSendRejected(linkID: Data, token: Data, reason: ChannelSendRejection)
             /// A single (non-link) packet sent with a receipt token was proved. Distinct from
             /// `packetDelivered(token:)`, which stays link-only.
             case singlePacketDelivered(token: Data)
@@ -723,6 +732,14 @@ public struct TransportEndpoint {
                 return .send(.delegate(.packetDelivered(token: token)))
             case let .linkPlane(.delegate(.packetDeliveryFailed(token))):
                 return .send(.delegate(.packetDeliveryFailed(token: token)))
+            case let .linkPlane(.delegate(.channelMessageReceived(linkID, msgType, payload))):
+                return .send(.delegate(.channelMessageReceived(linkID: linkID, msgType: msgType, payload: payload)))
+            case let .linkPlane(.delegate(.channelMessageSent(linkID, token, sequence))):
+                return .send(.delegate(.channelMessageSent(linkID: linkID, token: token, sequence: sequence)))
+            case let .linkPlane(.delegate(.channelMessageDelivered(linkID, token))):
+                return .send(.delegate(.channelMessageDelivered(linkID: linkID, token: token)))
+            case let .linkPlane(.delegate(.channelSendRejected(linkID, token, reason))):
+                return .send(.delegate(.channelSendRejected(linkID: linkID, token: token, reason: reason)))
             case let .linkPlane(.delegate(.localLinkOpened(linkID))):
                 return .send(.transport(.registerLocalLink(linkID)))
             case let .linkPlane(.delegate(.localLinkClosed(linkID))):
@@ -966,6 +983,12 @@ extension TransportEndpoint.Action.AllCasePaths {
                     return .sendWithReceiptOverLink(linkID: linkID, data: data, token: token)
                 case let .provePacketOverLink(linkID, packetHash):
                     return .provePacketOverLink(linkID: linkID, packetHash: packetHash)
+                case let .openChannelOverLink(linkID):
+                    return .openChannelOverLink(linkID: linkID)
+                case let .registerChannelMessageTypeOverLink(linkID, type):
+                    return .registerChannelMessageTypeOverLink(linkID: linkID, type: type)
+                case let .sendChannelMessageOverLink(linkID, type, payload, token):
+                    return .sendChannelMessageOverLink(linkID: linkID, type: type, payload: payload, token: token)
                 case let .closeLink(linkID):
                     return .closeLink(linkID: linkID)
                 case let .registerRequestHandler(path, policy):
@@ -997,6 +1020,12 @@ extension TransportEndpoint.Action.AllCasePaths {
                     return .sendWithReceiptOverLink(linkID: linkID, data: data, token: token)
                 case let .provePacketOverLink(linkID, packetHash):
                     return .provePacketOverLink(linkID: linkID, packetHash: packetHash)
+                case let .openChannelOverLink(linkID):
+                    return .openChannelOverLink(linkID: linkID)
+                case let .registerChannelMessageTypeOverLink(linkID, type):
+                    return .registerChannelMessageTypeOverLink(linkID: linkID, type: type)
+                case let .sendChannelMessageOverLink(linkID, type, payload, token):
+                    return .sendChannelMessageOverLink(linkID: linkID, type: type, payload: payload, token: token)
                 case let .closeLink(linkID):
                     return .closeLink(linkID: linkID)
                 case let .registerRequestHandler(path, policy):

@@ -108,6 +108,10 @@ private let ifA = InterfaceID("iface-a")
     #expect(roundTrips(.sendWithReceiptOverLink(linkID: linkID, data: Data("msg".utf8),
                                                token: Data(repeating: 0x06, count: 16))))
     #expect(roundTrips(.provePacketOverLink(linkID: linkID, packetHash: Data(repeating: 0x0C, count: 32))))
+    #expect(roundTrips(.openChannelOverLink(linkID: linkID)))
+    #expect(roundTrips(.registerChannelMessageTypeOverLink(linkID: linkID, type: ChannelMessageType(7)!)))
+    #expect(roundTrips(.sendChannelMessageOverLink(linkID: linkID, type: ChannelMessageType(7)!,
+                                                   payload: Data("ch".utf8), token: Data(repeating: 0x10, count: 16))))
     #expect(roundTrips(.closeLink(linkID: linkID)))
     #expect(roundTrips(.registerRequestHandler(path: "svc/echo", policy: .all)))
     #expect(roundTrips(.deregisterRequestHandler(path: "svc/echo")))
@@ -147,6 +151,10 @@ private let ifA = InterfaceID("iface-a")
     let tok = Data(repeating: 0x0B, count: 16)
     #expect(roundTrips(.delegate(.packetDelivered(token: tok))))
     #expect(roundTrips(.delegate(.packetDeliveryFailed(token: tok))))
+    #expect(roundTrips(.delegate(.channelMessageReceived(linkID: linkID, msgType: 7, payload: Data([0x01])))))
+    #expect(roundTrips(.delegate(.channelMessageSent(linkID: linkID, token: tok, sequence: 3))))
+    #expect(roundTrips(.delegate(.channelMessageDelivered(linkID: linkID, token: tok))))
+    #expect(roundTrips(.delegate(.channelSendRejected(linkID: linkID, token: tok, reason: .tooBig))))
 }
 
 // MARK: - Re-homing helpers (Task 5)

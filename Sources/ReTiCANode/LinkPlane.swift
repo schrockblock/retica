@@ -211,6 +211,10 @@ public struct LinkPlane {
         case sendWithReceiptOverLink(linkID: Data, data: Data, token: Data)
         /// Prove one inbound data packet on `linkID` (reference `RNS.Packet.prove()`).
         case provePacketOverLink(linkID: Data, packetHash: Data)
+        /// Channel on `linkID` (see `LinkSession.Action.openChannel` and its siblings).
+        case openChannelOverLink(linkID: Data)
+        case registerChannelMessageTypeOverLink(linkID: Data, type: ChannelMessageType)
+        case sendChannelMessageOverLink(linkID: Data, type: ChannelMessageType, payload: Data, token: Data)
         case closeLink(linkID: Data)
         case registerRequestHandler(path: String, policy: RequestPolicy)
         case deregisterRequestHandler(path: String)
@@ -242,6 +246,11 @@ public struct LinkPlane {
             case requestFailed(linkID: Data, requestID: Data)
             case packetDelivered(token: Data)
             case packetDeliveryFailed(token: Data)
+            /// `LinkSession`'s channel delegates, keyed by the link they happened on.
+            case channelMessageReceived(linkID: Data, msgType: UInt16, payload: Data)
+            case channelMessageSent(linkID: Data, token: Data, sequence: UInt16)
+            case channelMessageDelivered(linkID: Data, token: Data)
+            case channelSendRejected(linkID: Data, token: Data, reason: ChannelSendRejection)
             /// A local link's linkID was assigned / released — Transport tracks these to avoid
             /// relaying or shadowing links we are an endpoint of.
             case localLinkOpened(linkID: Data)
@@ -579,6 +588,19 @@ public struct LinkPlane {
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .provePacket(packetHash: packetHash))))
 
+            case let .openChannelOverLink(linkID):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .openChannel)))
+
+            case let .registerChannelMessageTypeOverLink(linkID, type):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id, action: .registerChannelMessageType(type))))
+
+            case let .sendChannelMessageOverLink(linkID, type, payload, token):
+                guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
+                return .send(.link(.element(id: element.id,
+                                            action: .sendChannelMessage(type: type, payload: payload, token: token))))
+
             case let .closeLink(linkID):
                 guard let element = state.links.first(where: { $0.linkID == linkID }) else { return .none }
                 return .send(.link(.element(id: element.id, action: .close)))
@@ -746,6 +768,22 @@ public struct LinkPlane {
 
             case let .link(.element(_, .delegate(.packetDeliveryFailed(token)))):
                 return .send(.delegate(.packetDeliveryFailed(token: token)))
+
+            case let .link(.element(elementID, .delegate(.channelMessageReceived(msgType, payload)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.channelMessageReceived(linkID: linkID, msgType: msgType, payload: payload)))
+
+            case let .link(.element(elementID, .delegate(.channelMessageSent(token, sequence)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.channelMessageSent(linkID: linkID, token: token, sequence: sequence)))
+
+            case let .link(.element(elementID, .delegate(.channelMessageDelivered(token)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.channelMessageDelivered(linkID: linkID, token: token)))
+
+            case let .link(.element(elementID, .delegate(.channelSendRejected(token, reason)))):
+                guard let linkID = state.links[id: elementID]?.linkID else { return .none }
+                return .send(.delegate(.channelSendRejected(linkID: linkID, token: token, reason: reason)))
 
             case let .link(.element(elementID, .delegate(.rehomed(interfaceID)))):
                 // ResourceTransfer.State.interfaceID is a snapshot taken at creation and every

@@ -14,7 +14,12 @@ import ReTiCA
 public struct LinkSession {
     public enum Role: Equatable, Sendable { case initiator, responder }
     public enum Status: Equatable, Sendable { case pending, handshake, active, closed }
-    public enum CloseReason: Equatable, Sendable { case initiatorClosed, destinationClosed, timedOut }
+    public enum CloseReason: Equatable, Sendable {
+        case initiatorClosed, destinationClosed, timedOut
+        /// A channel envelope went unproven through `ChannelConstants.maxTries` sends, and the
+        /// channel tore the link down (RNS Channel.py:469-483 → `LinkChannelOutlet.timed_out`).
+        case channelRetriesExhausted
+    }
 
     /// Why establishment failed. The distinction is load-bearing above: a timeout is evidence
     /// about the PATH, a rejection is evidence about the PEER.
@@ -127,11 +132,14 @@ public struct LinkSession {
         /// on a slow link where the derived cadence is far longer than 30 s.
         var staleTime: TimeInterval { max(keepaliveInterval, effectiveKeepalive) * 2 }
         public var relayNextHop: Data? = nil
-        /// Responder only: authenticated link traffic (DATA/NONE, LINKIDENTIFY, REQUEST) that
+        /// Responder only: authenticated link traffic (DATA/NONE, LINKIDENTIFY, REQUEST, CHANNEL) that
         /// arrived while still in `.handshake`, i.e. BEFORE the LRRTT that activates the link.
         /// Replayed in arrival order, right after `.established`, when the LRRTT lands. Bounded by
         /// `LinkSession.handshakeBacklogLimit`; dropped if the handshake times out.
         var handshakeBacklog: [BufferedPacket] = []
+        /// This link's RNS `Channel`: nil until `.openChannel` (or `.registerChannelMessageType`),
+        /// and nil again once the link closes, by any path.
+        public var channel: ChannelState? = nil
         /// Initiator: link to a known destination identity.
         public init(id: UUID = UUID(), initiatorTo destinationIdentity: Identity, destinationHash: Data,
                     interfaceID: InterfaceID, ephemeral: Identity = Identity(),
@@ -220,6 +228,18 @@ public struct LinkSession {
         /// `resourceFailed` follows. Unknown hash: no-op. Mirrors reference `Resource.cancel()`
         /// (RNS/Resource.py:1084-1117) as driven by `LXMRouter.cancel_outbound`.
         case cancelResource(hash: Data)
+        /// Open this link's channel (RNS `Link.get_channel()`, Link.py:1007-1014). Idempotent; there
+        /// is no wire handshake. Until a channel is open, inbound CHANNEL packets are dropped
+        /// unproven (Link.py:1234-1236).
+        case openChannel
+        /// Accept envelopes of `type` on this link's channel, opening it first if needed.
+        case registerChannelMessageType(ChannelMessageType)
+        /// Send one channel message (RNS `Channel.send`, Channel.py:495-530). Answered by
+        /// `channelMessageSent` or `channelSendRejected`, then `channelMessageDelivered` once the
+        /// peer proves it.
+        case sendChannelMessage(type: ChannelMessageType, payload: Data, token: Data)
+        /// Internal: the retry timer of the outbound envelope `sequence` ran out.
+        case channelDeadline(sequence: UInt16)
         case transfer(IdentifiedActionOf<ResourceTransfer>)
         case delegate(Delegate)
 
@@ -258,6 +278,14 @@ public struct LinkSession {
             /// (never relays or shadows it). Emitted for both initiator (.establish) and responder
             /// (.acceptRequest).
             case linkIDAssigned(Data)
+            /// A channel envelope of a registered type was delivered in sequence order.
+            case channelMessageReceived(msgType: UInt16, payload: Data)
+            /// A channel message went out under `sequence`.
+            case channelMessageSent(token: Data, sequence: UInt16)
+            /// The peer proved the channel message sent with `token`.
+            case channelMessageDelivered(token: Data)
+            /// `sendChannelMessage` sent nothing.
+            case channelSendRejected(token: Data, reason: ChannelSendRejection)
         }
     }
 
@@ -266,7 +294,11 @@ public struct LinkSession {
     @Dependency(\.uuid) var uuid
     @Dependency(\.randomBytes) var randomBytes
 
-    private enum CancelID: Hashable { case establishment, keepalive, inactivity, request(Data), receipt(Data) }
+    enum CancelID: Hashable {
+        case establishment, keepalive, inactivity, request(Data), receipt(Data)
+        /// The retry timer of outbound channel envelope `sequence` (`LinkSession+Channel.swift`).
+        case channel(UInt16)
+    }
 
     public init() {}
 
@@ -282,6 +314,33 @@ public struct LinkSession {
             guard let x = state.peerX25519Pub, let ed = state.peerSigningPub else { return nil }
             return Identity(publicKey: x + ed)
         }
+    }
+
+    /// Transmit a proof of the inbound link packet `packetHash`, or nothing when the F4 guards
+    /// refuse. Reference RNS 1.6.0 Link.py:463-474 `prove_packet`:
+    ///   signature  = self.sign(packet.packet_hash)
+    ///   proof_data = packet.packet_hash + signature
+    ///   RNS.Packet(self, proof_data, RNS.Packet.PROOF).send()   # context NONE, unencrypted
+    /// `self.sign` uses the link's `sig_prv` (Link.py:1276-1277): on a RESPONDER the owning
+    /// destination's identity key (Link.py:303), on an INITIATOR the per-link Ed25519 key
+    /// (Link.py:316) whose public half went out in the LINKREQUEST — which is `state.ephemeral`, sent
+    /// whole by `.establish`. The peer validates against whichever it loaded (`proofValidator`).
+    /// F4 guard set: the signer is read from session state, never from an action argument; the link
+    /// must be `.active`; and the signer must hold a private key, because `Identity.sign`
+    /// `preconditionFailure`s without one. A keyless signer can be seeded by a direct-composition
+    /// caller, so guard the crash site itself, which also defends every caller (`.provePacket` and
+    /// the channel's prove-on-receive).
+    func proofTransmit(_ state: State, packetHash: Data) -> Effect<Action> {
+        let signer: Identity? = state.role == .initiator ? state.ephemeral : state.owningIdentity
+        guard state.status == .active, let signer, signer.privateKey != nil else { return .none }
+        let proofData = packetHash + signer.sign(packetHash)
+        let proofPacket = Packet(headerType: .header1, packetType: .proof,
+                                 transportType: .broadcast, destinationType: .link,
+                                 context: .none, contextFlag: false, hops: 0,
+                                 destinationHash: state.linkID, transportId: nil,
+                                 payload: proofData)
+        guard let raw = try? proofPacket.packed() else { return .none }
+        return .send(.delegate(.transmit(state.interfaceID, raw)))
     }
 
     public var body: some ReducerOf<Self> {
@@ -347,16 +406,32 @@ public struct LinkSession {
                        .cancel(id: CancelID.keepalive),
                        .cancel(id: CancelID.inactivity))
             }
+            // The per-link half of every close path's cleanup (`cancelAll` is the fixed timers):
+            // pending requests, and the channel with every retry timer it has armed (RNS
+            // `link_closed` → `Channel._shutdown`, Link.py:775), so no channel delegate can follow
+            // `.closed`. Like `cancelAll`, a function, so its eager cancels run only when called.
             func cancelPending(_ state: inout State) -> Effect<Action> {
                 let cancels = state.pendingRequests.map { Effect<Action>.cancel(id: CancelID.request($0)) }
                 state.pendingRequests.removeAll()
-                return .merge(cancels)
+                return .merge(cancels + [closeChannel(&state)])
             }
             func linkPacket(_ linkID: Data, _ context: PacketContext, _ payload: Data) -> Data? {
                 let p = Packet(headerType: .header1, packetType: .data, transportType: .broadcast,
                                destinationType: .link, context: context, contextFlag: false, hops: 0,
                                destinationHash: linkID, transportId: nil, payload: payload)
                 return try? p.packed()
+            }
+            // Close an ACTIVE link from this end: LINKCLOSE out, `.closed(reason)`, everything
+            // cancelled. One copy for `.close`, the inactivity deadline and channel retry exhaustion.
+            func closeActive(_ state: inout State, _ reason: CloseReason) -> Effect<Action> {
+                let cipher = Link.encrypt(state.linkID, sessionKey: state.sessionKey)
+                state.status = .closed
+                let closedAction = Action.delegate(.closed(reason))
+                let pending = cancelPending(&state)
+                guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
+                    return .merge(.send(closedAction), cancelAll(), pending)
+                }
+                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll(), pending)
             }
 
             switch action {
@@ -605,7 +680,8 @@ public struct LinkSession {
 
                 case (.responder, .handshake, .data, .none),
                      (.responder, .handshake, .data, .linkIdentify),
-                     (.responder, .handshake, .data, .request):
+                     (.responder, .handshake, .data, .request),
+                     (.responder, .handshake, .data, .channel):
                     // Authenticated traffic that overtook the LRRTT. The initiator goes `.active`
                     // on the proof and may send DATA/identify/request immediately after the RTT;
                     // nothing guarantees they arrive after it (TCPClientInterface once reordered
@@ -636,6 +712,9 @@ public struct LinkSession {
                     guard let plain = authDecrypt(packet.payload, state.sessionKey)
                     else { return .none }   // corrupt/foreign data is ignored, link stays active
                     return .send(.delegate(.dataReceived(data: plain, packetHash: packet.packetHash)))
+
+                case (_, .active, .data, .channel):
+                    return receiveChannelPacket(&state, packet, decrypt: authDecrypt)
 
                 case (_, .active, .data, .linkClose):
                     guard let plain = authDecrypt(packet.payload, state.sessionKey),
@@ -769,8 +848,10 @@ public struct LinkSession {
                     guard packet.payload.count == 96 else { return .none }
                     let proofHash = Data(packet.payload.prefix(32))
                     let signature = Data(packet.payload.suffix(64))
-                    guard let token = state.pendingDataReceipts[proofHash],
-                          let peer = proofValidator(state),
+                    guard let token = state.pendingDataReceipts[proofHash] else {
+                        return channelProofReceived(&state, proofHash: proofHash, signature: signature)
+                    }
+                    guard let peer = proofValidator(state),
                           peer.validate(signature: signature, message: proofHash)
                     else { return .none }
                     state.pendingDataReceipts[proofHash] = nil
@@ -989,15 +1070,7 @@ public struct LinkSession {
                 // link's traffic, same as when the establishment deadline fires.
                 if state.status == .handshake { state.handshakeBacklog = [] }
                 guard state.status == .active else { return .none }
-                let cipher = Link.encrypt(state.linkID, sessionKey: state.sessionKey)
-                state.status = .closed
-                let reason: CloseReason = state.role == .initiator ? .initiatorClosed : .destinationClosed
-                let closedAction = Action.delegate(.closed(reason))
-                let pending = cancelPending(&state)
-                guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
-                    return .merge(.send(closedAction), cancelAll(), pending)
-                }
-                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll(), pending)
+                return closeActive(&state, state.role == .initiator ? .initiatorClosed : .destinationClosed)
 
             case .establishmentDeadline:
                 guard state.status == .pending || state.status == .handshake else { return .none }
@@ -1033,14 +1106,7 @@ public struct LinkSession {
 
             case .inactivityDeadline:
                 guard state.status == .active else { return .none }
-                let cipher = Link.encrypt(state.linkID, sessionKey: state.sessionKey)
-                state.status = .closed
-                let closedAction = Action.delegate(.closed(.timedOut))
-                let pending = cancelPending(&state)
-                guard let raw = linkPacket(state.linkID, .linkClose, cipher) else {
-                    return .merge(.send(closedAction), cancelAll(), pending)
-                }
-                return .merge(.send(.delegate(.transmit(state.interfaceID, raw))), .send(closedAction), cancelAll(), pending)
+                return closeActive(&state, .timedOut)
 
             case let .requestDeadline(requestID):
                 guard state.pendingRequests.contains(requestID) else { return .none }
@@ -1065,30 +1131,27 @@ public struct LinkSession {
                     }.cancellable(id: CancelID.receipt(packetHash), cancelInFlight: true))
 
             case let .provePacket(packetHash):
-                // Reference RNS 1.6.0 Link.py:463-474 `prove_packet`:
-                //   signature  = self.sign(packet.packet_hash)
-                //   proof_data = packet.packet_hash + signature
-                //   RNS.Packet(self, proof_data, RNS.Packet.PROOF).send()   # context NONE, unencrypted
-                // `self.sign` uses the link's `sig_prv` (Link.py:1276-1277): on a RESPONDER the
-                // owning destination's identity key (Link.py:303), on an INITIATOR the per-link
-                // Ed25519 key (Link.py:316) whose public half went out in the LINKREQUEST — which is
-                // `state.ephemeral`, sent whole by `.establish`. The peer validates against whichever
-                // it loaded (`proofValidator`).
-                // F4 guard set: the signer is read from session state, never from an action
-                // argument; the link must be `.active`; and the signer must hold a private key,
-                // because `Identity.sign` `preconditionFailure`s without one. A keyless signer can be
-                // seeded by a direct-composition caller, so guard the crash site itself, which also
-                // defends every other caller of `provePacket`.
-                let signer: Identity? = state.role == .initiator ? state.ephemeral : state.owningIdentity
-                guard state.status == .active, let signer, signer.privateKey != nil else { return .none }
-                let proofData = packetHash + signer.sign(packetHash)
-                let proofPacket = Packet(headerType: .header1, packetType: .proof,
-                                         transportType: .broadcast, destinationType: .link,
-                                         context: .none, contextFlag: false, hops: 0,
-                                         destinationHash: state.linkID, transportId: nil,
-                                         payload: proofData)
-                guard let raw = try? proofPacket.packed() else { return .none }
-                return .send(.delegate(.transmit(state.interfaceID, raw)))
+                // Signing, F4 guards and the reference citations live in `proofTransmit`.
+                return proofTransmit(state, packetHash: packetHash)
+
+            case .openChannel:
+                openChannel(&state)
+                return .none
+
+            case let .registerChannelMessageType(type):
+                openChannel(&state)
+                state.channel?.registered.insert(type.rawValue)
+                return .none
+
+            case let .sendChannelMessage(type, payload, token):
+                return sendChannelMessage(&state, type: type, payload: payload, token: token)
+
+            case let .channelDeadline(sequence):
+                switch channelDeadline(&state, sequence: sequence) {
+                case .ignored: return .none
+                case let .resent(effect): return effect
+                case .exhausted: return closeActive(&state, .channelRetriesExhausted)
+                }
 
             case let .dataProofDeadline(packetHash):
                 guard let token = state.pendingDataReceipts[packetHash] else { return .none }
